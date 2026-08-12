@@ -26,17 +26,24 @@ const MAX_BYTES = 5 * 1024 * 1024
 export function createFileSink(file: string, maxBytes: number = MAX_BYTES): Sink {
   const rotated = `${file}.1`
   return (line: string) => {
-    // The mode option on mkdirSync applies only when it creates the
-    // directory, so an existing directory keeps its old mode. chmodSync
-    // enforces 0700 unconditionally, matching paths.ts's ensureStateDir.
-    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
-    chmodSync(dirname(file), 0o700)
+    // A log call must never throw. Callers log from inside their own catch
+    // blocks, so a throw here would escape a handler that promises not to
+    // throw. A lost log line costs less than a crashed key press.
     try {
-      if (statSync(file).size > maxBytes) renameSync(file, rotated)
+      // The mode option on mkdirSync applies only when it creates the
+      // directory, so an existing directory keeps its old mode. chmodSync
+      // enforces 0700 unconditionally, matching paths.ts's ensureStateDir.
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+      chmodSync(dirname(file), 0o700)
+      try {
+        if (statSync(file).size > maxBytes) renameSync(file, rotated)
+      } catch {
+        // The file does not exist yet. Nothing to rotate.
+      }
+      appendFileSync(file, line + '\n')
     } catch {
-      // The file does not exist yet. Nothing to rotate.
+      // The disk is full, or the path is not writable. Drop the line.
     }
-    appendFileSync(file, line + '\n')
   }
 }
 

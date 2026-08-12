@@ -93,4 +93,18 @@ describe('createFileSink', () => {
 
     expect(readFileSync(nested, 'utf8')).toBe('first line\n')
   })
+
+  it('does not throw when the log path cannot be written', () => {
+    // `blocker` is a regular file, so treating it as a directory component
+    // makes mkdirSync fail. A log call must survive a full disk or an
+    // unwritable path the same way, because callers log from inside a catch
+    // block that itself promises never to throw.
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'not a directory')
+    const unwritable = join(blocker, 'nested', 'deckd.log')
+    const sink = createFileSink(unwritable)
+
+    expect(() => sink('line')).not.toThrow()
+    expect(existsSync(unwritable)).toBe(false)
+  })
 })

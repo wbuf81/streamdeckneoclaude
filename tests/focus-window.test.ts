@@ -3,8 +3,10 @@ import {
   terminalAppName,
   buildFocusScript,
   findTerminalPid,
+  focusWindow,
   MAX_WALK,
 } from '../src/focus-window.js'
+import { createLogger } from '../src/log.js'
 
 describe('terminalAppName', () => {
   it('maps ghostty', () => {
@@ -70,5 +72,46 @@ describe('findTerminalPid', () => {
 
   it('returns the pid unchanged when it is already 1', () => {
     expect(findTerminalPid(1, () => null)).toBe(1)
+  })
+})
+
+describe('focusWindow', () => {
+  it('logs a repeated failure only once, and logs again after it clears', async () => {
+    const written: string[] = []
+    const logger = createLogger((line) => written.push(line))
+    const failingRunner = async (): Promise<{ stdout: string; stderr: string }> => {
+      throw new Error('boom')
+    }
+
+    // A user holding down the same key while macOS denies automation must
+    // not fill the log with one line per press.
+    await focusWindow(123, 'ghostty', failingRunner, logger)
+    await focusWindow(123, 'ghostty', failingRunner, logger)
+    await focusWindow(123, 'ghostty', failingRunner, logger)
+    expect(written).toHaveLength(1)
+
+    const okRunner = async (): Promise<{ stdout: string; stderr: string }> => ({
+      stdout: '',
+      stderr: '',
+    })
+
+    // A success clears the once-key, so a later failure logs again.
+    await focusWindow(123, 'ghostty', okRunner, logger)
+    await focusWindow(123, 'ghostty', failingRunner, logger)
+    expect(written).toHaveLength(2)
+  })
+
+  it('resolves true on success and false on failure, without throwing', async () => {
+    const logger = createLogger(() => {})
+    const okRunner = async (): Promise<{ stdout: string; stderr: string }> => ({
+      stdout: '',
+      stderr: '',
+    })
+    const failingRunner = async (): Promise<{ stdout: string; stderr: string }> => {
+      throw new Error('boom')
+    }
+
+    await expect(focusWindow(1, 'ghostty', okRunner, logger)).resolves.toBe(true)
+    await expect(focusWindow(1, 'ghostty', failingRunner, logger)).resolves.toBe(false)
   })
 })

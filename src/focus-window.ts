@@ -1,8 +1,11 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { log } from './log.js'
+import { log, type Logger } from './log.js'
 
 const run = promisify(execFile)
+
+/** The shape of `run`. A test injects a fake to avoid shelling out. */
+type Runner = (file: string, args: readonly string[]) => Promise<{ stdout: string; stderr: string }>
 
 /** Depth cap for the process walk. A broken tree must not loop. */
 export const MAX_WALK = 12
@@ -71,18 +74,33 @@ export async function readParentPid(pid: number): Promise<number | null> {
 /**
  * Raises the terminal window of a session. It returns false on any failure, and
  * the caller flashes the key red. A failure is never fatal.
+ *
+ * `runner` and `logger` default to the real `osascript` call and the shared
+ * `log`. A test overrides both, so it can inject a failure and capture the
+ * log lines without shelling out or raising a window. Later callers use the
+ * two-argument form.
  */
-export async function focusWindow(pid: number, termProgram: string): Promise<boolean> {
+export async function focusWindow(
+  pid: number,
+  termProgram: string,
+  runner: Runner = run,
+  logger: Logger = log,
+): Promise<boolean> {
   const app = terminalAppName(termProgram)
   if (!app) {
-    log.once(`term-${termProgram}`, `no window focus rule for terminal "${termProgram}"`)
+    logger.once(`term-${termProgram}`, `no window focus rule for terminal "${termProgram}"`)
     return false
   }
   try {
-    await run('/usr/bin/osascript', ['-e', buildFocusScript(app)])
+    await runner('/usr/bin/osascript', ['-e', buildFocusScript(app)])
+    // A later success after a failure should log again if it fails once more.
+    logger.clearOnce(`focus-${app}`)
     return true
   } catch (e) {
-    log.warn(`window focus failed for ${app} pid ${pid}: ${String(e)}`)
+    // `log.once`, not `log.warn`. A user who presses the same key while macOS
+    // denies automation would otherwise write one line per press, without a
+    // limit. The key clears on the next success.
+    logger.once(`focus-${app}`, `window focus failed for ${app} pid ${pid}: ${String(e)}`)
     return false
   }
 }
