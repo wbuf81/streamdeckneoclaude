@@ -50,6 +50,12 @@ describe('keyHash', () => {
     const b: KeySpec = { kind: 'gauge', lines: ['x'], lineColors: [[230, 60, 60]] }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
+
+  it('differs when the emoji changes, so the daemon redraws a changed forecast icon', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['THU'], emoji: '☀️' }
+    const b: KeySpec = { kind: 'gauge', lines: ['THU'], emoji: '⛈' }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
 })
 
 describe('stripHash', () => {

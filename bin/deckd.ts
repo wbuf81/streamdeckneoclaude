@@ -5,10 +5,12 @@ import { PageManager } from '../src/page-manager.js'
 import { ClaudePage } from '../src/pages/claude-page.js'
 import { SpotifyPage } from '../src/pages/spotify-page.js'
 import { StocksPage } from '../src/pages/stocks-page.js'
+import { WeatherPage } from '../src/pages/weather-page.js'
 import { ClaudeSource } from '../src/sources/claude.js'
 import { UsageSource } from '../src/sources/usage.js'
 import { SpotifySource } from '../src/sources/spotify.js'
 import { StockSource } from '../src/sources/stocks.js'
+import { WeatherSource } from '../src/sources/weather.js'
 import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
@@ -30,18 +32,21 @@ async function start(): Promise<void> {
   const clientId = readClientId()
   const spotify = new SpotifySource(clientId)
   const stocks = new StockSource()
+  const weather = new WeatherSource()
   await claude.start()
   await usage.start()
   await spotify.start()
   await stocks.start()
+  await weather.start()
 
   const device = new Device()
   const pages = new PageManager()
   pages.add(new ClaudePage(claude, usage, focusWindow))
   pages.add(new SpotifyPage(spotify))
   pages.add(new StocksPage(stocks))
+  pages.add(new WeatherPage(weather))
 
-  // Only now, with all three pages present, may a saved index be restored.
+  // Only now, with all four pages present, may a saved index be restored.
   // `PageManager.setIndex` silently ignores an index outside the current
   // page count, so restoring before every page exists would strand the deck
   // on an earlier page with no error and no log line.
@@ -63,6 +68,7 @@ async function start(): Promise<void> {
   usage.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
   spotify.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
   stocks.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
+  weather.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
 
   const shutdown = async () => {
     log.info('deckd stopping')
@@ -72,6 +78,7 @@ async function start(): Promise<void> {
     await usage.stop()
     await spotify.stop()
     await stocks.stop()
+    await weather.stop()
     await device.disconnect()
     process.exit(0)
   }

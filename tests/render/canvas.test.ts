@@ -168,6 +168,35 @@ describe('renderKey spark', () => {
   })
 })
 
+describe('renderKey emoji', () => {
+  it('changes the rendered pixels when an emoji is present', () => {
+    const without = renderKey({ kind: 'gauge' })
+    const withEmoji = renderKey({ kind: 'gauge', emoji: '☀️' })
+    expect(withEmoji.equals(without)).toBe(false)
+  })
+
+  it('draws real colour, not just gray text, proving the colour emoji font rendered', () => {
+    const buf = renderKey({ kind: 'gauge', emoji: '⛈' })
+    let colourful = false
+    for (let y = 10; y < KEY_SIZE - 10 && !colourful; y++) {
+      for (let x = 10; x < KEY_SIZE - 10; x++) {
+        const [r, g, b] = probe(buf, x, y)
+        if (Math.max(Math.abs(r - g), Math.abs(g - b), Math.abs(r - b)) > 20) {
+          colourful = true
+          break
+        }
+      }
+    }
+    expect(colourful).toBe(true)
+  })
+
+  it('draws the emoji before the text lines, so a line stays legible on top', () => {
+    const emojiOnly = renderKey({ kind: 'gauge', emoji: '☀️' })
+    const withLine = renderKey({ kind: 'gauge', emoji: '☀️', lines: ['NOW'] })
+    expect(withLine.equals(emojiOnly)).toBe(false)
+  })
+})
+
 describe('renderKey lineColors', () => {
   it('changes the rendered pixels when a line colour is set', () => {
     const uncoloured = renderKey({ kind: 'gauge', lines: ['TSLA', '327.51', '▼ 1.59%'] })

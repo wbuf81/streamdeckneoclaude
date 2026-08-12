@@ -112,6 +112,16 @@ export function renderKey(spec: KeySpec): Buffer {
     ctx.fillText(spec.glyph, KEY_SIZE / 2, KEY_SIZE / 2)
   }
 
+  if (spec.emoji) {
+    // Drawn before the text lines, so a label or number that overlaps it
+    // stays on top and legible. A missing emoji font simply draws nothing,
+    // which is acceptable degradation — there is no fallback glyph.
+    ctx.font = '40px "Apple Color Emoji"'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText(spec.emoji, KEY_SIZE / 2, 44)
+  }
+
   if (spec.lines?.length) {
     const centered = spec.align === 'center'
     ctx.font = `11px ${FONT}`

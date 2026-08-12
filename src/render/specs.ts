@@ -35,6 +35,8 @@ export interface KeySpec {
   bar?: BarSpec
   /** A large centred symbol, for a transport control. */
   glyph?: string
+  /** A single emoji, drawn large and centred. Used by the weather page. */
+  emoji?: string
   /** An asset name, for example `crab`. */
   sprite?: string
   /** An already-decoded image, for example album art. `keyHash` ignores this field. */
