@@ -1377,7 +1377,7 @@ Create `tests/sources/spotify-auth.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, statSync, existsSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, statSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -1496,6 +1496,24 @@ describe('TokenStore', () => {
     expect(statSync(f).mode & 0o777).toBe(0o600)
   })
 
+  it('tightens the mode on a file that already exists too open', () => {
+    // `writeFileSync`'s mode option applies only when it creates the file, so
+    // a pre-existing loose file would otherwise keep its permissions.
+    const f = join(dir, 'spotify.json')
+    writeFileSync(f, '{}', { mode: 0o644 })
+    expect(statSync(f).mode & 0o777).toBe(0o644)
+    new TokenStore(f).save({ accessToken: 'a', refreshToken: 'r', expiresAt: 1 })
+    expect(statSync(f).mode & 0o777).toBe(0o600)
+  })
+
+  it('tightens the mode on a directory that already exists too open', () => {
+    const sub = join(dir, 'nested')
+    mkdirSync(sub, { mode: 0o755 })
+    new TokenStore(join(sub, 'spotify.json'))
+      .save({ accessToken: 'a', refreshToken: 'r', expiresAt: 1 })
+    expect(statSync(sub).mode & 0o777).toBe(0o700)
+  })
+
   it('returns null for a corrupt file', () => {
     const f = join(dir, 'spotify.json')
     const s = new TokenStore(f)
@@ -1533,7 +1551,7 @@ Expected: FAIL. The error names a missing module.
 ```ts
 import { createServer } from 'node:http'
 import { createHash, randomBytes } from 'node:crypto'
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, chmodSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { execFile } from 'node:child_process'
 import { paths } from '../paths.js'
@@ -1619,8 +1637,14 @@ export class TokenStore {
   }
 
   save(t: Tokens): void {
+    // The `mode` option applies only when the call creates the target. An
+    // existing directory or file keeps its old permissions, and no error
+    // reports it. So chmod both without a condition. This file holds a
+    // refresh token.
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
+    chmodSync(dirname(this.file), 0o700)
     writeFileSync(this.file, JSON.stringify(t), { mode: 0o600 })
+    chmodSync(this.file, 0o600)
   }
 
   clear(): void {
@@ -2099,9 +2123,9 @@ Expected: FAIL. The error names a missing module.
 
 ```ts
 import { EventEmitter } from 'node:events'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { paths } from '../paths.js'
+import { paths, ensureStateDir } from '../paths.js'
 import { log } from '../log.js'
 import { TokenStore, refreshTokens, type Tokens } from './spotify-auth.js'
 
@@ -2432,7 +2456,8 @@ export class SpotifySource extends EventEmitter {
       if (!res.ok) return
       const buf = Buffer.from(await res.arrayBuffer())
       this.remember(trackId, buf)
-      mkdirSync(paths.artDir, { recursive: true, mode: 0o700 })
+      // Reuse the shared helper, so the 0700 enforcement lives in one place.
+      ensureStateDir()
       writeFileSync(join(paths.artDir, `${trackId}.img`), buf)
       this.emit('change')
     } catch {

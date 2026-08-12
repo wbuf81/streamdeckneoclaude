@@ -31,6 +31,13 @@
 - Never write `require(` in `src/`, `bin/`, or `scripts/`. Those files are ESM.
   A `node -e` shell one-liner runs in CommonJS scope, so `require` is correct
   there and only there.
+- The `mode` option on `mkdirSync` and `writeFileSync` applies only when the
+  call creates the target. An existing directory or file keeps its old
+  permissions, and the call reports no error. So every place that needs an
+  exact mode must also `chmodSync` without a condition. This matters for
+  `~/.local/state/deckd/` at 0700 and `spotify.json` at 0600, because those
+  hold a refresh token. A test that writes into a fresh temporary directory
+  cannot catch this. Test the already-exists-too-open case directly.
 
 ## Deviations from the spec
 
