@@ -4,8 +4,6 @@ import { join, dirname } from 'node:path'
 import { loadImage, type Image } from '@napi-rs/canvas'
 import { log } from '../log.js'
 
-const cache = new Map<string, Image>()
-
 /** A decoded frame sequence for one animated state, plus its own delay. */
 interface FrameSet {
   frames: Image[]
@@ -120,37 +118,23 @@ export async function loadCrabFrames(
 }
 
 /**
- * Decodes every sprite once, at startup. The renderer cannot decode, because
- * `@napi-rs/canvas` has no synchronous decode.
+ * Decodes every crab animation frame once, at startup. The renderer cannot
+ * decode, because `@napi-rs/canvas` has no synchronous decode.
  *
- * This loads two things: the legacy single-image cache that `getSprite` reads
- * (unchanged, for backward compatibility with any existing caller), and the
- * per-state crab frame sequences that `getSpriteFrame` reads.
+ * This used to also fill a legacy single-decoded-image lookup, keyed by
+ * sprite name. That whole path was removed once the Claude page's crab
+ * animation moved entirely onto `KeySpec.image`/`imageKey`, leaving no
+ * caller. `names` is unused now, kept only so an existing caller
+ * (`bin/deckd.ts`) does not need an argument-count change for a parameter
+ * with no live use.
  */
-export async function loadSprites(names: string[] = ['crab']): Promise<void> {
+export async function loadSprites(_names: string[] = ['crab']): Promise<void> {
   const root = findAssetsDir()
   if (!root) {
     log.once('assets', 'assets directory not found. Sprites do not appear.')
     return
   }
-  for (const name of names) {
-    const file = join(root, name, 'idle.png')
-    if (!existsSync(file)) {
-      log.once(`sprite-${name}`, `sprite file absent: ${file}`)
-      continue
-    }
-    try {
-      cache.set(name, await loadImage(await readFile(file)))
-    } catch (e) {
-      log.once(`sprite-${name}`, `cannot decode sprite ${name}: ${String(e)}`)
-    }
-  }
   await loadCrabFrames(root)
-}
-
-/** Returns a decoded sprite, or null when it is absent. */
-export function getSprite(name: string): Image | null {
-  return cache.get(name) ?? null
 }
 
 /**

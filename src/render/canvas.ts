@@ -1,7 +1,6 @@
 import { createCanvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
 import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop } from './specs.js'
 import { theme } from './theme.js'
-import { getSprite } from './sprites.js'
 
 export const KEY_SIZE = 96
 export const STRIP_WIDTH = 248
@@ -16,9 +15,29 @@ const SPARK_Y = 48
 const SPARK_H = 40
 /** Baseline of the strip's second text line. */
 const STRIP_LINE_2_Y = 21
+/** Dims a colour, or a colour emoji's `globalAlpha`, to this fraction. One
+ * constant so text, border and emoji all dim by the same amount. */
+const DIM_FACTOR = 0.45
+/**
+ * Size and vertical centre of the emoji glyph.
+ *
+ * Measured with `ctx.getImageData` over every weather emoji this app draws
+ * (see the brief's band table for the nominal geometry): a colour emoji's
+ * real ink does not sit centred on its nominal font-size box the way plain
+ * text does. At `34px` centred on `y 34` — the brief's own suggested
+ * numbers — several glyphs (for example the rain and snow icons) painted
+ * ink as high as `y 12`, one row below where the day label's own ink ends,
+ * leaving no background gap at all between band 1 and band 2.
+ *
+ * `32px` centred on `y 38` was the smallest, lowest combination that kept
+ * every weather emoji's ink between `y 17` and `y 48` — clear of the label
+ * (ends by `y 12`) above and the temperature line (starts at `y 55`) below.
+ */
+const EMOJI_SIZE = 32
+const EMOJI_Y = 38
 
 function css(c: Rgb, dim = false): string {
-  const f = dim ? 0.45 : 1
+  const f = dim ? DIM_FACTOR : 1
   return `rgb(${Math.round(c[0] * f)},${Math.round(c[1] * f)},${Math.round(c[2] * f)})`
 }
 
@@ -147,13 +166,22 @@ export function renderKey(spec: KeySpec): Buffer {
   }
 
   if (spec.emoji) {
-    // Drawn before the text lines, so a label or number that overlaps it
-    // stays on top and legible. A missing emoji font simply draws nothing,
-    // which is acceptable degradation — there is no fallback glyph.
-    ctx.font = '40px "Apple Color Emoji"'
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'middle'
-    ctx.fillText(spec.emoji, KEY_SIZE / 2, 44)
+    // Colour emoji are bitmap glyphs and ignore `fillStyle`, so dimming
+    // needs `globalAlpha` instead. Restored in `finally`, so a throw here
+    // (or anywhere else in this function later) cannot leave every
+    // subsequent draw call on this context dimmed. A missing emoji font
+    // simply draws nothing, which is acceptable degradation — there is no
+    // fallback glyph.
+    const prevAlpha = ctx.globalAlpha
+    try {
+      if (dim) ctx.globalAlpha = DIM_FACTOR
+      ctx.font = `${EMOJI_SIZE}px "Apple Color Emoji"`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(spec.emoji, KEY_SIZE / 2, EMOJI_Y)
+    } finally {
+      ctx.globalAlpha = prevAlpha
+    }
   }
 
   if (spec.lines?.length) {
@@ -174,15 +202,13 @@ export function renderKey(spec: KeySpec): Buffer {
       ctx.font = `${size}px ${FONT}`
       const color = spec.lineColors?.[i] ?? theme.text
       ctx.fillStyle = css(color, dim)
-      ctx.fillText(spec.lines[i]!, x, y)
-      y += advance
+      // `lineY` is opt-in per line, same pattern as `lineSizes`. Its absence
+      // (the case for every page except the new weather layout) keeps the
+      // running automatic position, so nothing else changes.
+      const drawY = spec.lineY?.[i] ?? y
+      ctx.fillText(spec.lines[i]!, x, drawY)
+      y = drawY + advance
     }
-  }
-
-  if (spec.sprite) {
-    const img = getSprite(spec.sprite)
-    // 48 x 48 at a 48 pixel source keeps one source pixel per key pixel.
-    if (img) ctx.drawImage(img, KEY_SIZE / 2 - 24, 40, 48, 48)
   }
 
   if (spec.spark) {

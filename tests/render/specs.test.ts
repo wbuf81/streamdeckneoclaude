@@ -60,6 +60,17 @@ describe('keyHash', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
+  // The weather page's new banded layout places lines with `lineY` rather
+  // than letting them step automatically. If it were missing from the hash,
+  // a key whose text and size stayed the same but whose band moved would
+  // never redraw, leaving stale pixels on the glass — the same risk
+  // `lineSizes` already carries.
+  it('differs when lineY changes', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['THU'], lineY: [3] }
+    const b: KeySpec = { kind: 'gauge', lines: ['THU'], lineY: [10] }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
   it('differs when the emoji changes, so the daemon redraws a changed forecast icon', () => {
     const a: KeySpec = { kind: 'gauge', lines: ['THU'], emoji: '☀️' }
     const b: KeySpec = { kind: 'gauge', lines: ['THU'], emoji: '⛈' }

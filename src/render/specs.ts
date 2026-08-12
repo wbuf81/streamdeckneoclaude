@@ -43,6 +43,21 @@ export interface KeySpec {
    * renders exactly as it did before this field existed.
    */
   lineSizes?: number[]
+  /**
+   * Explicit top-edge y for one line, aligned by index with `lines`. A
+   * missing entry, or an index past the end of this array, keeps the running
+   * automatic advance (the position the previous line's advance landed on).
+   * Absent altogether, every line keeps its automatic position, exactly as
+   * before this field existed.
+   *
+   * The weather page needs this: the emoji owns a fixed band in the middle
+   * of the key, so its label, temperature and rain-chance lines cannot step
+   * uniformly from the top — they must land in the three bands the emoji
+   * leaves free, skipping over it. Without an explicit y, only a second
+   * layout mechanism (or overlapping the emoji, which is exactly the bug
+   * this task fixes) could place a line below a gap.
+   */
+  lineY?: number[]
   align?: 'left' | 'center'
   border?: Rgb
   /** True draws the border. False draws it dark. The page owns the phase. */
@@ -56,8 +71,6 @@ export interface KeySpec {
   glyphColor?: Rgb
   /** A single emoji, drawn large and centred. Used by the weather page. */
   emoji?: string
-  /** An asset name, for example `crab`. */
-  sprite?: string
   /** An already-decoded image, for example album art. `keyHash` ignores this field. */
   image?: Image
   /** Identity of `image`, for example a track id. `keyHash` uses this. */

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
-import { WeatherPage } from '../../src/pages/weather-page.js'
+import { WeatherPage, conditionTint, heatColor } from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
-import { ZIP } from '../../src/sources/weather.js'
+import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
 import type { Conditions, DayForecast, WeatherStatus } from '../../src/sources/weather.js'
 
 const NOW = 1786549560
@@ -126,12 +126,20 @@ describe('WeatherPage layout', () => {
     expect(key.lineColors?.[2]).toEqual(theme.textDim)
   })
 
-  it('leaves the temperature line uncoloured', () => {
+  it('colours the temperature line by heat, using the high when present', () => {
     const days = sevenDays()
-    days[0] = day('NOW', { precipPercent: 96 })
+    days[0] = day('NOW', { high: 95, low: 40 })
     const { page } = build({ days })
     const key = page.render(NOW).keys[0]!
-    expect(key.lineColors?.[1]).toBeUndefined()
+    expect(key.lineColors?.[1]).toEqual(theme.red)
+  })
+
+  it('colours the temperature line using the low when the high is null', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { high: null, low: 55 })
+    const { page } = build({ days })
+    const key = page.render(NOW).keys[0]!
+    expect(key.lineColors?.[1]).toEqual(theme.blue)
   })
 
   it('shows a placeholder tile when a day slot has no data yet', () => {
@@ -152,6 +160,137 @@ describe('WeatherPage layout', () => {
     const { page } = build({ conditions: null })
     const key = page.render(NOW).keys[7]!
     expect(key.lines![1]).toBe('--')
+  })
+})
+
+describe('heatColor', () => {
+  it('colours red at 90 and above', () => {
+    expect(heatColor(90, null)).toEqual(theme.red)
+  })
+
+  it('colours amber at 89', () => {
+    expect(heatColor(89, null)).toEqual(theme.amber)
+  })
+
+  it('colours amber at 80', () => {
+    expect(heatColor(80, null)).toEqual(theme.amber)
+  })
+
+  it('colours neutral at 79', () => {
+    expect(heatColor(79, null)).toEqual(theme.text)
+  })
+
+  it('colours neutral at 70', () => {
+    expect(heatColor(70, null)).toEqual(theme.text)
+  })
+
+  it('colours blue at 69', () => {
+    expect(heatColor(69, null)).toEqual(theme.blue)
+  })
+
+  it('stays neutral for a null temperature', () => {
+    expect(heatColor(null, null)).toEqual(theme.text)
+  })
+
+  it('uses the high over the low when both are present', () => {
+    expect(heatColor(95, 40)).toEqual(theme.red)
+  })
+
+  it('falls back to the low when the high is null', () => {
+    expect(heatColor(null, 65)).toEqual(theme.blue)
+  })
+})
+
+describe('conditionTint', () => {
+  it('agrees with the emoji matcher for a plain forecast string', () => {
+    const emoji = weatherEmoji('Sunny')
+    expect(emoji).toBe('☀️')
+    // The tint for this emoji must be the warm amber-brown the brief assigns
+    // to sunny/clear, proving the lookup used the SAME emoji, not a second
+    // independent keyword match that happens to agree by coincidence.
+    expect(conditionTint(emoji)).toEqual([34, 27, 18])
+  })
+
+  it('agrees with the emoji matcher when severity wins in a "then" string', () => {
+    // Per `weatherEmoji`'s own doc comment, the rules run most severe first,
+    // so this string maps to the thunderstorm icon rather than the sunny one
+    // that appears first in the text.
+    const forecast = 'Mostly Sunny then Chance Showers And Thunderstorms'
+    const emoji = weatherEmoji(forecast)
+    expect(emoji).toBe('⛈')
+    expect(conditionTint(emoji)).toEqual([28, 24, 48])
+  })
+
+  it('agrees with the emoji matcher for a rain forecast', () => {
+    const emoji = weatherEmoji('Chance Rain Showers')
+    expect(emoji).toBe('🌧')
+    expect(conditionTint(emoji)).toEqual([18, 28, 44])
+  })
+
+  it('agrees with the emoji matcher for a snow forecast', () => {
+    const emoji = weatherEmoji('Snow likely')
+    expect(emoji).toBe('🌨')
+    expect(conditionTint(emoji)).toEqual([26, 32, 40])
+  })
+
+  it('agrees with the emoji matcher for a fog forecast', () => {
+    const emoji = weatherEmoji('Patchy Fog')
+    expect(emoji).toBe('🌫')
+    expect(conditionTint(emoji)).toEqual([28, 28, 30])
+  })
+
+  it('agrees with the emoji matcher for an overcast forecast', () => {
+    const emoji = weatherEmoji('Mostly Cloudy')
+    expect(emoji).toBe('☁️')
+    expect(conditionTint(emoji)).toEqual([22, 24, 28])
+  })
+
+  it('agrees with the emoji matcher for a partly cloudy forecast', () => {
+    const emoji = weatherEmoji('Partly Sunny')
+    expect(emoji).toBe('⛅')
+    expect(conditionTint(emoji)).toEqual([28, 26, 24])
+  })
+
+  it('falls back to the cloudy tint for an emoji it does not recognise', () => {
+    expect(conditionTint('🤷')).toEqual([22, 24, 28])
+  })
+})
+
+describe('WeatherPage day tile layout details', () => {
+  it('gives each day tile a background tint that agrees with its own emoji', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { emoji: '⛈' })
+    const { page } = build({ days })
+    const key = page.render(NOW).keys[0]!
+    expect(key.bg).toEqual(conditionTint('⛈'))
+  })
+
+  it('centres the day tile lines, to match the centred emoji', () => {
+    const { page } = build()
+    const key = page.render(NOW).keys[0]!
+    expect(key.align).toBe('center')
+  })
+
+  it('places the label, temperature and rain-chance lines in their own bands, skipping the emoji band', () => {
+    const { page } = build()
+    const key = page.render(NOW).keys[0]!
+    // Three explicit y positions, one per text line, none inside the emoji's
+    // own band (roughly y 17 to 48 — see render/canvas.ts).
+    expect(key.lineY).toHaveLength(3)
+    const [labelY, tempY, precipY] = key.lineY!
+    expect(labelY).toBeLessThan(17)
+    expect(tempY).toBeGreaterThan(48)
+    expect(precipY).toBeGreaterThan(tempY!)
+  })
+
+  it('gives the conditions tile a bigger size for the fixed-width ZIP line only', () => {
+    const { page } = build()
+    const key = page.render(NOW).keys[7]!
+    // Line 1 (the wind reading) can run to 12 variable-length characters, so
+    // it stays at the default 11 px and cannot clip. Line 2 (the ZIP code)
+    // is always exactly 5 digits, so it is safe to enlarge.
+    expect(key.lineSizes?.[1]).toBe(11)
+    expect(key.lineSizes?.[2]).toBeGreaterThan(11)
   })
 })
 

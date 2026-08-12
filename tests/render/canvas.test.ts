@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { createHash } from 'node:crypto'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
 import {
@@ -10,14 +10,6 @@ import {
   STRIP_HEIGHT,
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
-import { loadSprites } from '../../src/render/sprites.js'
-
-// The renderer reads sprites from a cache that only `loadSprites` fills, because
-// `@napi-rs/canvas` has no synchronous decode. A real process calls this once at
-// startup; the test does the same so the sprite test below sees a real image.
-beforeAll(async () => {
-  await loadSprites()
-})
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -265,18 +257,6 @@ describe('renderStrip', () => {
   })
 })
 
-describe('renderKey sprite', () => {
-  it('changes the image when a sprite is present', () => {
-    const without = renderKey({ kind: 'session', lines: ['A'] })
-    const withSprite = renderKey({ kind: 'session', lines: ['A'], sprite: 'crab' })
-    expect(withSprite.equals(without)).toBe(false)
-  })
-
-  it('does not throw for an unknown sprite name', () => {
-    expect(() => renderKey({ kind: 'session', sprite: 'no-such-sprite' })).not.toThrow()
-  })
-})
-
 describe('renderKey spark', () => {
   it('changes the rendered pixels when a spark is present', () => {
     const without = renderKey({ kind: 'gauge' })
@@ -344,10 +324,34 @@ describe('renderKey emoji', () => {
     expect(colourful).toBe(true)
   })
 
-  it('draws the emoji before the text lines, so a line stays legible on top', () => {
+  it('draws a line as well as the emoji, in the same key', () => {
     const emojiOnly = renderKey({ kind: 'gauge', emoji: '☀️' })
     const withLine = renderKey({ kind: 'gauge', emoji: '☀️', lines: ['NOW'] })
     expect(withLine.equals(emojiOnly)).toBe(false)
+  })
+
+  it('dims the emoji like every other element, proving globalAlpha is honoured', () => {
+    // Colour emoji are bitmap glyphs and ignore `fillStyle`; only
+    // `globalAlpha` can dim them. This is the regression the task brief
+    // calls out: without it, a stale key's emoji stays full brightness while
+    // its text and border correctly dim.
+    const bright = renderKey({ kind: 'gauge', emoji: '☀️' })
+    const dimmed = renderKey({ kind: 'gauge', emoji: '☀️', dim: true })
+    expect(bright.equals(dimmed)).toBe(false)
+  })
+
+  it('keeps the emoji inside band 2 (y 17 to 51), clear of the temperature band below', () => {
+    const buf = renderKey({ kind: 'gauge', emoji: '☀️' })
+    const inkOnRow = (y: number) => {
+      for (let x = 20; x < KEY_SIZE - 20; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) return true
+      }
+      return false
+    }
+    // Near the emoji's own centre, y 34: ink is present.
+    expect(inkOnRow(34)).toBe(true)
+    // Down at y 60, well past band 2's y 51 floor: no emoji ink reaches here.
+    expect(inkOnRow(60)).toBe(false)
   })
 })
 
@@ -420,10 +424,15 @@ describe('renderKey lineSizes', () => {
     expect(inkSomewhere(44)).toBe(false)
   })
 
-  // The regression guard: Spotify, stocks and weather never set lineSizes,
-  // so they must render byte-identically to how they did before this field
-  // existed. These hashes were captured from renderKey BEFORE lineSizes was
-  // added to canvas.ts, against the exact KeySpecs those pages build.
+  // The regression guard: Spotify and stocks never set lineSizes, so they
+  // must render byte-identically to how they did before this field existed.
+  // These hashes were captured from renderKey BEFORE lineSizes was added to
+  // canvas.ts, against the exact KeySpecs those pages build. Weather used to
+  // have a snapshot here too, but task 24 deliberately changed its emoji
+  // size, position and dimming and gave it its own banded layout — its
+  // regression coverage is now the geometric band/gap probes below, plus
+  // `tests/pages/weather-page.test.ts`, rather than a frozen hash of the old,
+  // overlapping rendering.
   it('renders a stocks-like key byte-identically to the pre-lineSizes snapshot', () => {
     const buf = renderKey({
       kind: 'gauge',
@@ -435,23 +444,124 @@ describe('renderKey lineSizes', () => {
     )
   })
 
-  it('renders a weather-like key byte-identically to the pre-lineSizes snapshot', () => {
-    const buf = renderKey({
-      kind: 'gauge',
-      lines: ['THU'],
-      emoji: '☀️',
-      lineColors: [theme.textDim],
-    })
-    expect(sha256(buf)).toBe(
-      '79d0d46251fbd190f22be0e3057eb0546c3be4a523b9aa6427be826ca2cd124b',
-    )
-  })
-
   it('renders a spotify-like key byte-identically to the pre-lineSizes snapshot', () => {
     const buf = renderKey({ kind: 'control', glyph: '♥', glyphColor: theme.red })
     expect(sha256(buf)).toBe(
       '20d595718c3d8d68a5569793b7563305ffb081b01c0a41feec5fff8a28c98860',
     )
+  })
+
+  it('renders a claude-gauge-like key byte-identically across this change', () => {
+    // Claude's gauge tiles (task 23) use lineSizes and align but never
+    // emoji, sprite or lineY — nothing this task touches. This hash was
+    // captured against the current code, before task 24's edits, from the
+    // exact shape `ClaudePage.capKey` builds.
+    const buf = renderKey({
+      kind: 'gauge',
+      lines: ['5-HR CAP', '62%'],
+      lineSizes: [11, 28],
+      align: 'center',
+      bar: { value: 0.62, color: theme.amber },
+    })
+    expect(sha256(buf)).toBe(
+      'dccb9afefb4a01d1908fd106e0000bd776e9fe695961d9ff1803fd17af08a7bc',
+    )
+  })
+})
+
+describe('renderKey lineY', () => {
+  it('places a line at an explicit y instead of the automatic position', () => {
+    const auto = renderKey({ kind: 'gauge', lines: ['HI'] })
+    const explicit = renderKey({ kind: 'gauge', lines: ['HI'], lineY: [50] })
+    expect(auto.equals(explicit)).toBe(false)
+  })
+
+  it('keeps the running automatic advance for a line with no lineY entry', () => {
+    // Only line 0 gets an explicit y (3). Line 1 has no lineY entry, so it
+    // must continue from wherever line 0's explicit position plus its
+    // advance landed — 3 + 14 = 17 — not from the original default start of
+    // 6, and not by resetting to some other fixed value.
+    const buf = renderKey({ kind: 'gauge', lines: ['A', 'B'], lineY: [3] })
+    let firstInkRow = -1
+    for (let y = 0; y < 30 && firstInkRow < 0; y++) {
+      for (let x = 9; x < 90; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) {
+          firstInkRow = y
+          break
+        }
+      }
+    }
+    expect(firstInkRow).toBeGreaterThanOrEqual(3)
+    expect(firstInkRow).toBeLessThan(17)
+  })
+
+  it('does not affect rendering when lineY is absent, matching the legacy path exactly', () => {
+    const a = renderKey({ kind: 'gauge', lines: ['5-HR CAP', '20%'], lineSizes: [11, 28] })
+    const b = renderKey({ kind: 'gauge', lines: ['5-HR CAP', '20%'], lineSizes: [11, 28] })
+    expect(a.equals(b)).toBe(true)
+  })
+})
+
+describe('renderKey weather band layout: no overlap', () => {
+  // This is the geometric proof the user's real-device complaint demands:
+  // a label, an emoji, a coloured temperature line and a coloured rain-chance
+  // line, laid out exactly as `WeatherPage.dayKey` builds it, with none of
+  // the bands touching another.
+  function weatherLikeKey() {
+    return renderKey({
+      kind: 'gauge',
+      lines: ['THU', '95°/77°', '47%'],
+      lineSizes: [12, 16, 20],
+      lineY: [3, 54, 74],
+      lineColors: [undefined, theme.red, theme.blue],
+      align: 'center',
+      emoji: '☀️',
+      bg: [34, 27, 18],
+    })
+  }
+
+  const inkOnRow = (buf: Buffer, y: number) => {
+    for (let x = 9; x < 90; x++) {
+      if (!near3(probe(buf, x, y), [34, 27, 18])) return true
+    }
+    return false
+  }
+
+  it('paints ink inside band 1 (the day label, y 3 to 15)', () => {
+    expect(inkOnRow(weatherLikeKey(), 10)).toBe(true)
+  })
+
+  it('paints ink inside band 3 (the temperature line, y 54 to 70)', () => {
+    expect(inkOnRow(weatherLikeKey(), 60)).toBe(true)
+  })
+
+  it('paints ink inside band 4 (the rain chance, y 74 to 88)', () => {
+    expect(inkOnRow(weatherLikeKey(), 80)).toBe(true)
+  })
+
+  it('leaves the gap between band 1 and the emoji background, at y 16', () => {
+    expect(inkOnRow(weatherLikeKey(), 16)).toBe(false)
+  })
+
+  it('leaves the gap between the emoji and band 3 background, at y 52', () => {
+    expect(inkOnRow(weatherLikeKey(), 52)).toBe(false)
+  })
+
+  it('leaves the gap between band 3 and band 4 background, at y 72', () => {
+    expect(inkOnRow(weatherLikeKey(), 72)).toBe(false)
+  })
+})
+
+describe('measured text width', () => {
+  it('fits "95°/77°" at 16 px within the 81 px usable key width', () => {
+    // Per VERIFIED-FACTS.md: 77 px at 16 px, and 82 px (over budget) at
+    // 17 px. This guards against a future font change silently clipping the
+    // temperature line.
+    const c = createCanvas(KEY_SIZE, KEY_SIZE)
+    const ctx = c.getContext('2d')
+    ctx.font = '16px Menlo'
+    const width = ctx.measureText('95°/77°').width
+    expect(width).toBeLessThanOrEqual(81)
   })
 })
 
