@@ -39,6 +39,49 @@
   hold a refresh token. A test that writes into a fresh temporary directory
   cannot catch this. Test the already-exists-too-open case directly.
 
+## Verified device and canvas API
+
+I measured all of this against the real hardware and the installed packages. Do
+not assume any of it. Earlier drafts of this plan guessed, and every guess was
+wrong.
+
+**The device accepts raw pixel buffers only. It has no PNG support.**
+
+```
+fillKeyBuffer(keyIndex, buffer, { format: 'rgb' | 'rgba' | 'bgr' | 'bgra' })
+fillLcd(lcdIndex, buffer, { format: … })      // the whole 248 x 58 strip
+fillKeyColor(keyIndex, r, g, b)               // the RGB touch buttons, 8 and 9
+setBrightness(percent)
+clearKey(keyIndex)  clearPanel()  clearLcdSegment(lcdIndex)
+```
+
+There is no `setButtonColor` method. The RGB touch buttons take `fillKeyColor`
+with their key index, 8 or 9. A confirmed hardware run drove all of the above
+with `format: 'rgba'` and every call succeeded.
+
+**`@napi-rs/canvas` cannot decode an image synchronously.**
+
+`const img = new Image(); img.src = buf` sets `width`, `height`, and
+`complete` at once. The pixel data is not ready. A later `drawImage` paints
+transparent black, `[0, 0, 0, 0]`, for both PNG and JPEG. Only
+`await loadImage(buf)` gives a drawable image.
+
+**So the project decodes images once, away from the render loop.**
+
+1. `renderKey` and `renderStrip` return a raw RGBA buffer, not a PNG. The
+   device wants raw pixels, so encoding a PNG per frame would only waste time.
+2. `KeySpec.image` holds an already-decoded `Image`, not encoded bytes. The
+   producer decodes it.
+3. Only one thing in this project produces an image: Spotify album art, and it
+   arrives as JPEG. The Spotify source already downloads it in an async
+   background path, so it decodes there with `await loadImage(bytes)` and
+   caches the decoded `Image`.
+4. Nothing in `src/` decodes an image format by hand. A hand-written decoder
+   would need JPEG support and would not belong in a drawing module.
+
+This also makes the tests better. `probe` indexes the RGBA buffer directly, so
+it needs no decode step and stays synchronous.
+
 ## Deviations from the spec
 
 Three refinements. Each one is deliberate.
@@ -454,6 +497,8 @@ Expected: FAIL. The error names a missing module.
 - [ ] **Step 3: Write `src/render/specs.ts`**
 
 ```ts
+import type { Image } from '@napi-rs/canvas'
+
 export type Rgb = readonly [number, number, number]
 
 export interface BarSpec {
@@ -479,8 +524,12 @@ export interface KeySpec {
   glyph?: string
   /** An asset name, for example `crab`. */
   sprite?: string
-  /** Decoded image bytes. `keyHash` ignores this field. */
-  image?: Buffer
+  /**
+   * An already-decoded image. The producer decodes it with `await loadImage`,
+   * because `@napi-rs/canvas` has no synchronous decode. `keyHash` ignores
+   * this field.
+   */
+  image?: Image
   /** Identity of `image`, for example a track id. `keyHash` uses this. */
   imageKey?: string
   dim?: boolean
@@ -918,21 +967,41 @@ describe('renderStrip', () => {
   })
 })
 
-/** Builds a 96 by 96 solid-colour PNG, for the image test. */
-function solidPng(r: number, g: number, b: number): Buffer {
+/**
+ * Builds a decoded 96 by 96 solid-colour image, for the image test. It encodes
+ * a JPEG and decodes it again with `loadImage`, which is the same path the
+ * Spotify source uses for album art. JPEG is deliberate: album art is JPEG.
+ */
+async function solidImage(r: number, g: number, b: number): Promise<Image> {
   const c = createCanvas(96, 96)
   const ctx = c.getContext('2d')
   ctx.fillStyle = `rgb(${r},${g},${b})`
   ctx.fillRect(0, 0, 96, 96)
-  return c.toBuffer('image/png')
+  return loadImage(c.toBuffer('image/jpeg'))
 }
 ```
 
-Add this import at the top of the test file, beside the others. The project is
-ESM only, so `require` is not available:
+Add this import at the top of the test file, beside the others:
 
 ```ts
-import { createCanvas } from '@napi-rs/canvas'
+import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
+```
+
+The image test becomes `async`, because decoding needs `await`:
+
+```ts
+  it('renders an image key from a decoded image', async () => {
+    const img = await solidImage(255, 0, 0)
+    const buf = renderKey({ kind: 'image', image: img, imageKey: 'x' })
+    near(probe(buf, 48, 48), [255, 0, 0], 20)
+  })
+```
+
+Strip probes must pass the stride, because the buffer is raw RGBA:
+
+```ts
+    near(probe(stripBuf, 240, 4, STRIP_WIDTH), theme.bg)
+    near(probe(stripBuf, 200, 50, STRIP_WIDTH), theme.green)
 ```
 
 - [ ] **Step 2: Run the test and confirm it fails**
@@ -943,13 +1012,21 @@ Expected: FAIL. The error names a missing module `../../src/render/canvas.js`.
 - [ ] **Step 3: Write `src/render/canvas.ts`**
 
 ```ts
-import { createCanvas, Image, type SKRSContext2D } from '@napi-rs/canvas'
+import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas'
 import type { KeySpec, StripSpec, Rgb, BarSpec } from './specs.js'
 import { theme } from './theme.js'
 
 export const KEY_SIZE = 96
 export const STRIP_WIDTH = 248
 export const STRIP_HEIGHT = 58
+
+/**
+ * Copies the canvas out as raw RGBA. The device takes raw pixel buffers and
+ * has no PNG support, so the renderer never encodes an image format.
+ */
+function toRgba(ctx: SKRSContext2D, w: number, h: number): Buffer {
+  return Buffer.from(ctx.getImageData(0, 0, w, h).data.buffer)
+}
 
 const FONT = 'Menlo'
 const PAD = 6
@@ -985,7 +1062,7 @@ function drawBar(
   }
 }
 
-/** Renders one 96 by 96 key. The result is a PNG buffer. */
+/** Renders one 96 by 96 key. The result is a raw RGBA buffer. */
 export function renderKey(spec: KeySpec): Buffer {
   const canvas = createCanvas(KEY_SIZE, KEY_SIZE)
   const ctx = canvas.getContext('2d')
@@ -995,9 +1072,8 @@ export function renderKey(spec: KeySpec): Buffer {
   ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
 
   if (spec.image) {
-    // The caller supplies a decoded, pre-scaled image. Draw it edge to edge.
-    const img = decodeSync(spec.image)
-    if (img) ctx.drawImage(img, 0, 0, KEY_SIZE, KEY_SIZE)
+    // The producer already decoded this. Scale it to the key, edge to edge.
+    ctx.drawImage(spec.image, 0, 0, KEY_SIZE, KEY_SIZE)
   }
 
   if (spec.border) {
@@ -1032,10 +1108,13 @@ export function renderKey(spec: KeySpec): Buffer {
     drawBar(ctx, spec.bar, BORDER + PAD, BAR_Y, KEY_SIZE - BORDER - PAD * 2, BAR_H, dim)
   }
 
-  return canvas.toBuffer('image/png')
+  return toRgba(ctx, KEY_SIZE, KEY_SIZE)
 }
 
-/** Renders the 248 by 58 info strip as one image. */
+/**
+ * Renders the 248 by 58 info strip as one image. The result is a raw RGBA
+ * buffer. The strip reports `drawRegions: false`, so it must be one image.
+ */
 export function renderStrip(spec: StripSpec): Buffer {
   const canvas = createCanvas(STRIP_WIDTH, STRIP_HEIGHT)
   const ctx = canvas.getContext('2d')
@@ -1065,36 +1144,20 @@ export function renderStrip(spec: StripSpec): Buffer {
     drawBar(ctx, spec.bar, PAD, 46, STRIP_WIDTH - PAD * 2, 6, dim)
   }
 
-  return canvas.toBuffer('image/png')
+  return toRgba(ctx, STRIP_WIDTH, STRIP_HEIGHT)
 }
 
 /**
- * Reads one pixel from a PNG buffer. Tests use it for pixel probes.
- * It decodes the image every call, so it suits tests and not the render loop.
+ * Reads one pixel from a raw RGBA buffer. Tests use it for pixel probes. It
+ * needs no decode step, because the buffer already holds raw pixels.
+ * Pass `width` as `STRIP_WIDTH` when you probe a strip buffer.
  */
-export function probe(png: Buffer, x: number, y: number): Rgb {
-  const img = decodeSync(png)
-  if (!img) throw new Error('probe could not decode the image')
-  const c = createCanvas(img.width, img.height)
-  const ctx = c.getContext('2d')
-  ctx.drawImage(img, 0, 0)
-  const d = ctx.getImageData(x, y, 1, 1).data
-  return [d[0]!, d[1]!, d[2]!]
-}
-
-/**
- * Decodes an image buffer synchronously. The render loop cannot await, so this
- * uses `Image`, which decodes on assignment to `src`. The async `loadImage`
- * helper is deliberately unused.
- */
-function decodeSync(buf: Buffer): Image | null {
-  try {
-    const img = new Image()
-    img.src = buf
-    return img
-  } catch {
-    return null
+export function probe(rgba: Buffer, x: number, y: number, width = KEY_SIZE): Rgb {
+  const at = (y * width + x) * 4
+  if (at < 0 || at + 3 > rgba.length) {
+    throw new Error(`probe coordinate ${x},${y} is outside the buffer`)
   }
+  return [rgba[at]!, rgba[at + 1]!, rgba[at + 2]!]
 }
 ```
 
@@ -1336,26 +1399,29 @@ export class Device implements DeckDevice {
     return this.deck
   }
 
-  async setKeyImage(index: number, png: Buffer): Promise<void> {
+  // The method names and the format below are measured against the installed
+  // library and the real device. See "Verified device and canvas API" above.
+  // The device has no PNG support, so every buffer here is raw RGBA.
+
+  async setKeyImage(index: number, rgba: Buffer): Promise<void> {
     if (index < 0 || index >= NEO_KEY_COUNT) {
       throw new Error(`key index ${index} is outside 0 to 7`)
     }
-    await this.require().fillKeyBuffer(index, png, { format: 'png' })
+    await this.require().fillKeyBuffer(index, rgba, { format: 'rgba' })
   }
 
-  async setStrip(png: Buffer): Promise<void> {
-    await this.require().fillLcdRegion(0, 0, 0, png, {
-      format: 'png',
-      width: 248,
-      height: 58,
-    })
+  async setStrip(rgba: Buffer): Promise<void> {
+    // `fillLcd` writes the whole segment. The strip cannot take a sub-region.
+    await this.require().fillLcd(0, rgba, { format: 'rgba' })
   }
 
   async setButtonColor(index: number, rgb: Rgb): Promise<void> {
     if (index !== BUTTON_LEFT && index !== BUTTON_RIGHT) {
       throw new Error(`button index ${index} is not 8 or 9`)
     }
-    await this.require().setButtonColor(index, rgb[0], rgb[1], rgb[2])
+    // There is no `setButtonColor` on the library. The RGB touch buttons take
+    // `fillKeyColor` with their key index. `setButtonColor` is our own name.
+    await this.require().fillKeyColor(index, rgb[0], rgb[1], rgb[2])
   }
 
   async setBrightness(percent: number): Promise<void> {
@@ -1490,21 +1556,31 @@ export class FakeDevice implements DeckDevice {
 Run: `npx vitest run tests/fake-device.test.ts`
 Expected: PASS, 8 tests.
 
-- [ ] **Step 6: Verify the real library method names against the installed package**
+- [ ] **Step 6: Confirm the library method names still match**
 
-The `Device` class calls `fillKeyBuffer`, `fillLcdRegion`, `setButtonColor`, and `setBrightness`. Confirm each name exists before Task 5 runs on hardware.
+The `Device` class calls `fillKeyBuffer`, `fillLcd`, `fillKeyColor`, and
+`setBrightness`. I confirmed all four against the installed library and the real
+device, and a hardware run drove each one with `format: 'rgba'`. This step
+guards against a version drift, so run it and compare.
 
 Run:
 ```bash
-node -e "import('@elgato-stream-deck/node').then(async m => {
-  const [d] = await m.listStreamDecks();
-  const deck = await m.openStreamDeck(d.path);
-  const proto = Object.getPrototypeOf(deck);
-  console.log(Object.getOwnPropertyNames(proto).filter(n => /fill|Button|Bright|lcd|Lcd/i.test(n)));
-  await deck.close();
-})"
+node --input-type=module -e "
+import { listStreamDecks, openStreamDeck } from '@elgato-stream-deck/node'
+const [d] = await listStreamDecks()
+if (!d) { console.log('no device'); process.exit(0) }
+const deck = await openStreamDeck(d.path)
+const names = new Set()
+let p = Object.getPrototypeOf(deck)
+while (p && p !== Object.prototype) { Object.getOwnPropertyNames(p).forEach(n => names.add(n)); p = Object.getPrototypeOf(p) }
+console.log([...names].filter(n => /colo|fill|bright|lcd/i.test(n)).sort().join('\n'))
+await deck.close()
+"
 ```
-Expected: the list contains `fillKeyBuffer`, `setBrightness`, and an LCD fill method. Correct `src/device.ts` to match the real names. Note the exact names in a comment above each call.
+Expected: the list contains `fillKeyBuffer`, `fillLcd`, `fillKeyColor`, and
+`setBrightness`. There is no `setButtonColor`; that name is ours, not the
+library's. If a name is absent, stop and report it rather than guessing a
+replacement.
 
 - [ ] **Step 7: Run the whole suite and the typecheck**
 

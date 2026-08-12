@@ -1844,6 +1844,8 @@ git commit -m "feat: authorize Spotify with OAuth PKCE"
   - `type SpotifyStatus = 'ok' | 'unauthorized' | 'offline' | 'no-device'`.
   - `parsePlayer(json: unknown): PlayerState | null`.
   - `pickArtUrl(images, minWidth): string | null`.
+  - `getArt(trackId, url): Image | null` — returns a DECODED image, or null on a
+    miss while it loads in the background. The renderer cannot decode.
   - `class SpotifySource` with `start()`, `stop()`, `getState()`, `getStatus()`, `interpolate(now)`, `play()`, `pause()`, `next()`, `previous()`, `setVolume(p)`, `toggleShuffle()`, `cycleRepeat()`, `getArt(trackId)`, `on('change', cb)`.
 
 The source takes an injected `fetch`, so every test runs offline.
@@ -2125,6 +2127,7 @@ Expected: FAIL. The error names a missing module.
 import { EventEmitter } from 'node:events'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { loadImage, type Image } from '@napi-rs/canvas'
 import { paths, ensureStateDir } from '../paths.js'
 import { log } from '../log.js'
 import { TokenStore, refreshTokens, type Tokens } from './spotify-auth.js'
@@ -2223,13 +2226,18 @@ export class SpotifySource extends EventEmitter {
   private retryAfter = 0
   private timer: NodeJS.Timeout | null = null
   private visible = false
-  private artCache = new Map<string, Buffer>()
+  /** Decoded images, keyed by track id. */
+  private artCache = new Map<string, Image>()
+  /** Track ids with a load in flight, so one miss starts one load. */
+  private pending = new Set<string>()
 
   constructor(
     private readonly clientId: string,
     private readonly store: Store = new TokenStore(),
     private fetchFn: FetchLike = fetch as unknown as FetchLike,
     private readonly now: () => number = () => Math.floor(Date.now() / 1000),
+    /** Injected so a test can decode without a real image. */
+    private readonly loadImageFn: (b: Buffer) => Promise<Image> = loadImage,
   ) {
     super()
   }
@@ -2428,45 +2436,62 @@ export class SpotifySource extends EventEmitter {
   }
 
   /**
-   * Returns the cached album art for a track, or null. It downloads in the
-   * background and emits `change` when the image arrives, so the render loop
-   * never waits on the network.
+   * Returns the cached, decoded album art for a track, or null. The renderer
+   * cannot decode, because `@napi-rs/canvas` has no synchronous decode. So this
+   * source decodes with `await loadImage` in a background path and caches the
+   * decoded `Image`. Album art is JPEG, and `loadImage` handles JPEG.
+   *
+   * A miss returns null and starts the work. The page draws its fallback, and
+   * `change` fires when the image is ready. The render loop never waits on the
+   * network or on a decode.
    */
-  getArt(trackId: string, url: string | null): Buffer | null {
+  getArt(trackId: string, url: string | null): Image | null {
     if (!trackId) return null
     const cached = this.artCache.get(trackId)
     if (cached) return cached
-    const onDisk = join(paths.artDir, `${trackId}.img`)
-    if (existsSync(onDisk)) {
-      try {
-        const buf = readFileSync(onDisk)
-        this.remember(trackId, buf)
-        return buf
-      } catch {
-        // Fall through to a download.
-      }
+    if (!this.pending.has(trackId)) {
+      this.pending.add(trackId)
+      void this.loadArt(trackId, url)
     }
-    if (url) void this.download(trackId, url)
     return null
   }
 
-  private async download(trackId: string, url: string): Promise<void> {
+  /** Reads the disk cache, or downloads. Then decodes and caches the image. */
+  private async loadArt(trackId: string, url: string | null): Promise<void> {
     try {
-      const res = await this.fetchFn(url, {})
-      if (!res.ok) return
-      const buf = Buffer.from(await res.arrayBuffer())
-      this.remember(trackId, buf)
-      // Reuse the shared helper, so the 0700 enforcement lives in one place.
-      ensureStateDir()
-      writeFileSync(join(paths.artDir, `${trackId}.img`), buf)
+      const onDisk = join(paths.artDir, `${trackId}.img`)
+      let bytes: Buffer | null = null
+
+      if (existsSync(onDisk)) {
+        try {
+          bytes = readFileSync(onDisk)
+        } catch {
+          bytes = null
+        }
+      }
+
+      if (!bytes) {
+        if (!url) return
+        const res = await this.fetchFn(url, {})
+        if (!res.ok) return
+        bytes = Buffer.from(await res.arrayBuffer())
+        // Reuse the shared helper, so the 0700 enforcement lives in one place.
+        ensureStateDir()
+        writeFileSync(onDisk, bytes)
+      }
+
+      const img = await this.loadImageFn(bytes)
+      this.remember(trackId, img)
       this.emit('change')
     } catch {
       // No art this time. The page shows the fallback.
+    } finally {
+      this.pending.delete(trackId)
     }
   }
 
-  private remember(trackId: string, buf: Buffer): void {
-    this.artCache.set(trackId, buf)
+  private remember(trackId: string, img: Image): void {
+    this.artCache.set(trackId, img)
     // A Map keeps insertion order, so the first key is the oldest.
     while (this.artCache.size > ART_CACHE_MAX) {
       const oldest = this.artCache.keys().next().value
@@ -2555,7 +2580,13 @@ function player(over: Partial<PlayerState> = {}): PlayerState {
   }
 }
 
-function build(state: PlayerState | null, status: SpotifyStatus = 'ok', art: Buffer | null = null) {
+/**
+ * A stand-in for a decoded image. The page only passes it through to the
+ * KeySpec, so it never touches the image's contents.
+ */
+const FAKE_ART = { width: 96, height: 96 } as unknown as Image
+
+function build(state: PlayerState | null, status: SpotifyStatus = 'ok', art: Image | null = null) {
   const calls: string[] = []
   const source = {
     interpolate: () => state,
@@ -2580,11 +2611,10 @@ describe('SpotifyPage layout', () => {
   })
 
   it('puts album art on key 0 when it is cached', () => {
-    const art = Buffer.from('png-bytes')
-    const { page } = build(player(), 'ok', art)
+    const { page } = build(player(), 'ok', FAKE_ART)
     const key = page.render(NOW).keys[0]!
     expect(key.kind).toBe('image')
-    expect(key.image).toBe(art)
+    expect(key.image).toBe(FAKE_ART)
     expect(key.imageKey).toBe('track-1')
   })
 
@@ -2730,6 +2760,7 @@ Expected: FAIL. The error names a missing module.
 import type { DeckFrame, KeySpec, StripSpec } from '../render/specs.js'
 import { theme, barColor } from '../render/theme.js'
 import { truncate, formatClock } from '../render/text.js'
+import type { Image } from '@napi-rs/canvas'
 import type { Page } from './types.js'
 import type { PlayerState, SpotifyStatus, RepeatMode } from '../sources/spotify.js'
 
@@ -2740,7 +2771,7 @@ const TITLE_CHARS = 34
 export interface PlayerReader {
   interpolate(now: number): PlayerState | null
   getStatus(): SpotifyStatus
-  getArt(trackId: string, url: string | null): Buffer | null
+  getArt(trackId: string, url: string | null): Image | null
   play(): Promise<boolean>
   pause(): Promise<boolean>
   next(): Promise<boolean>
@@ -2868,7 +2899,10 @@ Expected: PASS, 24 tests.
 
 - [ ] **Step 5: Add the Spotify page to `bin/deckd.ts`**
 
-Album art arrives as a JPEG at 300 × 300, and the key is 96 × 96. Task 3 already scales any `image` to the key size with `drawImage`, so no extra scaling code is needed.
+Album art arrives as a JPEG at 300 × 300, and the key is 96 × 96. The Spotify
+source decodes it with `await loadImage`, because the renderer has no
+synchronous decode. `renderKey` then scales the decoded image to the key with
+`drawImage`, so no extra scaling code is needed.
 
 In `start()`, after the Claude page:
 
