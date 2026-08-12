@@ -9,7 +9,8 @@ import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, chmodSync } from 'node:fs'
+import { runAuthFlow, TokenStore } from '../src/sources/spotify-auth.js'
 
 async function start(): Promise<void> {
   ensureStateDir()
@@ -80,10 +81,66 @@ function usage(): never {
   process.exit(2)
 }
 
+/** Reads the client id from the CLI flag or the config file. */
+function readClientId(): string {
+  const flag = process.argv.indexOf('--client-id')
+  if (flag !== -1 && process.argv[flag + 1]) return process.argv[flag + 1]!
+  try {
+    const raw = JSON.parse(readFileSync(paths.configFile, 'utf8'))
+    return typeof raw?.spotify?.clientId === 'string' ? raw.spotify.clientId : ''
+  } catch {
+    return ''
+  }
+}
+
+async function authSpotify(): Promise<void> {
+  ensureStateDir()
+  const clientId = process.env.SPOTIFY_CLIENT_ID ?? readClientId()
+  if (!clientId) {
+    console.error(
+      'No Spotify client id.\n\n' +
+        '1. Open https://developer.spotify.com/dashboard and create an app.\n' +
+        '2. Add this redirect URI exactly:\n' +
+        '     http://127.0.0.1:8888/callback\n' +
+        '3. Copy the client id, then run:\n' +
+        '     deckd auth spotify --client-id <ID>\n',
+    )
+    process.exit(2)
+  }
+  const tokens = await runAuthFlow(clientId)
+  new TokenStore().save(tokens)
+  // Merge, do not overwrite. The config file may already hold other settings,
+  // and a wholesale write would silently drop them.
+  let config: Record<string, any> = {}
+  try {
+    config = JSON.parse(readFileSync(paths.configFile, 'utf8'))
+  } catch {
+    // No config yet, or it is unreadable. Start from an empty object.
+  }
+  config.spotify = { ...(config.spotify ?? {}), clientId }
+  writeFileSync(paths.configFile, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
+  chmodSync(paths.configFile, 0o600)
+  console.log('Spotify is connected. Restart deckd to pick it up.')
+}
+
 const cmd = process.argv[2]
 switch (cmd) {
   case 'start':
     void start()
+    break
+  case 'auth':
+    if (process.argv[3] === 'spotify') {
+      // Catch the rejection. The flow can time out, or the callback state can
+      // mismatch, and an unhandled rejection would print a stack trace instead
+      // of the reason.
+      authSpotify().catch((e) => {
+        console.error(String(e))
+        process.exit(1)
+      })
+    } else {
+      console.error('usage: deckd auth spotify')
+      process.exit(2)
+    }
     break
   case undefined:
     usage()
