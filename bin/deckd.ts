@@ -13,6 +13,7 @@ import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
 import { readFileSync, writeFileSync, chmodSync } from 'node:fs'
 import { runAuthFlow, TokenStore } from '../src/sources/spotify-auth.js'
+import { install, uninstall } from '../src/install/install.js'
 
 async function start(): Promise<void> {
   ensureStateDir()
@@ -139,6 +140,18 @@ const cmd = process.argv[2]
 switch (cmd) {
   case 'start':
     void start()
+    break
+  case 'install':
+    install().catch((e: unknown) => {
+      console.error(String(e))
+      process.exit(1)
+    })
+    break
+  case 'uninstall':
+    uninstall().catch((e: unknown) => {
+      console.error(String(e))
+      process.exit(1)
+    })
     break
   case 'auth':
     if (process.argv[3] === 'spotify') {
