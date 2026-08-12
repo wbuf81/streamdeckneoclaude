@@ -1377,7 +1377,7 @@ Create `tests/sources/spotify-auth.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, statSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, statSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -1500,7 +1500,7 @@ describe('TokenStore', () => {
     const f = join(dir, 'spotify.json')
     const s = new TokenStore(f)
     s.save({ accessToken: 'a', refreshToken: 'r', expiresAt: 1 })
-    require('node:fs').writeFileSync(f, '{ broken')
+    writeFileSync(f, '{ broken')
     expect(s.load()).toBeNull()
   })
 
@@ -1518,9 +1518,10 @@ describe('TokenStore', () => {
 })
 ```
 
-- [ ] **Step 2: Replace the `require` in the corrupt-file test with an import**
+- [ ] **Step 2: Confirm no CommonJS crept into the source**
 
-Add `writeFileSync` to the `node:fs` import at the top of the test file, and use it directly. The project is ESM only.
+Run: `! grep -rn "require(" src/ bin/ scripts/`
+Expected: it prints nothing and exits 0, which means no match was found.
 
 - [ ] **Step 3: Run the test and confirm it fails**
 

@@ -25,6 +25,12 @@
 - Session state values are exactly: `idle`, `thinking`, `tool`, `permission`, `done`. Any other value maps to `unknown`.
 - Stale session limit is 600 seconds. Stale usage limit is 900 seconds.
 - Commit after every task. Use `feat:`, `test:`, `chore:`, or `docs:` prefixes.
+- Cumulative test totals in the steps ("PASS, 42 tests") are indicative, not a
+  requirement. The per-file counts and the pass or fail result are what matter.
+  A different total is not a failure. A failing test is.
+- Never write `require(` in `src/`, `bin/`, or `scripts/`. Those files are ESM.
+  A `node -e` shell one-liner runs in CommonJS scope, so `require` is correct
+  there and only there.
 
 ## Deviations from the spec
 
@@ -907,9 +913,6 @@ describe('renderStrip', () => {
 
 /** Builds a 96 by 96 solid-colour PNG, for the image test. */
 function solidPng(r: number, g: number, b: number): Buffer {
-  // Implemented in the test file with @napi-rs/canvas.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { createCanvas } = require('@napi-rs/canvas')
   const c = createCanvas(96, 96)
   const ctx = c.getContext('2d')
   ctx.fillStyle = `rgb(${r},${g},${b})`
@@ -918,21 +921,14 @@ function solidPng(r: number, g: number, b: number): Buffer {
 }
 ```
 
-- [ ] **Step 2: Fix the helper to use ESM, then run the test and confirm it fails**
-
-Replace the `require` call in `solidPng` with a top-level import, because the project is ESM only:
+Add this import at the top of the test file, beside the others. The project is
+ESM only, so `require` is not available:
 
 ```ts
 import { createCanvas } from '@napi-rs/canvas'
-
-function solidPng(r: number, g: number, b: number): Buffer {
-  const c = createCanvas(96, 96)
-  const ctx = c.getContext('2d')
-  ctx.fillStyle = `rgb(${r},${g},${b})`
-  ctx.fillRect(0, 0, 96, 96)
-  return c.toBuffer('image/png')
-}
 ```
+
+- [ ] **Step 2: Run the test and confirm it fails**
 
 Run: `npx vitest run tests/render/canvas.test.ts`
 Expected: FAIL. The error names a missing module `../../src/render/canvas.js`.
@@ -940,7 +936,7 @@ Expected: FAIL. The error names a missing module `../../src/render/canvas.js`.
 - [ ] **Step 3: Write `src/render/canvas.ts`**
 
 ```ts
-import { createCanvas, loadImage, type SKRSContext2D } from '@napi-rs/canvas'
+import { createCanvas, Image, type SKRSContext2D } from '@napi-rs/canvas'
 import type { KeySpec, StripSpec, Rgb, BarSpec } from './specs.js'
 import { theme } from './theme.js'
 
@@ -1080,30 +1076,10 @@ export function probe(png: Buffer, x: number, y: number): Rgb {
 }
 
 /**
- * Decodes an image buffer. `@napi-rs/canvas` exposes an async `loadImage`, and
- * the render loop must stay synchronous, so this uses the sync path when the
- * library offers it and falls back to a cached async decode.
+ * Decodes an image buffer synchronously. The render loop cannot await, so this
+ * uses `Image`, which decodes on assignment to `src`. The async `loadImage`
+ * helper is deliberately unused.
  */
-function decodeSync(buf: Buffer): Awaited<ReturnType<typeof loadImage>> | null {
-  try {
-    // `Image` accepts a buffer assignment and decodes at once.
-    const { Image } = require('@napi-rs/canvas') as typeof import('@napi-rs/canvas')
-    const img = new Image()
-    img.src = buf
-    return img as unknown as Awaited<ReturnType<typeof loadImage>>
-  } catch {
-    return null
-  }
-}
-```
-
-- [ ] **Step 4: Replace the `require` in `decodeSync` with a static import**
-
-The project is ESM only, so `require` fails at runtime. Change the top import line and the function body:
-
-```ts
-import { createCanvas, Image, type SKRSContext2D } from '@napi-rs/canvas'
-
 function decodeSync(buf: Buffer): Image | null {
   try {
     const img = new Image()
@@ -1115,7 +1091,13 @@ function decodeSync(buf: Buffer): Image | null {
 }
 ```
 
-Delete the `loadImage` import. Change the `drawImage` call and `probe` to use the `Image` type.
+- [ ] **Step 4: Confirm no CommonJS crept into the source**
+
+The project is ESM only. A `require` call fails at runtime here, and the
+failure can look like a decode bug.
+
+Run: `! grep -rn "require(" src/ bin/ scripts/`
+Expected: it prints nothing and exits 0, which means no match was found.
 
 - [ ] **Step 5: Run the test and confirm it passes**
 
@@ -2233,7 +2215,7 @@ Expected: FAIL. The error names a missing module.
 
 ```ts
 import { EventEmitter } from 'node:events'
-import { readFileSync, existsSync, watch, type FSWatcher } from 'node:fs'
+import { readFileSync, readdirSync, existsSync, watch, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import { paths } from '../paths.js'
 import { log } from '../log.js'
@@ -2367,7 +2349,6 @@ export class UsageSource extends EventEmitter {
     if (!existsSync(this.sessionsDir)) return
     let names: string[]
     try {
-      const { readdirSync } = require('node:fs') as typeof import('node:fs')
       names = readdirSync(this.sessionsDir)
     } catch {
       return
@@ -2412,22 +2393,10 @@ export class UsageSource extends EventEmitter {
 }
 ```
 
-- [ ] **Step 4: Replace the `require` in `readMeta` with a static import**
+- [ ] **Step 4: Confirm no CommonJS crept into the source**
 
-The project is ESM only. Add `readdirSync` to the top import and delete the inline `require`:
-
-```ts
-import { readFileSync, readdirSync, existsSync, watch, type FSWatcher } from 'node:fs'
-```
-
-```ts
-    let names: string[]
-    try {
-      names = readdirSync(this.sessionsDir)
-    } catch {
-      return
-    }
-```
+Run: `! grep -rn "require(" src/ bin/ scripts/`
+Expected: it prints nothing and exits 0, which means no match was found.
 
 - [ ] **Step 5: Run the test and confirm it passes**
 

@@ -11,3 +11,6 @@ spotify.json
 .DS_Store
 .vscode/
 .idea/
+
+# SDD scratch: ledger, briefs, review packages. Not part of the project.
+.superpowers/
