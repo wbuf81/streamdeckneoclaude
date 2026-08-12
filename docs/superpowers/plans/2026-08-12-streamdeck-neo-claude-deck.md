@@ -2758,32 +2758,42 @@ fi
 Run: `npx vitest run tests/install/statusline-wrapper.test.ts`
 Expected: PASS, 7 tests.
 
-- [ ] **Step 10: Settle the session id field against a real payload**
+- [ ] **Step 10: Exercise the wrapper against a temporary directory only**
 
-The spec flags this as the one unverified fact. Settle it now.
+**Do not edit `~/.claude/settings.json` in this task.** An earlier draft of this
+plan told you to repoint `statusLine` to capture a live payload. That edits the
+user's working Claude Code configuration for a live session, and the payoff does
+not justify the risk. Task 15 settles the same question for free: it installs the
+wrapper properly, and then `usage.json` either appears with real numbers or it
+does not.
 
-Run this, then look at your terminal statusline once so Claude Code renders it:
+Instead, prove the wrapper works with a synthetic payload and a temporary
+directory:
+
 ```bash
-mkdir -p /tmp/deckd-probe
-DECKD_STATE_DIR=/tmp/deckd-probe DECKD_INNER="$HOME/.claude/statusline.sh" \
-  sh src/install/statusline-wrapper.sh < /dev/null
-ls -la /tmp/deckd-probe /tmp/deckd-probe/sessions 2>/dev/null
+TMP=$(mktemp -d)
+printf '%s' '{"session_id":"probe-1","model":{"display_name":"Opus 5"},
+  "context_window":{"used_percentage":41.2},"cost":{"total_cost_usd":1.23},
+  "rate_limits":{"five_hour":{"used_percentage":62,"resets_at":1786557420},
+  "seven_day":{"used_percentage":34,"resets_at":1786895160}},
+  "workspace":{"project_dir":"/tmp/x"}}' \
+  | DECKD_STATE_DIR="$TMP" DECKD_INNER="cat >/dev/null; echo INNER-RAN" \
+    sh src/install/statusline-wrapper.sh
+echo "--- files ---"; find "$TMP" -type f
+echo "--- usage.json ---"; cat "$TMP/usage.json"
+echo "--- per-session ---"; cat "$TMP/sessions/probe-1.json"
+rm -rf "$TMP"
 ```
 
-Then capture one real payload:
-```bash
-cp ~/.claude/settings.json /tmp/settings.backup.json
-node -e "
-const fs=require('fs');const p=process.env.HOME+'/.claude/settings.json';
-const s=JSON.parse(fs.readFileSync(p,'utf8'));
-console.log('current statusLine:', JSON.stringify(s.statusLine));
-"
-```
-Set the statusline to `tee /tmp/deckd-payload.json | ~/.claude/statusline.sh` by hand for one render, read the file, then restore `settings.json` from the backup.
+Expected: it prints `INNER-RAN`, `usage.json` holds the four rate limit values
+plus a numeric `ts`, and `sessions/probe-1.json` holds the model name, the
+context percentage, and the cost.
 
-Expected: `/tmp/deckd-payload.json` holds a `session_id` key at the top level. If the real key differs, correct the `jq` filter in the wrapper and the test payload. If no such key exists, leave the wrapper as it is. It already skips the per-session file, and the session keys omit the model line.
-
-Record the finding in a comment at the top of the wrapper.
+The `session_id` key remains the one field taken from Claude Code's documented
+statusline payload rather than measured. The wrapper already fails safe: with no
+such key it writes `usage.json` and skips the per-session file, so the gauges
+still work and only the model line is missing. Record that in a comment at the
+top of the wrapper, and leave the verification to Task 15.
 
 - [ ] **Step 11: Run the whole suite and the typecheck**
 
