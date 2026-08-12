@@ -1346,7 +1346,14 @@ export class Device implements DeckDevice {
     if (this.stopped || this.retry) return
     this.retry = setTimeout(() => {
       this.retry = null
-      void this.connect()
+      // A scheduled retry must never reject into nothing. A busy device throws
+      // from `tryOpen`, and an unhandled rejection can end the process. The
+      // throw also happens before `connect` reaches `scheduleRetry`, so without
+      // this catch the retry loop stops for good and never reconnects.
+      this.connect().catch((e) => {
+        log.once('open-failed', String(e))
+        this.scheduleRetry()
+      })
     }, 2000)
   }
 
@@ -1374,6 +1381,8 @@ export class Device implements DeckDevice {
       )
     }
     log.clearOnce('no-device')
+    log.clearOnce('open-failed')
+    log.clearOnce('enumerate')
     log.info(`connected to ${this.deck.PRODUCT_NAME}`)
     this.deck.on('down', (c) => this.pressCbs.forEach((cb) => cb(controlIndex(c))))
     this.deck.on('up', (c) => this.releaseCbs.forEach((cb) => cb(controlIndex(c))))
@@ -1397,6 +1406,10 @@ export class Device implements DeckDevice {
     const d = this.deck
     this.deck = null
     if (d) await d.close()
+    // Fire the callbacks here too. `FakeDevice` does, and a test written
+    // against the fake must describe the real device. `stopped` is already
+    // true, so no retry starts.
+    this.disconnectCbs.forEach((cb) => cb())
   }
 
   private getDeck(): StreamDeck {
@@ -1627,7 +1640,14 @@ const COLORS = [
 
 async function main(): Promise<void> {
   const device = new Device()
-  await device.connect()
+  try {
+    await device.connect()
+  } catch (e) {
+    // A present but busy device throws. Report the cause instead of crashing
+    // with an unhandled rejection.
+    console.error(String(e))
+    process.exit(1)
+  }
   if (!device.isConnected()) {
     console.error('no Stream Deck Neo found. Plug it in and try again.')
     process.exit(1)
