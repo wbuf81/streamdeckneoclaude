@@ -13,6 +13,26 @@ import { KeyAssigner, SESSION_SLOTS } from './key-assigner.js'
 export const PROJECT_CHARS = 10
 const FIVE_HOURS = 5 * 3600
 
+/** Total keys the page draws: 4 session slots plus 4 gauges. Matches
+ * `DeckFrame.keys`'s fixed length of 8. */
+const KEY_COUNT = SESSION_SLOTS + 4
+
+/**
+ * How long a press's white/red border flash stays visible before reverting
+ * to the key's own colour. 200 ms is the project spec's figure. At this
+ * page's 100 ms tick (`tickMs` above) that is two to three render frames —
+ * enough to read as a flash on real hardware rather than nothing at all,
+ * without lingering long enough to look like a state colour.
+ */
+const FLASH_MS = 200
+
+/** A transient press-feedback border on one key: white for success, red for
+ * failure, until `expiresAtMs`. */
+interface Flash {
+  ok: boolean
+  expiresAtMs: number
+}
+
 /** The part of `ClaudeSource` this page needs. */
 export interface SessionReader {
   getSessions(): Session[]
@@ -26,7 +46,12 @@ export interface UsageReader {
   getMeta(sessionId: string): SessionMeta | null
 }
 
-export type FocusFn = (pid: number, termProgram: string) => Promise<boolean>
+export type FocusFn = (
+  pid: number,
+  termProgram: string,
+  cwd: string,
+  project: string,
+) => Promise<boolean>
 
 export class ClaudePage implements Page {
   readonly name = 'claude'
@@ -41,6 +66,17 @@ export class ClaudePage implements Page {
   private assigner = new KeyAssigner()
   /** Session id per key 0 to 3, from the last render. A press reads it. */
   private slots: (string | null)[] = new Array(SESSION_SLOTS).fill(null)
+  /** One transient flash per key, indices 0 to 7. `null` means no flash. */
+  private flashes: (Flash | null)[] = new Array(KEY_COUNT).fill(null)
+  /**
+   * The millisecond clock from the most recent `render()` call. `onKeyPress`
+   * has no clock of its own — the daemon calls it with only the key index,
+   * and a page must never call `Date.now()` itself — so a new flash anchors
+   * its expiry to the last time this page actually saw the clock. The
+   * daemon always renders again immediately after handling a press, so this
+   * is at most one tick stale.
+   */
+  private lastNowMs = 0
 
   constructor(
     private readonly sessions: SessionReader,
@@ -49,6 +85,8 @@ export class ClaudePage implements Page {
   ) {}
 
   render(now: number, nowMs: number = now * 1000): DeckFrame {
+    this.lastNowMs = nowMs
+
     const live = this.sessions.getSessions()
     const { slots, overflow } = this.assigner.assign(live)
     this.slots = slots
@@ -59,16 +97,46 @@ export class ClaudePage implements Page {
     for (let i = 0; i < SESSION_SLOTS; i++) {
       const id = slots[i]
       const session = id ? byId.get(id) : undefined
-      keys.push(session ? this.sessionKey(session, now, nowMs) : blankKey())
+      const key = session ? this.sessionKey(session, now, nowMs) : blankKey()
+      keys.push(this.withFlash(i, key, nowMs))
     }
 
-    keys.push(...this.gaugeKeys(now))
+    const gauges = this.gaugeKeys(now)
+    for (let i = 0; i < gauges.length; i++) {
+      keys.push(this.withFlash(SESSION_SLOTS + i, gauges[i]!, nowMs))
+    }
 
     return {
       keys,
       strip: this.strip(live, overflow, now),
       buttons: [theme.gray, theme.gray],
     }
+  }
+
+  /**
+   * Overlays the press-feedback flash for `index`, if one is still active.
+   * The flash wins over the key's own border and pulse — white or red is a
+   * direct answer to a human action a moment ago, and must not compete with
+   * the permission pulse for the eye.
+   *
+   * Once `nowMs` reaches the expiry, the stored flash is discarded and this
+   * function returns `key` untouched, so the key's hash goes back to
+   * exactly what it would have been with no flash ever recorded. That is
+   * what lets the daemon's dirty-key check stop redrawing it again.
+   */
+  private withFlash(index: number, key: KeySpec, nowMs: number): KeySpec {
+    const flash = this.flashes[index]
+    if (!flash) return key
+    if (nowMs >= flash.expiresAtMs) {
+      this.flashes[index] = null
+      return key
+    }
+    return { ...key, border: flash.ok ? theme.white : theme.red, pulseOn: undefined }
+  }
+
+  /** Records a flash for `index`, timed off the clock `render()` last saw. */
+  private setFlash(index: number, ok: boolean): void {
+    this.flashes[index] = { ok, expiresAtMs: this.lastNowMs + FLASH_MS }
   }
 
   private sessionKey(s: Session, now: number, nowMs: number): KeySpec {
@@ -234,13 +302,28 @@ export class ClaudePage implements Page {
   }
 
   async onKeyPress(index: number): Promise<void> {
-    // Keys 4 to 7 are gauges. They do nothing in v1.
-    if (index < 0 || index >= SESSION_SLOTS) return
+    if (index < 0 || index >= KEY_COUNT) return
+
+    // Keys 4 to 7 are gauges. They do nothing, but a press there still gets
+    // an answer — a brief red flash is honest feedback, rather than being
+    // indistinguishable from a press that did not register at all.
+    if (index >= SESSION_SLOTS) {
+      this.setFlash(index, false)
+      return
+    }
+
     const id = this.slots[index]
-    if (!id) return
+    if (!id) {
+      this.setFlash(index, false)
+      return
+    }
     const session = this.sessions.getSessions().find((s) => s.sessionId === id)
-    if (!session) return
-    await this.focus(session.pid, session.termProgram)
+    if (!session) {
+      this.setFlash(index, false)
+      return
+    }
+    const ok = await this.focus(session.pid, session.termProgram, session.cwd, session.project)
+    this.setFlash(index, ok)
   }
 }
 

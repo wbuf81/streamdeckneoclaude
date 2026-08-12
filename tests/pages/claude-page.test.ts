@@ -6,6 +6,7 @@ import { createCanvas } from '@napi-rs/canvas'
 import { ClaudePage, crabFrame } from '../../src/pages/claude-page.js'
 import { theme } from '../../src/render/theme.js'
 import { loadCrabFrames } from '../../src/render/sprites.js'
+import { keyHash } from '../../src/render/specs.js'
 import type { Session } from '../../src/sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../../src/sources/usage.js'
 
@@ -25,18 +26,24 @@ interface Fakes {
   usage: UsageSnapshot | null
   stale: boolean
   meta: Map<string, SessionMeta>
-  focused: { pid: number; term: string }[]
+  focused: { pid: number; term: string; cwd: string; project: string }[]
+  /** What the injected `focus` fake resolves to. A test sets this to false to
+   * simulate `focusWindow` failing, without needing the real implementation. */
+  focusResult: boolean
 }
 
 function build(over: Partial<Fakes> = {}) {
   const f: Fakes = {
     sessions: [], usage: null, stale: false,
-    meta: new Map(), focused: [], ...over,
+    meta: new Map(), focused: [], focusResult: true, ...over,
   }
   const page = new ClaudePage(
     { getSessions: () => f.sessions, directoryExists: () => true },
     { getUsage: () => f.usage, isStale: () => f.stale, getMeta: (id) => f.meta.get(id) ?? null },
-    async (pid, term) => { f.focused.push({ pid, term }); return true },
+    async (pid, term, cwd, project) => {
+      f.focused.push({ pid, term, cwd, project })
+      return f.focusResult
+    },
   )
   return { page, f }
 }
@@ -363,10 +370,14 @@ describe('ClaudePage strip', () => {
 
 describe('ClaudePage presses', () => {
   it('focuses the terminal of the pressed session', async () => {
-    const { page, f } = build({ sessions: [session({ pid: 4242 })] })
+    const { page, f } = build({
+      sessions: [session({ pid: 4242, cwd: '/x', project: 'streamdeckneoclaude' })],
+    })
     page.render(NOW)
     await page.onKeyPress(0)
-    expect(f.focused).toEqual([{ pid: 4242, term: 'ghostty' }])
+    expect(f.focused).toEqual([
+      { pid: 4242, term: 'ghostty', cwd: '/x', project: 'streamdeckneoclaude' },
+    ])
   })
 
   it('does nothing for an empty session key', async () => {
@@ -392,6 +403,86 @@ describe('ClaudePage presses', () => {
     page.render(NOW)
     await page.onKeyPress(1)
     expect(f.focused[0]!.pid).toBe(2)
+  })
+})
+
+describe('ClaudePage press feedback (flash)', () => {
+  it('flashes the pressed key white on a successful press, then reverts', async () => {
+    const { page } = build({ sessions: [session({ state: 'tool' })] })
+    page.render(NOW, 0) // seeds the page's clock at nowMs 0
+    await page.onKeyPress(0)
+
+    const during = page.render(NOW, 100).keys[0]!
+    expect(during.border).toEqual(theme.white)
+
+    const after = page.render(NOW, 250).keys[0]!
+    expect(after.border).toEqual(theme.cyan) // the tool state's own colour
+  })
+
+  it('flashes the pressed key red on a failed press', async () => {
+    const { page } = build({ sessions: [session({ state: 'tool' })], focusResult: false })
+    page.render(NOW, 0)
+    await page.onKeyPress(0)
+
+    const during = page.render(NOW, 100).keys[0]!
+    expect(during.border).toEqual(theme.red)
+
+    const after = page.render(NOW, 250).keys[0]!
+    expect(after.border).toEqual(theme.cyan)
+  })
+
+  it('flashes red on an empty session slot, since nothing happened', async () => {
+    const { page } = build()
+    page.render(NOW, 0)
+    await page.onKeyPress(0)
+    expect(page.render(NOW, 100).keys[0]!.border).toEqual(theme.red)
+  })
+
+  it('flashes red on a gauge key, since a press there does nothing', async () => {
+    const { page } = build({ usage: freshUsage() })
+    page.render(NOW, 0)
+    await page.onKeyPress(4)
+    expect(page.render(NOW, 100).keys[4]!.border).toEqual(theme.red)
+  })
+
+  it('overrides the permission pulse while active, and the pulse resumes after', async () => {
+    const { page } = build({ sessions: [session({ state: 'permission' })] })
+    page.render(NOW, 0)
+    await page.onKeyPress(0)
+
+    const during = page.render(NOW, 100).keys[0]!
+    expect(during.border).toEqual(theme.white)
+    expect(during.pulseOn).toBeUndefined()
+
+    const after = page.render(NOW, 250).keys[0]!
+    expect(after.border).toEqual(theme.amber)
+    expect(after.pulseOn).toBe(NOW % 2 === 0)
+  })
+
+  it('is per key: flashing key 0 does not touch key 1', async () => {
+    const { page } = build({
+      sessions: [
+        session({ sessionId: 'a', pid: 1, ts: NOW, state: 'tool' }),
+        session({ sessionId: 'b', pid: 2, ts: NOW - 1, state: 'tool' }),
+      ],
+    })
+    page.render(NOW, 0)
+    await page.onKeyPress(0)
+
+    const frame = page.render(NOW, 100)
+    expect(frame.keys[0]!.border).toEqual(theme.white)
+    expect(frame.keys[1]!.border).toEqual(theme.cyan)
+  })
+
+  it('leaves no trace in keyHash once the flash has expired', async () => {
+    const { page } = build({ sessions: [session({ state: 'tool' })] })
+    const before = keyHash(page.render(NOW, 0).keys[0]!)
+
+    await page.onKeyPress(0)
+    expect(keyHash(page.render(NOW, 100).keys[0]!)).not.toBe(before)
+
+    const after = keyHash(page.render(NOW, 250).keys[0]!)
+    expect(after).toBe(before)
   })
 })
 
