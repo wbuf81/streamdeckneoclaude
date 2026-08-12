@@ -92,10 +92,35 @@ describe('SpotifyPage layout', () => {
 })
 
 describe('SpotifyPage strip', () => {
-  it('shows the artist and the title', () => {
+  it('shows the title on line 1 and the artist on line 2', () => {
     const { page } = build(player())
-    expect(page.render(NOW).strip.lines[0]).toContain('Black Sabbath')
     expect(page.render(NOW).strip.lines[0]).toContain('Planet Caravan')
+    expect(page.render(NOW).strip.lines[1]).toContain('Black Sabbath')
+  })
+
+  it('keeps the full title visible for a track with several artists', () => {
+    // A joined "artist — title" line truncated at 34 characters let a long
+    // artist list consume the whole budget, collapsing the title to a lone
+    // ellipsis. The title must survive on its own line regardless.
+    const { page } = build(player({
+      artist: 'Helynt, GameChops, mellow mode',
+      title: 'Chrono Trigger Blues',
+    }))
+    const line0 = page.render(NOW).strip.lines[0]!
+    expect(line0).toContain('Chrono Trigger Blues')
+    expect(line0).not.toBe('…')
+  })
+
+  it('carries the artist on line 2', () => {
+    const { page } = build(player({ artist: 'Black Sabbath' }))
+    expect(page.render(NOW).strip.lines[1]).toContain('Black Sabbath')
+  })
+
+  it('truncates an over-long title at 30 characters, not 34', () => {
+    const { page } = build(player({ title: 'A'.repeat(50) }))
+    const line0 = page.render(NOW).strip.lines[0]!
+    expect(line0.length).toBe(30)
+    expect(line0.length).toBeLessThan(34)
   })
 
   it('shows the position and the duration as a clock', () => {

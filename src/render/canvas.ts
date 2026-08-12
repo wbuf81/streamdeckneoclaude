@@ -12,6 +12,8 @@ const PAD = 6
 const BORDER = 3
 const BAR_Y = 66
 const BAR_H = 8
+/** Baseline of the strip's second text line. */
+const STRIP_LINE_2_Y = 21
 
 function css(c: Rgb, dim = false): string {
   const f = dim ? 0.45 : 1
@@ -124,9 +126,12 @@ export function renderStrip(spec: StripSpec): Buffer {
   }
 
   if (spec.right) {
+    // Right-aligned on the SECOND line, beside line 2's text. Line 1 is reserved
+    // for the title, which needs the full width. Measured: a line holds 30
+    // characters at 13 px Menlo, and this clock takes 11 of them.
     ctx.textAlign = 'right'
     ctx.fillStyle = css(theme.textDim, dim)
-    ctx.fillText(spec.right, STRIP_WIDTH - PAD, 4)
+    ctx.fillText(spec.right, STRIP_WIDTH - PAD, STRIP_LINE_2_Y)
     ctx.textAlign = 'left'
   }
 

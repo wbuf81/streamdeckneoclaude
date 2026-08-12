@@ -6,7 +6,19 @@ import type { Page } from './types.js'
 import type { PlayerState, SpotifyStatus, RepeatMode } from '../sources/spotify.js'
 
 const VOLUME_STEP = 10
-const TITLE_CHARS = 34
+/**
+ * Measured, not guessed. At 13 px Menlo one character advances 7.83 px, and the
+ * strip has 236 px of usable width, so a line holds 30 characters. The clock
+ * `2:17 / 2:33` needs 11 of them.
+ *
+ * So the title gets the WHOLE first line, and the artist shares the second line
+ * with the clock. An earlier version joined the artist and the title on one line
+ * and truncated the pair at 34 characters. A track with three artists then filled
+ * the budget and the TITLE became a single ellipsis, which loses the one thing
+ * the user most wants to read.
+ */
+const TITLE_CHARS = 30
+const ARTIST_CHARS = 18
 
 /** The part of `SpotifySource` this page needs. */
 export interface PlayerReader {
@@ -80,14 +92,12 @@ export class SpotifyPage implements Page {
       return { lines: ['spotify', 'nothing playing'], dim: true }
     }
 
-    const headline = truncate(
-      state.artist ? `${state.artist} — ${state.title}` : state.title,
-      TITLE_CHARS,
-    )
+    // Title on its own line, artist on the second beside the clock. The title
+    // must never be the field that gets truncated away.
     const fraction = state.durationMs > 0 ? state.positionMs / state.durationMs : 0
 
     return {
-      lines: [headline, ''],
+      lines: [truncate(state.title, TITLE_CHARS), truncate(state.artist, ARTIST_CHARS)],
       right: `${formatClock(state.positionMs / 1000)} / ${formatClock(state.durationMs / 1000)}`,
       bar: { value: fraction, color: theme.green },
       dim: status === 'offline',
