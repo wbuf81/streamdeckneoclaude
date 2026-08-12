@@ -1367,7 +1367,19 @@ git commit -m "feat: run the deck with a live Claude page"
   - `runAuthFlow(clientId: string): Promise<Tokens>`.
   - `refreshTokens(clientId, refreshToken, fetchFn?): Promise<Tokens>`.
 
-Spotify allows a loopback redirect over plain HTTP, but only on `127.0.0.1`. It rejects `localhost`. The redirect URI must match the dashboard entry exactly.
+Spotify allows a loopback redirect over plain HTTP, but only on a loopback
+literal. It rejects `localhost`. The redirect URI must match the dashboard entry
+exactly, including case and any trailing slash.
+
+Confirmed against Spotify's redirect URI documentation, quoted:
+
+> "Use HTTPS for your redirect URI, unless you are using a loopback address,
+> when HTTP is permitted."
+>
+> "localhost is not allowed as redirect URI."
+
+So `http://127.0.0.1:23400/callback` is correct. The IPv6 form
+`http://[::1]:23400/callback` is also allowed, if the IPv4 form ever fails.
 
 - [ ] **Step 1: Write the failing test**
 
