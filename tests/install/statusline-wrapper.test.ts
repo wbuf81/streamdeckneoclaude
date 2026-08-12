@@ -1,0 +1,103 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const WRAPPER = join(process.cwd(), 'src/install/statusline-wrapper.sh')
+
+const PAYLOAD = JSON.stringify({
+  session_id: 'aaaa-bbbb',
+  model: { display_name: 'Opus 5' },
+  context_window: { used_percentage: 41.2 },
+  cost: { total_cost_usd: 1.23 },
+  rate_limits: {
+    five_hour: { used_percentage: 62, resets_at: 1786557420 },
+    seven_day: { used_percentage: 34, resets_at: 1786895160 },
+  },
+  workspace: { project_dir: '/Users/you/Vibecoding/streamdeckneoclaude' },
+})
+
+describe('statusline-wrapper.sh', () => {
+  let dir: string
+  let inner: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'deckd-wrap-'))
+    inner = join(dir, 'inner.sh')
+    // The inner script proves stdin passes through unchanged.
+    writeFileSync(inner, '#!/bin/sh\ncat > "$1"\necho "INNER OUTPUT"\n')
+    chmodSync(inner, 0o755)
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const run = () =>
+    execFileSync('/bin/sh', [WRAPPER], {
+      input: PAYLOAD,
+      env: {
+        ...process.env,
+        DECKD_STATE_DIR: dir,
+        DECKD_INNER: `${inner} ${join(dir, 'seen.json')}`,
+      },
+      encoding: 'utf8',
+    })
+
+  it('prints the inner statusline output unchanged', () => {
+    expect(run()).toContain('INNER OUTPUT')
+  })
+
+  it('passes stdin to the inner command byte for byte', () => {
+    run()
+    expect(readFileSync(join(dir, 'seen.json'), 'utf8')).toBe(PAYLOAD)
+  })
+
+  it('writes usage.json with the rate limits and a timestamp', () => {
+    run()
+    const u = JSON.parse(readFileSync(join(dir, 'usage.json'), 'utf8'))
+    expect(u.rate_limits.five_hour.used_percentage).toBe(62)
+    expect(u.rate_limits.seven_day.resets_at).toBe(1786895160)
+    expect(typeof u.ts).toBe('number')
+    expect(u.ts).toBeGreaterThan(1700000000)
+  })
+
+  it('writes a per-session file keyed by session_id', () => {
+    run()
+    const f = join(dir, 'sessions', 'aaaa-bbbb.json')
+    expect(existsSync(f)).toBe(true)
+    const m = JSON.parse(readFileSync(f, 'utf8'))
+    expect(m.model).toBe('Opus 5')
+    expect(m.ctxPct).toBe(41.2)
+    expect(m.costUsd).toBe(1.23)
+  })
+
+  it('still writes usage.json when session_id is absent', () => {
+    execFileSync('/bin/sh', [WRAPPER], {
+      input: JSON.stringify({ rate_limits: { five_hour: { used_percentage: 5, resets_at: 1 } } }),
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: `${inner} ${join(dir, 'seen.json')}` },
+      encoding: 'utf8',
+    })
+    expect(existsSync(join(dir, 'usage.json'))).toBe(true)
+  })
+
+  it('prints the inner output even when the payload is not JSON', () => {
+    const out = execFileSync('/bin/sh', [WRAPPER], {
+      input: 'not json at all',
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: `${inner} ${join(dir, 'seen.json')}` },
+      encoding: 'utf8',
+    })
+    expect(out).toContain('INNER OUTPUT')
+  })
+
+  it('prints nothing extra when no inner command is set', () => {
+    const out = execFileSync('/bin/sh', [WRAPPER], {
+      input: PAYLOAD,
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: '' },
+      encoding: 'utf8',
+    })
+    expect(out.trim()).toBe('')
+    expect(existsSync(join(dir, 'usage.json'))).toBe(true)
+  })
+})
