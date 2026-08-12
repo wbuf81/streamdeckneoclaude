@@ -61,4 +61,15 @@ describe('FakeDevice', () => {
     expect(d.keyWrites).toEqual([])
     expect(d.stripWrites).toBe(0)
   })
+
+  it('fires onDisconnect on an explicit disconnect, like Device does', async () => {
+    const d = new FakeDevice()
+    let fired = false
+    d.onDisconnect(() => {
+      fired = true
+    })
+    await d.connect()
+    await d.disconnect()
+    expect(fired).toBe(true)
+  })
 })

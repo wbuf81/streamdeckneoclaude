@@ -6,6 +6,17 @@ import {
 import type { Rgb } from './render/specs.js'
 import { log } from './log.js'
 
+/**
+ * The two library calls `Device` needs, factored out so a test can inject a
+ * fake enumeration and a fake open. Defaults to the real library.
+ */
+export interface DeviceDeps {
+  listStreamDecks: typeof listStreamDecks
+  openStreamDeck: typeof openStreamDeck
+}
+
+const realDeps: DeviceDeps = { listStreamDecks, openStreamDeck }
+
 export const NEO_KEY_COUNT = 8
 export const BUTTON_LEFT = 8
 export const BUTTON_RIGHT = 9
@@ -40,6 +51,8 @@ export class Device implements DeckDevice {
   private retry: NodeJS.Timeout | null = null
   private stopped = false
 
+  constructor(private deps: DeviceDeps = realDeps) {}
+
   isConnected(): boolean {
     return this.deck !== null
   }
@@ -54,14 +67,21 @@ export class Device implements DeckDevice {
     if (this.stopped || this.retry) return
     this.retry = setTimeout(() => {
       this.retry = null
-      void this.connect()
+      // A scheduled retry must never reject into nothing. A busy device throws
+      // from `tryOpen`, and an unhandled rejection can end the process. The
+      // throw also happens before `connect` reaches `scheduleRetry`, so without
+      // this catch the retry loop stops for good and never reconnects.
+      this.connect().catch((e) => {
+        log.once('open-failed', String(e))
+        this.scheduleRetry()
+      })
     }, 2000)
   }
 
   private async tryOpen(): Promise<void> {
     let found
     try {
-      found = await listStreamDecks()
+      found = await this.deps.listStreamDecks()
     } catch (e) {
       log.once('enumerate', `cannot list devices: ${String(e)}`)
       return
@@ -72,7 +92,7 @@ export class Device implements DeckDevice {
       return
     }
     try {
-      this.deck = await openStreamDeck(neo.path)
+      this.deck = await this.deps.openStreamDeck(neo.path)
     } catch (e) {
       // An open failure almost always means another process owns the device.
       throw new DeviceBusyError(
@@ -82,6 +102,8 @@ export class Device implements DeckDevice {
       )
     }
     log.clearOnce('no-device')
+    log.clearOnce('open-failed')
+    log.clearOnce('enumerate')
     log.info(`connected to ${this.deck.PRODUCT_NAME}`)
     this.deck.on('down', (c) => this.pressCbs.forEach((cb) => cb(controlIndex(c))))
     this.deck.on('up', (c) => this.releaseCbs.forEach((cb) => cb(controlIndex(c))))
@@ -105,6 +127,10 @@ export class Device implements DeckDevice {
     const d = this.deck
     this.deck = null
     if (d) await d.close()
+    // Fire the callbacks here too. `FakeDevice` does, and a test written
+    // against the fake must describe the real device. `stopped` is already
+    // true, so no retry starts.
+    this.disconnectCbs.forEach((cb) => cb())
   }
 
   private getDeck(): StreamDeck {
