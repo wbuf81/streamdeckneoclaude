@@ -150,6 +150,34 @@ describe('StocksPage layout', () => {
     const { page } = build({ quotes })
     expect(page.render(NOW).keys[0]!.spark).toBeUndefined()
   })
+
+  it('colours the sparkline green for an up quote', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: 1.59, spark: [1, 2, 3] }))
+    const { page } = build({ quotes })
+    expect(page.render(NOW).keys[0]!.spark!.color).toEqual(theme.green)
+  })
+
+  it('colours the sparkline red for a down quote', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: -1.59, spark: [1, 2, 3] }))
+    const { page } = build({ quotes })
+    expect(page.render(NOW).keys[0]!.spark!.color).toEqual(theme.red)
+  })
+
+  it('colours the sparkline neutral for a flat quote', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: 0, spark: [1, 2, 3] }))
+    const { page } = build({ quotes })
+    expect(page.render(NOW).keys[0]!.spark!.color).toEqual(theme.gray)
+  })
+
+  it('colours the sparkline neutral for an unknown quote', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: null, spark: [1, 2, 3] }))
+    const { page } = build({ quotes })
+    expect(page.render(NOW).keys[0]!.spark!.color).toEqual(theme.gray)
+  })
 })
 
 describe('StocksPage strip', () => {

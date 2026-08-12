@@ -132,7 +132,7 @@ export class StocksPage implements Page {
 
     const spark = downsample(quote?.spark ?? [], SPARK_BUCKETS)
     if (spark.length >= 2) {
-      key.spark = { values: spark, color: theme.textDim }
+      key.spark = { values: spark, color: trendColor(trend) }
     }
 
     if (sourceStale || unknown) key.dim = true
