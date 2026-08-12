@@ -14,3 +14,7 @@ spotify.json
 
 # SDD scratch: ledger, briefs, review packages. Not part of the project.
 .superpowers/
+
+# Contact-sheet preview from scripts/crab-contact-sheet.ts. A human aid for
+# judging frame legibility, not a project asset.
+/crab-frames.png

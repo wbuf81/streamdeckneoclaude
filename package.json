@@ -3,15 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
-  "bin": { "deckd": "./dist/bin/deckd.js" },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "deckd": "./dist/bin/deckd.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/bin/deckd.js start",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "smoke": "npm run build && node dist/scripts/smoke.js"
+    "smoke": "npm run build && node dist/scripts/smoke.js",
+    "extract:crabs": "npm run build && node dist/scripts/extract-crab-frames.js",
+    "crab:contact-sheet": "npm run build && node dist/scripts/crab-contact-sheet.js"
   },
   "dependencies": {
     "@elgato-stream-deck/node": "^7.1.2",
@@ -19,6 +25,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/omggif": "^1.0.5",
+    "omggif": "^1.0.10",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
   }
