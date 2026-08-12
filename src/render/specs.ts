@@ -11,10 +11,22 @@ export interface BarSpec {
 
 export type KeyKind = 'blank' | 'session' | 'gauge' | 'control' | 'image'
 
+export interface SparkSpec {
+  /** Oldest first. Fewer than 2 points draws nothing. */
+  values: number[]
+  color: Rgb
+}
+
 export interface KeySpec {
   kind: KeyKind
   /** Up to 4 text lines, top to bottom. */
   lines?: string[]
+  /**
+   * Per-line text colour, aligned by index with `lines`. An absent entry, or
+   * an index past the end of this array, uses the default text colour. The
+   * stocks page uses this to tint only the change line, never the price.
+   */
+  lineColors?: (Rgb | undefined)[]
   align?: 'left' | 'center'
   border?: Rgb
   /** True draws the border. False draws it dark. The page owns the phase. */
@@ -29,6 +41,8 @@ export interface KeySpec {
   image?: Image
   /** Identity of `image`, for example a track id. `keyHash` uses this. */
   imageKey?: string
+  /** A small series drawn as vertical bars. Used by the stocks page. */
+  spark?: SparkSpec
   dim?: boolean
 }
 

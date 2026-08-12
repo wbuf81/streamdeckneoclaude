@@ -38,6 +38,18 @@ describe('keyHash', () => {
   it('gives a blank key a stable hash', () => {
     expect(keyHash(blankKey())).toBe(keyHash(blankKey()))
   })
+
+  it('differs when the spark series changes', () => {
+    const a: KeySpec = { kind: 'gauge', spark: { values: [1, 2, 3], color: [70, 200, 110] } }
+    const b: KeySpec = { kind: 'gauge', spark: { values: [3, 2, 1], color: [70, 200, 110] } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('differs when a line colour changes', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['x'], lineColors: [[70, 200, 110]] }
+    const b: KeySpec = { kind: 'gauge', lines: ['x'], lineColors: [[230, 60, 60]] }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
 })
 
 describe('stripHash', () => {

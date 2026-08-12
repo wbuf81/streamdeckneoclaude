@@ -123,6 +123,63 @@ describe('renderKey sprite', () => {
   })
 })
 
+describe('renderKey spark', () => {
+  it('changes the rendered pixels when a spark is present', () => {
+    const without = renderKey({ kind: 'gauge' })
+    const withSpark = renderKey({
+      kind: 'gauge',
+      spark: { values: [1, 5, 2, 8, 3, 6], color: theme.green },
+    })
+    expect(withSpark.equals(without)).toBe(false)
+  })
+
+  it('draws a centred line for a flat series without dividing by zero', () => {
+    expect(() =>
+      renderKey({ kind: 'gauge', spark: { values: [4, 4, 4, 4], color: theme.green } }),
+    ).not.toThrow()
+    const flat = renderKey({ kind: 'gauge', spark: { values: [4, 4, 4, 4], color: theme.green } })
+    const blank = renderKey({ kind: 'gauge' })
+    expect(flat.equals(blank)).toBe(false)
+  })
+
+  it('draws nothing for an empty series', () => {
+    const blank = renderKey({ kind: 'gauge' })
+    const withSpark = renderKey({ kind: 'gauge', spark: { values: [], color: theme.green } })
+    expect(withSpark.equals(blank)).toBe(true)
+  })
+
+  it('draws nothing for a single value', () => {
+    const blank = renderKey({ kind: 'gauge' })
+    const withSpark = renderKey({ kind: 'gauge', spark: { values: [7], color: theme.green } })
+    expect(withSpark.equals(blank)).toBe(true)
+  })
+
+  it('dims the spark like every other element', () => {
+    const bright = renderKey({
+      kind: 'gauge',
+      spark: { values: [1, 5, 2, 8], color: theme.green },
+    })
+    const dimmed = renderKey({
+      kind: 'gauge',
+      spark: { values: [1, 5, 2, 8], color: theme.green },
+      dim: true,
+    })
+    expect(bright.equals(dimmed)).toBe(false)
+  })
+})
+
+describe('renderKey lineColors', () => {
+  it('changes the rendered pixels when a line colour is set', () => {
+    const uncoloured = renderKey({ kind: 'gauge', lines: ['TSLA', '327.51', '▼ 1.59%'] })
+    const coloured = renderKey({
+      kind: 'gauge',
+      lines: ['TSLA', '327.51', '▼ 1.59%'],
+      lineColors: [undefined, undefined, theme.red],
+    })
+    expect(coloured.equals(uncoloured)).toBe(false)
+  })
+})
+
 /**
  * Builds a 96 by 96 solid-colour image, already decoded. It goes through
  * JPEG on purpose: real album art arrives as JPEG, decoded by the producer

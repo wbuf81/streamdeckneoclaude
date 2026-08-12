@@ -4,9 +4,11 @@ import { Daemon } from '../src/daemon.js'
 import { PageManager } from '../src/page-manager.js'
 import { ClaudePage } from '../src/pages/claude-page.js'
 import { SpotifyPage } from '../src/pages/spotify-page.js'
+import { StocksPage } from '../src/pages/stocks-page.js'
 import { ClaudeSource } from '../src/sources/claude.js'
 import { UsageSource } from '../src/sources/usage.js'
 import { SpotifySource } from '../src/sources/spotify.js'
+import { StockSource } from '../src/sources/stocks.js'
 import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
@@ -27,19 +29,22 @@ async function start(): Promise<void> {
   const usage = new UsageSource()
   const clientId = readClientId()
   const spotify = new SpotifySource(clientId)
+  const stocks = new StockSource()
   await claude.start()
   await usage.start()
   await spotify.start()
+  await stocks.start()
 
   const device = new Device()
   const pages = new PageManager()
   pages.add(new ClaudePage(claude, usage, focusWindow))
   pages.add(new SpotifyPage(spotify))
+  pages.add(new StocksPage(stocks))
 
-  // Only now, with both pages present, may a saved index of 1 be restored.
+  // Only now, with all three pages present, may a saved index be restored.
   // `PageManager.setIndex` silently ignores an index outside the current
-  // page count, so restoring before the Spotify page exists would strand
-  // the deck on the Claude page with no error and no log line.
+  // page count, so restoring before every page exists would strand the deck
+  // on an earlier page with no error and no log line.
   restorePage(pages)
 
   const daemon = new Daemon(device, pages)
@@ -57,6 +62,7 @@ async function start(): Promise<void> {
   claude.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
   usage.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
   spotify.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
+  stocks.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
 
   const shutdown = async () => {
     log.info('deckd stopping')
@@ -65,6 +71,7 @@ async function start(): Promise<void> {
     await claude.stop()
     await usage.stop()
     await spotify.stop()
+    await stocks.stop()
     await device.disconnect()
     process.exit(0)
   }

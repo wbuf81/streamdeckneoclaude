@@ -1,5 +1,5 @@
 import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas'
-import type { KeySpec, StripSpec, Rgb, BarSpec } from './specs.js'
+import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec } from './specs.js'
 import { theme } from './theme.js'
 import { getSprite } from './sprites.js'
 
@@ -12,6 +12,8 @@ const PAD = 6
 const BORDER = 3
 const BAR_Y = 66
 const BAR_H = 8
+const SPARK_Y = 48
+const SPARK_H = 40
 /** Baseline of the strip's second text line. */
 const STRIP_LINE_2_Y = 21
 
@@ -40,6 +42,37 @@ function drawBar(
   if (fill > 0) {
     ctx.fillStyle = css(bar.color, dim)
     ctx.fillRect(x, y, fill, h)
+  }
+}
+
+/**
+ * Draws one series as vertical bars, one per value, filling the width from
+ * `BORDER + PAD` to `KEY_SIZE - PAD`. Normalises between the series minimum
+ * and maximum. A flat series (`range === 0`) draws every bar at half height,
+ * which reads as a centred horizontal line, rather than dividing by zero.
+ * Fewer than 2 values draws nothing at all.
+ */
+function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
+  const { values, color } = spark
+  if (values.length < 2) return
+
+  const x0 = BORDER + PAD
+  const x1 = KEY_SIZE - PAD
+  const width = x1 - x0
+  const barW = width / values.length
+
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const range = max - min
+
+  ctx.fillStyle = css(color, dim)
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i]!
+    const frac = range === 0 ? 0.5 : (v - min) / range
+    const h = frac * SPARK_H
+    const x = x0 + i * barW
+    const y = SPARK_Y + (SPARK_H - h)
+    if (h > 0) ctx.fillRect(x, y, Math.max(1, barW - 1), h)
   }
 }
 
@@ -81,14 +114,15 @@ export function renderKey(spec: KeySpec): Buffer {
 
   if (spec.lines?.length) {
     const centered = spec.align === 'center'
-    ctx.fillStyle = css(theme.text, dim)
     ctx.font = `11px ${FONT}`
     ctx.textAlign = centered ? 'center' : 'left'
     ctx.textBaseline = 'top'
     const x = centered ? KEY_SIZE / 2 : BORDER + PAD
     let y = PAD
-    for (const line of spec.lines) {
-      ctx.fillText(line, x, y)
+    for (let i = 0; i < spec.lines.length; i++) {
+      const color = spec.lineColors?.[i] ?? theme.text
+      ctx.fillStyle = css(color, dim)
+      ctx.fillText(spec.lines[i]!, x, y)
       y += 14
     }
   }
@@ -97,6 +131,10 @@ export function renderKey(spec: KeySpec): Buffer {
     const img = getSprite(spec.sprite)
     // 48 x 48 at a 48 pixel source keeps one source pixel per key pixel.
     if (img) ctx.drawImage(img, KEY_SIZE / 2 - 24, 40, 48, 48)
+  }
+
+  if (spec.spark) {
+    drawSpark(ctx, spec.spark, dim)
   }
 
   if (spec.bar) {
