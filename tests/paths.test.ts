@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
-import { paths } from '../src/paths.js'
+import { paths, ensureStateDir } from '../src/paths.js'
 import { homedir } from 'node:os'
+import { mkdirSync, chmodSync, statSync } from 'node:fs'
 
 describe('paths', () => {
   it('puts runtime state under ~/.local/state/deckd', () => {
@@ -21,5 +22,21 @@ describe('paths', () => {
     expect(paths.launchAgent).toBe(
       `${homedir()}/Library/LaunchAgents/com.wbard.deckd.plist`,
     )
+  })
+})
+
+describe('ensureStateDir', () => {
+  it('forces mode 0700 on state directories that already exist with a looser mode', () => {
+    mkdirSync(paths.sessionsDir, { recursive: true })
+    mkdirSync(paths.artDir, { recursive: true })
+    chmodSync(paths.stateDir, 0o755)
+    chmodSync(paths.sessionsDir, 0o755)
+    chmodSync(paths.artDir, 0o755)
+
+    ensureStateDir()
+
+    expect(statSync(paths.stateDir).mode & 0o777).toBe(0o700)
+    expect(statSync(paths.sessionsDir).mode & 0o777).toBe(0o700)
+    expect(statSync(paths.artDir).mode & 0o777).toBe(0o700)
   })
 })

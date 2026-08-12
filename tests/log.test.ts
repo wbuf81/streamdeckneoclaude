@@ -1,5 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest'
-import { createLogger } from '../src/log.js'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { createLogger, fileSink } from '../src/log.js'
+import { paths, ensureStateDir } from '../src/paths.js'
+import { writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
 
 describe('createLogger', () => {
   let written: string[]
@@ -39,5 +41,44 @@ describe('createLogger', () => {
     log.clearOnce('no-device')
     log.once('no-device', 'device absent')
     expect(written).toHaveLength(2)
+  })
+})
+
+describe('fileSink', () => {
+  const rotatedFile = `${paths.logFile}.1`
+
+  beforeEach(() => {
+    ensureStateDir()
+    rmSync(paths.logFile, { force: true })
+    rmSync(rotatedFile, { force: true })
+  })
+
+  afterEach(() => {
+    rmSync(paths.logFile, { force: true })
+    rmSync(rotatedFile, { force: true })
+  })
+
+  it('rotates the log file past 5 MB and starts a fresh file', () => {
+    const oldContent = 'x'.repeat(5 * 1024 * 1024 + 1)
+    writeFileSync(paths.logFile, oldContent)
+
+    fileSink('first line after rotation')
+
+    expect(existsSync(rotatedFile)).toBe(true)
+    expect(readFileSync(rotatedFile, 'utf8')).toBe(oldContent)
+    expect(readFileSync(paths.logFile, 'utf8')).toBe(
+      'first line after rotation\n',
+    )
+  })
+
+  it('does not rotate a log file under 5 MB', () => {
+    writeFileSync(paths.logFile, 'small\n')
+
+    fileSink('appended line')
+
+    expect(existsSync(rotatedFile)).toBe(false)
+    expect(readFileSync(paths.logFile, 'utf8')).toBe(
+      'small\nappended line\n',
+    )
   })
 })

@@ -1,6 +1,6 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, chmodSync } from 'node:fs'
 
 const home = homedir()
 const stateDir = join(home, '.local', 'state', 'deckd')
@@ -21,9 +21,17 @@ export const paths = {
   launchAgent: join(home, 'Library', 'LaunchAgents', 'com.wbard.deckd.plist'),
 } as const
 
-/** Creates the state directory tree. Mode 0700, because it holds a token. */
+/**
+ * Creates the state directory tree. Mode 0700, because it holds a token.
+ *
+ * `mkdirSync` applies `mode` only to directories it creates. A directory
+ * that already exists keeps its old mode. So each directory gets an
+ * unconditional `chmodSync` too, to enforce 0700 even on a stale directory
+ * left behind by a prior process, a backup restore, or an unpacked archive.
+ */
 export function ensureStateDir(): void {
-  mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 })
-  mkdirSync(paths.sessionsDir, { recursive: true, mode: 0o700 })
-  mkdirSync(paths.artDir, { recursive: true, mode: 0o700 })
+  for (const dir of [paths.stateDir, paths.sessionsDir, paths.artDir]) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    chmodSync(dir, 0o700)
+  }
 }
