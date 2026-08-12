@@ -1,3 +1,5 @@
+import type { Image } from '@napi-rs/canvas'
+
 export type Rgb = readonly [number, number, number]
 
 export interface BarSpec {
@@ -23,8 +25,8 @@ export interface KeySpec {
   glyph?: string
   /** An asset name, for example `crab`. */
   sprite?: string
-  /** Decoded image bytes. `keyHash` ignores this field. */
-  image?: Buffer
+  /** An already-decoded image, for example album art. `keyHash` ignores this field. */
+  image?: Image
   /** Identity of `image`, for example a track id. `keyHash` uses this. */
   imageKey?: string
   dim?: boolean

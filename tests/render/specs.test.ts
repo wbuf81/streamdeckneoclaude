@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { Image } from '@napi-rs/canvas'
 import { keyHash, stripHash, blankKey } from '../../src/render/specs.js'
 import type { KeySpec } from '../../src/render/specs.js'
 
@@ -15,15 +16,16 @@ describe('keyHash', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
-  it('ignores the image bytes and uses imageKey', () => {
-    const a: KeySpec = { kind: 'image', image: Buffer.from('aaaa'), imageKey: 'track-1' }
-    const b: KeySpec = { kind: 'image', image: Buffer.from('bbbb'), imageKey: 'track-1' }
+  it('ignores the image and uses imageKey', () => {
+    const a: KeySpec = { kind: 'image', image: new Image(), imageKey: 'track-1' }
+    const b: KeySpec = { kind: 'image', image: new Image(), imageKey: 'track-1' }
     expect(keyHash(a)).toBe(keyHash(b))
   })
 
   it('differs when imageKey changes', () => {
-    const a: KeySpec = { kind: 'image', image: Buffer.from('aaaa'), imageKey: 'track-1' }
-    const b: KeySpec = { kind: 'image', image: Buffer.from('aaaa'), imageKey: 'track-2' }
+    const sameImage = new Image()
+    const a: KeySpec = { kind: 'image', image: sameImage, imageKey: 'track-1' }
+    const b: KeySpec = { kind: 'image', image: sameImage, imageKey: 'track-2' }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
