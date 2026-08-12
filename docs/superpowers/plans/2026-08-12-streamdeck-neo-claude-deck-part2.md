@@ -207,9 +207,13 @@ export async function focusWindow(pid: number, termProgram: string): Promise<boo
   }
   try {
     await run('/usr/bin/osascript', ['-e', buildFocusScript(app)])
+    log.clearOnce(`focus-${app}`)
     return true
   } catch (e) {
-    log.warn(`window focus failed for ${app} pid ${pid}: ${String(e)}`)
+    // `log.once`, not `log.warn`. A user who presses the same key while macOS
+    // denies automation would otherwise write one line per press, without a
+    // limit. The key clears on the next success.
+    log.once(`focus-${app}`, `window focus failed for ${app} pid ${pid}: ${String(e)}`)
     return false
   }
 }

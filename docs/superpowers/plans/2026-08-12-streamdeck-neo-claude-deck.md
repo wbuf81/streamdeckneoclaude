@@ -40,6 +40,10 @@
      its test deleted the user's real log AND its only `.1` backup on every run.
      Once the launchd agent is installed that file holds the daemon's
      diagnostics, so `npm test` would have destroyed them.
+- **A log call must never throw.** Callers log from inside their own catch
+  blocks, and several promise never to throw. So the sink swallows its own write
+  errors: a full disk or an unwritable path drops the line rather than escaping
+  into a key-press handler or a render loop.
 - Never write `require(` in `src/`, `bin/`, or `scripts/`. Those files are ESM.
   A `node -e` shell one-liner runs in CommonJS scope, so `require` is correct
   there and only there.
@@ -390,17 +394,24 @@ const MAX_BYTES = 5 * 1024 * 1024
  * must never read, write, rename, or delete the real log in the user's home
  * directory.
  */
-export function createFileSink(file: string): Sink {
+export function createFileSink(file: string, maxBytes = MAX_BYTES): Sink {
   const rotated = `${file}.1`
   return (line: string) => {
-    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
-    chmodSync(dirname(file), 0o700)
+    // A log call must never throw. Callers log from inside their own catch
+    // blocks, so a throw here would escape a handler that promises not to
+    // throw. A lost log line costs less than a crashed key press.
     try {
-      if (statSync(file).size > MAX_BYTES) renameSync(file, rotated)
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+      chmodSync(dirname(file), 0o700)
+      try {
+        if (statSync(file).size > maxBytes) renameSync(file, rotated)
+      } catch {
+        // The file does not exist yet. Nothing to rotate.
+      }
+      appendFileSync(file, line + '\n')
     } catch {
-      // The file does not exist yet. Nothing to rotate.
+      // The disk is full, or the path is not writable. Drop the line.
     }
-    appendFileSync(file, line + '\n')
   }
 }
 
