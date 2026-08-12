@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, chmodSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { execFile } from 'node:child_process'
+import type { AddressInfo } from 'node:net'
 import { paths } from '../paths.js'
 import { log } from '../log.js'
 
@@ -105,8 +106,11 @@ export class TokenStore {
   }
 }
 
-async function postForm(body: URLSearchParams): Promise<Record<string, unknown>> {
-  const res = await fetch(TOKEN_URL, {
+async function postForm(
+  body: URLSearchParams,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Record<string, unknown>> {
+  const res = await fetchImpl(TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
@@ -128,19 +132,53 @@ export async function refreshTokens(
   return parseTokenResponse(await postForm(body), refreshToken, now())
 }
 
+/** Opens the URL in the default browser, macOS-style. A failed open is fine, because the URL is also printed to the terminal. */
+function defaultOpenUrl(url: string): void {
+  execFile('/usr/bin/open', [url], () => {
+    // A failure here is fine. The user has the URL printed above.
+  })
+}
+
+export interface RunAuthFlowOptions {
+  /** The port to bind the loopback listener on. Defaults to `AUTH_PORT`. A test passes `0` for an OS-assigned port, so it never binds 8888. */
+  port?: number
+  /** Opens the authorize URL. Defaults to macOS's `open`. A test injects a fake, so no real browser opens. */
+  openUrl?: (url: string) => void
+  /** The fetch implementation for the token exchange. Defaults to the global `fetch`. A test injects a fake, so it never calls Spotify's real API. */
+  fetchFn?: typeof fetch
+  /** How long to wait for the callback before giving up. Defaults to 5 minutes. A test injects a short one, only to identify its timer; the test still lets the flow finish long before it would fire. */
+  timeoutMs?: number
+  /** Reports the bound port once the server is listening. A test uses this to learn the OS-assigned port. */
+  onListening?: (port: number) => void
+}
+
 /**
  * Runs the full authorization flow once. It starts a loopback listener, opens
  * the browser, and waits for the redirect. It rejects on a state mismatch,
  * because that indicates a forged callback.
  */
-export async function runAuthFlow(clientId: string): Promise<Tokens> {
+export async function runAuthFlow(
+  clientId: string,
+  opts: RunAuthFlowOptions = {},
+): Promise<Tokens> {
+  const port = opts.port ?? AUTH_PORT
+  const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000
+  const openUrl = opts.openUrl ?? defaultOpenUrl
+  const fetchImpl = opts.fetchFn ?? fetch
+
   const verifier = makeVerifier()
   const state = randomBytes(16).toString('hex')
   const url = buildAuthUrl(clientId, REDIRECT_URI, challengeFor(verifier), state)
 
   const code = await new Promise<string>((resolve, reject) => {
+    // Declared before the server, because the request handler and the error
+    // handler both close over it. It is assigned below, before either
+    // handler can possibly run, since both fire only once the event loop
+    // gets a chance to process I/O after this synchronous setup finishes.
+    let timer: NodeJS.Timeout
+
     const server = createServer((req, res) => {
-      const requested = new URL(req.url ?? '/', `http://127.0.0.1:${AUTH_PORT}`)
+      const requested = new URL(req.url ?? '/', `http://127.0.0.1:${port}`)
       if (requested.pathname !== '/callback') {
         res.writeHead(404).end()
         return
@@ -152,32 +190,40 @@ export async function runAuthFlow(clientId: string): Promise<Tokens> {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       if (err || !gotCode) {
         res.end('<h1>Authorization failed</h1><p>Return to the terminal.</p>')
+        clearTimeout(timer)
         server.close()
         reject(new Error(`authorization failed: ${err ?? 'no code'}`))
         return
       }
       if (gotState !== state) {
         res.end('<h1>State mismatch</h1><p>Return to the terminal.</p>')
+        clearTimeout(timer)
         server.close()
         reject(new Error('state mismatch. The callback did not match the request.'))
         return
       }
       res.end('<h1>deckd is connected</h1><p>You can close this tab.</p>')
+      clearTimeout(timer)
       server.close()
       resolve(gotCode)
     })
-    server.on('error', reject)
-    server.listen(AUTH_PORT, '127.0.0.1', () => {
-      console.log('Opening the browser to authorize Spotify.')
-      console.log(`If it does not open, visit:\n${url}`)
-      execFile('/usr/bin/open', [url], () => {
-        // A failure here is fine. The user has the URL printed above.
-      })
+    server.on('error', (e) => {
+      // A bind failure (e.g. `EADDRINUSE`) settles the promise too, and a
+      // pending timer would otherwise keep the process alive after it does.
+      clearTimeout(timer)
+      reject(e)
     })
-    setTimeout(() => {
+    timer = setTimeout(() => {
       server.close()
       reject(new Error('authorization timed out after 5 minutes'))
-    }, 5 * 60 * 1000)
+    }, timeoutMs)
+    server.listen(port, '127.0.0.1', () => {
+      const actualPort = (server.address() as AddressInfo).port
+      opts.onListening?.(actualPort)
+      console.log('Opening the browser to authorize Spotify.')
+      console.log(`If it does not open, visit:\n${url}`)
+      openUrl(url)
+    })
   })
 
   const body = new URLSearchParams({
@@ -187,7 +233,11 @@ export async function runAuthFlow(clientId: string): Promise<Tokens> {
     client_id: clientId,
     code_verifier: verifier,
   })
-  const tokens = parseTokenResponse(await postForm(body), '', Math.floor(Date.now() / 1000))
+  const tokens = parseTokenResponse(
+    await postForm(body, fetchImpl),
+    '',
+    Math.floor(Date.now() / 1000),
+  )
   log.info('spotify authorized')
   return tokens
 }

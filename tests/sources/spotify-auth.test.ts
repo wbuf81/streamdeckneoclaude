@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, statSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import {
-  TokenStore, makeVerifier, challengeFor, buildAuthUrl,
+  TokenStore, makeVerifier, challengeFor, buildAuthUrl, runAuthFlow,
   SCOPES, REDIRECT_URI, AUTH_PORT, parseTokenResponse,
 } from '../../src/sources/spotify-auth.js'
 
@@ -154,5 +154,52 @@ describe('TokenStore', () => {
 
   it('does not throw when clear runs on a missing file', () => {
     expect(() => new TokenStore(join(dir, 'nope.json')).clear()).not.toThrow()
+  })
+})
+
+describe('runAuthFlow', () => {
+  // Regression test for: the 5-minute timeout timer was never captured, so
+  // it was never cleared on any settle path. A pending Node timer keeps the
+  // event loop alive, so a CLI process would print success and then hang for
+  // up to 5 minutes needing Ctrl-C. This drives the real success path (a real
+  // loopback server, a real HTTP round trip to it) while injecting fakes for
+  // the two things that must never happen in a test: a real browser opening,
+  // and a real network call to Spotify's token endpoint. It binds an
+  // OS-assigned port (0), never the real 8888.
+  it('clears the timeout timer once the flow succeeds, so a pending timer does not keep the process alive', async () => {
+    const uniqueMs = 654321 // distinct from any delay Node might use internally, so the spy match below is unambiguous
+    const setSpy = vi.spyOn(global, 'setTimeout')
+    const clearSpy = vi.spyOn(global, 'clearTimeout')
+
+    const fetchFn = vi.fn(async () => ({
+      json: async () => ({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 }),
+    })) as unknown as typeof fetch
+
+    let port = 0
+    try {
+      const tokens = await runAuthFlow('cid', {
+        port: 0,
+        timeoutMs: uniqueMs,
+        fetchFn,
+        onListening: (p) => { port = p },
+        openUrl: (url) => {
+          // Stands in for the user's browser completing the real Spotify
+          // consent screen: fire the same redirect Spotify would send, at
+          // the loopback server this process itself just started.
+          const state = new URL(url).searchParams.get('state')
+          void fetch(`http://127.0.0.1:${port}/callback?code=testcode&state=${state}`)
+        },
+      })
+
+      expect(tokens).toEqual({ accessToken: 'at', refreshToken: 'rt', expiresAt: expect.any(Number) })
+
+      const callIndex = setSpy.mock.calls.findIndex((c) => c[1] === uniqueMs)
+      expect(callIndex).toBeGreaterThanOrEqual(0)
+      const timerId = setSpy.mock.results[callIndex]?.value
+      expect(clearSpy.mock.calls.some((c) => c[0] === timerId)).toBe(true)
+    } finally {
+      setSpy.mockRestore()
+      clearSpy.mockRestore()
+    }
   })
 })
