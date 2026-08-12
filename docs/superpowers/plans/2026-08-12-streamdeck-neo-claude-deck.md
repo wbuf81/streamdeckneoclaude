@@ -2120,7 +2120,7 @@ Expected: PASS, 17 tests.
 Run:
 ```bash
 npx tsx --version >/dev/null 2>&1 || npm i -D tsx
-npx tsx -e "
+npx tsx --input-type=module -e "
 import { ClaudeSource } from './src/sources/claude.js'
 const s = new ClaudeSource()
 await s.start()

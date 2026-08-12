@@ -224,7 +224,7 @@ Expected: PASS, 14 tests.
 
 Switch to another application, then run:
 ```bash
-npx tsx -e "
+npx tsx --input-type=module -e "
 import { focusWindow } from './src/focus-window.js'
 console.log('focused:', await focusWindow(process.pid, 'ghostty'))
 "
@@ -2532,7 +2532,7 @@ Expected: PASS, 30 tests.
 
 Start playing something in Spotify, then run:
 ```bash
-npx tsx -e "
+npx tsx --input-type=module -e "
 import { SpotifySource } from './src/sources/spotify.js'
 import { readFileSync } from 'node:fs'
 import { paths } from './src/paths.js'
