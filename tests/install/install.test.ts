@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, statSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   buildPlist, wrapStatusLine, unwrapStatusLine, recoverStatusLine, isInstalled, verifyWrap,
+  writeAtomic, describeStatusLineOutcome,
   WRAPPER_MARKER,
 } from '../../src/install/install.js'
 
@@ -35,6 +36,33 @@ describe('buildPlist', () => {
     const p = buildPlist('com.wbard.deckd', '/usr/bin/node', '/x/deckd.js', '/x/out.log')
     expect(p.startsWith('<?xml')).toBe(true)
     expect(p).toContain('</plist>')
+  })
+
+  it('XML-escapes an interpolated path containing an ampersand', () => {
+    // A path with `&`, `<`, or `>` is not exotic -- a username or a
+    // directory someone named years ago can contain one -- and an
+    // unescaped one breaks the plist's own XML syntax, which launchd may
+    // then refuse to load.
+    const p = buildPlist(
+      'com.wbard.deckd',
+      '/usr/bin/node',
+      "/Users/a&b/<script>deckd.js",
+      '/x/out & log.log',
+    )
+    expect(p).not.toContain('a&b')
+    expect(p).not.toContain('<script>')
+    expect(p).toContain('a&amp;b')
+    expect(p).toContain('&lt;script&gt;')
+    expect(p).toContain('out &amp; log.log')
+  })
+
+  it('produces a document an XML parser accepts once escaped', () => {
+    const p = buildPlist('com.wbard.deckd', '/usr/bin/node', '/x/a&b.js', '/x/out.log')
+    // A cheap well-formedness check: every literal `&` in the output starts
+    // a recognised entity. An unescaped ampersand would leave a bare `&`
+    // that fails this.
+    const bareAmpersand = /&(?!amp;|lt;|gt;|quot;|apos;)/
+    expect(bareAmpersand.test(p)).toBe(false)
   })
 })
 
@@ -244,5 +272,110 @@ describe('recoverStatusLine', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('writeAtomic', () => {
+  // Every case uses a directory under the OS temp dir, never a path under
+  // the real home directory.
+  it('preserves the mode of a file that already exists, even a tighter one than the default', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-'))
+    try {
+      const f = join(dir, 'settings.json')
+      writeFileSync(f, '{}', { mode: 0o600 })
+      expect(statSync(f).mode & 0o777).toBe(0o600)
+
+      // `writeFileSync`'s `mode` option only applies at creation. The temp
+      // file this function writes through is always newly created, so
+      // without preserving the target's mode explicitly, the rename would
+      // silently replace 0600 with the default 0644.
+      writeAtomic(f, '{"a":1}')
+
+      expect(statSync(f).mode & 0o777).toBe(0o600)
+      expect(readFileSync(f, 'utf8')).toBe('{"a":1}')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a looser mode too, not just a tight one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-'))
+    try {
+      const f = join(dir, 'plist.xml')
+      writeFileSync(f, 'old', { mode: 0o644 })
+      chmodSync(f, 0o664)
+
+      writeAtomic(f, 'new')
+
+      expect(statSync(f).mode & 0o777).toBe(0o664)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('uses the requested mode for a file that does not exist yet', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-'))
+    try {
+      const f = join(dir, 'brand-new.json')
+      writeAtomic(f, '{}', 0o600)
+      expect(statSync(f).mode & 0o777).toBe(0o600)
+      expect(readFileSync(f, 'utf8')).toBe('{}')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('describeStatusLineOutcome', () => {
+  it('says "restored ... from the backup" when the backup carried a real value', () => {
+    const line = describeStatusLineOutcome(
+      { statusLine: 'x.sh', source: 'backup' },
+      '/x/settings.json',
+    )
+    expect(line).toContain('restored')
+    expect(line).toContain('from the backup')
+  })
+
+  it('says "restored" (no backup wording) for a real embedded value', () => {
+    const line = describeStatusLineOutcome(
+      { statusLine: 'x.sh', source: 'embedded' },
+      '/x/settings.json',
+    )
+    expect(line).toContain('restored')
+    expect(line).not.toContain('backup')
+  })
+
+  // Regression coverage for the actual defect: `recoverStatusLine` can
+  // report `source: 'backup'` while `statusLine` is `undefined` -- the
+  // backup file existed and parsed, but it had no `statusLine` key of its
+  // own, e.g. because install ran when statusLine was already absent. The
+  // old wording said "restored ... from the backup" even though nothing
+  // was restored; the key was deleted from settings.
+  it('says "deleted", not "restored", when the backup source had no actual value', () => {
+    const line = describeStatusLineOutcome(
+      { statusLine: undefined, source: 'backup' },
+      '/x/settings.json',
+    )
+    expect(line).toContain('deleted')
+    expect(line).not.toContain('restored')
+  })
+
+  it('says "deleted", not "restored", when the embedded source had no actual value', () => {
+    const line = describeStatusLineOutcome(
+      { statusLine: undefined, source: 'embedded' },
+      '/x/settings.json',
+    )
+    expect(line).toContain('deleted')
+    expect(line).not.toContain('restored')
+  })
+
+  it('reports the unrecoverable case distinctly, without claiming a delete or a restore', () => {
+    const line = describeStatusLineOutcome(
+      { statusLine: undefined, source: 'none', warning: 'x' },
+      '/x/settings.json',
+    )
+    expect(line).toContain('left statusLine absent')
+    expect(line).not.toContain('restored')
+    expect(line).not.toContain('deleted')
   })
 })

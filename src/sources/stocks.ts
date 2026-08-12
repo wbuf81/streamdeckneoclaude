@@ -205,8 +205,11 @@ export class StockSource extends EventEmitter {
     this.fetchFn = f
   }
 
+  /** Returns a copy. The caller cannot mutate the source's own state through
+   * the result, and the map keeps being valid even after a later refresh
+   * replaces `this.quotes` with a new one. */
   getQuotes(): Map<string, Quote> {
-    return this.quotes
+    return new Map(this.quotes)
   }
 
   getStatus(): StockStatus {
@@ -230,6 +233,20 @@ export class StockSource extends EventEmitter {
     }
     if (newest === -Infinity) return false
     return this.now() - newest > STALE_SECONDS
+  }
+
+  /**
+   * True when THIS symbol's own quote is older than 15 minutes while the
+   * market is open. `isStale()` looks only at the newest quote across every
+   * symbol, so one lagging symbol can hide behind the others and never dim
+   * on its own. This lets a caller check staleness per symbol instead.
+   * False for a symbol with no quote yet — there is nothing stale to show.
+   */
+  isSymbolStale(symbol: string): boolean {
+    if (this.marketState !== 'open') return false
+    const q = this.quotes.get(symbol)
+    if (!q) return false
+    return this.now() - q.asOf > STALE_SECONDS
   }
 
   /** Called when the stocks page becomes visible. It refreshes at once and

@@ -1,6 +1,6 @@
 import {
   readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync,
-  existsSync, chmodSync, mkdirSync,
+  existsSync, chmodSync, mkdirSync, statSync,
 } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { execFile, spawn } from 'node:child_process'
@@ -33,6 +33,20 @@ export function projectRoot(): string | null {
   return null
 }
 
+/** Escapes the five XML special characters. `nodePath`, `scriptPath`, and
+ * `logPath` all come from filesystem paths, which can legally contain `&`,
+ * `<`, `>`, `'`, or `"` (a username with an ampersand is not exotic). An
+ * unescaped one would produce a malformed plist that launchd may refuse to
+ * load, or that reads back with a corrupted path. */
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+}
+
 export function buildPlist(
   label: string,
   nodePath: string,
@@ -44,11 +58,11 @@ export function buildPlist(
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${label}</string>
+  <string>${escapeXml(label)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodePath}</string>
-    <string>${scriptPath}</string>
+    <string>${escapeXml(nodePath)}</string>
+    <string>${escapeXml(scriptPath)}</string>
     <string>start</string>
   </array>
   <key>RunAtLoad</key>
@@ -56,9 +70,9 @@ export function buildPlist(
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${logPath}</string>
+  <string>${escapeXml(logPath)}</string>
   <key>StandardErrorPath</key>
-  <string>${logPath}</string>
+  <string>${escapeXml(logPath)}</string>
 </dict>
 </plist>
 `
@@ -193,11 +207,33 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`
 }
 
-/** Writes a file through a temporary name, so a crash cannot truncate it. */
-function writeAtomic(file: string, content: string, mode = 0o644): void {
+/**
+ * Writes a file through a temporary name, so a crash cannot truncate it.
+ *
+ * The temp file is always newly created, so `mode` does apply to it -- but
+ * `renameSync` then makes that temp file BECOME `file`, and the temp file's
+ * mode is not necessarily the mode `file` already had. A target that
+ * existed with a tighter mode (a token file at 0600, say) would otherwise
+ * silently loosen to `mode`'s default of 0644 the next time something
+ * wrote through this function. So the target's own mode, when it already
+ * exists, is preserved with an unconditional `chmodSync` after the rename --
+ * `mode` only decides the mode for a file that does not exist yet.
+ *
+ * Exported so a test can drive it directly against a temporary file,
+ * without going through `install()`/`uninstall()`, which hard-code the
+ * real paths under `~` and must never run in a test.
+ */
+export function writeAtomic(file: string, content: string, mode = 0o644): void {
   const tmp = `${file}.${process.pid}.tmp`
+  let existingMode: number | null = null
+  try {
+    existingMode = statSync(file).mode & 0o777
+  } catch {
+    // The target does not exist yet. Nothing to preserve.
+  }
   writeFileSync(tmp, content, { mode })
   renameSync(tmp, file)
+  if (existingMode !== null) chmodSync(file, existingMode)
 }
 
 export async function install(): Promise<void> {
@@ -422,6 +458,32 @@ export async function verifyWrap(
   return { ok: true, reason: 'identical output', before, after }
 }
 
+/**
+ * Describes what `uninstall` actually did with the recovered statusLine
+ * value, for the printed summary. A separate, exported function so a test
+ * can check the wording directly against a synthetic `RecoverResult`,
+ * without running the whole of `uninstall()`, which hard-codes the real
+ * `paths.claudeSettings` and must never run in a test.
+ *
+ * `recoverStatusLine` can report `source: 'backup'` or `'embedded'` while
+ * still giving back `statusLine: undefined` -- both sources can recover a
+ * legitimately empty original, e.g. because install ran when statusLine was
+ * already absent. That case is a deletion, not a restoration, and the
+ * summary must say so plainly rather than claiming a restore that did not
+ * happen.
+ */
+export function describeStatusLineOutcome(recovered: RecoverResult, settingsPath: string): string {
+  if (recovered.source === 'none') {
+    return `left statusLine absent in ${settingsPath} (original unrecoverable, see warning above)`
+  }
+  if (recovered.statusLine === undefined) {
+    return `deleted statusLine in ${settingsPath} (the recovered original was empty)`
+  }
+  return recovered.source === 'backup'
+    ? `restored statusLine in ${settingsPath} from the backup`
+    : `restored statusLine in ${settingsPath}`
+}
+
 export async function uninstall(): Promise<void> {
   const removed: string[] = []
 
@@ -439,13 +501,7 @@ export async function uninstall(): Promise<void> {
     if (recovered.statusLine === undefined) delete settings.statusLine
     else settings.statusLine = recovered.statusLine
     writeAtomic(paths.claudeSettings, JSON.stringify(settings, null, 2))
-    removed.push(
-      recovered.source === 'backup'
-        ? `restored statusLine in ${paths.claudeSettings} from the backup`
-        : recovered.source === 'none'
-          ? `left statusLine absent in ${paths.claudeSettings} (original unrecoverable, see warning above)`
-          : `restored statusLine in ${paths.claudeSettings}`,
-    )
+    removed.push(describeStatusLineOutcome(recovered, paths.claudeSettings))
   }
 
   const wrapper = join(paths.stateDir, 'statusline-wrapper.sh')

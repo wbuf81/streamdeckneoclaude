@@ -388,6 +388,69 @@ describe('StockSource', () => {
     await src.refresh()
     expect(src.isStale()).toBe(false)
   })
+
+  it('returns a copy from getQuotes, so mutating the result cannot corrupt the source', async () => {
+    const { fetchFn } = build({
+      AAA: chartBody({}, { symbol: 'AAA' }),
+      BBB: chartBody({}, { symbol: 'BBB' }),
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+
+    const quotes = src.getQuotes()
+    quotes.delete('AAA')
+    quotes.set('ZZZ', quotes.get('BBB')!)
+
+    const fresh = src.getQuotes()
+    expect(fresh.has('AAA')).toBe(true)
+    expect(fresh.has('ZZZ')).toBe(false)
+    expect(fresh.size).toBe(2)
+  })
+
+  it('is stale for one symbol while a fresher symbol keeps the whole source non-stale', async () => {
+    // `isStale()` only ever looks at the NEWEST quote across every symbol,
+    // so a single lagging symbol hides behind a fresh one and the
+    // whole-source method reports false. Per-symbol staleness must catch
+    // it, and the existing whole-source method must keep behaving exactly
+    // as before -- a page not owned by this change still calls it.
+    const freshBody = chartBody({}, { symbol: 'AAA', regularMarketTime: NOW })
+    const staleBody = chartBody({}, { symbol: 'BBB', regularMarketTime: NOW - 20 * 60 })
+    const { fetchFn } = build({ AAA: freshBody, BBB: staleBody })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+
+    expect(src.getMarketState()).toBe('open')
+    expect(src.isSymbolStale('AAA')).toBe(false)
+    expect(src.isSymbolStale('BBB')).toBe(true)
+    expect(src.isStale()).toBe(false)
+  })
+
+  it('is not per-symbol stale while the market is closed, even with an old quote', async () => {
+    const closedPeriod = {
+      pre: { start: NOW - 100000, end: NOW - 90000 },
+      regular: { start: NOW - 90000, end: NOW - 80000 },
+      post: { start: NOW - 80000, end: NOW - 70000 },
+    }
+    const body = chartBody(
+      {},
+      { symbol: 'AAA', regularMarketTime: NOW - 20 * 60, currentTradingPeriod: closedPeriod },
+    )
+    const { fetchFn } = build({ AAA: body, BBB: body })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+
+    expect(src.getMarketState()).toBe('closed')
+    expect(src.isSymbolStale('AAA')).toBe(false)
+  })
+
+  it('is not per-symbol stale for a symbol with no quote at all, even while the market is open', async () => {
+    const body = chartBody({}, { symbol: 'AAA' })
+    const { fetchFn } = build({ AAA: body, BBB: body })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+    expect(src.getMarketState()).toBe('open')
+    expect(src.isSymbolStale('ZZZ')).toBe(false)
+  })
 })
 
 describe('StockSource stop() during an in-flight refresh', () => {
