@@ -100,4 +100,48 @@ describe('statusline-wrapper.sh', () => {
     expect(out.trim()).toBe('')
     expect(existsSync(join(dir, 'usage.json'))).toBe(true)
   })
+
+  it('passes trailing blank lines through to the inner command, exact byte count', () => {
+    // $(cat) in a shell variable strips trailing newlines. A payload ending
+    // in two newlines proves the wrapper preserves them: 9 bytes in must be
+    // 9 bytes out, not 7.
+    const payload = '{"a":1}\n\n'
+    execFileSync('/bin/sh', [WRAPPER], {
+      input: payload,
+      env: {
+        ...process.env,
+        DECKD_STATE_DIR: dir,
+        DECKD_INNER: `${inner} ${join(dir, 'seen.json')}`,
+      },
+      encoding: 'utf8',
+    })
+    const seen = readFileSync(join(dir, 'seen.json'), 'utf8')
+    expect(Buffer.byteLength(seen, 'utf8')).toBe(Buffer.byteLength(payload, 'utf8'))
+    expect(seen).toBe(payload)
+  })
+
+  it('rejects a session_id with path traversal characters', () => {
+    // "/" is outside the allowed charset, so "../evil" is rejected outright.
+    // Without the guard, "$STATE_DIR/sessions/../evil.json" resolves to
+    // "$STATE_DIR/evil.json" — one directory above where per-session files
+    // belong, inside the user's state directory.
+    const payload = JSON.stringify({
+      session_id: '../evil',
+      model: { display_name: 'Opus 5' },
+      rate_limits: { five_hour: { used_percentage: 1, resets_at: 1 } },
+    })
+    execFileSync('/bin/sh', [WRAPPER], {
+      input: payload,
+      env: {
+        ...process.env,
+        DECKD_STATE_DIR: dir,
+        DECKD_INNER: `${inner} ${join(dir, 'seen.json')}`,
+      },
+      encoding: 'utf8',
+    })
+    expect(existsSync(join(dir, 'usage.json'))).toBe(true)
+    expect(existsSync(join(dir, 'evil.json'))).toBe(false)
+    expect(existsSync(join(dir, 'evil.json.tmp'))).toBe(false)
+    expect(existsSync(join(dir, 'sessions', 'evil.json'))).toBe(false)
+  })
 })

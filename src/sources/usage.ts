@@ -111,12 +111,23 @@ export class UsageSource extends EventEmitter {
   }
 
   async refresh(): Promise<void> {
-    const next = this.readUsage()
-    this.readMeta()
-    const key = JSON.stringify(next)
+    const nextUsage = this.readUsage()
+    const nextMeta = this.readMeta()
+    // The key folds in BOTH the usage snapshot and the freshly-read metadata.
+    // ClaudeSource had the same bug once: a key built from only some fields
+    // let the model/context/cost line go stale, because usage.json can stay
+    // put across renders while the per-session file changes underneath it.
+    // Map order is not guaranteed to match write order, so entries are
+    // sorted before stringifying, or two functionally-identical maps could
+    // produce different keys and fire a spurious `change`.
+    const key = JSON.stringify({
+      usage: nextUsage,
+      meta: Array.from(nextMeta.entries()).sort(([a], [b]) => a.localeCompare(b)),
+    })
     if (key === this.lastKey) return
     this.lastKey = key
-    this.usage = next
+    this.usage = nextUsage
+    this.meta = nextMeta
     this.emit('change')
   }
 
@@ -129,20 +140,23 @@ export class UsageSource extends EventEmitter {
     }
   }
 
-  private readMeta(): void {
-    if (!existsSync(this.sessionsDir)) return
+  /** Reads every per-session file fresh. Returns the map rather than only
+   * mutating `this.meta`, so `refresh()` can fold it into the change key. */
+  private readMeta(): Map<string, SessionMeta> {
+    const out = new Map<string, SessionMeta>()
+    if (!existsSync(this.sessionsDir)) return out
     let names: string[]
     try {
       names = readdirSync(this.sessionsDir)
     } catch {
-      return
+      return out
     }
     for (const name of names) {
       if (!name.endsWith('.json')) continue
       const id = name.slice(0, -'.json'.length)
       try {
         const raw = JSON.parse(readFileSync(join(this.sessionsDir, name), 'utf8'))
-        this.meta.set(id, {
+        out.set(id, {
           model: typeof raw.model === 'string' ? raw.model : '',
           ctxPct: pct(raw.ctxPct),
           costUsd: pct(raw.costUsd),
@@ -152,6 +166,7 @@ export class UsageSource extends EventEmitter {
         // Skip a corrupt file. The model line simply does not appear.
       }
     }
+    return out
   }
 
   getUsage(): UsageSnapshot | null {

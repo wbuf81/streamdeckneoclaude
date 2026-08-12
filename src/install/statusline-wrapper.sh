@@ -22,27 +22,43 @@ set -u
 STATE_DIR="${DECKD_STATE_DIR:-$HOME/.local/state/deckd}"
 INNER="${DECKD_INNER:-}"
 
-# Read all of stdin once. The inner command needs the same bytes.
-PAYLOAD=$(cat)
+# Capture stdin to a temp file rather than a shell variable. `PAYLOAD=$(cat)`
+# strips trailing newlines from command substitution, which would corrupt
+# byte-for-byte passthrough. A file preserves every byte, including trailing
+# newlines. If mktemp fails, TMPIN stays empty, caching is skipped, and the
+# wrapper's own stdin is left untouched so the inner command can still read
+# it directly below.
+TMPIN=$(mktemp 2>/dev/null) || TMPIN=""
+if [ -n "$TMPIN" ]; then
+  trap 'rm -f "$TMPIN"' EXIT
+  cat > "$TMPIN"
+fi
 
-if command -v jq >/dev/null 2>&1; then
+if [ -n "$TMPIN" ] && command -v jq >/dev/null 2>&1; then
   mkdir -p "$STATE_DIR/sessions" 2>/dev/null || true
   NOW=$(date +%s)
 
   # usage.json holds the newest rate limits. The gauge keys read it.
-  printf '%s' "$PAYLOAD" | jq -c --argjson ts "$NOW" \
+  jq -c --argjson ts "$NOW" \
     '{rate_limits: (.rate_limits // {}), ts: $ts}' \
+    < "$TMPIN" \
     > "$STATE_DIR/usage.json.tmp" 2>/dev/null \
     && mv "$STATE_DIR/usage.json.tmp" "$STATE_DIR/usage.json" 2>/dev/null || true
 
   # The per-session file carries the model name. state.d does not have it.
-  SID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null || true)
+  SID=$(jq -r '.session_id // empty' < "$TMPIN" 2>/dev/null || true)
+  # session_id lands in a file path below. Reject anything outside a safe
+  # charset, so a crafted id cannot write outside the sessions directory.
+  case "$SID" in
+    *[!A-Za-z0-9._-]*) SID="" ;;
+  esac
   if [ -n "$SID" ]; then
-    printf '%s' "$PAYLOAD" | jq -c --argjson ts "$NOW" \
+    jq -c --argjson ts "$NOW" \
       '{model: (.model.display_name // ""),
         ctxPct: (.context_window.used_percentage // null),
         costUsd: (.cost.total_cost_usd // null),
         ts: $ts}' \
+      < "$TMPIN" \
       > "$STATE_DIR/sessions/$SID.json.tmp" 2>/dev/null \
       && mv "$STATE_DIR/sessions/$SID.json.tmp" "$STATE_DIR/sessions/$SID.json" 2>/dev/null || true
   fi
@@ -51,5 +67,11 @@ fi
 # Run the real statusline with the original stdin. Its output is the only
 # output this script produces.
 if [ -n "$INNER" ]; then
-  printf '%s' "$PAYLOAD" | sh -c "$INNER"
+  if [ -n "$TMPIN" ]; then
+    cat "$TMPIN" | sh -c "$INNER"
+  else
+    # No temp file. Nothing was cached, but stdin was never consumed either,
+    # so the inner command still gets the original bytes unchanged.
+    sh -c "$INNER"
+  fi
 fi

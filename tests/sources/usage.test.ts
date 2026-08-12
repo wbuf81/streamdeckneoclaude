@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -141,6 +141,54 @@ describe('UsageSource', () => {
     const s = new UsageSource(dir, () => NOW)
     await s.start()
     expect(s.getMeta('bad')).toBeNull()
+    await s.stop()
+  })
+
+  it('does not emit change when nothing changed', async () => {
+    write({ rate_limits: {}, ts: NOW })
+    const s = new UsageSource(dir, () => NOW)
+    await s.start()
+    let changes = 0
+    s.on('change', () => { changes += 1 })
+    await s.refresh()
+    await s.refresh()
+    expect(changes).toBe(0)
+    await s.stop()
+  })
+
+  it('emits change when only a per-session file changes, usage.json untouched', async () => {
+    // usage.json is byte-identical across both refreshes here. Only a
+    // per-session file changes. A key built from readUsage() alone would
+    // miss this, and getMeta() would return new data with no `change` to
+    // tell a listener to redraw. That is the bug ClaudeSource hit once,
+    // fixed by keying on the whole snapshot instead of a few fields.
+    const usagePayload = {
+      rate_limits: {
+        five_hour: { used_percentage: 62, resets_at: NOW + 100 },
+        seven_day: { used_percentage: 34, resets_at: NOW + 200 },
+      },
+      ts: NOW,
+    }
+    write(usagePayload)
+    writeFileSync(
+      join(dir, 'sessions', 'aaaa.json'),
+      JSON.stringify({ model: 'Sonnet 5', ctxPct: 10, costUsd: 0.1, ts: NOW }),
+    )
+    const s = new UsageSource(dir, () => NOW)
+    await s.start()
+    let changes = 0
+    s.on('change', () => { changes += 1 })
+
+    const before = readFileSync(join(dir, 'usage.json'), 'utf8')
+    writeFileSync(
+      join(dir, 'sessions', 'aaaa.json'),
+      JSON.stringify({ model: 'Opus 5', ctxPct: 10, costUsd: 0.1, ts: NOW }),
+    )
+    expect(readFileSync(join(dir, 'usage.json'), 'utf8')).toBe(before)
+
+    await s.refresh()
+    expect(changes).toBeGreaterThan(0)
+    expect(s.getMeta('aaaa')!.model).toBe('Opus 5')
     await s.stop()
   })
 })
