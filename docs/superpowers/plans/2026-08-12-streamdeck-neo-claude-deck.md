@@ -28,6 +28,12 @@
 - Cumulative test totals in the steps ("PASS, 42 tests") are indicative, not a
   requirement. The per-file counts and the pass or fail result are what matter.
   A different total is not a failure. A failing test is.
+- **A test must never write outside the project.** The `log` singleton binds to
+  `fileSink`, which appends to the real `~/.local/state/deckd/deckd.log`. So any
+  module that logs writes to the user's home directory during a test run. One
+  seam fixes this for every module: `log.ts` exports `setDefaultSink`, and
+  `tests/setup.ts` swaps the sink for a no-op. `vitest.config.ts` loads that file
+  through `setupFiles`. Never point a test at a real path under `~`.
 - Never write `require(` in `src/`, `bin/`, or `scripts/`. Those files are ESM.
   A `node -e` shell one-liner runs in CommonJS scope, so `require` is correct
   there and only there.
@@ -378,6 +384,16 @@ export function fileSink(line: string): void {
   appendFileSync(paths.logFile, line + '\n')
 }
 
+/**
+ * The sink the singleton `log` writes through. A test swaps it for a no-op, so
+ * the suite never appends to the real log file in the user's home directory.
+ */
+let defaultSink: Sink = fileSink
+
+export function setDefaultSink(sink: Sink): void {
+  defaultSink = sink
+}
+
 export function createLogger(sink: Sink = fileSink): Logger {
   const seen = new Set<string>()
 
@@ -400,7 +416,33 @@ export function createLogger(sink: Sink = fileSink): Logger {
   }
 }
 
-export const log = createLogger()
+/**
+ * The shared logger. It writes through `defaultSink`, which a test replaces, so
+ * the suite cannot append to the real log file.
+ */
+export const log = createLogger((line) => defaultSink(line))
+```
+
+Create `tests/setup.ts`, and load it from `vitest.config.ts`:
+
+```ts
+import { setDefaultSink } from '../src/log.js'
+
+// Keep the suite off the real log file at ~/.local/state/deckd/deckd.log.
+// Any module that uses the shared `log` would otherwise write to the user's
+// home directory during a test run.
+setDefaultSink(() => {})
+```
+
+```ts
+// vitest.config.ts
+export default defineConfig({
+  test: {
+    include: ['tests/**/*.test.ts'],
+    environment: 'node',
+    setupFiles: ['tests/setup.ts'],
+  },
+})
 ```
 
 - [ ] **Step 12: Run the whole suite and the typecheck**
@@ -2062,7 +2104,11 @@ export class ClaudeSource extends EventEmitter {
   /** Re-reads the directory. Emits `change` only when the result differs. */
   async refresh(): Promise<void> {
     const next = this.read()
-    const key = next.map((s) => `${s.sessionId}:${s.state}:${s.ts}:${s.tool}`).join('|')
+    // Compare the whole session list, not a few chosen fields. An earlier
+    // version keyed on sessionId, state, ts and tool. `ts` holds whole seconds,
+    // so two writes inside one second with a new `label` gave the same key. The
+    // deck then kept the old text, because it redraws only on `change`.
+    const key = JSON.stringify(next)
     if (key === this.lastKey) return
     this.lastKey = key
     this.sessions = next
