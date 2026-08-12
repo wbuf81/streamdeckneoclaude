@@ -28,12 +28,18 @@
 - Cumulative test totals in the steps ("PASS, 42 tests") are indicative, not a
   requirement. The per-file counts and the pass or fail result are what matter.
   A different total is not a failure. A failing test is.
-- **A test must never write outside the project.** The `log` singleton binds to
-  `fileSink`, which appends to the real `~/.local/state/deckd/deckd.log`. So any
-  module that logs writes to the user's home directory during a test run. One
-  seam fixes this for every module: `log.ts` exports `setDefaultSink`, and
-  `tests/setup.ts` swaps the sink for a no-op. `vitest.config.ts` loads that file
-  through `setupFiles`. Never point a test at a real path under `~`.
+- **A test must never read, write, rename, or delete anything under `~`.** Two
+  separate seams enforce this, and both are required:
+  1. The `log` singleton binds to `fileSink`, which appends to the real
+     `~/.local/state/deckd/deckd.log`, so any module that logs would write to the
+     user's home directory during a test run. `log.ts` exports `setDefaultSink`,
+     and `tests/setup.ts` swaps the sink for a no-op. `vitest.config.ts` loads
+     that file through `setupFiles`.
+  2. `createFileSink(file)` takes the log path as a parameter, so a rotation test
+     points at a temporary file. An earlier version hardcoded the real path, and
+     its test deleted the user's real log AND its only `.1` backup on every run.
+     Once the launchd agent is installed that file holds the daemon's
+     diagnostics, so `npm test` would have destroyed them.
 - Never write `require(` in `src/`, `bin/`, or `scripts/`. Those files are ESM.
   A `node -e` shell one-liner runs in CommonJS scope, so `require` is correct
   there and only there.
@@ -293,6 +299,10 @@ export function ensureStateDir(): void {
 Run: `npx vitest run tests/paths.test.ts`
 Expected: PASS, 3 tests.
 
+The rotation test uses `createFileSink(tempFile)`, never `fileSink`. It creates
+its own temporary directory and removes only that. It must not name
+`paths.logFile` at all.
+
 - [ ] **Step 9: Write the failing test for the logger**
 
 Create `tests/log.test.ts`:
@@ -353,8 +363,11 @@ Expected: FAIL. The error names a missing module `../src/log.js`.
 The `once` method exists for a reason. A disconnected device retries every 2 seconds, and an unguarded log fills the disk.
 
 ```ts
-import { appendFileSync, statSync, renameSync } from 'node:fs'
-import { paths, ensureStateDir } from './paths.js'
+import {
+  appendFileSync, statSync, renameSync, mkdirSync, chmodSync,
+} from 'node:fs'
+import { dirname } from 'node:path'
+import { paths } from './paths.js'
 
 export type Sink = (line: string) => void
 export type Level = 'INFO' | 'WARN' | 'ERROR'
@@ -371,18 +384,28 @@ export interface Logger {
 
 const MAX_BYTES = 5 * 1024 * 1024
 
-/** Appends to the log file. Rotates at 5 MB and keeps one old copy. */
-export function fileSink(line: string): void {
-  ensureStateDir()
-  try {
-    if (statSync(paths.logFile).size > MAX_BYTES) {
-      renameSync(paths.logFile, `${paths.logFile}.1`)
+/**
+ * Builds a sink that appends to `file`. It rotates at 5 MB and keeps one old
+ * copy. The path is a parameter so a test can point at a temporary file. A test
+ * must never read, write, rename, or delete the real log in the user's home
+ * directory.
+ */
+export function createFileSink(file: string): Sink {
+  const rotated = `${file}.1`
+  return (line: string) => {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+    chmodSync(dirname(file), 0o700)
+    try {
+      if (statSync(file).size > MAX_BYTES) renameSync(file, rotated)
+    } catch {
+      // The file does not exist yet. Nothing to rotate.
     }
-  } catch {
-    // The file does not exist yet. Nothing to rotate.
+    appendFileSync(file, line + '\n')
   }
-  appendFileSync(paths.logFile, line + '\n')
 }
+
+/** Appends to the real log file. Rotates at 5 MB and keeps one old copy. */
+export const fileSink: Sink = createFileSink(paths.logFile)
 
 /**
  * The sink the singleton `log` writes through. A test swaps it for a no-op, so
