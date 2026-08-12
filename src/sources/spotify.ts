@@ -121,6 +121,13 @@ export class SpotifySource extends EventEmitter {
   /** Track ids whose last attempt failed (or had no URL), mapped to the
    * earliest time (in `now()` seconds) a retry is allowed. */
   private artRetryAt = new Map<string, number>()
+  /** The track id the saved-state check was last run for. Lets a poll tell a
+   * track CHANGE apart from a poll that just repeats the same track, so the
+   * rate-limited saved-state endpoint is hit once per track, not once per poll. */
+  private savedTrackId: string | null = null
+  /** True when saved, false when not, null when unknown (not yet fetched, or
+   * the token lacks the library scopes). */
+  private saved: boolean | null = null
 
   constructor(
     private readonly clientId: string,
@@ -260,6 +267,8 @@ export class SpotifySource extends EventEmitter {
     if (res.status === 204) {
       this.state = null
       this.status = 'no-device'
+      this.savedTrackId = null
+      this.saved = null
       return
     }
 
@@ -272,6 +281,131 @@ export class SpotifySource extends EventEmitter {
     this.state = parsed
     this.status = parsed ? 'ok' : 'no-device'
     this.polledAt = this.now()
+
+    if (!parsed) {
+      this.savedTrackId = null
+      this.saved = null
+      return
+    }
+    // The saved-state endpoint is rate-limited and does not drift on its
+    // own, so fetch it only when the track CHANGES, never on every poll.
+    if (parsed.trackId && parsed.trackId !== this.savedTrackId) {
+      this.savedTrackId = parsed.trackId
+      this.saved = null
+      await this.fetchSaved(parsed.trackId)
+    }
+  }
+
+  /** True when saved, false when not, null when unknown or unfetched. */
+  isSaved(): boolean | null {
+    return this.saved
+  }
+
+  /** Reads `/me/tracks/contains` for one track. Refreshes once on a 401 and
+   * retries. A 403 means the token lacks the library scopes: report it once
+   * and leave `saved` at null, with no retry, because a 403 never resolves
+   * itself and this endpoint is rate-limited. */
+  private async fetchSaved(trackId: string, retried = false): Promise<void> {
+    const token = await this.accessToken()
+    if (!token) return
+
+    let res
+    try {
+      res = await this.fetchFn(`${API}/me/tracks/contains?ids=${trackId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    } catch (e) {
+      log.once('spotify-saved-offline', `spotify saved-track check failed: ${String(e)}`)
+      return
+    }
+
+    if (res.status === 401) {
+      if (retried) return
+      const t = this.store.load()
+      if (!t) return
+      const fresh = await this.doRefresh(t)
+      if (!fresh) return
+      return this.fetchSaved(trackId, true)
+    }
+
+    if (res.status === 403) {
+      log.once(
+        'spotify-saved-scope',
+        'spotify saved-track check got 403: the token lacks user-library-read',
+      )
+      this.saved = null
+      return
+    }
+
+    if (!res.ok) return
+
+    const body = await res.json()
+    this.saved = Array.isArray(body) ? body[0] === true : null
+  }
+
+  /**
+   * Toggles the saved state of the current track. Returns true on success.
+   * Updates the cached value immediately on success, so the heart on the
+   * page responds at once rather than waiting for the next poll, and emits
+   * `change`. A 403 means the token lacks the library scopes: report it once,
+   * leave the cache at null, and do NOT retry — retrying a 403 would be a
+   * request storm against a rate-limited API, and it will never succeed
+   * until the user re-authorizes.
+   */
+  async toggleSaved(): Promise<boolean> {
+    const trackId = this.state?.trackId
+    if (!trackId) return false
+    return this.doToggleSaved(trackId, !(this.saved ?? false))
+  }
+
+  private async doToggleSaved(
+    trackId: string,
+    nextSaved: boolean,
+    retried = false,
+  ): Promise<boolean> {
+    const token = await this.accessToken()
+    if (!token) return false
+
+    let res
+    try {
+      res = await this.fetchFn(`${API}/me/tracks?ids=${trackId}`, {
+        method: nextSaved ? 'PUT' : 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    } catch (e) {
+      log.once('spotify-toggle-offline', `spotify save toggle failed: ${String(e)}`)
+      return false
+    }
+
+    if (res.status === 401) {
+      if (retried) {
+        this.status = 'unauthorized'
+        return false
+      }
+      const t = this.store.load()
+      if (!t) {
+        this.status = 'unauthorized'
+        return false
+      }
+      const fresh = await this.doRefresh(t)
+      if (!fresh) return false
+      return this.doToggleSaved(trackId, nextSaved, true)
+    }
+
+    if (res.status === 403) {
+      log.once(
+        'spotify-toggle-scope',
+        'spotify save toggle got 403: the token lacks user-library-modify',
+      )
+      this.saved = null
+      return false
+    }
+
+    if (!res.ok) return false
+
+    this.saved = nextSaved
+    this.emit('change')
+    return true
   }
 
   /**

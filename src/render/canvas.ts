@@ -1,5 +1,5 @@
-import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas'
-import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec } from './specs.js'
+import { createCanvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
+import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop } from './specs.js'
 import { theme } from './theme.js'
 import { getSprite } from './sprites.js'
 
@@ -77,6 +77,39 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
 }
 
 /**
+ * Draws `img` onto the whole key. With no `crop`, this scales the entire
+ * image edge to edge, exactly as before `imageCrop` existed. With a `crop`,
+ * it draws only that source rectangle — fractions of `img`'s own size, so
+ * the caller never needs to know the natural pixel dimensions.
+ *
+ * Fractions clamp into 0 to 1 first. A crop whose clamped width or height is
+ * zero or negative draws nothing, so a bad crop cannot throw inside the
+ * render loop.
+ */
+function drawCroppedImage(ctx: SKRSContext2D, img: Image, crop?: ImageCrop): void {
+  if (!crop) {
+    ctx.drawImage(img, 0, 0, KEY_SIZE, KEY_SIZE)
+    return
+  }
+  const sx = clamp01(crop.sx)
+  const sy = clamp01(crop.sy)
+  const sw = clamp01(crop.sw)
+  const sh = clamp01(crop.sh)
+  if (sw <= 0 || sh <= 0) return
+  ctx.drawImage(
+    img,
+    sx * img.width,
+    sy * img.height,
+    sw * img.width,
+    sh * img.height,
+    0,
+    0,
+    KEY_SIZE,
+    KEY_SIZE,
+  )
+}
+
+/**
  * Copies the canvas out as raw RGBA. The device takes raw pixel buffers and
  * has no PNG support, so the renderer never encodes an image format.
  */
@@ -94,8 +127,9 @@ export function renderKey(spec: KeySpec): Buffer {
   ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
 
   if (spec.image) {
-    // The producer already decoded this. Scale it to the key, edge to edge.
-    ctx.drawImage(spec.image, 0, 0, KEY_SIZE, KEY_SIZE)
+    // The producer already decoded this. With no crop, it scales to the key,
+    // edge to edge, exactly as before `imageCrop` existed.
+    drawCroppedImage(ctx, spec.image, spec.imageCrop)
   }
 
   if (spec.border) {
@@ -105,7 +139,7 @@ export function renderKey(spec: KeySpec): Buffer {
   }
 
   if (spec.glyph) {
-    ctx.fillStyle = css(theme.text, dim)
+    ctx.fillStyle = css(spec.glyphColor ?? theme.text, dim)
     ctx.font = `28px ${FONT}`
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'

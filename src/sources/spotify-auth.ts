@@ -14,6 +14,8 @@ export const SCOPES = [
   'user-read-playback-state',
   'user-modify-playback-state',
   'user-read-currently-playing',
+  'user-library-read',
+  'user-library-modify',
 ]
 
 const TOKEN_URL = 'https://accounts.spotify.com/api/token'

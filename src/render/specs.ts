@@ -11,6 +11,14 @@ export interface BarSpec {
 
 export type KeyKind = 'blank' | 'session' | 'gauge' | 'control' | 'image'
 
+export interface ImageCrop {
+  /** Source rectangle, in fractions of the image, 0 to 1. */
+  sx: number
+  sy: number
+  sw: number
+  sh: number
+}
+
 export interface SparkSpec {
   /** Oldest first. Fewer than 2 points draws nothing. */
   values: number[]
@@ -35,6 +43,9 @@ export interface KeySpec {
   bar?: BarSpec
   /** A large centred symbol, for a transport control. */
   glyph?: string
+  /** Tints `glyph`. An absent value uses the default text colour. Used by the
+   * Spotify heart, the one place on that page where colour earns its keep. */
+  glyphColor?: Rgb
   /** A single emoji, drawn large and centred. Used by the weather page. */
   emoji?: string
   /** An asset name, for example `crab`. */
@@ -43,6 +54,14 @@ export interface KeySpec {
   image?: Image
   /** Identity of `image`, for example a track id. `keyHash` uses this. */
   imageKey?: string
+  /**
+   * Draws only part of `image`, in fractions of the source, 0 to 1. Used to
+   * span one image across several keys, each with a different crop but the
+   * SAME `imageKey`. Because the daemon writes a key only when its `keyHash`
+   * changes, `imageCrop` must be (and is) part of that hash — otherwise a
+   * track change would update only one of the spanned keys.
+   */
+  imageCrop?: ImageCrop
   /** A small series drawn as vertical bars. Used by the stocks page. */
   spark?: SparkSpec
   dim?: boolean

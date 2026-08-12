@@ -56,6 +56,61 @@ describe('keyHash', () => {
     const b: KeySpec = { kind: 'gauge', lines: ['THU'], emoji: '⛈' }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
+
+  // The most important test in this task. All four album-art quadrant keys
+  // share one `imageKey` (the track id), so the daemon's change detection can
+  // only tell two quadrants apart by their `imageCrop`. If `imageCrop` were
+  // ever missing from the hash, three of the four keys would never redraw on
+  // a track change, and the art would tear across the 2x2 block.
+  it('differs when imageCrop changes, even with the same imageKey and image', () => {
+    const sameImage = new Image()
+    const topLeft: KeySpec = {
+      kind: 'image',
+      image: sameImage,
+      imageKey: 'track-1',
+      imageCrop: { sx: 0, sy: 0, sw: 0.5, sh: 0.5 },
+    }
+    const topRight: KeySpec = {
+      kind: 'image',
+      image: sameImage,
+      imageKey: 'track-1',
+      imageCrop: { sx: 0.5, sy: 0, sw: 0.5, sh: 0.5 },
+    }
+    expect(keyHash(topLeft)).not.toBe(keyHash(topRight))
+  })
+
+  it('differs for all four quadrant crops used by the Spotify page', () => {
+    const crops = [
+      { sx: 0.0, sy: 0.0, sw: 0.5, sh: 0.5 },
+      { sx: 0.5, sy: 0.0, sw: 0.5, sh: 0.5 },
+      { sx: 0.0, sy: 0.5, sw: 0.5, sh: 0.5 },
+      { sx: 0.5, sy: 0.5, sw: 0.5, sh: 0.5 },
+    ]
+    const sameImage = new Image()
+    const hashes = crops.map((imageCrop) =>
+      keyHash({ kind: 'image', image: sameImage, imageKey: 'track-1', imageCrop }),
+    )
+    expect(new Set(hashes).size).toBe(4)
+  })
+
+  it('matches when imageCrop is equal', () => {
+    const sameImage = new Image()
+    const a: KeySpec = {
+      kind: 'image', image: sameImage, imageKey: 'track-1',
+      imageCrop: { sx: 0, sy: 0, sw: 0.5, sh: 0.5 },
+    }
+    const b: KeySpec = {
+      kind: 'image', image: sameImage, imageKey: 'track-1',
+      imageCrop: { sx: 0, sy: 0, sw: 0.5, sh: 0.5 },
+    }
+    expect(keyHash(a)).toBe(keyHash(b))
+  })
+
+  it('differs when the glyph colour changes', () => {
+    const a: KeySpec = { kind: 'control', glyph: '♥' }
+    const b: KeySpec = { kind: 'control', glyph: '♥', glyphColor: [230, 60, 60] }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
 })
 
 describe('stripHash', () => {

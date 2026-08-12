@@ -1,6 +1,8 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
+import { theme } from '../../src/render/theme.js'
+import type { Image } from '@napi-rs/canvas'
 
 const NOW = 1786549560
 
@@ -17,21 +19,25 @@ function player(over: Partial<PlayerState> = {}): PlayerState {
  * A stand-in for a decoded image. The page only passes it through to the
  * KeySpec, so it never touches the image's contents.
  */
-const FAKE_ART = { width: 96, height: 96 } as unknown as Image
+const FAKE_ART = { width: 300, height: 300 } as unknown as Image
 
-function build(state: PlayerState | null, status: SpotifyStatus = 'ok', art: Image | null = null) {
+function build(
+  state: PlayerState | null,
+  status: SpotifyStatus = 'ok',
+  art: Image | null = null,
+  saved: boolean | null = false,
+) {
   const calls: string[] = []
   const source = {
     interpolate: () => state,
     getStatus: () => status,
     getArt: () => art,
+    isSaved: () => saved,
     play: async () => { calls.push('play'); return true },
     pause: async () => { calls.push('pause'); return true },
     next: async () => { calls.push('next'); return true },
-    previous: async () => { calls.push('previous'); return true },
     setVolume: async (p: number) => { calls.push(`volume:${p}`); return true },
-    toggleShuffle: async () => { calls.push('shuffle'); return true },
-    cycleRepeat: async () => { calls.push('repeat'); return true },
+    toggleSaved: async () => { calls.push('toggleSaved'); return true },
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
   }
   return { page: new SpotifyPage(source as never), calls }
@@ -43,51 +49,122 @@ describe('SpotifyPage layout', () => {
     expect(page.render(NOW).keys).toHaveLength(8)
   })
 
-  it('puts album art on key 0 when it is cached', () => {
+  it('spans the album art across keys 0, 1, 4 and 5 with one shared imageKey', () => {
     const { page } = build(player(), 'ok', FAKE_ART)
-    const key = page.render(NOW).keys[0]!
-    expect(key.kind).toBe('image')
-    expect(key.image).toBe(FAKE_ART)
-    expect(key.imageKey).toBe('track-1')
+    const keys = page.render(NOW).keys
+    for (const i of [0, 1, 4, 5]) {
+      expect(keys[i]!.kind).toBe('image')
+      expect(keys[i]!.image).toBe(FAKE_ART)
+      expect(keys[i]!.imageKey).toBe('track-1')
+    }
   })
 
-  it('falls back to text on key 0 when art is absent', () => {
+  it('gives keys 0, 1, 4 and 5 the four distinct quadrant crops', () => {
+    const { page } = build(player(), 'ok', FAKE_ART)
+    const keys = page.render(NOW).keys
+    expect(keys[0]!.imageCrop).toEqual({ sx: 0.0, sy: 0.0, sw: 0.5, sh: 0.5 })
+    expect(keys[1]!.imageCrop).toEqual({ sx: 0.5, sy: 0.0, sw: 0.5, sh: 0.5 })
+    expect(keys[4]!.imageCrop).toEqual({ sx: 0.0, sy: 0.5, sw: 0.5, sh: 0.5 })
+    expect(keys[5]!.imageCrop).toEqual({ sx: 0.5, sy: 0.5, sw: 0.5, sh: 0.5 })
+    // All four crops must be pairwise distinct, or three quadrants would
+    // share a hash with a fourth and never redraw independently.
+    const crops = [0, 1, 4, 5].map((i) => JSON.stringify(keys[i]!.imageCrop))
+    expect(new Set(crops).size).toBe(4)
+  })
+
+  it('shows the album-name fallback on key 0 only when art is absent, and leaves 1, 4, 5 blank', () => {
     const { page } = build(player(), 'ok', null)
-    expect(page.render(NOW).keys[0]!.kind).not.toBe('image')
+    const keys = page.render(NOW).keys
+    expect(keys[0]!.kind).not.toBe('image')
+    expect(keys[0]!.lines!.join(' ')).toContain('Paranoid'.slice(0, 10))
+    for (const i of [1, 4, 5]) {
+      expect(keys[i]!.kind).toBe('blank')
+      expect(keys[i]!.image).toBeUndefined()
+    }
   })
 
-  it('shows SIGN IN on key 0 when unauthorized', () => {
+  it('shows SIGN IN on key 0 when unauthorized, and leaves 1, 4, 5 blank', () => {
     const { page } = build(null, 'unauthorized')
-    expect(page.render(NOW).keys[0]!.lines!.join(' ')).toContain('SIGN IN')
+    const keys = page.render(NOW).keys
+    expect(keys[0]!.lines!.join(' ')).toContain('SIGN IN')
+    for (const i of [1, 4, 5]) {
+      expect(keys[i]!.kind).toBe('blank')
+    }
   })
 
-  it('shows a pause glyph while playing', () => {
+  it('shows a pause glyph on key 2 while playing', () => {
     const { page } = build(player({ isPlaying: true }))
     expect(page.render(NOW).keys[2]!.glyph).toBe('❙❙')
   })
 
-  it('shows a play glyph while paused', () => {
+  it('shows a play glyph on key 2 while paused', () => {
     const { page } = build(player({ isPlaying: false }))
     expect(page.render(NOW).keys[2]!.glyph).toBe('▶')
   })
 
-  it('shows the skip glyphs on keys 1 and 3', () => {
+  it('shows the next-track glyph on key 3', () => {
+    const { page } = build(player())
+    expect(page.render(NOW).keys[3]!.glyph).toBe('▶▶')
+  })
+
+  it('shows a filled red heart on key 6 when the track is saved', () => {
+    const { page } = build(player(), 'ok', FAKE_ART, true)
+    const key = page.render(NOW).keys[6]!
+    expect(key.glyph).toBe('♥')
+    expect(key.glyphColor).toEqual(theme.red)
+    expect(key.dim).not.toBe(true)
+  })
+
+  it('shows an outline heart on key 6 when the track is not saved', () => {
+    const { page } = build(player(), 'ok', FAKE_ART, false)
+    const key = page.render(NOW).keys[6]!
+    expect(key.glyph).toBe('♡')
+    expect(key.glyphColor).toBeUndefined()
+  })
+
+  it('shows a dim outline heart on key 6 when saved state is unknown', () => {
+    const { page } = build(player(), 'ok', FAKE_ART, null)
+    const key = page.render(NOW).keys[6]!
+    expect(key.glyph).toBe('♡')
+    expect(key.dim).toBe(true)
+  })
+
+  it('never shows a play count anywhere near the heart', () => {
+    const { page } = build(player(), 'ok', FAKE_ART, true)
+    const key = page.render(NOW).keys[6]!
+    // The heart key carries no lines with digits — no locally derived count.
+    expect(key.lines ?? []).not.toEqual(expect.arrayContaining([expect.stringMatching(/\d/)]))
+  })
+
+  it('shows VOL + and the current percent on key 7', () => {
+    const { page } = build(player({ volumePercent: 55 }))
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines!.join(' ')).toContain('VOL +')
+    expect(key.lines!.join(' ')).toContain('55')
+  })
+
+  it('shows a placeholder on key 7 when the volume is unknown', () => {
+    const { page } = build(player({ volumePercent: null }))
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines!.join(' ')).not.toMatch(/\d/)
+  })
+
+  it('dims keys 2, 3, 6 and 7 when there is no device', () => {
+    const { page } = build(null, 'no-device')
+    const keys = page.render(NOW).keys
+    expect(keys[2]!.dim).toBe(true)
+    expect(keys[3]!.dim).toBe(true)
+    expect(keys[7]!.dim).toBe(true)
+  })
+
+  it('does not render previous, shuffle, or repeat anywhere on the deck', () => {
     const { page } = build(player())
     const keys = page.render(NOW).keys
-    expect(keys[1]!.glyph).toBe('◀◀')
-    expect(keys[3]!.glyph).toBe('▶▶')
-  })
-
-  it('shows the shuffle and repeat state', () => {
-    const { page } = build(player({ shuffle: true, repeat: 'track' }))
-    const keys = page.render(NOW).keys
-    expect(keys[6]!.lines!.join(' ')).toContain('on')
-    expect(keys[7]!.lines!.join(' ')).toContain('track')
-  })
-
-  it('dims the transport keys when there is no device', () => {
-    const { page } = build(null, 'no-device')
-    expect(page.render(NOW).keys[2]!.dim).toBe(true)
+    const allGlyphs = keys.map((k) => k.glyph ?? '').join(' ')
+    const allLines = keys.flatMap((k) => k.lines ?? []).join(' ').toUpperCase()
+    expect(allGlyphs).not.toContain('◀◀')
+    expect(allLines).not.toContain('SHUFFLE')
+    expect(allLines).not.toContain('REPEAT')
   })
 })
 
@@ -99,9 +176,6 @@ describe('SpotifyPage strip', () => {
   })
 
   it('keeps the full title visible for a track with several artists', () => {
-    // A joined "artist — title" line truncated at 34 characters let a long
-    // artist list consume the whole budget, collapsing the title to a lone
-    // ellipsis. The title must survive on its own line regardless.
     const { page } = build(player({
       artist: 'Helynt, GameChops, mellow mode',
       title: 'Chrono Trigger Blues',
@@ -109,11 +183,6 @@ describe('SpotifyPage strip', () => {
     const line0 = page.render(NOW).strip.lines[0]!
     expect(line0).toContain('Chrono Trigger Blues')
     expect(line0).not.toBe('…')
-  })
-
-  it('carries the artist on line 2', () => {
-    const { page } = build(player({ artist: 'Black Sabbath' }))
-    expect(page.render(NOW).strip.lines[1]).toContain('Black Sabbath')
   })
 
   it('truncates an over-long title at 30 characters, not 34', () => {
@@ -162,39 +231,36 @@ describe('SpotifyPage presses', () => {
     expect(calls).toContain('play')
   })
 
-  it('maps the skip keys', async () => {
+  it('advances to the next track on key 3', async () => {
     const { page, calls } = build(player())
-    await page.onKeyPress(1)
     await page.onKeyPress(3)
-    expect(calls).toContain('previous')
     expect(calls).toContain('next')
   })
 
-  it('steps the volume by 10 points', async () => {
+  it('raises the volume by 10 points on key 7', async () => {
     const { page, calls } = build(player({ volumePercent: 55 }))
-    await page.onKeyPress(4)
-    await page.onKeyPress(5)
-    expect(calls).toContain('volume:45')
+    await page.onKeyPress(7)
     expect(calls).toContain('volume:65')
   })
 
-  it('assumes 50 percent when the volume is unknown', async () => {
+  it('assumes 50 percent when the volume is unknown, before raising it', async () => {
     const { page, calls } = build(player({ volumePercent: null }))
-    await page.onKeyPress(5)
+    await page.onKeyPress(7)
     expect(calls).toContain('volume:60')
   })
 
-  it('maps the shuffle and repeat keys', async () => {
+  it('calls toggleSaved on key 6', async () => {
     const { page, calls } = build(player())
     await page.onKeyPress(6)
-    await page.onKeyPress(7)
-    expect(calls).toContain('shuffle')
-    expect(calls).toContain('repeat')
+    expect(calls).toContain('toggleSaved')
   })
 
-  it('does nothing on the album art key', async () => {
+  it('does nothing on any of the four album-art keys', async () => {
     const { page, calls } = build(player())
     await page.onKeyPress(0)
+    await page.onKeyPress(1)
+    await page.onKeyPress(4)
+    await page.onKeyPress(5)
     expect(calls).toEqual([])
   })
 

@@ -92,6 +92,146 @@ describe('renderKey', () => {
     const buf = renderKey({ kind: 'image', image: solid, imageKey: 'x' })
     near(probe(buf, 48, 48), [255, 0, 0], 20)
   })
+
+  it('draws the glyph in its default colour when no glyphColor is set', () => {
+    const buf = renderKey({ kind: 'control', glyph: '♡' })
+    // Just proving it renders without throwing and paints something.
+    expect(buf.length).toBeGreaterThan(0)
+  })
+
+  it('tints the glyph red when glyphColor is set', () => {
+    const buf = renderKey({ kind: 'control', glyph: '♥', glyphColor: theme.red })
+    near(probe(buf, 48, 48), theme.red, 40)
+  })
+})
+
+/**
+ * Builds a 300 by 300 decoded image with a distinct solid colour in each
+ * quadrant: red top-left, green top-right, blue bottom-left, yellow
+ * bottom-right. This stands in for real album art (which arrives as JPEG),
+ * and lets a test prove a crop draws the RIGHT quarter, not just any quarter.
+ */
+async function quadrantImage(): Promise<Image> {
+  const size = 300
+  const half = size / 2
+  const c = createCanvas(size, size)
+  const ctx = c.getContext('2d')
+  ctx.fillStyle = 'rgb(255,0,0)' // top-left: red
+  ctx.fillRect(0, 0, half, half)
+  ctx.fillStyle = 'rgb(0,255,0)' // top-right: green
+  ctx.fillRect(half, 0, half, half)
+  ctx.fillStyle = 'rgb(0,0,255)' // bottom-left: blue
+  ctx.fillRect(0, half, half, half)
+  ctx.fillStyle = 'rgb(255,255,0)' // bottom-right: yellow
+  ctx.fillRect(half, half, half, half)
+  return loadImage(c.toBuffer('image/jpeg'))
+}
+
+describe('renderKey imageCrop', () => {
+  it('draws the whole image edge to edge when imageCrop is absent, exactly as before', async () => {
+    const solid = await solidImage(10, 20, 30)
+    const buf = renderKey({ kind: 'image', image: solid, imageKey: 'x' })
+    near(probe(buf, 0, 0), [10, 20, 30], 20)
+    near(probe(buf, 95, 95), [10, 20, 30], 20)
+  })
+
+  it('draws only the top-left quadrant when cropped to it', async () => {
+    const img = await quadrantImage()
+    const buf = renderKey({
+      kind: 'image', image: img, imageKey: 'track-1',
+      imageCrop: { sx: 0.0, sy: 0.0, sw: 0.5, sh: 0.5 },
+    })
+    near(probe(buf, 48, 48), [255, 0, 0], 30)
+  })
+
+  it('draws only the top-right quadrant when cropped to it', async () => {
+    const img = await quadrantImage()
+    const buf = renderKey({
+      kind: 'image', image: img, imageKey: 'track-1',
+      imageCrop: { sx: 0.5, sy: 0.0, sw: 0.5, sh: 0.5 },
+    })
+    near(probe(buf, 48, 48), [0, 255, 0], 30)
+  })
+
+  it('draws only the bottom-left quadrant when cropped to it', async () => {
+    const img = await quadrantImage()
+    const buf = renderKey({
+      kind: 'image', image: img, imageKey: 'track-1',
+      imageCrop: { sx: 0.0, sy: 0.5, sw: 0.5, sh: 0.5 },
+    })
+    near(probe(buf, 48, 48), [0, 0, 255], 30)
+  })
+
+  it('draws only the bottom-right quadrant when cropped to it', async () => {
+    const img = await quadrantImage()
+    const buf = renderKey({
+      kind: 'image', image: img, imageKey: 'track-1',
+      imageCrop: { sx: 0.5, sy: 0.5, sw: 0.5, sh: 0.5 },
+    })
+    near(probe(buf, 48, 48), [255, 255, 0], 30)
+  })
+
+  it('produces four different key buffers for the four quadrant crops of the same image', async () => {
+    const img = await quadrantImage()
+    const crops = [
+      { sx: 0.0, sy: 0.0, sw: 0.5, sh: 0.5 },
+      { sx: 0.5, sy: 0.0, sw: 0.5, sh: 0.5 },
+      { sx: 0.0, sy: 0.5, sw: 0.5, sh: 0.5 },
+      { sx: 0.5, sy: 0.5, sw: 0.5, sh: 0.5 },
+    ]
+    const buffers = crops.map((imageCrop) =>
+      renderKey({ kind: 'image', image: img, imageKey: 'track-1', imageCrop }),
+    )
+    for (let i = 0; i < buffers.length; i++) {
+      for (let j = i + 1; j < buffers.length; j++) {
+        expect(buffers[i]!.equals(buffers[j]!)).toBe(false)
+      }
+    }
+  })
+
+  it('draws nothing extra for a zero-width crop, and does not throw', async () => {
+    const img = await quadrantImage()
+    const blank = renderKey({ kind: 'image', imageKey: 'x' })
+    expect(() =>
+      renderKey({
+        kind: 'image', image: img, imageKey: 'track-1',
+        imageCrop: { sx: 0.2, sy: 0.2, sw: 0, sh: 0.5 },
+      }),
+    ).not.toThrow()
+    const buf = renderKey({
+      kind: 'image', image: img, imageKey: 'track-1',
+      imageCrop: { sx: 0.2, sy: 0.2, sw: 0, sh: 0.5 },
+    })
+    expect(buf.equals(blank)).toBe(true)
+  })
+
+  it('draws nothing extra for a negative-height crop, and does not throw', async () => {
+    const img = await quadrantImage()
+    const blank = renderKey({ kind: 'image', imageKey: 'x' })
+    expect(() =>
+      renderKey({
+        kind: 'image', image: img, imageKey: 'track-1',
+        imageCrop: { sx: 0.2, sy: 0.2, sw: 0.5, sh: -0.3 },
+      }),
+    ).not.toThrow()
+    const buf = renderKey({
+      kind: 'image', image: img, imageKey: 'track-1',
+      imageCrop: { sx: 0.2, sy: 0.2, sw: 0.5, sh: -0.3 },
+    })
+    expect(buf.equals(blank)).toBe(true)
+  })
+
+  it('clamps crop fractions outside 0 to 1, rather than throwing or wrapping', async () => {
+    const img = await quadrantImage()
+    // sx negative and sw past 1: clamps to something inside the image, and
+    // must not throw despite the out-of-range fractions.
+    expect(() =>
+      renderKey({
+        kind: 'image', image: img, imageKey: 'track-1',
+        imageCrop: { sx: -0.5, sy: -0.5, sw: 2, sh: 2 },
+      }),
+    ).not.toThrow()
+  })
 })
 
 describe('renderStrip', () => {

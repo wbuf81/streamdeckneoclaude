@@ -56,13 +56,15 @@ describe('buildAuthUrl', () => {
     expect(u.searchParams.get('state')).toBe('st')
   })
 
-  it('requests the three scopes the deck needs', () => {
+  it('requests the five scopes the deck needs, including the original three', () => {
     const u = new URL(buildAuthUrl('cid', REDIRECT_URI, 'chal', 'st'))
     const scopes = u.searchParams.get('scope')!.split(' ')
     expect(scopes).toContain('user-read-playback-state')
     expect(scopes).toContain('user-modify-playback-state')
     expect(scopes).toContain('user-read-currently-playing')
-    expect(SCOPES).toHaveLength(3)
+    expect(scopes).toContain('user-library-read')
+    expect(scopes).toContain('user-library-modify')
+    expect(SCOPES).toHaveLength(5)
   })
 
   it('uses a loopback IP redirect, because Spotify rejects localhost', () => {

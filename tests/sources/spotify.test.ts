@@ -461,6 +461,163 @@ describe('SpotifySource.getArt', () => {
   })
 })
 
+describe('SpotifySource saved-track state', () => {
+  it('returns null (unknown) before any poll has happened', () => {
+    const { src } = build([{ status: 200, body: PLAYER }])
+    expect(src.isSaved()).toBeNull()
+  })
+
+  it('fetches the saved state once a poll reveals a track id', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [true] },
+    ])
+    await src.poll()
+    expect(calls.some((c) => c.url.includes('/me/tracks/contains') && c.url.includes('track-1'))).toBe(true)
+    expect(src.isSaved()).toBe(true)
+  })
+
+  it('reads false when the API reports the track is not saved', async () => {
+    const { src } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [false] },
+    ])
+    await src.poll()
+    expect(src.isSaved()).toBe(false)
+  })
+
+  it('does not re-fetch the saved state on a poll that keeps the same track', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [true] },
+      { status: 200, body: PLAYER },
+    ])
+    await src.poll()
+    const containsCallsAfterFirst = calls.filter((c) => c.url.includes('/me/tracks/contains')).length
+    expect(containsCallsAfterFirst).toBe(1)
+    await src.poll() // Same track id. Must not fetch /me/tracks/contains again.
+    const containsCallsAfterSecond = calls.filter((c) => c.url.includes('/me/tracks/contains')).length
+    expect(containsCallsAfterSecond).toBe(1)
+  })
+
+  it('re-fetches the saved state when the track id changes', async () => {
+    const track2 = { ...PLAYER, item: { ...PLAYER.item, id: 'track-2' } }
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [true] },
+      { status: 200, body: track2 },
+      { status: 200, body: [false] },
+    ])
+    await src.poll()
+    expect(src.isSaved()).toBe(true)
+    await src.poll()
+    expect(src.isSaved()).toBe(false)
+    const containsCalls = calls.filter((c) => c.url.includes('/me/tracks/contains'))
+    expect(containsCalls).toHaveLength(2)
+  })
+
+  it('sets isSaved to null and logs once, without retrying, on a 403', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 403 },
+    ])
+    await src.poll()
+    expect(src.isSaved()).toBeNull()
+    const containsCalls = calls.filter((c) => c.url.includes('/me/tracks/contains'))
+    expect(containsCalls).toHaveLength(1) // Never retried.
+  })
+
+  it('does not retry a 403 across repeated polls for the same track', async () => {
+    const track2 = { ...PLAYER, item: { ...PLAYER.item, id: 'track-2' } }
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 403 },
+      { status: 200, body: PLAYER }, // same track id again
+    ])
+    await src.poll()
+    await src.poll()
+    const containsCalls = calls.filter((c) => c.url.includes('/me/tracks/contains'))
+    expect(containsCalls).toHaveLength(1) // Same track: never re-fetched, 403 or not.
+    void track2
+  })
+
+  it('refreshes once on a 401 from the saved-state check, then retries', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 401 },
+      { status: 200, body: { access_token: 'new', expires_in: 3600 } },
+      { status: 200, body: [true] },
+    ])
+    await src.poll()
+    expect(src.isSaved()).toBe(true)
+    expect(calls.some((c) => c.url.includes('/api/token'))).toBe(true)
+  })
+})
+
+describe('SpotifySource.toggleSaved', () => {
+  it('sends a PUT and flips the cached state to true when currently unsaved', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [false] },
+      { status: 200 },
+    ])
+    await src.poll()
+    expect(src.isSaved()).toBe(false)
+    expect(await src.toggleSaved()).toBe(true)
+    expect(src.isSaved()).toBe(true)
+    const last = calls[calls.length - 1]!
+    expect(last.method).toBe('PUT')
+    expect(last.url).toContain('/me/tracks')
+    expect(last.url).toContain('track-1')
+  })
+
+  it('sends a DELETE and flips the cached state to false when currently saved', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [true] },
+      { status: 200 },
+    ])
+    await src.poll()
+    expect(src.isSaved()).toBe(true)
+    expect(await src.toggleSaved()).toBe(true)
+    expect(src.isSaved()).toBe(false)
+    const last = calls[calls.length - 1]!
+    expect(last.method).toBe('DELETE')
+  })
+
+  it('emits change immediately after a successful toggle, without waiting for the next poll', async () => {
+    const { src } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [false] },
+      { status: 200 },
+    ])
+    await src.poll()
+    const changed = new Promise<void>((resolve) => src.once('change', resolve))
+    await src.toggleSaved()
+    await changed // Resolves synchronously if `change` already fired.
+  })
+
+  it('does nothing and returns false when there is no current track', async () => {
+    const src = new SpotifySource(
+      'cid', { load: () => tokens(), save: vi.fn(), clear: vi.fn() } as never,
+    )
+    expect(await src.toggleSaved()).toBe(false)
+  })
+
+  it('reports false and sets isSaved to null on a 403, without retrying', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 200, body: [false] },
+      { status: 403 },
+    ])
+    await src.poll()
+    expect(await src.toggleSaved()).toBe(false)
+    expect(src.isSaved()).toBeNull()
+    const toggleCalls = calls.filter((c) => c.method === 'PUT' && c.url.includes('/me/tracks') && !c.url.includes('contains'))
+    expect(toggleCalls).toHaveLength(1) // Never retried.
+  })
+})
+
 describe('SpotifySource stop() during an in-flight poll', () => {
   // Regression coverage for: `stop()` cleared the timers but never marked
   // itself as stopped. `setVisible(true)` and the recurring timer both run
