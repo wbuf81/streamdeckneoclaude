@@ -1,0 +1,25 @@
+{
+  "name": "streamdeckneoclaude",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "bin": { "deckd": "./dist/bin/deckd.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/bin/deckd.js start",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke": "npm run build && node dist/scripts/smoke.js"
+  },
+  "dependencies": {
+    "@elgato-stream-deck/node": "^7.1.2",
+    "@napi-rs/canvas": "^0.1.60"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
