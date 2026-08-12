@@ -694,31 +694,93 @@ Expected: PASS, 26 tests.
 The renderer accepts a `sprite` name but Task 3 did not draw it. Add the asset and the draw step now.
 
 ```bash
+```bash
 mkdir -p assets/crab
-cp ~/Vibecoding/clawd-on-desk/assets/icon.png assets/crab/idle.png
-ls -la ~/Vibecoding/clawd-on-desk/assets/gif ~/Vibecoding/clawd-on-desk/assets/svg 2>/dev/null | head -20
+# 48 x 48 matches the draw size exactly, so the pixel art stays crisp. The
+# 1024 x 1024 icon.png would be downscaled by 21 times and turn to mush.
+cp ~/Vibecoding/clawd-on-desk/assets/icons/48x48.png assets/crab/idle.png
+ls -l assets/crab/idle.png
 ```
 
-Pick one still frame that reads well at 40 × 40 px. Save it as `assets/crab/idle.png`.
+I confirmed `~/Vibecoding/clawd-on-desk/assets/icons/` holds 16, 32, 48, 64, 128,
+256 and 512 pixel variants. Use `48x48.png`, and draw it at 48 × 48 so one source
+pixel maps to one key pixel. If the crab reads poorly at that size, `64x64.png` is
+the next choice; do not use `icon.png`.
 
-Then add sprite support to `src/render/canvas.ts`. Load each sprite once and cache it, because the render loop must not read the disk.
+Then add sprite support to the renderer. The render loop must not read the disk,
+and it must not decode.
+
+Two traps here, and the obvious version of this code falls into both.
+
+**Trap one: `process.cwd()` is wrong.** The daemon runs under launchd, where the
+working directory is not the project. `join(process.cwd(), 'assets', …)` would
+look at `/assets/…` and find nothing, so the sprite would silently never appear.
+Resolve the asset directory from the module's own location instead, and search
+upward, because the file sits at `src/render/` when `tsx` runs it and at
+`dist/src/render/` after a build.
+
+**Trap two: decoding must be asynchronous.** `new Image(); img.src = bytes` sets
+the width and height at once but leaves the pixels unavailable, so `drawImage`
+paints transparent black. This is measured, not theoretical. Only
+`await loadImage(bytes)` produces a drawable image. The render loop cannot await,
+so sprites load ONCE at startup and the renderer reads them from the cache.
+
+Create `src/render/sprites.ts`:
 
 ```ts
-import { readFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { join, dirname } from 'node:path'
+import { loadImage, type Image } from '@napi-rs/canvas'
+import { log } from '../log.js'
 
-const spriteCache = new Map<string, Image | null>()
+const cache = new Map<string, Image>()
 
-function loadSprite(name: string): Image | null {
-  if (spriteCache.has(name)) return spriteCache.get(name)!
-  const file = join(process.cwd(), 'assets', name, 'idle.png')
-  let img: Image | null = null
-  if (existsSync(file)) {
-    img = new Image()
-    img.src = readFileSync(file)
+/**
+ * Finds the `assets` directory from this module's own location. The module sits
+ * at `src/render/` under `tsx` and at `dist/src/render/` after a build, so the
+ * search walks up. `process.cwd()` cannot be used: launchd gives the daemon a
+ * working directory that is not the project.
+ */
+function findAssetsDir(): string | null {
+  let dir = import.meta.dirname
+  for (let i = 0; i < 6; i++) {
+    const candidate = join(dir, 'assets')
+    if (existsSync(candidate)) return candidate
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
   }
-  spriteCache.set(name, img)
-  return img
+  return null
+}
+
+/**
+ * Decodes every sprite once, at startup. The renderer cannot decode, because
+ * `@napi-rs/canvas` has no synchronous decode.
+ */
+export async function loadSprites(names: string[] = ['crab']): Promise<void> {
+  const root = findAssetsDir()
+  if (!root) {
+    log.once('assets', 'assets directory not found. Sprites do not appear.')
+    return
+  }
+  for (const name of names) {
+    const file = join(root, name, 'idle.png')
+    if (!existsSync(file)) {
+      log.once(`sprite-${name}`, `sprite file absent: ${file}`)
+      continue
+    }
+    try {
+      cache.set(name, await loadImage(await readFile(file)))
+    } catch (e) {
+      log.once(`sprite-${name}`, `cannot decode sprite ${name}: ${String(e)}`)
+    }
+  }
+}
+
+/** Returns a decoded sprite, or null when it is absent. */
+export function getSprite(name: string): Image | null {
+  return cache.get(name) ?? null
 }
 ```
 
@@ -726,10 +788,19 @@ In `renderKey`, draw the sprite after the text and before the bar:
 
 ```ts
   if (spec.sprite) {
-    const img = loadSprite(spec.sprite)
-    if (img) ctx.drawImage(img, KEY_SIZE / 2 - 20, 40, 40, 40)
+    const img = getSprite(spec.sprite)
+    // 48 x 48 at a 48 pixel source keeps one source pixel per key pixel.
+    if (img) ctx.drawImage(img, KEY_SIZE / 2 - 24, 40, 48, 48)
   }
 ```
+
+`canvas.ts` imports `getSprite` from `./sprites.js`. It never decodes anything
+itself, and it stays synchronous.
+
+The daemon must call `await loadSprites()` once during startup, before the first
+render. A later task wires that in. Without it every sprite is absent and the keys
+simply render without the crab, which is a graceful degradation rather than a
+crash.
 
 - [ ] **Step 7: Add a sprite test**
 
@@ -1168,6 +1239,7 @@ export class Daemon {
 
   /** Forgets what is on the glass, so the next render writes everything. */
   async handleReconnect(): Promise<void> {
+    log.clearOnce('render')
     this.lastKeys = new Array(NEO_KEY_COUNT).fill(null)
     this.lastStrip = null
     this.lastButtons = [null, null]
@@ -1201,7 +1273,10 @@ export class Daemon {
       await this.writeButton(1, BUTTON_RIGHT, frame.buttons[1])
     } catch (e) {
       // A write failure means the cable moved. The Device retries the open.
-      log.warn(`render failed: ${String(e)}`)
+      // `log.once`, not `log.warn`. This loop runs once per second, so a
+      // persistent failure such as an unplugged cable would otherwise write a
+      // line every second without a limit. `handleReconnect` clears the key.
+      log.once('render', `render failed: ${String(e)}`)
       this.lastKeys = new Array(NEO_KEY_COUNT).fill(null)
       this.lastStrip = null
       this.lastButtons = [null, null]
@@ -1240,6 +1315,7 @@ import { ClaudePage } from '../src/pages/claude-page.js'
 import { ClaudeSource } from '../src/sources/claude.js'
 import { UsageSource } from '../src/sources/usage.js'
 import { focusWindow } from '../src/focus-window.js'
+import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -1247,6 +1323,10 @@ import { readFileSync, writeFileSync } from 'node:fs'
 async function start(): Promise<void> {
   ensureStateDir()
   log.info('deckd starting')
+
+  // Decode the sprites once, before the first render. The renderer cannot
+  // decode, so a missing call here means the crab never appears.
+  await loadSprites()
 
   const claude = new ClaudeSource()
   const usage = new UsageSource()
