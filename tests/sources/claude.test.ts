@@ -138,6 +138,18 @@ describe('ClaudeSource', () => {
     await src.stop()
   })
 
+  it('returns a copy from getSessions, so mutating the result cannot corrupt the source', async () => {
+    writeFileSync(join(dir, 'a.json'), fileFor({ sessionId: 'a', ts: NOW }))
+    const src = new ClaudeSource(dir, () => NOW)
+    await src.refresh()
+
+    const sessions = src.getSessions()
+    sessions.length = 0
+
+    expect(src.getSessions()).toHaveLength(1)
+    expect(src.getSessions()[0]?.sessionId).toBe('a')
+  })
+
   it('emits change when a session file appears', async () => {
     const src = new ClaudeSource(dir, () => NOW)
     let changes = 0

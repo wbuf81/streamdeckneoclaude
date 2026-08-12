@@ -159,8 +159,11 @@ export class ClaudeSource extends EventEmitter {
     return out.sort((a, b) => b.ts - a.ts)
   }
 
+  /** Returns a copy. The caller cannot mutate the source's own state through
+   * the result, and the array keeps being valid even after a later poll
+   * replaces `this.sessions` with a new one. */
   getSessions(): Session[] {
-    return this.sessions
+    return [...this.sessions]
   }
 
   async stop(): Promise<void> {
