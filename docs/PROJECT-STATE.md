@@ -94,7 +94,7 @@ Files: `src/sources/{claude,usage,spotify,spotify-auth,stocks,weather}.ts`,
 
 ---
 
-## Task ledger — 21 of 24 complete
+## Task ledger — 23 of 24 complete
 
 Full detail is in `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck/progress.md`,
 but **that directory is git-ignored**, so this file is the durable record.
@@ -122,20 +122,18 @@ anything still needed before that directory is cleaned.
 
 ### Remaining work, in dependency order
 
-1. **Task 23** — `lineSizes` on `KeySpec` + variable line advance; gauges become
-   `5-HR CAP` / `WEEK CAP` with big percentages, `BURN RATE` showing
-   `UNDER`/`ON PACE`/`OVER` plus an evidence line `20% of 44%`, and `RESETS IN`.
-   Must reuse `computePace` rather than duplicating the arithmetic.
-2. **Task 24** — weather tiles: four non-overlapping bands (label 12 px, emoji 34 px at
-   y 34, temps 16 px, rain 20 px), a dark per-condition background tint from the **same**
-   keyword matcher as the emoji, heat-coloured temperatures, and the emoji `globalAlpha`
-   dim fix. Needs Task 23's field.
-3. **Task 22** — animation: `Page.tickMs`, `render(now, nowMs)`, per-page daemon interval,
-   `getSpriteFrame(state, nowMs)`. Assets ready: 24 frames per state, 70 ms delay,
-   in `assets/crab/<state>/` with `meta.json`. **User approved the frames.**
-4. **Task 16** — per-window focus (needs the user to grant Accessibility to the `node`
-   binary manually; may not prompt) and press feedback (flash white on success, red on
-   failure — specified in the spec, never implemented).
+Full briefs are preserved in `docs/pending-briefs/`.
+
+1. **Task 24** — weather tiles. The 40 px emoji currently OVERLAPS the text, which the user
+   reported from the device, and the text is too small. Four non-overlapping bands: label
+   12 px, emoji 34 px centred at y 34, temps 16 px, rain 20 px. Plus a dark per-condition
+   background tint derived from the SAME keyword matcher as the emoji, heat-coloured
+   temperatures, and the emoji `globalAlpha` dim fix. Uses Task 23's `lineSizes`, which
+   has landed.
+2. **Task 16** — per-window terminal focus, and press feedback. Needs the user to grant
+   Accessibility to the bare `node` binary manually, and it may never prompt; say so
+   honestly if it does not work cleanly. Press feedback needs Task 22's faster tick, which
+   has landed, because a 200 ms flash is invisible at 1 fps.
 
 ### Not yet reviewed
 
