@@ -1363,7 +1363,7 @@ git commit -m "feat: run the deck with a live Claude page"
   - `class TokenStore` with `load(): Tokens | null`, `save(t: Tokens): void`, `clear(): void`.
   - `makeVerifier(random: () => string): string`, `challengeFor(verifier: string): string`.
   - `buildAuthUrl(clientId, redirectUri, challenge, state): string`.
-  - `SCOPES: string[]`, `REDIRECT_URI`, `AUTH_PORT = 23400`.
+  - `SCOPES: string[]`, `REDIRECT_URI`, `AUTH_PORT = 8888`.
   - `runAuthFlow(clientId: string): Promise<Tokens>`.
   - `refreshTokens(clientId, refreshToken, fetchFn?): Promise<Tokens>`.
 
@@ -1378,8 +1378,26 @@ Confirmed against Spotify's redirect URI documentation, quoted:
 >
 > "localhost is not allowed as redirect URI."
 
-So `http://127.0.0.1:23400/callback` is correct. The IPv6 form
-`http://[::1]:23400/callback` is also allowed, if the IPv4 form ever fails.
+So `http://127.0.0.1:8888/callback` is correct. The IPv6 form
+`http://[::1]:8888/callback` is also allowed, if the IPv4 form ever fails.
+
+**The user already has a registered Spotify app, so no dashboard work is needed.**
+Their `m5stackfirmware` project holds one at
+`~/Vibecoding/m5stackfirmware/src/config/secrets.h`. Facts I read from it:
+
+- The client id is already provisioned in `~/.local/state/deckd/config.json`,
+  mode 0600, outside this repository. No credential belongs in git.
+- That app registers exactly `http://127.0.0.1:8888/callback`. This plan now uses
+  port 8888 to match it, so the dashboard needs no change.
+- Its scopes already include all three this project needs:
+  `user-read-playback-state`, `user-modify-playback-state`, and
+  `user-read-currently-playing`.
+- The file also holds a client secret and a refresh token. **This project uses
+  neither.** PKCE needs no secret, and reusing that refresh token could break the
+  m5 device if Spotify ever rotates it. Run a fresh authorization and store a
+  separate token.
+- Port 8888 is free, and the m5 auth tool binds it only during its own one-time
+  run, so there is no clash.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1569,7 +1587,7 @@ import { execFile } from 'node:child_process'
 import { paths } from '../paths.js'
 import { log } from '../log.js'
 
-export const AUTH_PORT = 23400
+export const AUTH_PORT = 8888
 /** Spotify allows plain HTTP only on a loopback IP. It rejects `localhost`. */
 export const REDIRECT_URI = `http://127.0.0.1:${AUTH_PORT}/callback`
 export const SCOPES = [
@@ -1776,7 +1794,7 @@ async function authSpotify(): Promise<void> {
       'No Spotify client id.\n\n' +
         '1. Open https://developer.spotify.com/dashboard and create an app.\n' +
         '2. Add this redirect URI exactly:\n' +
-        '     http://127.0.0.1:23400/callback\n' +
+        '     http://127.0.0.1:8888/callback\n' +
         '3. Copy the client id, then run:\n' +
         '     deckd auth spotify --client-id <ID>\n',
     )
@@ -1818,7 +1836,7 @@ Add to the switch:
 
 - [ ] **Step 7: Run the real flow**
 
-Create the Spotify app first. Add the redirect URI `http://127.0.0.1:23400/callback` exactly, with no trailing slash.
+Create the Spotify app first. Add the redirect URI `http://127.0.0.1:8888/callback` exactly, with no trailing slash.
 
 Run: `npm run build && node dist/bin/deckd.js auth spotify --client-id <YOUR_ID>`
 Expected: the browser opens, you approve, the page reads `deckd is connected`, and the terminal reports success.
@@ -3412,7 +3430,7 @@ Create a free app at https://developer.spotify.com/dashboard first. Add this
 redirect URI exactly:
 
 ```
-http://127.0.0.1:23400/callback
+http://127.0.0.1:8888/callback
 ```
 
 Spotify rejects `localhost` for a plain HTTP redirect, so the URI must use the
