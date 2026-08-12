@@ -1,6 +1,11 @@
-import { describe, it, expect, vi } from 'vitest'
-import { ClaudePage } from '../../src/pages/claude-page.js'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createCanvas } from '@napi-rs/canvas'
+import { ClaudePage, crabFrame } from '../../src/pages/claude-page.js'
 import { theme } from '../../src/render/theme.js'
+import { loadCrabFrames } from '../../src/render/sprites.js'
 import type { Session } from '../../src/sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../../src/sources/usage.js'
 
@@ -387,5 +392,159 @@ describe('ClaudePage presses', () => {
     page.render(NOW)
     await page.onKeyPress(1)
     expect(f.focused[0]!.pid).toBe(2)
+  })
+})
+
+describe('ClaudePage crab animation', () => {
+  it('wants a faster tick than the daemon default, so the crab animates', () => {
+    const { page } = build()
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
+  })
+})
+
+/** A fresh temporary crab asset tree, so these tests never touch the real
+ * `assets/crab/` directory or its committed frame counts and delays. */
+function tinyPng(): Buffer {
+  const c = createCanvas(2, 2)
+  const ctx = c.getContext('2d')
+  ctx.fillStyle = 'rgb(9,9,9)'
+  ctx.fillRect(0, 0, 2, 2)
+  return c.toBuffer('image/png')
+}
+
+function writeCrabState(
+  root: string,
+  state: string,
+  meta: { frameCount: number; delayMs: number },
+): void {
+  const dir = join(root, 'crab', state)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta))
+  for (let i = 0; i < meta.frameCount; i++) {
+    writeFileSync(join(dir, `${String(i).padStart(2, '0')}.png`), tinyPng())
+  }
+}
+
+describe('crabFrame', () => {
+  let root: string
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'deckd-claude-page-crab-'))
+  })
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('returns null when neither the state nor idle has frames', async () => {
+    // Runs before any other test in this block loads 'idle': `frameCache`
+    // inside `sprites.ts` is a module singleton that outlives one `it`, so
+    // this must run while 'idle' is still genuinely uncached, not merely
+    // absent from this test's own fixture.
+    await loadCrabFrames(root, ['some-state', 'idle'])
+    expect(crabFrame('some-state', 0)).toBeNull()
+  })
+
+  it('resolves to the state itself when frames exist for it', async () => {
+    writeCrabState(root, 'tool', { frameCount: 4, delayMs: 10 })
+    writeCrabState(root, 'idle', { frameCount: 4, delayMs: 10 })
+    await loadCrabFrames(root, ['tool', 'idle'])
+
+    const frame = crabFrame('tool', 0)
+    expect(frame).not.toBeNull()
+    expect(frame!.imageKey.startsWith('crab:tool:')).toBe(true)
+  })
+
+  it('falls back to idle when the session state has no cached frames', async () => {
+    writeCrabState(root, 'idle', { frameCount: 4, delayMs: 10 })
+    // Deliberately do not write 'permission' at all.
+    await loadCrabFrames(root, ['idle', 'permission'])
+
+    const frame = crabFrame('permission', 0)
+    expect(frame).not.toBeNull()
+    expect(frame!.imageKey.startsWith('crab:idle:')).toBe(true)
+  })
+
+  it('emits a different frame for two nowMs values one frame apart', async () => {
+    writeCrabState(root, 'thinking', { frameCount: 4, delayMs: 10 })
+    await loadCrabFrames(root, ['thinking'])
+
+    const a = crabFrame('thinking', 0)
+    const b = crabFrame('thinking', 10)
+    expect(a).not.toBeNull()
+    expect(b).not.toBeNull()
+    expect(a!.image).not.toBe(b!.image)
+    expect(a!.imageKey).not.toBe(b!.imageKey)
+  })
+
+  it('emits the same frame for two nowMs values inside one frame duration', async () => {
+    writeCrabState(root, 'thinking', { frameCount: 4, delayMs: 10 })
+    await loadCrabFrames(root, ['thinking'])
+
+    const a = crabFrame('thinking', 12)
+    const b = crabFrame('thinking', 18)
+    expect(a).not.toBeNull()
+    expect(a!.image).toBe(b!.image)
+    expect(a!.imageKey).toBe(b!.imageKey)
+  })
+})
+
+describe('ClaudePage renders the crab through the page, not just the helper', () => {
+  let root: string
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'deckd-claude-page-render-'))
+  })
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('sets image and imageKey on a session key once frames are loaded', async () => {
+    writeCrabState(root, 'tool', { frameCount: 4, delayMs: 10 })
+    await loadCrabFrames(root, ['tool'])
+
+    const { page } = build({ sessions: [session({ state: 'tool' })] })
+    const key = page.render(NOW, 0).keys[0]!
+    expect(key.image).toBeDefined()
+    expect(key.imageKey).toBe('crab:tool:0')
+  })
+
+  it('advances the key image as nowMs advances, one render call apart', async () => {
+    writeCrabState(root, 'tool', { frameCount: 4, delayMs: 10 })
+    await loadCrabFrames(root, ['tool'])
+
+    const { page } = build({ sessions: [session({ state: 'tool' })] })
+    const first = page.render(NOW, 0).keys[0]!
+    const second = page.render(NOW, 10).keys[0]!
+    expect(first.image).not.toBe(second.image)
+    expect(first.imageKey).not.toBe(second.imageKey)
+  })
+
+  it('keeps the same key image for two renders inside one frame duration', async () => {
+    writeCrabState(root, 'tool', { frameCount: 4, delayMs: 10 })
+    await loadCrabFrames(root, ['tool'])
+
+    const { page } = build({ sessions: [session({ state: 'tool' })] })
+    const first = page.render(NOW, 12).keys[0]!
+    const second = page.render(NOW, 18).keys[0]!
+    expect(first.image).toBe(second.image)
+    expect(first.imageKey).toBe(second.imageKey)
+  })
+
+  it('does not disturb the once-per-second permission pulse at a 10 fps tick', () => {
+    // No crab frames loaded here on purpose: this test isolates the pulse,
+    // which must stay driven by whole seconds regardless of the millisecond
+    // clock or whether a crab is even present.
+    const { page } = build({ sessions: [session({ state: 'permission' })] })
+    const a = page.render(NOW, 0).keys[0]!
+    const b = page.render(NOW, 40).keys[0]!
+    const c = page.render(NOW, 90).keys[0]!
+    // Same second (NOW), any millisecond within it: pulseOn must not change.
+    expect(a.pulseOn).toBe(b.pulseOn)
+    expect(b.pulseOn).toBe(c.pulseOn)
+    const d = page.render(NOW + 1, (NOW + 1) * 1000).keys[0]!
+    expect(d.pulseOn).not.toBe(a.pulseOn)
   })
 })

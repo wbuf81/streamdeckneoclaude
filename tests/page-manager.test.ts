@@ -3,9 +3,10 @@ import { PageManager } from '../src/page-manager.js'
 import type { Page } from '../src/pages/types.js'
 import type { DeckFrame } from '../src/render/specs.js'
 
-function fakePage(name: string, log: string[] = []): Page {
+function fakePage(name: string, log: string[] = [], tickMs?: number): Page {
   return {
     name,
+    tickMs,
     render: (): DeckFrame => ({
       keys: Array.from({ length: 8 }, () => ({ kind: 'blank' as const })),
       strip: { lines: [name] },
@@ -97,5 +98,24 @@ describe('PageManager', () => {
     m.add(fakePage('b'))
     m.setIndex(1)
     expect(m.current().name).toBe('b')
+  })
+
+  it("exposes the current page's own tickMs, unset by default", () => {
+    const m = new PageManager()
+    m.add(fakePage('a'))
+    expect(m.current().tickMs).toBeUndefined()
+  })
+
+  it("carries a page's tickMs through to the caller after a page change", () => {
+    // PageManager itself does nothing special with `tickMs` — it just hands
+    // back whichever page is current. The daemon is what reads this value to
+    // decide the render interval; this test only proves the value survives
+    // the trip through `next()`.
+    const m = new PageManager()
+    m.add(fakePage('slow', [], 1000))
+    m.add(fakePage('fast', [], 100))
+    expect(m.current().tickMs).toBe(1000)
+    m.next()
+    expect(m.current().tickMs).toBe(100)
   })
 })

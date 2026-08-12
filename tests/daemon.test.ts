@@ -1,7 +1,8 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Daemon } from '../src/daemon.js'
 import { FakeDevice } from '../src/fake-device.js'
 import { PageManager } from '../src/page-manager.js'
+import { BUTTON_RIGHT } from '../src/device.js'
 import type { Page } from '../src/pages/types.js'
 import type { DeckFrame, KeySpec } from '../src/render/specs.js'
 
@@ -119,6 +120,132 @@ describe('Daemon', () => {
     device.setKeyImage = async () => { throw new Error('usb gone') }
     await expect(daemon.renderOnce(2)).resolves.not.toThrow()
     device.setKeyImage = original
+    await daemon.stop()
+  })
+})
+
+/** A page whose `tickMs` and content the test controls, for the animation tests below. */
+class TickPage implements Page {
+  readonly name = 'tick'
+  renderCount = 0
+  /** When set, each key 0's text shows the millisecond clock, so a test can
+   * tell two renders apart without decoding a real sprite. */
+  animate = false
+
+  constructor(public tickMs: number | undefined) {}
+
+  render(now: number, nowMs: number = now * 1000): DeckFrame {
+    this.renderCount += 1
+    const text = this.animate ? String(Math.floor(nowMs / 100)) : 'static'
+    const keys: KeySpec[] = Array.from({ length: 8 }, (_, i) =>
+      i === 0 ? { kind: 'gauge', lines: [text] } : { kind: 'blank' })
+    return {
+      keys,
+      strip: { lines: ['tick'] },
+      buttons: [[0, 0, 0], [0, 0, 0]],
+    }
+  }
+
+  onKeyPress(): void {}
+}
+
+describe('Daemon per-page render interval', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('uses the current page tickMs for the render interval', async () => {
+    vi.useFakeTimers()
+    const device = new FakeDevice()
+    const page = new TickPage(100)
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+
+    await daemon.start()
+    page.renderCount = 0
+    await vi.advanceTimersByTimeAsync(1000)
+    // 1000 ms at a 100 ms tick is 10 renders, not the default 1.
+    expect(page.renderCount).toBe(10)
+    await daemon.stop()
+  })
+
+  it('does not raise the rate for a page with no tickMs', async () => {
+    vi.useFakeTimers()
+    const device = new FakeDevice()
+    const page = new TickPage(undefined)
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+
+    await daemon.start()
+    page.renderCount = 0
+    await vi.advanceTimersByTimeAsync(1000)
+    // The default interval is 1000 ms, so 1000 ms of elapsed time is 1 render.
+    expect(page.renderCount).toBe(1)
+    await daemon.stop()
+  })
+
+  it('re-arms the interval when the page changes', async () => {
+    vi.useFakeTimers()
+    const device = new FakeDevice()
+    const slow = new TickPage(1000)
+    const fast = new TickPage(100)
+    const manager = new PageManager()
+    manager.add(slow)
+    manager.add(fast)
+    const daemon = new Daemon(device, manager)
+
+    await daemon.start()
+    slow.renderCount = 0
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(slow.renderCount).toBe(1)
+
+    device.simulatePress(BUTTON_RIGHT)
+    await vi.advanceTimersByTimeAsync(0)
+    fast.renderCount = 0
+    await vi.advanceTimersByTimeAsync(1000)
+    // Had the daemon kept the old 1000 ms timer, this would be 1, not 10.
+    expect(fast.renderCount).toBe(10)
+
+    await daemon.stop()
+  })
+
+  it('produces zero key writes across many ticks when content does not change', async () => {
+    vi.useFakeTimers()
+    const device = new FakeDevice()
+    const page = new TickPage(100)
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+
+    await daemon.start()
+    device.reset()
+    // 20 ticks of a page that always renders the same content: the dirty-key
+    // hash means every one of them is a no-op write.
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(device.keyWrites).toHaveLength(0)
+    expect(device.stripWrites).toBe(0)
+
+    await daemon.stop()
+  })
+
+  it('writes on every tick when the animating key actually changes', async () => {
+    vi.useFakeTimers()
+    const device = new FakeDevice()
+    const page = new TickPage(100)
+    page.animate = true
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+
+    await daemon.start()
+    device.reset()
+    await vi.advanceTimersByTimeAsync(500)
+    // 5 ticks, each with a different millisecond-derived label: 5 writes.
+    expect(device.keyWrites.length).toBeGreaterThanOrEqual(4)
+    expect(device.keyWrites.length).toBeLessThanOrEqual(5)
+
     await daemon.stop()
   })
 })
