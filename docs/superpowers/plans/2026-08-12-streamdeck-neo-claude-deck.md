@@ -851,10 +851,15 @@ git commit -m "feat: add render types, theme, and text helpers"
 **Interfaces:**
 - Consumes: `KeySpec`, `StripSpec`, `Rgb` from Task 2. `theme` from Task 2.
 - Produces:
-  - `renderKey(spec: KeySpec): Buffer` — a 96 × 96 raw BGRA-independent PNG buffer.
-  - `renderStrip(spec: StripSpec): Buffer` — a 248 × 58 PNG buffer.
+  - `renderKey(spec: KeySpec): Buffer` — a 96 × 96 raw RGBA buffer, 36864 bytes.
+  - `renderStrip(spec: StripSpec): Buffer` — a 248 × 58 raw RGBA buffer, 57536 bytes.
   - `KEY_SIZE = 96`, `STRIP_WIDTH = 248`, `STRIP_HEIGHT = 58`.
-  - `probe(png: Buffer, x: number, y: number): Rgb` — a test helper for pixel probes.
+  - `probe(rgba: Buffer, x: number, y: number, width = KEY_SIZE): Rgb` — a test
+    helper for pixel probes. It indexes the buffer and needs no decode. Pass
+    `STRIP_WIDTH` as `width` when probing a strip buffer.
+
+The device has no PNG support, so neither function encodes an image format. See
+"Verified device and canvas API" near the top of this plan.
 
 Tests use pixel probes, not full-image snapshots. A probe reads one coordinate. It asserts intent, and a font update cannot break it.
 
@@ -883,58 +888,58 @@ function near(actual: readonly number[], expected: readonly number[], tol = 12) 
 
 describe('renderKey', () => {
   it('returns a 96 by 96 image', () => {
-    const png = renderKey({ kind: 'blank' })
-    expect(png.length).toBeGreaterThan(0)
-    expect(probe(png, 0, 0)).toHaveLength(3)
+    const buf = renderKey({ kind: 'blank' })
+    expect(buf.length).toBe(KEY_SIZE * KEY_SIZE * 4)
+    expect(probe(buf, 0, 0)).toHaveLength(3)
     expect(KEY_SIZE).toBe(96)
   })
 
   it('fills a blank key with the background colour', () => {
-    const png = renderKey({ kind: 'blank' })
-    near(probe(png, 48, 48), theme.bg)
+    const buf = renderKey({ kind: 'blank' })
+    near(probe(buf, 48, 48), theme.bg)
   })
 
   it('draws the border colour on the left edge', () => {
-    const png = renderKey({ kind: 'session', border: theme.amber, pulseOn: true })
-    near(probe(png, 1, 48), theme.amber)
+    const buf = renderKey({ kind: 'session', border: theme.amber, pulseOn: true })
+    near(probe(buf, 1, 48), theme.amber)
   })
 
   it('draws a dark border when pulseOn is false', () => {
-    const png = renderKey({ kind: 'session', border: theme.amber, pulseOn: false })
-    const px = probe(png, 1, 48)
+    const buf = renderKey({ kind: 'session', border: theme.amber, pulseOn: false })
+    const px = probe(buf, 1, 48)
     expect(px[0]).toBeLessThan(theme.amber[0])
   })
 
   it('draws a solid border when pulseOn is absent', () => {
-    const png = renderKey({ kind: 'session', border: theme.cyan })
-    near(probe(png, 1, 48), theme.cyan)
+    const buf = renderKey({ kind: 'session', border: theme.cyan })
+    near(probe(buf, 1, 48), theme.cyan)
   })
 
   it('draws a bar filled to the given fraction', () => {
-    const png = renderKey({
+    const buf = renderKey({
       kind: 'gauge',
       bar: { value: 1.0, color: theme.green },
     })
     // The bar spans the key width at y = 70. A full bar paints the right end.
-    near(probe(png, 80, 70), theme.green)
+    near(probe(buf, 80, 70), theme.green)
   })
 
   it('leaves the bar track unpainted past the fill', () => {
-    const png = renderKey({
+    const buf = renderKey({
       kind: 'gauge',
       bar: { value: 0.1, color: theme.green },
     })
-    near(probe(png, 80, 70), theme.barTrack)
+    near(probe(buf, 80, 70), theme.barTrack)
   })
 
   it('clamps a bar value above 1', () => {
-    const png = renderKey({ kind: 'gauge', bar: { value: 5, color: theme.green } })
-    near(probe(png, 88, 70), theme.green)
+    const buf = renderKey({ kind: 'gauge', bar: { value: 5, color: theme.green } })
+    near(probe(buf, 88, 70), theme.green)
   })
 
   it('clamps a bar value below 0', () => {
-    const png = renderKey({ kind: 'gauge', bar: { value: -5, color: theme.green } })
-    near(probe(png, 12, 70), theme.barTrack)
+    const buf = renderKey({ kind: 'gauge', bar: { value: -5, color: theme.green } })
+    near(probe(buf, 12, 70), theme.barTrack)
   })
 
   it('paints text pixels somewhere on the key', () => {
@@ -945,8 +950,8 @@ describe('renderKey', () => {
 
   it('renders an image key from raw pixels', () => {
     const solid = solidPng(255, 0, 0)
-    const png = renderKey({ kind: 'image', image: solid, imageKey: 'x' })
-    near(probe(png, 48, 48), [255, 0, 0], 20)
+    const buf = renderKey({ kind: 'image', image: solid, imageKey: 'x' })
+    near(probe(buf, 48, 48), [255, 0, 0], 20)
   })
 })
 
@@ -954,16 +959,16 @@ describe('renderStrip', () => {
   it('returns a 248 by 58 image', () => {
     expect(STRIP_WIDTH).toBe(248)
     expect(STRIP_HEIGHT).toBe(58)
-    const png = renderStrip({ lines: ['hello'] })
-    near(probe(png, 240, 4), theme.bg)
+    const buf = renderStrip({ lines: ['hello'] })
+    near(probe(buf, 240, 4), theme.bg)
   })
 
   it('draws a progress bar filled to the fraction', () => {
-    const png = renderStrip({
+    const buf = renderStrip({
       lines: ['a', 'b'],
       bar: { value: 1.0, color: theme.green },
     })
-    near(probe(png, 200, 50), theme.green)
+    near(probe(buf, 200, 50), theme.green)
   })
 })
 
@@ -1631,7 +1636,7 @@ async function main(): Promise<void> {
   await device.setBrightness(80)
 
   for (let i = 0; i < 8; i++) {
-    const png = renderKey({
+    const buf = renderKey({
       kind: 'gauge',
       lines: [`KEY ${i}`, i < 4 ? 'row 0' : 'row 1'],
       border: COLORS[i],
