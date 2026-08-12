@@ -427,6 +427,7 @@ export class SpotifySource extends EventEmitter {
     path: string,
     method: 'PUT' | 'POST',
     query: Record<string, string> = {},
+    retried = false,
   ): Promise<boolean> {
     const token = await this.accessToken()
     if (!token) return false
@@ -437,6 +438,25 @@ export class SpotifySource extends EventEmitter {
         method,
         headers: { Authorization: `Bearer ${token}`, 'Content-Length': '0' },
       })
+      if (res.status === 401) {
+        // Consistent with `pollInner`: refresh once and retry, rather than
+        // reporting the control as failed while a fresh token would have
+        // succeeded. Never more than once — `retried` guards that — and a
+        // 403 is a separate branch below that this never reaches, so it
+        // still never retries.
+        if (retried) {
+          this.status = 'unauthorized'
+          return false
+        }
+        const t = this.store.load()
+        if (!t) {
+          this.status = 'unauthorized'
+          return false
+        }
+        const fresh = await this.doRefresh(t)
+        if (!fresh) return false
+        return this.command(path, method, query, true)
+      }
       if (res.status === 403 || res.status === 404) {
         // Spotify returns these when no device is active. The failure must
         // be visible, so the page can dim the transport keys.
@@ -557,7 +577,7 @@ export class SpotifySource extends EventEmitter {
         // Covers both a genuine failure and the "no URL yet" case (the early
         // `return` above), so a URL that becomes available moments later
         // still waits out the cooldown rather than firing immediately.
-        this.artRetryAt.set(trackId, this.now() + ART_RETRY_COOLDOWN_SECONDS)
+        this.rememberRetry(trackId, this.now() + ART_RETRY_COOLDOWN_SECONDS)
       }
     }
   }
@@ -569,6 +589,19 @@ export class SpotifySource extends EventEmitter {
       const oldest = this.artCache.keys().next().value
       if (oldest === undefined) break
       this.artCache.delete(oldest)
+    }
+  }
+
+  /** Bounded the same way as `artCache`: unlike a decoded image, a cooldown
+   * entry is small, but a track id that never resolves (or a listening
+   * session that cycles through many tracks) would otherwise grow this map
+   * forever, one entry per distinct track id, for the life of the process. */
+  private rememberRetry(trackId: string, at: number): void {
+    this.artRetryAt.set(trackId, at)
+    while (this.artRetryAt.size > ART_CACHE_MAX) {
+      const oldest = this.artRetryAt.keys().next().value
+      if (oldest === undefined) break
+      this.artRetryAt.delete(oldest)
     }
   }
 

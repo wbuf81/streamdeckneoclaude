@@ -271,6 +271,41 @@ describe('SpotifySource', () => {
     await src.poll()
     expect(await src.pause()).toBe(true)
   })
+
+  it('refreshes once on a 401 during a control call and retries, like the poll path', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER }, // poll, to seed state
+      { status: 401 }, // pause, first attempt
+      { status: 200, body: { access_token: 'new', expires_in: 3600 } }, // token refresh
+      { status: 204 }, // pause, retried attempt
+    ])
+    await src.poll()
+    expect(await src.pause()).toBe(true)
+    expect(calls.some((c) => c.url.includes('/api/token'))).toBe(true)
+    expect(calls[calls.length - 1]!.url).toContain('/me/player/pause')
+  })
+
+  it('reports unauthorized after a second 401 on a control call, never retrying twice', async () => {
+    const { src, calls } = build([
+      { status: 200, body: PLAYER },
+      { status: 401 },
+      { status: 200, body: { access_token: 'new', expires_in: 3600 } },
+      { status: 401 },
+    ])
+    await src.poll()
+    expect(await src.pause()).toBe(false)
+    expect(src.getStatus()).toBe('unauthorized')
+    const tokenCalls = calls.filter((c) => c.url.includes('/api/token')).length
+    expect(tokenCalls).toBe(1)
+  })
+
+  it('never retries a 403 on a control call', async () => {
+    const { src, calls } = build([{ status: 200, body: PLAYER }, { status: 403 }])
+    await src.poll()
+    expect(await src.pause()).toBe(false)
+    // Exactly the poll plus the one failing control call: no refresh, no retry.
+    expect(calls).toHaveLength(2)
+  })
 })
 
 describe('SpotifySource visibility-gated polling', () => {
@@ -459,6 +494,37 @@ describe('SpotifySource.getArt', () => {
     expect(src.getArt('track-4', 'https://art/track-4.jpg')).toBeNull()
     await new Promise((r) => setTimeout(r, 10))
     expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  // Regression coverage for: `artRetryAt` had no cap, unlike `artCache`
+  // beside it. A track id that never resolves -- or simply a long listening
+  // session that cycles through many tracks -- would otherwise grow this
+  // map by one entry per distinct track id for the entire life of the
+  // process. `now()` is held fixed here, so a cooldown that is still
+  // present never expires on its own; the only way `track-0` becomes
+  // retriable again is eviction.
+  it('bounds the retry-cooldown map, evicting the oldest entry past the cap', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: false, status: 500, headers: { get: () => null },
+      json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0),
+    }))
+    const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
+    const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000, undefined, artDir)
+
+    // One more than the 200-entry cap the sibling `artCache` uses.
+    for (let i = 0; i < 201; i++) {
+      src.getArt(`track-${i}`, `https://art/track-${i}.jpg`)
+      await new Promise((r) => setTimeout(r, 0))
+    }
+    const callsBeforeRetry = fetchFn.mock.calls.length
+
+    // track-0's cooldown was recorded first. If the map were unbounded it
+    // would still be present and block this call. Bounded like `artCache`,
+    // the 201st insertion evicted it, so this starts a fresh fetch right
+    // away despite being well inside the 60-second cooldown window.
+    src.getArt('track-0', 'https://art/track-0.jpg')
+    await new Promise((r) => setTimeout(r, 0))
+    expect(fetchFn.mock.calls.length).toBeGreaterThan(callsBeforeRetry)
   })
 })
 

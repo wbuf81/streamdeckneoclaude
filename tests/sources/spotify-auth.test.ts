@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { connect as netConnect, type Socket } from 'node:net'
+import { Server, ServerResponse } from 'node:http'
 import {
   TokenStore, makeVerifier, challengeFor, buildAuthUrl, runAuthFlow,
   SCOPES, REDIRECT_URI, AUTH_PORT, parseTokenResponse,
@@ -274,5 +275,71 @@ describe('runAuthFlow', () => {
       })
       probe.on('error', () => resolve()) // ECONNREFUSED is the expected, healthy outcome.
     })
+  })
+
+  // Regression coverage for: `closeAllConnections()` ran on the very next
+  // synchronous line after `res.end(html)`, with no callback given to
+  // `end` at all. `res.end()` handing data to the socket is not the same
+  // moment as Node actually finishing the flush -- that only happens when
+  // the callback `end` accepts fires. Closing before that point risked
+  // truncating the browser's confirmation page. This does not try to
+  // reproduce the truncation itself, which depends on OS-level socket
+  // timing and would be flaky; instead it proves the STRUCTURAL fix: `end`
+  // is called with a flush callback, and the connections are only closed
+  // from inside it, never before.
+  it('closes connections only after the response has flushed, never before', async () => {
+    const originalEnd = ServerResponse.prototype.end
+    const originalCloseAll = Server.prototype.closeAllConnections
+    const order: string[] = []
+
+    const endSpy = vi
+      .spyOn(ServerResponse.prototype, 'end')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(function (this: ServerResponse, ...args: any[]) {
+        const last = args[args.length - 1]
+        if (typeof last === 'function') {
+          args[args.length - 1] = (...cbArgs: unknown[]) => {
+            order.push('flushed')
+            last(...cbArgs)
+          }
+        } else {
+          // The unfixed code calls `res.end(html)` with no callback at
+          // all, so there is nothing to defer the close on.
+          order.push('ended-without-callback')
+        }
+        return (originalEnd as unknown as (...a: unknown[]) => unknown).apply(this, args)
+      })
+    const closeSpy = vi
+      .spyOn(Server.prototype, 'closeAllConnections')
+      .mockImplementation(function (this: Server) {
+        order.push('closed')
+        return originalCloseAll.apply(this)
+      })
+
+    try {
+      const fetchFn = vi.fn(async () => ({
+        json: async () => ({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 }),
+      })) as unknown as typeof fetch
+
+      let port = 0
+      await runAuthFlow('cid', {
+        port: 0,
+        fetchFn,
+        onListening: (p) => { port = p },
+        openUrl: (url) => {
+          const state = new URL(url).searchParams.get('state')
+          void fetch(`http://127.0.0.1:${port}/callback?code=testcode&state=${state}`)
+        },
+      })
+
+      expect(order).not.toContain('ended-without-callback')
+      const flushedAt = order.indexOf('flushed')
+      const closedAt = order.indexOf('closed')
+      expect(flushedAt).toBeGreaterThanOrEqual(0)
+      expect(closedAt).toBeGreaterThan(flushedAt)
+    } finally {
+      endSpy.mockRestore()
+      closeSpy.mockRestore()
+    }
   })
 })

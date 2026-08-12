@@ -210,22 +210,25 @@ export async function runAuthFlow(
 
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', Connection: 'close' })
       if (err || !gotCode) {
-        res.end('<h1>Authorization failed</h1><p>Return to the terminal.</p>')
+        // `closeServer` runs from `res.end`'s own callback, which Node fires
+        // only once the response has actually flushed. Closing right after
+        // the synchronous `res.end()` call, before that flush, risked
+        // truncating the browser's confirmation page -- the same class of
+        // bug as the keep-alive socket in `closeServer`'s own doc comment,
+        // just on the write side instead of the connection side.
+        res.end('<h1>Authorization failed</h1><p>Return to the terminal.</p>', () => closeServer(server))
         clearTimeout(timer)
-        closeServer(server)
         reject(new Error(`authorization failed: ${err ?? 'no code'}`))
         return
       }
       if (gotState !== state) {
-        res.end('<h1>State mismatch</h1><p>Return to the terminal.</p>')
+        res.end('<h1>State mismatch</h1><p>Return to the terminal.</p>', () => closeServer(server))
         clearTimeout(timer)
-        closeServer(server)
         reject(new Error('state mismatch. The callback did not match the request.'))
         return
       }
-      res.end('<h1>deckd is connected</h1><p>You can close this tab.</p>')
+      res.end('<h1>deckd is connected</h1><p>You can close this tab.</p>', () => closeServer(server))
       clearTimeout(timer)
-      closeServer(server)
       resolve(gotCode)
     })
     server.on('error', (e) => {
