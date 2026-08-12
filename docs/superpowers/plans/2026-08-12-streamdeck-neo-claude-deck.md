@@ -1399,7 +1399,7 @@ export class Device implements DeckDevice {
     if (d) await d.close()
   }
 
-  private require(): StreamDeck {
+  private getDeck(): StreamDeck {
     if (!this.deck) throw new Error('device is not connected')
     return this.deck
   }
@@ -1412,12 +1412,12 @@ export class Device implements DeckDevice {
     if (index < 0 || index >= NEO_KEY_COUNT) {
       throw new Error(`key index ${index} is outside 0 to 7`)
     }
-    await this.require().fillKeyBuffer(index, rgba, { format: 'rgba' })
+    await this.getDeck().fillKeyBuffer(index, rgba, { format: 'rgba' })
   }
 
   async setStrip(rgba: Buffer): Promise<void> {
     // `fillLcd` writes the whole segment. The strip cannot take a sub-region.
-    await this.require().fillLcd(0, rgba, { format: 'rgba' })
+    await this.getDeck().fillLcd(0, rgba, { format: 'rgba' })
   }
 
   async setButtonColor(index: number, rgb: Rgb): Promise<void> {
@@ -1426,11 +1426,11 @@ export class Device implements DeckDevice {
     }
     // There is no `setButtonColor` on the library. The RGB touch buttons take
     // `fillKeyColor` with their key index. `setButtonColor` is our own name.
-    await this.require().fillKeyColor(index, rgb[0], rgb[1], rgb[2])
+    await this.getDeck().fillKeyColor(index, rgb[0], rgb[1], rgb[2])
   }
 
   async setBrightness(percent: number): Promise<void> {
-    await this.require().setBrightness(Math.min(100, Math.max(0, percent)))
+    await this.getDeck().setBrightness(Math.min(100, Math.max(0, percent)))
   }
 
   onPress(cb: (i: number) => void): void {
