@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeAll } from 'vitest'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
 import {
   renderKey,
@@ -9,6 +9,14 @@ import {
   STRIP_HEIGHT,
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
+import { loadSprites } from '../../src/render/sprites.js'
+
+// The renderer reads sprites from a cache that only `loadSprites` fills, because
+// `@napi-rs/canvas` has no synchronous decode. A real process calls this once at
+// startup; the test does the same so the sprite test below sees a real image.
+beforeAll(async () => {
+  await loadSprites()
+})
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -100,6 +108,18 @@ describe('renderStrip', () => {
       bar: { value: 1.0, color: theme.green },
     })
     near(probe(buf, 200, 50, STRIP_WIDTH), theme.green)
+  })
+})
+
+describe('renderKey sprite', () => {
+  it('changes the image when a sprite is present', () => {
+    const without = renderKey({ kind: 'session', lines: ['A'] })
+    const withSprite = renderKey({ kind: 'session', lines: ['A'], sprite: 'crab' })
+    expect(withSprite.equals(without)).toBe(false)
+  })
+
+  it('does not throw for an unknown sprite name', () => {
+    expect(() => renderKey({ kind: 'session', sprite: 'no-such-sprite' })).not.toThrow()
   })
 })
 

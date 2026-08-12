@@ -1,6 +1,7 @@
 import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas'
 import type { KeySpec, StripSpec, Rgb, BarSpec } from './specs.js'
 import { theme } from './theme.js'
+import { getSprite } from './sprites.js'
 
 export const KEY_SIZE = 96
 export const STRIP_WIDTH = 248
@@ -88,6 +89,12 @@ export function renderKey(spec: KeySpec): Buffer {
       ctx.fillText(line, x, y)
       y += 14
     }
+  }
+
+  if (spec.sprite) {
+    const img = getSprite(spec.sprite)
+    // 48 x 48 at a 48 pixel source keeps one source pixel per key pixel.
+    if (img) ctx.drawImage(img, KEY_SIZE / 2 - 24, 40, 48, 48)
   }
 
   if (spec.bar) {
