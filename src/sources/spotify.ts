@@ -11,6 +11,10 @@ const POLL_PLAYING_MS = 3000
 const POLL_IDLE_MS = 30000
 const ART_MIN_WIDTH = 96
 const ART_CACHE_MAX = 200
+/** How long a failed (or URL-less) art attempt is left alone before a retry.
+ * Without this, a render loop that asks for art once a second would start a
+ * brand-new load every tick for a track whose art never resolves. */
+const ART_RETRY_COOLDOWN_SECONDS = 60
 /** The API needs a moment to settle after a command, so poll again shortly. */
 const SETTLE_MS = 300
 
@@ -106,10 +110,17 @@ export class SpotifySource extends EventEmitter {
   private timer: NodeJS.Timeout | null = null
   private settleTimer: NodeJS.Timeout | null = null
   private visible = false
+  /** Set by `stop()`, so a poll continuation that was already in flight
+   * cannot arm a new timer after shutdown. Distinct from `visible`, which is
+   * the page-visibility signal, not a shutdown signal. */
+  private stopped = false
   /** Decoded images, keyed by track id. */
   private artCache = new Map<string, Image>()
   /** Track ids with a load in flight, so one miss starts one load. */
   private pending = new Set<string>()
+  /** Track ids whose last attempt failed (or had no URL), mapped to the
+   * earliest time (in `now()` seconds) a retry is allowed. */
+  private artRetryAt = new Map<string, number>()
 
   constructor(
     private readonly clientId: string,
@@ -150,6 +161,7 @@ export class SpotifySource extends EventEmitter {
   setVisible(visible: boolean): void {
     this.visible = visible
     if (visible) {
+      this.stopped = false
       void this.poll().then(() => this.schedule())
     } else if (this.timer) {
       clearTimeout(this.timer)
@@ -158,6 +170,11 @@ export class SpotifySource extends EventEmitter {
   }
 
   private schedule(): void {
+    // A poll started before `stop()` can still be in flight when it
+    // resolves. Its `.then(() => this.schedule())` continuation must not
+    // arm a new timer after shutdown, so this check runs before anything
+    // else, ahead of even the `visible` check below.
+    if (this.stopped) return
     if (this.timer) clearTimeout(this.timer)
     if (!this.visible) return
     const base = this.state?.isPlaying ? POLL_PLAYING_MS : POLL_IDLE_MS
@@ -349,15 +366,21 @@ export class SpotifySource extends EventEmitter {
     if (!trackId) return null
     const cached = this.artCache.get(trackId)
     if (cached) return cached
-    if (!this.pending.has(trackId)) {
-      this.pending.add(trackId)
-      void this.loadArt(trackId, url)
-    }
+    if (this.pending.has(trackId)) return null
+    // A render happens once a second. Without this cooldown, a track whose
+    // art fails (or has no URL at all) would start a brand-new load on every
+    // tick for as long as it stays on screen — a request storm against a
+    // rate-limited API, using the user's credential.
+    const retryAt = this.artRetryAt.get(trackId)
+    if (retryAt !== undefined && this.now() < retryAt) return null
+    this.pending.add(trackId)
+    void this.loadArt(trackId, url)
     return null
   }
 
   /** Reads the disk cache, or downloads. Then decodes and caches the image. */
   private async loadArt(trackId: string, url: string | null): Promise<void> {
+    let ok = false
     try {
       const onDisk = join(this.artDir, `${trackId}.img`)
       let bytes: Buffer | null = null
@@ -385,12 +408,21 @@ export class SpotifySource extends EventEmitter {
       const img = await this.loadImageFn(bytes)
       this.remember(trackId, img)
       this.emit('change')
+      ok = true
     } catch (e) {
       // No art this time. The page shows the fallback. A miss can recur on
       // every render that asks for this track, so this must not spam the log.
       log.once('spotify-art-failed', `spotify album art failed: ${String(e)}`)
     } finally {
       this.pending.delete(trackId)
+      if (ok) {
+        this.artRetryAt.delete(trackId)
+      } else {
+        // Covers both a genuine failure and the "no URL yet" case (the early
+        // `return` above), so a URL that becomes available moments later
+        // still waits out the cooldown rather than firing immediately.
+        this.artRetryAt.set(trackId, this.now() + ART_RETRY_COOLDOWN_SECONDS)
+      }
     }
   }
 
@@ -409,6 +441,7 @@ export class SpotifySource extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true
     if (this.timer) clearTimeout(this.timer)
     if (this.settleTimer) clearTimeout(this.settleTimer)
     this.timer = null

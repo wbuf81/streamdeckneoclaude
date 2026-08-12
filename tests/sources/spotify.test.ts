@@ -397,4 +397,109 @@ describe('SpotifySource.getArt', () => {
     expect(fetchFn).not.toHaveBeenCalled()
     expect(src.getArt('track-2', null)).toBeNull()
   })
+
+  // Regression coverage for: the once-per-track guard (`pending`) is cleared
+  // the instant an attempt finishes, success or not. A render happens once a
+  // second, so a track whose art fails forever — or a track with no art URL
+  // — would otherwise start a brand-new load on every single tick, for as
+  // long as it stays on screen. That is a request storm against a
+  // rate-limited API, made with the user's credential.
+
+  it('does not retry every render tick after a failed load; it backs off for a cooldown', async () => {
+    let now = 1000
+    const fetchFn = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      headers: { get: () => null },
+      json: async () => ({}),
+      arrayBuffer: async () => new ArrayBuffer(0),
+    }))
+    const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
+    const src = new SpotifySource('cid', store as never, fetchFn as never, () => now, undefined, artDir)
+
+    expect(src.getArt('track-3', 'https://art/track-3.jpg')).toBeNull()
+    // Let the one failing attempt settle. It only awaits microtask-level work.
+    await new Promise((r) => setTimeout(r, 10))
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+
+    // Simulate 30 render ticks, a simulated second apart, all still well
+    // inside the 60 second cooldown. Before the fix, each call below starts
+    // a brand-new load, because `pending` was already cleared.
+    for (let i = 0; i < 30; i++) {
+      now += 1
+      expect(src.getArt('track-3', 'https://art/track-3.jpg')).toBeNull()
+      await new Promise((r) => setTimeout(r, 0))
+    }
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not repeatedly attempt a track with no art url, even once a url becomes available inside the cooldown', async () => {
+    let now = 1000
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({}),
+      arrayBuffer: async () => new ArrayBuffer(4),
+    }))
+    const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
+    const src = new SpotifySource('cid', store as never, fetchFn as never, () => now, undefined, artDir)
+
+    expect(src.getArt('track-4', null)).toBeNull()
+    await new Promise((r) => setTimeout(r, 10))
+
+    for (let i = 0; i < 5; i++) {
+      now += 1
+      expect(src.getArt('track-4', null)).toBeNull()
+    }
+    // A URL is now available, but the cooldown from the no-URL miss above has
+    // not elapsed. Before the fix, this call alone starts a fetch, because a
+    // miss with no URL left no memory that it had already been tried.
+    expect(src.getArt('track-4', 'https://art/track-4.jpg')).toBeNull()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+})
+
+describe('SpotifySource stop() during an in-flight poll', () => {
+  // Regression coverage for: `stop()` cleared the timers but never marked
+  // itself as stopped. `setVisible(true)` and the recurring timer both run
+  // `poll().then(() => this.schedule())`. If `stop()` runs while that poll is
+  // still awaiting a real HTTP round trip, the continuation fires afterwards,
+  // sees `visible` still true, and arms a brand-new timer — a poll that
+  // survives shutdown.
+  it('does not arm a new timer if stop() runs while a poll is still in flight', async () => {
+    vi.useFakeTimers()
+    let resolveFetch!: (v: unknown) => void
+    const fetchPromise = new Promise((resolve) => {
+      resolveFetch = resolve
+    })
+    const fetchFn = vi.fn(() => fetchPromise)
+    const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
+    const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
+
+    src.setVisible(true) // Starts a poll. It blocks on the unresolved fetch.
+    // `accessToken()` resolves through a couple of microtask ticks before
+    // `pollInner` reaches the fetch call. Flush those first.
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+
+    await src.stop() // stop() runs while that poll is still in flight.
+
+    resolveFetch({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({}),
+      arrayBuffer: async () => new ArrayBuffer(0),
+    })
+    // Flush the now-resolved poll's `.then(() => this.schedule())` continuation.
+    await vi.advanceTimersByTimeAsync(0)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(vi.getTimerCount()).toBe(0)
+  })
 })
