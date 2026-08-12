@@ -1,11 +1,11 @@
-import type { DeckFrame, KeySpec, StripSpec } from '../render/specs.js'
+import type { DeckFrame, KeySpec, StripSpec, Rgb } from '../render/specs.js'
 import { blankKey } from '../render/specs.js'
 import { theme, stateColor, stateLabel, barColor } from '../render/theme.js'
 import { truncate, formatDuration } from '../render/text.js'
 import type { Page } from './types.js'
 import type { Session } from '../sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../sources/usage.js'
-import { computePace } from '../sources/usage.js'
+import { computePace, elapsedPercent } from '../sources/usage.js'
 import { KeyAssigner, SESSION_SLOTS } from './key-assigner.js'
 
 export const PROJECT_CHARS = 10
@@ -86,50 +86,119 @@ export class ClaudePage implements Page {
 
     if (!u) {
       return [
-        { kind: 'gauge', lines: ['5h', '--'], dim: true },
-        { kind: 'gauge', lines: ['7d', '--'], dim: true },
-        { kind: 'gauge', lines: ['PACE', '--'], dim: true },
-        { kind: 'gauge', lines: ['RESET', '--'], dim: true },
+        { kind: 'gauge', lines: ['5-HR CAP', '--'], lineSizes: [11, 28], align: 'center', dim: true },
+        { kind: 'gauge', lines: ['WEEK CAP', '--'], lineSizes: [11, 28], align: 'center', dim: true },
+        { kind: 'gauge', lines: ['BURN RATE', '--'], lineSizes: [11, 16], align: 'center', dim: true },
+        { kind: 'gauge', lines: ['RESETS IN', '--'], lineSizes: [11, 24], align: 'center', dim: true },
       ]
     }
 
-    const suffix = stale ? 'STALE' : ''
     const five = u.fiveHourPct
     const seven = u.sevenDayPct
 
-    const gauge = (label: string, pct: number | null): KeySpec => {
-      const spec: KeySpec = {
+    return [
+      this.capKey('5-HR CAP', five, stale),
+      this.capKey('WEEK CAP', seven, stale),
+      this.burnRateKey(five, u.fiveHourResetsAt, now, stale),
+      this.resetKey(u.fiveHourResetsAt, now, stale),
+    ]
+  }
+
+  /** Keys 4 and 5: label, whole-percent value, and a bar — unless the cache
+   * is stale, when the bar gives way to a `STALE` third line instead, so a
+   * dimmed bar can never be mistaken for a current one. */
+  private capKey(label: string, pct: number | null, stale: boolean): KeySpec {
+    const value = pct === null ? '--' : `${Math.floor(pct)}%`
+
+    if (stale) {
+      return {
         kind: 'gauge',
-        lines: [label, pct === null ? '--' : `${Math.floor(pct)}%`, suffix].filter(Boolean),
+        lines: [label, value, 'STALE'],
+        lineSizes: [11, 28, 11],
+        align: 'center',
+        dim: true,
       }
+    }
+
+    const spec: KeySpec = {
+      kind: 'gauge',
+      lines: [label, value],
+      lineSizes: [11, 28],
+      align: 'center',
+    }
+    if (pct !== null) {
+      spec.bar = { value: pct / 100, color: barColor(pct / 100) }
+    }
+    return spec
+  }
+
+  /**
+   * Key 6: a one-word verdict on whether usage is ahead of or behind the
+   * clock, plus the evidence beneath it. Reuses `computePace` for the
+   * verdict and `elapsedPercent` for the evidence line, so the word and the
+   * numbers under it are always computed from the same comparison and can
+   * never disagree with each other.
+   */
+  private burnRateKey(
+    usedPct: number | null,
+    resetsAt: number,
+    now: number,
+    stale: boolean,
+  ): KeySpec {
+    const label = 'BURN RATE'
+
+    if (usedPct === null) {
+      const lines = stale ? [label, '--', 'STALE'] : [label, '--']
+      const lineSizes = stale ? [11, 16, 11] : [11, 16]
+      const spec: KeySpec = { kind: 'gauge', lines, lineSizes, align: 'center' }
       if (stale) spec.dim = true
-      if (pct !== null) {
-        spec.bar = { value: pct / 100, color: barColor(pct / 100) }
-      }
       return spec
     }
 
-    const pace =
-      five === null
-        ? 'even'
-        : computePace(five, u.fiveHourResetsAt, FIVE_HOURS, now)
-    const paceArrow = pace === 'fast' ? '⇡' : pace === 'slow' ? '⇣' : '·'
+    const pace = computePace(usedPct, resetsAt, FIVE_HOURS, now)
+    const word = pace === 'slow' ? 'UNDER' : pace === 'fast' ? 'OVER' : 'ON PACE'
+    const wordColor: Rgb = pace === 'slow' ? theme.green : pace === 'fast' ? theme.red : theme.amber
 
-    const paceKey: KeySpec = {
-      kind: 'gauge',
-      lines: [`PACE ${paceArrow}`, pace, suffix].filter(Boolean),
-    }
-    const resetSeconds = u.fiveHourResetsAt ? u.fiveHourResetsAt - now : 0
-    const resetKey: KeySpec = {
-      kind: 'gauge',
-      lines: ['RESET', u.fiveHourResetsAt ? formatDuration(resetSeconds) : '--', suffix].filter(Boolean),
-    }
     if (stale) {
-      paceKey.dim = true
-      resetKey.dim = true
+      return {
+        kind: 'gauge',
+        lines: [label, word, 'STALE'],
+        lineSizes: [11, 16, 11],
+        lineColors: [undefined, wordColor],
+        align: 'center',
+        dim: true,
+      }
     }
 
-    return [gauge('5h', five), gauge('7d', seven), paceKey, resetKey]
+    const elapsedPct = elapsedPercent(resetsAt, FIVE_HOURS, now)
+    const lines = [label, word]
+    const lineSizes = [11, 16]
+    if (elapsedPct !== null) {
+      lines.push(`${Math.round(usedPct)}% of ${Math.round(elapsedPct)}%`)
+      lineSizes.push(11)
+    }
+
+    return {
+      kind: 'gauge',
+      lines,
+      lineSizes,
+      lineColors: [undefined, wordColor],
+      align: 'center',
+    }
+  }
+
+  /** Key 7: the countdown to the five-hour reset, with a third line naming
+   * which window it is — the countdown alone does not say. */
+  private resetKey(resetsAt: number, now: number, stale: boolean): KeySpec {
+    const value = resetsAt ? formatDuration(resetsAt - now) : '--'
+    const spec: KeySpec = {
+      kind: 'gauge',
+      lines: ['RESETS IN', value, stale ? 'STALE' : '5-hr'],
+      lineSizes: [11, 24, 11],
+      align: 'center',
+    }
+    if (stale) spec.dim = true
+    return spec
   }
 
   private strip(live: Session[], overflow: number, now: number): StripSpec {

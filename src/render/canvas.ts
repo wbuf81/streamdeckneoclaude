@@ -158,16 +158,24 @@ export function renderKey(spec: KeySpec): Buffer {
 
   if (spec.lines?.length) {
     const centered = spec.align === 'center'
-    ctx.font = `11px ${FONT}`
     ctx.textAlign = centered ? 'center' : 'left'
     ctx.textBaseline = 'top'
     const x = centered ? KEY_SIZE / 2 : BORDER + PAD
     let y = PAD
     for (let i = 0; i < spec.lines.length; i++) {
+      // `lineSizes` is opt-in per key. Its absence takes the exact legacy
+      // path: 11 px text on a fixed 14 px advance, so every page that has
+      // never set it (Spotify, stocks, weather) renders pixel-for-pixel as
+      // it did before this field existed. A present array switches to
+      // size-driven spacing, because a 28 px line needs more room below it
+      // than an 11 px one — a fixed advance would let two lines overlap.
+      const size = spec.lineSizes ? spec.lineSizes[i] ?? 11 : 11
+      const advance = spec.lineSizes ? size + 4 : 14
+      ctx.font = `${size}px ${FONT}`
       const color = spec.lineColors?.[i] ?? theme.text
       ctx.fillStyle = css(color, dim)
       ctx.fillText(spec.lines[i]!, x, y)
-      y += 14
+      y += advance
     }
   }
 

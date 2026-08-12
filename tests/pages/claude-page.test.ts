@@ -106,17 +106,41 @@ describe('ClaudePage layout', () => {
   })
 })
 
-describe('ClaudePage gauges', () => {
-  it('shows the 5 hour and 7 day percentages', () => {
+describe('ClaudePage gauges: 5-hr and week cap (keys 4 and 5)', () => {
+  it('labels key 4 the 5-hour cap and key 5 the week cap', () => {
     const { page } = build({ usage: freshUsage() })
     const keys = page.render(NOW).keys
-    expect(keys[4]!.lines!.join(' ')).toContain('62%')
-    expect(keys[5]!.lines!.join(' ')).toContain('34%')
+    expect(keys[4]!.lines![0]).toBe('5-HR CAP')
+    expect(keys[5]!.lines![0]).toBe('WEEK CAP')
   })
 
-  it('fills the gauge bars to the percentage', () => {
+  it('shows the whole percent as the value, at 28 px', () => {
+    const { page } = build({ usage: freshUsage() })
+    const keys = page.render(NOW).keys
+    expect(keys[4]!.lines![1]).toBe('62%')
+    expect(keys[4]!.lineSizes![1]).toBe(28)
+    expect(keys[5]!.lines![1]).toBe('34%')
+    expect(keys[5]!.lineSizes![1]).toBe(28)
+  })
+
+  it('fills the gauge bar to the percentage', () => {
     const { page } = build({ usage: freshUsage() })
     expect(page.render(NOW).keys[4]!.bar!.value).toBeCloseTo(0.62, 2)
+  })
+
+  it('colours the bar green below 60 percent', () => {
+    const { page } = build({ usage: freshUsage({ fiveHourPct: 40 }) })
+    expect(page.render(NOW).keys[4]!.bar!.color).toEqual(theme.green)
+  })
+
+  it('colours the bar amber at exactly 60 percent, the lower threshold', () => {
+    const { page } = build({ usage: freshUsage({ fiveHourPct: 60 }) })
+    expect(page.render(NOW).keys[4]!.bar!.color).toEqual(theme.amber)
+  })
+
+  it('colours the bar amber at exactly 85 percent, the upper threshold', () => {
+    const { page } = build({ usage: freshUsage({ fiveHourPct: 85 }) })
+    expect(page.render(NOW).keys[4]!.bar!.color).toEqual(theme.amber)
   })
 
   it('colours the bar red above 85 percent', () => {
@@ -124,31 +148,174 @@ describe('ClaudePage gauges', () => {
     expect(page.render(NOW).keys[4]!.bar!.color).toEqual(theme.red)
   })
 
-  it('shows the pace on key 6', () => {
-    const { page } = build({ usage: freshUsage({ fiveHourPct: 90 }) })
-    expect(page.render(NOW).keys[6]!.lines!.join(' ')).toContain('fast')
-  })
-
-  it('shows the reset countdown on key 7', () => {
-    const { page } = build({ usage: freshUsage({ fiveHourResetsAt: NOW + 7860 }) })
-    expect(page.render(NOW).keys[7]!.lines!.join(' ')).toContain('2h11m')
-  })
-
-  it('shows two dashes when no usage file exists', () => {
+  it('shows two dashes and no bar when no usage file exists', () => {
     const { page } = build({ usage: null })
-    expect(page.render(NOW).keys[4]!.lines!.join(' ')).toContain('--')
-  })
-
-  it('marks the gauges STALE past the limit', () => {
-    const { page } = build({ usage: freshUsage(), stale: true })
     const key = page.render(NOW).keys[4]!
-    expect(key.lines!.join(' ')).toContain('STALE')
+    expect(key.lines).toEqual(['5-HR CAP', '--'])
+    expect(key.bar).toBeUndefined()
     expect(key.dim).toBe(true)
   })
 
   it('does not dim a fresh gauge', () => {
     const { page } = build({ usage: freshUsage() })
     expect(page.render(NOW).keys[4]!.dim).not.toBe(true)
+  })
+
+  it('marks the gauge STALE on the third line and dims it past the limit', () => {
+    const { page } = build({ usage: freshUsage(), stale: true })
+    const key = page.render(NOW).keys[4]!
+    expect(key.lines).toEqual(['5-HR CAP', '62%', 'STALE'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('suppresses the bar entirely when stale, even though the percent is known', () => {
+    const { page } = build({ usage: freshUsage(), stale: true })
+    expect(page.render(NOW).keys[4]!.bar).toBeUndefined()
+  })
+})
+
+describe('ClaudePage gauges: burn rate (key 6)', () => {
+  it('labels key 6 BURN RATE', () => {
+    const { page } = build({ usage: freshUsage() })
+    expect(page.render(NOW).keys[6]!.lines![0]).toBe('BURN RATE')
+  })
+
+  it('shows UNDER in green when usage trails elapsed time by more than 5 points', () => {
+    // Halfway through the 5-hour window (elapsed 50%), used only 20%: delta
+    // is -30, well past the -5 dead band.
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 20, fiveHourResetsAt: NOW + FIVE_HOURS / 2 }),
+    })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines![1]).toBe('UNDER')
+    expect(key.lineSizes![1]).toBe(16)
+    expect(key.lineColors![1]).toEqual(theme.green)
+  })
+
+  it('shows ON PACE in amber within the 5 point dead band', () => {
+    // Elapsed 50%, used 52%: delta is +2, inside the band.
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 52, fiveHourResetsAt: NOW + FIVE_HOURS / 2 }),
+    })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines![1]).toBe('ON PACE')
+    expect(key.lineColors![1]).toEqual(theme.amber)
+  })
+
+  it('stays ON PACE exactly at the +5 point boundary', () => {
+    // Elapsed 50%, used 55%: delta is exactly +5, still inside the band.
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 55, fiveHourResetsAt: NOW + FIVE_HOURS / 2 }),
+    })
+    expect(page.render(NOW).keys[6]!.lines![1]).toBe('ON PACE')
+  })
+
+  it('shows OVER in red once usage leads elapsed time by more than 5 points', () => {
+    // Elapsed 50%, used 90%: delta is +40, well past the +5 dead band.
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 90, fiveHourResetsAt: NOW + FIVE_HOURS / 2 }),
+    })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines![1]).toBe('OVER')
+    expect(key.lineColors![1]).toEqual(theme.red)
+  })
+
+  it('tips over to OVER just past the +5 point boundary', () => {
+    // Elapsed 50%, used 55.1%: delta is +5.1, just outside the band.
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 55.1, fiveHourResetsAt: NOW + FIVE_HOURS / 2 }),
+    })
+    expect(page.render(NOW).keys[6]!.lines![1]).toBe('OVER')
+  })
+
+  it('shows the rounded used and elapsed percent as evidence on the third line', () => {
+    // Elapsed is exactly 44% of the window; used is 20%.
+    const resetsAt = NOW + Math.round(FIVE_HOURS * 0.56)
+    const { page } = build({ usage: freshUsage({ fiveHourPct: 20, fiveHourResetsAt: resetsAt }) })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines![2]).toBe('20% of 44%')
+    expect(key.lineSizes![2]).toBe(11)
+  })
+
+  it('rounds a fractional evidence percent to the nearest whole number', () => {
+    const resetsAt = NOW + Math.round(FIVE_HOURS * 0.7)
+    const { page } = build({ usage: freshUsage({ fiveHourPct: 33.6, fiveHourResetsAt: resetsAt }) })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines![2]).toBe('34% of 30%')
+  })
+
+  it('shows two dashes when no usage file exists', () => {
+    const { page } = build({ usage: null })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines).toEqual(['BURN RATE', '--'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('replaces the evidence line with STALE and dims the key past the limit', () => {
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 90, fiveHourResetsAt: NOW + FIVE_HOURS / 2 }),
+      stale: true,
+    })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines).toEqual(['BURN RATE', 'OVER', 'STALE'])
+    expect(key.dim).toBe(true)
+  })
+})
+
+describe('ClaudePage gauges: resets in (key 7)', () => {
+  it('labels key 7 RESETS IN', () => {
+    const { page } = build({ usage: freshUsage() })
+    expect(page.render(NOW).keys[7]!.lines![0]).toBe('RESETS IN')
+  })
+
+  it('shows the duration at 24 px', () => {
+    const { page } = build({ usage: freshUsage({ fiveHourResetsAt: NOW + 7860 }) })
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines![1]).toBe('2h11m')
+    expect(key.lineSizes![1]).toBe(24)
+  })
+
+  it('names the window on the third line, at 11 px', () => {
+    const { page } = build({ usage: freshUsage({ fiveHourResetsAt: NOW + 7860 }) })
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines![2]).toBe('5-hr')
+    expect(key.lineSizes![2]).toBe(11)
+  })
+
+  it('shows two dashes when no usage file exists', () => {
+    const { page } = build({ usage: null })
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines).toEqual(['RESETS IN', '--'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('replaces the window line with STALE and dims the key past the limit', () => {
+    const { page } = build({
+      usage: freshUsage({ fiveHourResetsAt: NOW + 7860 }),
+      stale: true,
+    })
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines).toEqual(['RESETS IN', '2h11m', 'STALE'])
+    expect(key.dim).toBe(true)
+  })
+})
+
+describe('ClaudePage gauges: no cache at all', () => {
+  it('shows -- and dims every one of the four gauges', () => {
+    const { page } = build({ usage: null })
+    const keys = page.render(NOW).keys.slice(4)
+    for (const key of keys) {
+      expect(key.lines![1]).toBe('--')
+      expect(key.dim).toBe(true)
+    }
+  })
+
+  it('never shows NaN or 0% for a null percentage', () => {
+    const { page } = build({ usage: freshUsage({ fiveHourPct: null }) })
+    const key = page.render(NOW).keys[4]!
+    expect(key.lines).toContain('--')
+    expect(key.lines!.join(' ')).not.toContain('NaN')
+    expect(key.lines!.join(' ')).not.toContain('0%')
   })
 })
 

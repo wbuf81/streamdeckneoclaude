@@ -26,6 +26,25 @@ export interface SessionMeta {
 }
 
 /**
+ * The percent of `windowSeconds` that has elapsed toward `resetsAt`, as of
+ * `now`. Null when `resetsAt` is unknown, the window length is not
+ * positive, or the window has not started yet — the same conditions under
+ * which `computePace` falls back to `even`, because there is nothing yet to
+ * compare a usage percentage against.
+ */
+export function elapsedPercent(
+  resetsAt: number,
+  windowSeconds: number,
+  now: number,
+): number | null {
+  if (!resetsAt || windowSeconds <= 0) return null
+  const remaining = resetsAt - now
+  const elapsed = windowSeconds - remaining
+  if (elapsed <= 0) return null
+  return (elapsed / windowSeconds) * 100
+}
+
+/**
  * Compares usage against elapsed window time. `fast` means usage leads the
  * clock. A missing `resetsAt` gives `even`, because elapsed time is unknown.
  */
@@ -35,11 +54,8 @@ export function computePace(
   windowSeconds: number,
   now: number,
 ): Pace {
-  if (!resetsAt || windowSeconds <= 0) return 'even'
-  const remaining = resetsAt - now
-  const elapsed = windowSeconds - remaining
-  if (elapsed <= 0) return 'even'
-  const elapsedPct = (elapsed / windowSeconds) * 100
+  const elapsedPct = elapsedPercent(resetsAt, windowSeconds, now)
+  if (elapsedPct === null) return 'even'
   const delta = usedPct - elapsedPct
   if (delta > PACE_BAND) return 'fast'
   if (delta < -PACE_BAND) return 'slow'

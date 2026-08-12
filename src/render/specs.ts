@@ -35,6 +35,14 @@ export interface KeySpec {
    * stocks page uses this to tint only the change line, never the price.
    */
   lineColors?: (Rgb | undefined)[]
+  /**
+   * Font size per line, in pixels, aligned by index with `lines`. A missing
+   * entry, or an index past the end of this array, uses the default size.
+   * Absent altogether, every line keeps the original 11 px size and the
+   * original fixed line advance, so a page that never sets this field
+   * renders exactly as it did before this field existed.
+   */
+  lineSizes?: number[]
   align?: 'left' | 'center'
   border?: Rgb
   /** True draws the border. False draws it dark. The page owns the phase. */

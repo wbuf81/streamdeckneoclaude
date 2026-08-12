@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest'
+import { createHash } from 'node:crypto'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
 import {
   renderKey,
@@ -23,6 +24,19 @@ function near(actual: readonly number[], expected: readonly number[], tol = 12) 
   for (let i = 0; i < 3; i++) {
     expect(Math.abs(actual[i]! - expected[i]!)).toBeLessThanOrEqual(tol)
   }
+}
+
+/** Same tolerance as `near`, but returns a boolean instead of asserting, so
+ * a probe loop can ask "is this pixel background?" without throwing. */
+function near3(actual: readonly number[], expected: readonly number[], tol = 12): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(actual[i]! - expected[i]!) > tol) return false
+  }
+  return true
+}
+
+function sha256(buf: Buffer): string {
+  return createHash('sha256').update(buf).digest('hex')
 }
 
 describe('renderKey', () => {
@@ -346,6 +360,98 @@ describe('renderKey lineColors', () => {
       lineColors: [undefined, undefined, theme.red],
     })
     expect(coloured.equals(uncoloured)).toBe(false)
+  })
+})
+
+describe('renderKey lineSizes', () => {
+  it('renders a line at 28 px differently than the same line at 11 px', () => {
+    const small = renderKey({ kind: 'gauge', lines: ['20%'], lineSizes: [11] })
+    const big = renderKey({ kind: 'gauge', lines: ['20%'], lineSizes: [28] })
+    expect(small.equals(big)).toBe(false)
+  })
+
+  it('falls back to the default size for a missing lineSizes entry', () => {
+    // lineSizes has no entry for the second line, so it should fall back to
+    // 11, exactly as if 11 had been written explicitly.
+    const implicit = renderKey({ kind: 'gauge', lines: ['5-HR CAP', '20%'], lineSizes: [11] })
+    const explicit = renderKey({ kind: 'gauge', lines: ['5-HR CAP', '20%'], lineSizes: [11, 11] })
+    expect(implicit.equals(explicit)).toBe(true)
+  })
+
+  it('advances by size plus 4, matching the measured y positions for an 11/28 pair', () => {
+    // Per the brief: an 11 px line at y 6 is followed by a 28 px line at
+    // y 21, an advance of 15 (11 + 4). Probe just above and at the second
+    // line's start row to confirm the label has finished and the value has
+    // not started early.
+    const buf = renderKey({ kind: 'gauge', lines: ['5-HR CAP', '20%'], lineSizes: [11, 28] })
+    let firstInkRow = -1
+    for (let y = 0; y < 30 && firstInkRow < 0; y++) {
+      for (let x = 9; x < 90; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) {
+          firstInkRow = y
+          break
+        }
+      }
+    }
+    expect(firstInkRow).toBeGreaterThanOrEqual(6)
+    expect(firstInkRow).toBeLessThan(21)
+  })
+
+  it('does not overlap three lines at 11, 24 and 11 px: gaps stay background, lines carry ink', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      lines: ['AAAA', 'BBBB', 'CCCC'],
+      lineSizes: [11, 24, 11],
+    })
+    const inkSomewhere = (y: number) => {
+      for (let x = 9; x < 90; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) return true
+      }
+      return false
+    }
+    // Ink within each line (measured, see tests/render/_probe scan used to
+    // derive these rows: line 0 paints 7-14, line 1 paints 22-39, line 2
+    // paints 50-57).
+    expect(inkSomewhere(10)).toBe(true)
+    expect(inkSomewhere(30)).toBe(true)
+    expect(inkSomewhere(53)).toBe(true)
+    // Background in the gaps between them.
+    expect(inkSomewhere(18)).toBe(false)
+    expect(inkSomewhere(44)).toBe(false)
+  })
+
+  // The regression guard: Spotify, stocks and weather never set lineSizes,
+  // so they must render byte-identically to how they did before this field
+  // existed. These hashes were captured from renderKey BEFORE lineSizes was
+  // added to canvas.ts, against the exact KeySpecs those pages build.
+  it('renders a stocks-like key byte-identically to the pre-lineSizes snapshot', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      lines: ['TSLA', '327.51', '▼ 1.59%'],
+      lineColors: [undefined, undefined, theme.red],
+    })
+    expect(sha256(buf)).toBe(
+      'e07d0e4ed7e055e58d977fe94abd2d3f8e687a36ac5a06cdbc367bfbd8462181',
+    )
+  })
+
+  it('renders a weather-like key byte-identically to the pre-lineSizes snapshot', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      lines: ['THU'],
+      emoji: '☀️',
+      lineColors: [theme.textDim],
+    })
+    expect(sha256(buf)).toBe(
+      '79d0d46251fbd190f22be0e3057eb0546c3be4a523b9aa6427be826ca2cd124b',
+    )
+  })
+
+  it('renders a spotify-like key byte-identically to the pre-lineSizes snapshot', () => {
+    const buf = renderKey({ kind: 'control', glyph: '♥', glyphColor: theme.red })
+    expect(sha256(buf)).toBe(
+      '20d595718c3d8d68a5569793b7563305ffb081b01c0a41feec5fff8a28c98860',
+    )
   })
 })
 

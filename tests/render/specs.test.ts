@@ -51,6 +51,15 @@ describe('keyHash', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
+  // The daemon writes a key only when its hash changes. If a line size were
+  // missing from the hash, a key whose text stayed the same but whose size
+  // changed would never redraw, leaving stale pixels on the glass.
+  it('differs when lineSizes changes', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['20%'], lineSizes: [11] }
+    const b: KeySpec = { kind: 'gauge', lines: ['20%'], lineSizes: [28] }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
   it('differs when the emoji changes, so the daemon redraws a changed forecast icon', () => {
     const a: KeySpec = { kind: 'gauge', lines: ['THU'], emoji: '☀️' }
     const b: KeySpec = { kind: 'gauge', lines: ['THU'], emoji: '⛈' }
