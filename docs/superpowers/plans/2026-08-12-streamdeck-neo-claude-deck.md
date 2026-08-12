@@ -1662,7 +1662,7 @@ async function main(): Promise<void> {
       border: COLORS[i],
       bar: { value: (i + 1) / 8, color: COLORS[i]! },
     })
-    await device.setKeyImage(i, png)
+    await device.setKeyImage(i, buf)
   }
 
   await device.setStrip(
