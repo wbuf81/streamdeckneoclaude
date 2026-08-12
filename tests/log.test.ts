@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { createLogger, fileSink } from '../src/log.js'
-import { paths, ensureStateDir } from '../src/paths.js'
-import { writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
+import { createLogger, createFileSink } from '../src/log.js'
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 describe('createLogger', () => {
   let written: string[]
@@ -44,41 +45,52 @@ describe('createLogger', () => {
   })
 })
 
-describe('fileSink', () => {
-  const rotatedFile = `${paths.logFile}.1`
+describe('createFileSink', () => {
+  // A dedicated temp directory per test. This suite must never name, read,
+  // write, rename, or delete anything under the real ~/.local/state/deckd —
+  // createFileSink takes the path as a parameter for exactly this reason.
+  let dir: string
+  let file: string
+  let rotatedFile: string
 
   beforeEach(() => {
-    ensureStateDir()
-    rmSync(paths.logFile, { force: true })
-    rmSync(rotatedFile, { force: true })
+    dir = mkdtempSync(join(tmpdir(), 'deckd-log-'))
+    file = join(dir, 'deckd.log')
+    rotatedFile = `${file}.1`
   })
 
   afterEach(() => {
-    rmSync(paths.logFile, { force: true })
-    rmSync(rotatedFile, { force: true })
+    rmSync(dir, { recursive: true, force: true })
   })
 
-  it('rotates the log file past 5 MB and starts a fresh file', () => {
-    const oldContent = 'x'.repeat(5 * 1024 * 1024 + 1)
-    writeFileSync(paths.logFile, oldContent)
+  it('rotates the log file past the threshold and starts a fresh file', () => {
+    const sink = createFileSink(file, 100)
+    const oldContent = 'x'.repeat(101)
+    writeFileSync(file, oldContent)
 
-    fileSink('first line after rotation')
+    sink('first line after rotation')
 
     expect(existsSync(rotatedFile)).toBe(true)
     expect(readFileSync(rotatedFile, 'utf8')).toBe(oldContent)
-    expect(readFileSync(paths.logFile, 'utf8')).toBe(
-      'first line after rotation\n',
-    )
+    expect(readFileSync(file, 'utf8')).toBe('first line after rotation\n')
   })
 
-  it('does not rotate a log file under 5 MB', () => {
-    writeFileSync(paths.logFile, 'small\n')
+  it('does not rotate a log file under the threshold', () => {
+    const sink = createFileSink(file, 100)
+    writeFileSync(file, 'small\n')
 
-    fileSink('appended line')
+    sink('appended line')
 
     expect(existsSync(rotatedFile)).toBe(false)
-    expect(readFileSync(paths.logFile, 'utf8')).toBe(
-      'small\nappended line\n',
-    )
+    expect(readFileSync(file, 'utf8')).toBe('small\nappended line\n')
+  })
+
+  it('creates the log directory on first write, matching the real fileSink default', () => {
+    const nested = join(dir, 'nested', 'deckd.log')
+    const sink = createFileSink(nested)
+
+    sink('first line')
+
+    expect(readFileSync(nested, 'utf8')).toBe('first line\n')
   })
 })

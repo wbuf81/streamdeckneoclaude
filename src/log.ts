@@ -1,5 +1,6 @@
-import { appendFileSync, statSync, renameSync } from 'node:fs'
-import { paths, ensureStateDir } from './paths.js'
+import { appendFileSync, statSync, renameSync, mkdirSync, chmodSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { paths } from './paths.js'
 
 export type Sink = (line: string) => void
 export type Level = 'INFO' | 'WARN' | 'ERROR'
@@ -16,18 +17,31 @@ export interface Logger {
 
 const MAX_BYTES = 5 * 1024 * 1024
 
-/** Appends to the log file. Rotates at 5 MB and keeps one old copy. */
-export function fileSink(line: string): void {
-  ensureStateDir()
-  try {
-    if (statSync(paths.logFile).size > MAX_BYTES) {
-      renameSync(paths.logFile, `${paths.logFile}.1`)
+/**
+ * Builds a sink that appends to `file`. It rotates past `maxBytes` and keeps
+ * one old copy. The path is a parameter so a test can point at a temporary
+ * file. A test must never read, write, rename, or delete the real log in the
+ * user's home directory.
+ */
+export function createFileSink(file: string, maxBytes: number = MAX_BYTES): Sink {
+  const rotated = `${file}.1`
+  return (line: string) => {
+    // The mode option on mkdirSync applies only when it creates the
+    // directory, so an existing directory keeps its old mode. chmodSync
+    // enforces 0700 unconditionally, matching paths.ts's ensureStateDir.
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+    chmodSync(dirname(file), 0o700)
+    try {
+      if (statSync(file).size > maxBytes) renameSync(file, rotated)
+    } catch {
+      // The file does not exist yet. Nothing to rotate.
     }
-  } catch {
-    // The file does not exist yet. Nothing to rotate.
+    appendFileSync(file, line + '\n')
   }
-  appendFileSync(paths.logFile, line + '\n')
 }
+
+/** Appends to the real log file. Rotates at 5 MB and keeps one old copy. */
+export const fileSink: Sink = createFileSink(paths.logFile)
 
 /**
  * The sink the singleton `log` writes through. A test swaps it for a no-op, so
