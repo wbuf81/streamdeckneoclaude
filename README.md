@@ -21,6 +21,24 @@ In development. The design is complete. See
 Stream Deck Neo only. USB `0x0FD9:0x009A`. The deck has 8 keys of 96 × 96 px, a
 248 × 58 px info strip, and 2 touch buttons with no screen.
 
+## Development
+
+Requires macOS and Node 22 or later.
+
+```bash
+npm install
+npm test          # unit tests, no hardware needed
+npm run typecheck
+npm run smoke     # draws a test pattern, needs the real device
+```
+
+`npm run smoke` is the fastest way to confirm the device works. It draws a
+labelled pattern on all 8 keys, the info strip, and both touch buttons. It then
+prints every press index.
+
+Pass `--once` to draw the pattern and exit right away, with no wait for a key
+press. Use it for an automated check: `npm run smoke -- --once`.
+
 ## Credits
 
 The crab sprite art comes from
