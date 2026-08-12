@@ -3217,6 +3217,42 @@ describe('isInstalled', () => {
   })
 })
 
+describe('verifyWrap', () => {
+  it('accepts a wrapper that reproduces the original output', async () => {
+    // A stand-in "original" that echoes a fixed line, and a "wrapped" form that
+    // runs the same thing through a transparent shell pipeline.
+    const inner = "printf 'STATUS OK\\n'"
+    const wrapped = `cat >/dev/null; ${inner}`
+    const r = await verifyWrap(wrapped, inner)
+    expect(r.ok).toBe(true)
+    expect(r.before).toBe(r.after)
+  })
+
+  it('rejects a wrapper whose output differs', async () => {
+    const r = await verifyWrap("printf 'DIFFERENT\\n'", "printf 'STATUS OK\\n'")
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('differs')
+  })
+
+  it('rejects a wrapper that fails to run', async () => {
+    const r = await verifyWrap('exit 3', "printf 'STATUS OK\\n'")
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('wrapped command failed')
+  })
+
+  it('allows the install when the ORIGINAL command already fails', async () => {
+    // Not our problem to fix, and wrapping does not make it worse.
+    const r = await verifyWrap("printf 'x\\n'", 'exit 4')
+    expect(r.ok).toBe(true)
+    expect(r.reason).toContain('original command failed')
+  })
+
+  it('treats an empty original as empty output', async () => {
+    const r = await verifyWrap('cat >/dev/null', '')
+    expect(r.ok).toBe(true)
+  })
+})
+
 describe('unwrapStatusLine', () => {
   it('restores a wrapped string command', () => {
     const r = wrapStatusLine('~/.claude/statusline.sh', WRAPPER)
@@ -3324,7 +3360,16 @@ interface WrapResult {
 /**
  * Builds a statusline command that runs the wrapper first. The original command
  * travels inside the new one, after the marker, so uninstall needs no other
- * record.
+ * record. Losing the state directory therefore cannot strand a wrapped config.
+ *
+ * The command relies on three shell behaviours: a `VAR=value` assignment prefix,
+ * `#` starting a comment so the trailing JSON is inert, and tilde expansion
+ * inside the inner command. Claude Code does run the statusline through a shell,
+ * and there is direct evidence rather than an assumption: this user's existing
+ * value is `~/.claude/statusline.sh`, whose leading tilde only resolves under a
+ * shell. A direct exec would fail with ENOENT.
+ *
+ * Step 6 still proves the wrap end to end before trusting it.
  */
 export function wrapStatusLine(current: unknown, wrapperPath: string): WrapResult {
   const inner = extractCommand(current)
@@ -3408,10 +3453,27 @@ export async function install(): Promise<void> {
     copyFileSync(paths.claudeSettings, backup)
     changed.push(`backed up ${paths.claudeSettings} to ${backup}`)
   }
-  const { statusLine } = wrapStatusLine(settings.statusLine, wrapperDst)
+  const originalStatusLine = settings.statusLine
+  const { statusLine, inner } = wrapStatusLine(settings.statusLine, wrapperDst)
+
+  // Prove the wrap before trusting it. This is the user's live terminal
+  // statusline: if the wrapped command produces different output from the
+  // original, the wrap is broken and must not be left in place. Feed both a
+  // synthetic payload and compare. Roll back on any difference.
+  const probe = await verifyWrap(extractCommand(statusLine), inner)
+  if (!probe.ok) {
+    throw new Error(
+      'the wrapped statusline did not reproduce the original output, so nothing ' +
+        `was changed.\nreason: ${probe.reason}\n` +
+        `original output: ${JSON.stringify(probe.before)}\n` +
+        `wrapped output:  ${JSON.stringify(probe.after)}`,
+    )
+  }
+
   settings.statusLine = statusLine
   writeAtomic(paths.claudeSettings, JSON.stringify(settings, null, 2))
   changed.push(`wrapped statusLine in ${paths.claudeSettings}`)
+  void originalStatusLine
 
   // 3. Write and load the launchd agent.
   const script = join(root, 'dist', 'bin', 'deckd.js')
@@ -3433,6 +3495,64 @@ export async function install(): Promise<void> {
   for (const line of changed) console.log(`  · ${line}`)
   console.log('\nThe deck starts now, and at every login.')
   console.log('macOS may ask to allow automation. Approve it, so window focus works.')
+}
+
+/** A representative statusline payload, used only to prove the wrap works. */
+const PROBE_PAYLOAD = JSON.stringify({
+  session_id: 'deckd-install-probe',
+  model: { display_name: 'Opus 5' },
+  context_window: { used_percentage: 10, total_input_tokens: 1, context_window_size: 2 },
+  cost: { total_cost_usd: 0 },
+  effort: { level: 'medium' },
+  rate_limits: {
+    five_hour: { used_percentage: 1, resets_at: 0 },
+    seven_day: { used_percentage: 1, resets_at: 0 },
+  },
+  workspace: { project_dir: '/tmp' },
+})
+
+export interface WrapProbe {
+  ok: boolean
+  reason: string
+  before: string
+  after: string
+}
+
+/**
+ * Runs the original statusline command and the wrapped one with the same
+ * payload, then compares their output. The wrapper must be transparent, so any
+ * difference means the wrap is broken and install must not proceed.
+ *
+ * Both run through `sh -c`, which is how Claude Code runs a statusline command.
+ */
+export async function verifyWrap(wrapped: string, inner: string): Promise<WrapProbe> {
+  const run = async (cmd: string): Promise<string> => {
+    if (!cmd) return ''
+    const { stdout } = await promisify(execFile)('/bin/sh', ['-c', cmd], {
+      input: PROBE_PAYLOAD,
+    } as never)
+    return String(stdout)
+  }
+
+  let before = ''
+  let after = ''
+  try {
+    before = await run(inner)
+  } catch (e) {
+    // The ORIGINAL command already fails. That is not ours to fix, and wrapping
+    // it changes nothing, so allow the install to continue.
+    return { ok: true, reason: `original command failed: ${String(e)}`, before, after }
+  }
+  try {
+    after = await run(wrapped)
+  } catch (e) {
+    return { ok: false, reason: `wrapped command failed: ${String(e)}`, before, after }
+  }
+
+  if (before !== after) {
+    return { ok: false, reason: 'output differs', before, after }
+  }
+  return { ok: true, reason: 'identical output', before, after }
 }
 
 export async function uninstall(): Promise<void> {
@@ -3516,7 +3636,18 @@ console.log('now:', JSON.stringify(b.statusLine).slice(0,120));
 ```
 Expected: `statusLine changed: true`, and the new value names the wrapper.
 
-Open a new Claude Code session and confirm the terminal statusline still renders exactly as before. This is the one check that matters most.
+Open a new Claude Code session and confirm the terminal statusline still renders
+exactly as before. This is the one check that matters most.
+
+`install` now proves this itself before writing anything. `verifyWrap` runs the
+ORIGINAL command and the WRAPPED command with the same synthetic payload, through
+`sh -c`, and compares their stdout byte for byte. On any difference it throws and
+leaves `settings.json` untouched, so a broken wrap cannot reach the user's
+terminal. If the original command already fails on its own, the install proceeds,
+because wrapping a broken command does not make it worse.
+
+Confirm you saw that self-test pass in the install output. If it threw, do NOT
+work around it — report the reason, because it means the wrap is genuinely wrong.
 
 Then confirm the cache appears:
 ```bash
