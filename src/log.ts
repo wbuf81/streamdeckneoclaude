@@ -29,6 +29,16 @@ export function fileSink(line: string): void {
   appendFileSync(paths.logFile, line + '\n')
 }
 
+/**
+ * The sink the singleton `log` writes through. A test swaps it for a no-op, so
+ * the suite never appends to the real log file in the user's home directory.
+ */
+let defaultSink: Sink = fileSink
+
+export function setDefaultSink(sink: Sink): void {
+  defaultSink = sink
+}
+
 export function createLogger(sink: Sink = fileSink): Logger {
   const seen = new Set<string>()
 
@@ -51,4 +61,8 @@ export function createLogger(sink: Sink = fileSink): Logger {
   }
 }
 
-export const log = createLogger()
+/**
+ * The shared logger. It writes through `defaultSink`, which a test replaces, so
+ * the suite cannot append to the real log file.
+ */
+export const log = createLogger((line) => defaultSink(line))

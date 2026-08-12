@@ -122,7 +122,11 @@ export class ClaudeSource extends EventEmitter {
   /** Re-reads the directory. Emits `change` only when the result differs. */
   async refresh(): Promise<void> {
     const next = this.read()
-    const key = next.map((s) => `${s.sessionId}:${s.state}:${s.ts}:${s.tool}`).join('|')
+    // Compare the whole session list, not a few chosen fields. An earlier
+    // version keyed on sessionId, state, ts and tool. `ts` holds whole seconds,
+    // so two writes inside one second with a new `label` gave the same key. The
+    // deck then kept the old text, because it redraws only on `change`.
+    const key = JSON.stringify(next)
     if (key === this.lastKey) return
     this.lastKey = key
     this.sessions = next

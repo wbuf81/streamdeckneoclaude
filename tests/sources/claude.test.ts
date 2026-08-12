@@ -162,4 +162,20 @@ describe('ClaudeSource', () => {
     expect(changes).toBe(0)
     await src.stop()
   })
+
+  it('emits change when only label differs within the same second', async () => {
+    // sessionId, state, tool and ts (whole seconds) all stay identical here.
+    // A key built from only those fields would miss this update, and the
+    // deck (which redraws only on `change`) would keep showing stale text.
+    writeFileSync(join(dir, 'a.json'), fileFor({ sessionId: 'a', label: 'Old label', ts: NOW }))
+    const src = new ClaudeSource(dir, () => NOW)
+    await src.start()
+    let changes = 0
+    src.on('change', () => { changes += 1 })
+    writeFileSync(join(dir, 'a.json'), fileFor({ sessionId: 'a', label: 'New label', ts: NOW }))
+    await src.refresh()
+    expect(changes).toBeGreaterThan(0)
+    expect(src.getSessions()[0]?.label).toBe('New label')
+    await src.stop()
+  })
 })
