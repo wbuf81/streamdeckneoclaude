@@ -1,7 +1,9 @@
-import { describe, it, expect } from 'vitest'
-import { paths, ensureStateDir } from '../src/paths.js'
+import { describe, it, expect, afterEach } from 'vitest'
+import { paths, enforceDirModes } from '../src/paths.js'
 import { homedir } from 'node:os'
-import { mkdirSync, chmodSync, statSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, chmodSync, statSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 describe('paths', () => {
   it('puts runtime state under ~/.local/state/deckd', () => {
@@ -25,18 +27,44 @@ describe('paths', () => {
   })
 })
 
-describe('ensureStateDir', () => {
-  it('forces mode 0700 on state directories that already exist with a looser mode', () => {
-    mkdirSync(paths.sessionsDir, { recursive: true })
-    mkdirSync(paths.artDir, { recursive: true })
-    chmodSync(paths.stateDir, 0o755)
-    chmodSync(paths.sessionsDir, 0o755)
-    chmodSync(paths.artDir, 0o755)
+describe('enforceDirModes', () => {
+  // `ensureStateDir()` itself is not exercised here: it hard-codes the real
+  // paths under `~/.local/state/deckd`, and this suite must never create,
+  // chmod, or otherwise touch that real tree. `enforceDirModes` is the
+  // logic `ensureStateDir` calls, with the directory list taken as a
+  // parameter instead, so this test drives the exact same code against a
+  // throwaway temporary directory. Mirrors `createFileSink(file)` in
+  // tests/log.test.ts.
+  let dir: string
 
-    ensureStateDir()
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
 
-    expect(statSync(paths.stateDir).mode & 0o777).toBe(0o700)
-    expect(statSync(paths.sessionsDir).mode & 0o777).toBe(0o700)
-    expect(statSync(paths.artDir).mode & 0o777).toBe(0o700)
+  it('forces mode 0700 on directories that already exist with a looser mode', () => {
+    dir = mkdtempSync(join(tmpdir(), 'deckd-paths-'))
+    const stateDir = join(dir, 'state')
+    const sessionsDir = join(dir, 'state', 'sessions')
+    const artDir = join(dir, 'state', 'art')
+    mkdirSync(sessionsDir, { recursive: true })
+    mkdirSync(artDir, { recursive: true })
+    chmodSync(stateDir, 0o755)
+    chmodSync(sessionsDir, 0o755)
+    chmodSync(artDir, 0o755)
+
+    enforceDirModes([stateDir, sessionsDir, artDir])
+
+    expect(statSync(stateDir).mode & 0o777).toBe(0o700)
+    expect(statSync(sessionsDir).mode & 0o777).toBe(0o700)
+    expect(statSync(artDir).mode & 0o777).toBe(0o700)
+  })
+
+  it('creates a directory that does not exist yet, at the requested mode', () => {
+    dir = mkdtempSync(join(tmpdir(), 'deckd-paths-'))
+    const fresh = join(dir, 'brand-new')
+
+    enforceDirModes([fresh], 0o700)
+
+    expect(statSync(fresh).mode & 0o777).toBe(0o700)
   })
 })
