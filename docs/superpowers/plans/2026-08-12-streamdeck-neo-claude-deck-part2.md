@@ -3032,7 +3032,30 @@ source decodes it with `await loadImage`, because the renderer has no
 synchronous decode. `renderKey` then scales the decoded image to the key with
 `drawImage`, so no extra scaling code is needed.
 
-In `start()`, after the Claude page:
+**The ORDER here matters, and getting it wrong fails silently.** `start()` currently
+reads:
+
+```
+  pages.add(new ClaudePage(...))
+  restorePage(pages)               <-- currently right after the one page
+  const daemon = new Daemon(device, pages)
+```
+
+`restorePage` calls `setIndex`, and `PageManager.setIndex` ignores an index outside
+the current page count. So if the Spotify page is added AFTER `restorePage`, a saved
+index of 1 is rejected and the deck always starts on the Claude page. Nothing
+errors, and nothing logs. The required order is:
+
+1. add the Claude page
+2. add the Spotify page
+3. `restorePage(pages)` — after BOTH, so a saved index of 1 is valid
+4. construct the `Daemon`
+5. `daemon.start()`
+6. subscribe the `change` listeners
+
+Note step 6: `spotify.on('change', ...)` references `daemon`, so it cannot run
+before the `Daemon` exists. Keep the existing `claude` and `usage` subscriptions in
+the same place.
 
 ```ts
 import { SpotifySource } from '../src/sources/spotify.js'
@@ -3042,12 +3065,22 @@ import { SpotifyPage } from '../src/pages/spotify-page.js'
   const spotify = new SpotifySource(clientId)
   await spotify.start()
   pages.add(new SpotifyPage(spotify))
+
+  // Only now, with both pages present, may a saved index of 1 be restored.
+  restorePage(pages)
+```
+
+and beside the other subscriptions, after `daemon.start()`:
+
+```ts
   spotify.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
 ```
 
-Add `await spotify.stop()` to `shutdown()`.
+Add `await spotify.stop()` to `shutdown()`, so its poll timer cannot outlive the
+process.
 
-Move `restorePage(pages)` to run after both pages are added, because a saved index of 1 is invalid while only one page exists.
+`readClientId()` already exists in this file. The client id is already provisioned
+in `~/.local/state/deckd/config.json`, so no flag is needed.
 
 - [ ] **Step 6: Run the deck with both pages — milestone 3**
 
