@@ -94,17 +94,80 @@ export function wrapStatusLine(current: unknown, wrapperPath: string): WrapResul
   return { statusLine: command, inner }
 }
 
-/** Recovers the original statusline from a wrapped one. */
-export function unwrapStatusLine(current: unknown): unknown {
+interface UnwrapAttempt {
+  /** False only when the marker is present but the trailing JSON blob will
+   * not parse -- e.g. the command was hand-edited. True covers both "no
+   * marker" and "marker, and the embedded original was legitimately empty",
+   * which `unwrapStatusLine` cannot tell apart on its own, so callers that
+   * need to distinguish "recovered nothing" from "recovery failed" use this
+   * instead. */
+  ok: boolean
+  value: unknown
+}
+
+function tryUnwrapStatusLine(current: unknown): UnwrapAttempt {
   const command = extractCommand(current)
   const at = command.indexOf(WRAPPER_MARKER)
-  if (at === -1) return current
+  if (at === -1) return { ok: true, value: current }
   try {
     const blob = command.slice(at + WRAPPER_MARKER.length).trim()
     const parsed = JSON.parse(blob) as { original: unknown }
-    return parsed.original ?? undefined
+    return { ok: true, value: parsed.original ?? undefined }
   } catch {
-    return undefined
+    return { ok: false, value: undefined }
+  }
+}
+
+/** Recovers the original statusline from a wrapped one. */
+export function unwrapStatusLine(current: unknown): unknown {
+  return tryUnwrapStatusLine(current).value
+}
+
+export interface RecoverResult {
+  /** The value to assign to `statusLine`, or `undefined` to leave it absent. */
+  statusLine: unknown
+  source: 'embedded' | 'backup' | 'none'
+  /** Set only when the embedded copy failed, so the caller can report it. */
+  warning?: string
+}
+
+/**
+ * Recovers the statusLine value that `uninstall` should restore.
+ *
+ * The embedded copy inside the wrapped command is the normal path: it is
+ * self-contained, and almost every uninstall uses it with no other file
+ * involved. It can fail only if the wrapped command was hand-edited so the
+ * trailing JSON blob no longer parses. In that case the pre-install backup at
+ * `backupPath` is a safe fallback, because `install` wrote it before it ever
+ * touched `statusLine`.
+ *
+ * If even the backup is missing or unreadable, this function does NOT invent
+ * a value and does NOT signal "just delete it" by returning `undefined`
+ * quietly -- it returns `source: 'none'` with a warning, so the caller can
+ * tell the user plainly that their original statusline could not be found,
+ * rather than silently discarding it.
+ */
+export function recoverStatusLine(current: unknown, backupPath: string): RecoverResult {
+  const attempt = tryUnwrapStatusLine(current)
+  if (attempt.ok) return { statusLine: attempt.value, source: 'embedded' }
+
+  try {
+    const backup = JSON.parse(readFileSync(backupPath, 'utf8')) as Record<string, unknown>
+    return {
+      statusLine: backup.statusLine,
+      source: 'backup',
+      warning:
+        'the embedded original statusLine command was unreadable, so deckd restored ' +
+        `it from the backup at ${backupPath}.`,
+    }
+  } catch {
+    return {
+      statusLine: undefined,
+      source: 'none',
+      warning:
+        'the embedded original statusLine command was unreadable, and no usable backup ' +
+        `was found at ${backupPath}. statusLine is left absent. Claude Code will use its default.`,
+    }
   }
 }
 
@@ -232,6 +295,12 @@ export interface WrapProbe {
   after: string
 }
 
+const DEFAULT_PROBE_TIMEOUT_MS = 10_000
+
+/** Distinguishes "the command never exited" from every other failure, so
+ * `verifyWrap` can apply a different policy to it (see below). */
+class ProbeTimeoutError extends Error {}
+
 /**
  * Runs one shell command, feeding it `input` on stdin and collecting stdout.
  *
@@ -241,8 +310,13 @@ export interface WrapProbe {
  * completion, such as `cat >/dev/null; ...`, would then block forever on a
  * pipe nothing ever closes. `spawn` writes the payload and ends stdin itself,
  * so the child always sees an EOF.
+ *
+ * That alone bounds a command that reads its input and then exits. It does
+ * NOT bound a command that never exits at all -- an infinite loop, or a
+ * network call that never returns -- so this also enforces `timeoutMs`,
+ * killing the child and rejecting with `ProbeTimeoutError` if it fires.
  */
-function runWithStdin(cmd: string, input: string): Promise<string> {
+function runWithStdin(cmd: string, input: string, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
     if (!cmd) {
       resolve('')
@@ -251,10 +325,32 @@ function runWithStdin(cmd: string, input: string): Promise<string> {
     const child = spawn('/bin/sh', ['-c', cmd])
     let out = ''
     let err = ''
+    let settled = false
+
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      child.kill('SIGKILL')
+      reject(new ProbeTimeoutError(`timed out after ${timeoutMs}ms running: ${cmd}`))
+    }, timeoutMs)
+
     child.stdout.on('data', (d: Buffer) => { out += d })
     child.stderr.on('data', (d: Buffer) => { err += d })
-    child.on('error', reject)
+    // A child that exits before it reads stdin -- e.g. `exit 3` with a
+    // payload still queued -- makes this write emit EPIPE. The 'close'
+    // handler below still reports the real outcome, so this only needs to
+    // stop the unhandled error from crashing the process.
+    child.stdin.on('error', () => {})
+    child.on('error', (e) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(e)
+    })
     child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
       if (code !== 0) reject(new Error(`exit ${String(code)}: ${err}`))
       else resolve(out)
     })
@@ -269,22 +365,54 @@ function runWithStdin(cmd: string, input: string): Promise<string> {
  * difference means the wrap is broken and install must not proceed.
  *
  * Both run through `sh -c`, which is how Claude Code runs a statusline command.
+ *
+ * `timeoutMs` defaults to 10 seconds -- generous, since a statusline runs on
+ * every render and anything slower is already broken -- but is a parameter so
+ * a test can inject a short one instead of actually waiting.
+ *
+ * Timeout policy is deliberately NOT the same as the existing "original
+ * already fails" rule, and that asymmetry is the point, not an oversight:
+ *
+ *   - A command that FAILS FAST is fine to wrap. Wrapping does not make it
+ *     worse, and the fast failure is itself the comparison result.
+ *   - A command that HANGS cannot be compared at all -- there is no output to
+ *     diff against -- so proceeding would mean installing unverified, which
+ *     defeats the reason `verifyWrap` exists. So a timeout on EITHER side
+ *     means `ok: false`, even when it is the original that hung. Do not
+ *     "simplify" this into reusing the already-failing-original branch.
  */
-export async function verifyWrap(wrapped: string, inner: string): Promise<WrapProbe> {
-  const runProbe = (cmd: string): Promise<string> => runWithStdin(cmd, PROBE_PAYLOAD)
+export async function verifyWrap(
+  wrapped: string,
+  inner: string,
+  timeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+): Promise<WrapProbe> {
+  const runProbe = (cmd: string): Promise<string> => runWithStdin(cmd, PROBE_PAYLOAD, timeoutMs)
 
   let before = ''
   let after = ''
   try {
     before = await runProbe(inner)
   } catch (e) {
-    // The ORIGINAL command already fails. That is not ours to fix, and wrapping
-    // it changes nothing, so allow the install to continue.
+    if (e instanceof ProbeTimeoutError) {
+      return {
+        ok: false,
+        reason:
+          `the original command did not finish within ${timeoutMs}ms, so the wrap could ` +
+          `not be verified: ${e.message}`,
+        before,
+        after,
+      }
+    }
+    // The ORIGINAL command already fails, quickly. That is not ours to fix,
+    // and wrapping it changes nothing, so allow the install to continue.
     return { ok: true, reason: `original command failed: ${String(e)}`, before, after }
   }
   try {
     after = await runProbe(wrapped)
   } catch (e) {
+    if (e instanceof ProbeTimeoutError) {
+      return { ok: false, reason: `wrapped command timed out: ${e.message}`, before, after }
+    }
     return { ok: false, reason: `wrapped command failed: ${String(e)}`, before, after }
   }
 
@@ -305,11 +433,19 @@ export async function uninstall(): Promise<void> {
 
   const settings = readSettings()
   if (isInstalled(settings)) {
-    const original = unwrapStatusLine(settings.statusLine)
-    if (original === undefined) delete settings.statusLine
-    else settings.statusLine = original
+    const backupPath = `${paths.claudeSettings}.deckd-backup`
+    const recovered = recoverStatusLine(settings.statusLine, backupPath)
+    if (recovered.warning) console.warn(recovered.warning)
+    if (recovered.statusLine === undefined) delete settings.statusLine
+    else settings.statusLine = recovered.statusLine
     writeAtomic(paths.claudeSettings, JSON.stringify(settings, null, 2))
-    removed.push(`restored statusLine in ${paths.claudeSettings}`)
+    removed.push(
+      recovered.source === 'backup'
+        ? `restored statusLine in ${paths.claudeSettings} from the backup`
+        : recovered.source === 'none'
+          ? `left statusLine absent in ${paths.claudeSettings} (original unrecoverable, see warning above)`
+          : `restored statusLine in ${paths.claudeSettings}`,
+    )
   }
 
   const wrapper = join(paths.stateDir, 'statusline-wrapper.sh')
