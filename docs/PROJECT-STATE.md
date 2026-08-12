@@ -112,8 +112,8 @@ but **that directory is git-ignored**, so this file is the durable record.
 | 19 | weather source + page | complete |
 | 20 | Spotify redesign: 2×2 art, read-only heart | complete |
 | 21 | extract animated crab frames | complete |
-| 22 | animate the Claude crabs | **in progress / next** |
-| 23 | gauge row legibility (`lineSizes`) | **in progress** |
+| 22 | animate the Claude crabs | complete, **NOT reviewed** |
+| 23 | gauge row legibility (`lineSizes`) | complete, **NOT reviewed** |
 | 24 | weather tile overlap + tint | **pending, needs 23** |
 
 Briefs and reports for tasks 9–24 are in
@@ -137,7 +137,20 @@ anything still needed before that directory is cleaned.
    binary manually; may not prompt) and press feedback (flash white on success, red on
    failure — specified in the spec, never implemented).
 
-### Deferred minors worth a sweep
+### Not yet reviewed
+
+Tasks 22 and 23 landed with strong self-evidence — measured `renderKey` cost of 0.032 ms,
+before/after hashing proving the other three pages are pixel-identical, and verified frame
+advance at 70 ms for all five states — and the controller independently confirmed the test
+counts, the opt-in legacy text path, the shared `elapsedPercent` helper, and the frame
+timing. **But neither went through the review loop.** That loop found real defects in most
+tasks this session, so review them before trusting them fully.
+
+## Deferred minors worth a sweep
+
+- **Dead code:** the `sprite` field on `KeySpec` and `getSprite` in `src/render/sprites.ts`
+  are now unused, because animation reuses `image`/`imageKey`. Task 22 left them rather than
+  edit files another agent held. Remove them.
 
 - `runAuthFlow` calls `closeAllConnections()` right after `res.end()`, which could truncate
   the browser's confirmation page. Close **after the response flushes** instead.
