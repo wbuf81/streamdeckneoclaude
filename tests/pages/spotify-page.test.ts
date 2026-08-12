@@ -37,7 +37,6 @@ function build(
     pause: async () => { calls.push('pause'); return true },
     next: async () => { calls.push('next'); return true },
     setVolume: async (p: number) => { calls.push(`volume:${p}`); return true },
-    toggleSaved: async () => { calls.push('toggleSaved'); return true },
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
   }
   return { page: new SpotifyPage(source as never), calls }
@@ -249,10 +248,13 @@ describe('SpotifyPage presses', () => {
     expect(calls).toContain('volume:60')
   })
 
-  it('calls toggleSaved on key 6', async () => {
+  it('does nothing on key 6 — the heart is display-only', async () => {
+    // Spotify 403s the save/unsave endpoint at the app level, even with the
+    // right scopes, so there is no toggle to call: `PlayerReader` no longer
+    // has one, and a press here must not throw or call anything.
     const { page, calls } = build(player())
     await page.onKeyPress(6)
-    expect(calls).toContain('toggleSaved')
+    expect(calls).toEqual([])
   })
 
   it('does nothing on any of the four album-art keys', async () => {

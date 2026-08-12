@@ -39,14 +39,14 @@ export interface PlayerReader {
   interpolate(now: number): PlayerState | null
   getStatus(): SpotifyStatus
   getArt(trackId: string, url: string | null): Image | null
-  /** True when saved, false when not, null when unknown. */
+  /** True when saved, false when not, null when unknown. Read-only: Spotify
+   * 403s the save/unsave endpoint at the app level regardless of scope, so
+   * there is no toggle — see `SpotifySource.isSaved`. */
   isSaved(): boolean | null
   play(): Promise<boolean>
   pause(): Promise<boolean>
   next(): Promise<boolean>
   setVolume(percent: number): Promise<boolean>
-  /** Toggles the saved state of the current track. Returns true on success. */
-  toggleSaved(): Promise<boolean>
   setVisible(visible: boolean): void
 }
 
@@ -121,9 +121,11 @@ export class SpotifyPage implements Page {
   }
 
   /**
-   * Key 6. Filled and red when saved, outline when not, and a dim outline
-   * when the saved state is unknown (not yet fetched, or the token lacks the
-   * library scopes). This is the one place colour earns its keep on this
+   * Key 6. Display-only: filled and red when saved, outline when not, and a
+   * dim outline when the saved state is unknown (the library has not
+   * loaded, or failed to). Spotify 403s the save/unsave endpoint at the app
+   * level even with the right scopes, so there is nothing a press could do
+   * — see `onKeyPress`. This is the one place colour earns its keep on this
    * page, because the art supplies everything else. There is no play count:
    * Spotify exposes none, and a locally-derived one would look like a
    * Spotify statistic without being one.
@@ -171,9 +173,6 @@ export class SpotifyPage implements Page {
       case 3:
         await this.source.next()
         return
-      case 6:
-        await this.source.toggleSaved()
-        return
       case 7:
         await this.source.setVolume(volume + VOLUME_STEP)
         return
@@ -181,7 +180,9 @@ export class SpotifyPage implements Page {
         // Keys 0, 1, 4 and 5 (the album art) do nothing, and so does any
         // other index. Previous-track, shuffle and repeat are gone: the
         // user named play/pause, next and favourite as what they use, and
-        // an unused key invites a misfire.
+        // an unused key invites a misfire. Key 6 (the heart) is display-only
+        // — Spotify 403s the save/unsave endpoint at the app level even with
+        // the right scopes, so a press there does nothing too.
         return
     }
   }

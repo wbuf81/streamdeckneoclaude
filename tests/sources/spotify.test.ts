@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { parsePlayer, pickArtUrl, SpotifySource } from '../../src/sources/spotify.js'
 import type { Tokens } from '../../src/sources/spotify-auth.js'
 import type { Image } from '@napi-rs/canvas'
+import { log } from '../../src/log.js'
 
 const PLAYER = {
   is_playing: true,
@@ -461,160 +462,147 @@ describe('SpotifySource.getArt', () => {
   })
 })
 
-describe('SpotifySource saved-track state', () => {
-  it('returns null (unknown) before any poll has happened', () => {
-    const { src } = build([{ status: 200, body: PLAYER }])
+/**
+ * Builds a `SpotifySource` whose `fetchFn` branches by URL rather than by
+ * call order, because `setVisible(true)` fires the player poll and the
+ * saved-library load concurrently, and their actual interleaving is an
+ * implementation detail this suite should not need to pin down. `/me/player`
+ * always answers with `PLAYER`. `/me/tracks?` (the bulk saved-library
+ * endpoint, distinct from the removed per-track `/me/tracks/contains` and
+ * `/me/tracks?ids=`) is served from `pages`, indexed by how many bulk calls
+ * have happened so far, so a test can hand it exactly the page sequence it
+ * wants to exercise.
+ */
+function buildSaved(pages: Array<{ status: number; body?: unknown; headers?: Record<string, string> }>) {
+  const calls: string[] = []
+  let bulkCalls = 0
+  const fetchFn = vi.fn(async (url: string) => {
+    calls.push(url)
+    if (url.includes('/me/player')) {
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        json: async () => PLAYER, arrayBuffer: async () => new ArrayBuffer(0),
+      }
+    }
+    const r = pages[Math.min(bulkCalls, pages.length - 1)]!
+    bulkCalls++
+    return {
+      ok: r.status >= 200 && r.status < 300,
+      status: r.status,
+      headers: { get: (k: string) => r.headers?.[k.toLowerCase()] ?? null },
+      json: async () => r.body ?? {},
+      arrayBuffer: async () => new ArrayBuffer(0),
+    }
+  })
+  const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
+  const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
+  return { src, fetchFn, calls, store }
+}
+
+describe('SpotifySource saved-library', () => {
+  it('does not load the saved library at construction — only setVisible(true) starts it', () => {
+    const { fetchFn } = buildSaved([{ status: 200, body: { items: [], total: 0 } }])
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('returns null before the saved library has loaded, then a boolean once it has', async () => {
+    const { src } = buildSaved([{ status: 200, body: { items: [{ track: { id: 'track-1' } }], total: 1 } }])
+    await src.poll() // Sets state.trackId. Polling alone never starts the bulk load.
     expect(src.isSaved()).toBeNull()
-  })
-
-  it('fetches the saved state once a poll reveals a track id', async () => {
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [true] },
-    ])
-    await src.poll()
-    expect(calls.some((c) => c.url.includes('/me/tracks/contains') && c.url.includes('track-1'))).toBe(true)
+    src.setVisible(true)
+    await new Promise((r) => setTimeout(r, 20))
     expect(src.isSaved()).toBe(true)
+    await src.stop()
   })
 
-  it('reads false when the API reports the track is not saved', async () => {
-    const { src } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [false] },
+  it('pages through the saved-library endpoint sequentially and builds the id set', async () => {
+    const { src, fetchFn } = buildSaved([
+      { status: 200, body: { items: [{ track: { id: 'track-1' } }, { track: { id: 'b' } }], total: 60 } },
+      { status: 200, body: { items: [{ track: { id: 'c' } }], total: 60 } },
     ])
-    await src.poll()
-    expect(src.isSaved()).toBe(false)
-  })
-
-  it('does not re-fetch the saved state on a poll that keeps the same track', async () => {
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [true] },
-      { status: 200, body: PLAYER },
-    ])
-    await src.poll()
-    const containsCallsAfterFirst = calls.filter((c) => c.url.includes('/me/tracks/contains')).length
-    expect(containsCallsAfterFirst).toBe(1)
-    await src.poll() // Same track id. Must not fetch /me/tracks/contains again.
-    const containsCallsAfterSecond = calls.filter((c) => c.url.includes('/me/tracks/contains')).length
-    expect(containsCallsAfterSecond).toBe(1)
-  })
-
-  it('re-fetches the saved state when the track id changes', async () => {
-    const track2 = { ...PLAYER, item: { ...PLAYER.item, id: 'track-2' } }
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [true] },
-      { status: 200, body: track2 },
-      { status: 200, body: [false] },
-    ])
-    await src.poll()
+    src.setVisible(true)
+    await new Promise((r) => setTimeout(r, 20))
+    const bulkCalls = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
+    expect(bulkCalls).toBe(2)
+    // 'track-1' (PLAYER's trackId) is in the first page, 'b' and 'c' are not
+    // the current track but prove the set spans both pages.
     expect(src.isSaved()).toBe(true)
-    await src.poll()
-    expect(src.isSaved()).toBe(false)
-    const containsCalls = calls.filter((c) => c.url.includes('/me/tracks/contains'))
-    expect(containsCalls).toHaveLength(2)
+    await src.stop()
   })
 
-  it('sets isSaved to null and logs once, without retrying, on a 403', async () => {
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 403 },
+  it('fetches saved-library pages sequentially, never in parallel', async () => {
+    const order: string[] = []
+    let resolveFirstPage!: (v: unknown) => void
+    const fetchFn = vi.fn((url: string) => {
+      if (url.includes('/me/player')) {
+        return Promise.resolve({
+          ok: true, status: 200, headers: { get: () => null },
+          json: async () => PLAYER, arrayBuffer: async () => new ArrayBuffer(0),
+        })
+      }
+      order.push(url)
+      if (order.length === 1) {
+        // The first page never resolves until the test says so below.
+        return new Promise((resolve) => { resolveFirstPage = resolve })
+      }
+      return Promise.resolve({
+        ok: true, status: 200, headers: { get: () => null },
+        json: async () => ({ items: [], total: 0 }), arrayBuffer: async () => new ArrayBuffer(0),
+      })
+    })
+    const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
+    const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
+
+    src.setVisible(true)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(order).toHaveLength(1) // The second page must not be requested while the first is still pending.
+
+    resolveFirstPage({
+      ok: true, status: 200, headers: { get: () => null },
+      json: async () => ({ items: [{ track: { id: 'x' } }], total: 60 }),
+      arrayBuffer: async () => new ArrayBuffer(0),
+    })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(order).toHaveLength(2) // Only after the first resolves does the second fire.
+    await src.stop()
+  })
+
+  it('leaves the saved state unknown and logs exactly once, without retrying, on a 403', async () => {
+    const onceSpy = vi.spyOn(log, 'once')
+    try {
+      const { src, fetchFn } = buildSaved([{ status: 403 }])
+      src.setVisible(true)
+      await new Promise((r) => setTimeout(r, 20))
+      expect(src.isSaved()).toBeNull()
+      const bulkCalls = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
+      expect(bulkCalls).toBe(1) // Never retried.
+      expect(onceSpy).toHaveBeenCalledTimes(1)
+      expect(onceSpy.mock.calls[0]![0]).toBe('spotify-saved-scope')
+      await src.stop()
+    } finally {
+      onceSpy.mockRestore()
+    }
+  })
+
+  it('loads the saved library only once, even across several visibility toggles', async () => {
+    const { src, fetchFn } = buildSaved([
+      { status: 200, body: { items: [{ track: { id: 'track-1' } }], total: 1 } },
     ])
-    await src.poll()
-    expect(src.isSaved()).toBeNull()
-    const containsCalls = calls.filter((c) => c.url.includes('/me/tracks/contains'))
-    expect(containsCalls).toHaveLength(1) // Never retried.
-  })
+    src.setVisible(true)
+    await new Promise((r) => setTimeout(r, 20))
+    const afterFirst = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
+    expect(afterFirst).toBe(1)
 
-  it('does not retry a 403 across repeated polls for the same track', async () => {
-    const track2 = { ...PLAYER, item: { ...PLAYER.item, id: 'track-2' } }
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 403 },
-      { status: 200, body: PLAYER }, // same track id again
-    ])
-    await src.poll()
-    await src.poll()
-    const containsCalls = calls.filter((c) => c.url.includes('/me/tracks/contains'))
-    expect(containsCalls).toHaveLength(1) // Same track: never re-fetched, 403 or not.
-    void track2
-  })
-
-  it('refreshes once on a 401 from the saved-state check, then retries', async () => {
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 401 },
-      { status: 200, body: { access_token: 'new', expires_in: 3600 } },
-      { status: 200, body: [true] },
-    ])
-    await src.poll()
-    expect(src.isSaved()).toBe(true)
-    expect(calls.some((c) => c.url.includes('/api/token'))).toBe(true)
-  })
-})
-
-describe('SpotifySource.toggleSaved', () => {
-  it('sends a PUT and flips the cached state to true when currently unsaved', async () => {
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [false] },
-      { status: 200 },
-    ])
-    await src.poll()
-    expect(src.isSaved()).toBe(false)
-    expect(await src.toggleSaved()).toBe(true)
-    expect(src.isSaved()).toBe(true)
-    const last = calls[calls.length - 1]!
-    expect(last.method).toBe('PUT')
-    expect(last.url).toContain('/me/tracks')
-    expect(last.url).toContain('track-1')
-  })
-
-  it('sends a DELETE and flips the cached state to false when currently saved', async () => {
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [true] },
-      { status: 200 },
-    ])
-    await src.poll()
-    expect(src.isSaved()).toBe(true)
-    expect(await src.toggleSaved()).toBe(true)
-    expect(src.isSaved()).toBe(false)
-    const last = calls[calls.length - 1]!
-    expect(last.method).toBe('DELETE')
-  })
-
-  it('emits change immediately after a successful toggle, without waiting for the next poll', async () => {
-    const { src } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [false] },
-      { status: 200 },
-    ])
-    await src.poll()
-    const changed = new Promise<void>((resolve) => src.once('change', resolve))
-    await src.toggleSaved()
-    await changed // Resolves synchronously if `change` already fired.
-  })
-
-  it('does nothing and returns false when there is no current track', async () => {
-    const src = new SpotifySource(
-      'cid', { load: () => tokens(), save: vi.fn(), clear: vi.fn() } as never,
-    )
-    expect(await src.toggleSaved()).toBe(false)
-  })
-
-  it('reports false and sets isSaved to null on a 403, without retrying', async () => {
-    const { src, calls } = build([
-      { status: 200, body: PLAYER },
-      { status: 200, body: [false] },
-      { status: 403 },
-    ])
-    await src.poll()
-    expect(await src.toggleSaved()).toBe(false)
-    expect(src.isSaved()).toBeNull()
-    const toggleCalls = calls.filter((c) => c.method === 'PUT' && c.url.includes('/me/tracks') && !c.url.includes('contains'))
-    expect(toggleCalls).toHaveLength(1) // Never retried.
+    src.setVisible(false)
+    src.setVisible(true)
+    src.setVisible(false)
+    src.setVisible(true)
+    await new Promise((r) => setTimeout(r, 20))
+    const afterMore = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
+    expect(afterMore).toBe(1) // Never re-fetched.
+    await src.stop()
   })
 })
 
@@ -635,13 +623,16 @@ describe('SpotifySource stop() during an in-flight poll', () => {
     const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
     const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
 
-    src.setVisible(true) // Starts a poll. It blocks on the unresolved fetch.
+    src.setVisible(true) // Starts a poll AND the one-time saved-library load.
     // `accessToken()` resolves through a couple of microtask ticks before
-    // `pollInner` reaches the fetch call. Flush those first.
+    // either reaches its fetch call. Flush those first.
     await Promise.resolve()
     await Promise.resolve()
     await Promise.resolve()
-    expect(fetchFn).toHaveBeenCalledTimes(1)
+    // Two callers, both blocked on the same unresolved fetch: the player
+    // poll, and the saved-library load that `setVisible(true)` also starts
+    // on the very first visit.
+    expect(fetchFn).toHaveBeenCalledTimes(2)
 
     await src.stop() // stop() runs while that poll is still in flight.
 

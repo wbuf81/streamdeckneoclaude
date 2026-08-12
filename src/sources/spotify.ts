@@ -17,6 +17,9 @@ const ART_CACHE_MAX = 200
 const ART_RETRY_COOLDOWN_SECONDS = 60
 /** The API needs a moment to settle after a command, so poll again shortly. */
 const SETTLE_MS = 300
+/** Page size for the one-time saved-library load. 946 saved tracks is 19
+ * requests at this size. */
+const SAVED_LIBRARY_PAGE_SIZE = 50
 
 export type RepeatMode = 'off' | 'context' | 'track'
 export type SpotifyStatus = 'ok' | 'unauthorized' | 'offline' | 'no-device'
@@ -97,6 +100,11 @@ interface Store {
   clear(): void
 }
 
+interface SavedLibraryPage {
+  items: unknown[]
+  total: number
+}
+
 /**
  * Reads and controls Spotify playback. It polls only while the page is
  * visible, and it advances the playback position locally between polls, so a
@@ -121,13 +129,21 @@ export class SpotifySource extends EventEmitter {
   /** Track ids whose last attempt failed (or had no URL), mapped to the
    * earliest time (in `now()` seconds) a retry is allowed. */
   private artRetryAt = new Map<string, number>()
-  /** The track id the saved-state check was last run for. Lets a poll tell a
-   * track CHANGE apart from a poll that just repeats the same track, so the
-   * rate-limited saved-state endpoint is hit once per track, not once per poll. */
-  private savedTrackId: string | null = null
-  /** True when saved, false when not, null when unknown (not yet fetched, or
-   * the token lacks the library scopes). */
-  private saved: boolean | null = null
+  /**
+   * The user's entire saved-tracks library, loaded once. `null` means
+   * unknown: not yet loaded, or the one load attempt failed. There is no
+   * per-track lookup — Spotify's app-level restriction returns 403 on both
+   * `GET /v1/me/tracks/contains` and `PUT /v1/me/tracks`, confirmed against
+   * the live API with a token that DID carry the library scopes, so no
+   * amount of retrying or re-authorizing unblocks them. `GET /v1/me/tracks`
+   * (the bulk list) works, so the heart is read-only, backed by a single
+   * paged load of this set.
+   */
+  private savedIds: Set<string> | null = null
+  /** True once a saved-library load has been started, successful or not, so
+   * it is attempted at most once per process — never on a timer, and never
+   * retried after a failure. */
+  private savedIdsAttempted = false
 
   constructor(
     private readonly clientId: string,
@@ -164,11 +180,20 @@ export class SpotifySource extends EventEmitter {
     return this.retryAfter
   }
 
-  /** Called when the Spotify page becomes visible. It starts the poll loop. */
+  /** Called when the Spotify page becomes visible. It starts the poll loop,
+   * and on the FIRST visit only, starts the one-time saved-library load. */
   setVisible(visible: boolean): void {
     this.visible = visible
     if (visible) {
       this.stopped = false
+      // Lazy: a session that never opens this page costs zero requests for
+      // this. Once-only: the flag is set before the load even starts, so a
+      // second `setVisible(true)` — even while the first load is still in
+      // flight — can never start a second one, success or failure.
+      if (!this.savedIdsAttempted) {
+        this.savedIdsAttempted = true
+        void this.loadSavedIds()
+      }
       void this.poll().then(() => this.schedule())
     } else if (this.timer) {
       clearTimeout(this.timer)
@@ -267,8 +292,6 @@ export class SpotifySource extends EventEmitter {
     if (res.status === 204) {
       this.state = null
       this.status = 'no-device'
-      this.savedTrackId = null
-      this.saved = null
       return
     }
 
@@ -281,131 +304,110 @@ export class SpotifySource extends EventEmitter {
     this.state = parsed
     this.status = parsed ? 'ok' : 'no-device'
     this.polledAt = this.now()
-
-    if (!parsed) {
-      this.savedTrackId = null
-      this.saved = null
-      return
-    }
-    // The saved-state endpoint is rate-limited and does not drift on its
-    // own, so fetch it only when the track CHANGES, never on every poll.
-    if (parsed.trackId && parsed.trackId !== this.savedTrackId) {
-      this.savedTrackId = parsed.trackId
-      this.saved = null
-      await this.fetchSaved(parsed.trackId)
-    }
   }
 
-  /** True when saved, false when not, null when unknown or unfetched. */
+  /**
+   * True when the current track is in the saved-tracks library, false when
+   * it is not, null when the library set has not loaded (or failed to
+   * load). This is a LOCAL membership check against `savedIds` — no
+   * network call per track, and no per-track lookup at all, because
+   * Spotify's app-level restriction 403s that endpoint regardless of scope.
+   */
   isSaved(): boolean | null {
-    return this.saved
+    if (!this.savedIds) return null
+    const trackId = this.state?.trackId
+    if (!trackId) return null
+    return this.savedIds.has(trackId)
   }
 
-  /** Reads `/me/tracks/contains` for one track. Refreshes once on a 401 and
-   * retries. A 403 means the token lacks the library scopes: report it once
-   * and leave `saved` at null, with no retry, because a 403 never resolves
-   * itself and this endpoint is rate-limited. */
-  private async fetchSaved(trackId: string, retried = false): Promise<void> {
+  /**
+   * Pages through the entire saved-tracks library exactly once and builds
+   * the id set. Requests are sequential, never parallel — a burst of ~19
+   * requests against a rate-limited API, right when the user first opens
+   * the page, is exactly the kind of storm this project has already been
+   * bitten by once (see `artRetryAt`). Any failure — offline, a 429, or a
+   * 403 — aborts the WHOLE load and leaves `savedIds` at null (unknown).
+   * There is no retry: a 403 here is Spotify's app-level restriction on
+   * this endpoint, confirmed present even with the correct scopes, so it
+   * will never resolve itself, and `setVisible` already guarantees this
+   * method itself is never called a second time.
+   */
+  private async loadSavedIds(): Promise<void> {
+    const ids = new Set<string>()
+    let offset = 0
+    for (;;) {
+      const page = await this.fetchSavedPage(offset)
+      if (!page) return
+      for (const item of page.items) {
+        const id = (item as { track?: { id?: unknown } } | null)?.track?.id
+        if (typeof id === 'string' && id) ids.add(id)
+      }
+      offset += SAVED_LIBRARY_PAGE_SIZE
+      if (page.items.length === 0 || offset >= page.total) break
+    }
+    this.savedIds = ids
+    this.emit('change')
+  }
+
+  /** Fetches one page of `/me/tracks`. Refreshes once on a 401 and retries.
+   * A 429 or 403 aborts (returns null) rather than retrying: a 429 here
+   * follows the same `retryAfter` bookkeeping the player poll uses, and a
+   * 403 means the app-level restriction described on `isSaved`, which no
+   * amount of retrying resolves. */
+  private async fetchSavedPage(offset: number, retried = false): Promise<SavedLibraryPage | null> {
     const token = await this.accessToken()
-    if (!token) return
+    if (!token) return null
 
     let res
     try {
-      res = await this.fetchFn(`${API}/me/tracks/contains?ids=${trackId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
+      res = await this.fetchFn(
+        `${API}/me/tracks?limit=${SAVED_LIBRARY_PAGE_SIZE}&offset=${offset}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      )
     } catch (e) {
-      log.once('spotify-saved-offline', `spotify saved-track check failed: ${String(e)}`)
-      return
+      log.once('spotify-saved-offline', `spotify saved-library load failed: ${String(e)}`)
+      return null
     }
 
     if (res.status === 401) {
-      if (retried) return
+      if (retried) return null
       const t = this.store.load()
-      if (!t) return
+      if (!t) return null
       const fresh = await this.doRefresh(t)
-      if (!fresh) return
-      return this.fetchSaved(trackId, true)
+      if (!fresh) return null
+      return this.fetchSavedPage(offset, true)
+    }
+
+    if (res.status === 429) {
+      this.retryAfter = Number.parseInt(res.headers.get('retry-after') ?? '5', 10) || 5
+      log.once(
+        'spotify-saved-rate-limited',
+        `spotify saved-library load rate limited. Waiting ${this.retryAfter} seconds.`,
+      )
+      return null
     }
 
     if (res.status === 403) {
       log.once(
         'spotify-saved-scope',
-        'spotify saved-track check got 403: the token lacks user-library-read',
+        'spotify saved-library load got 403; leaving the saved-track state unknown',
       )
-      this.saved = null
-      return
+      return null
     }
 
-    if (!res.ok) return
-
-    const body = await res.json()
-    this.saved = Array.isArray(body) ? body[0] === true : null
-  }
-
-  /**
-   * Toggles the saved state of the current track. Returns true on success.
-   * Updates the cached value immediately on success, so the heart on the
-   * page responds at once rather than waiting for the next poll, and emits
-   * `change`. A 403 means the token lacks the library scopes: report it once,
-   * leave the cache at null, and do NOT retry — retrying a 403 would be a
-   * request storm against a rate-limited API, and it will never succeed
-   * until the user re-authorizes.
-   */
-  async toggleSaved(): Promise<boolean> {
-    const trackId = this.state?.trackId
-    if (!trackId) return false
-    return this.doToggleSaved(trackId, !(this.saved ?? false))
-  }
-
-  private async doToggleSaved(
-    trackId: string,
-    nextSaved: boolean,
-    retried = false,
-  ): Promise<boolean> {
-    const token = await this.accessToken()
-    if (!token) return false
-
-    let res
-    try {
-      res = await this.fetchFn(`${API}/me/tracks?ids=${trackId}`, {
-        method: nextSaved ? 'PUT' : 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-      })
-    } catch (e) {
-      log.once('spotify-toggle-offline', `spotify save toggle failed: ${String(e)}`)
-      return false
-    }
-
-    if (res.status === 401) {
-      if (retried) {
-        this.status = 'unauthorized'
-        return false
-      }
-      const t = this.store.load()
-      if (!t) {
-        this.status = 'unauthorized'
-        return false
-      }
-      const fresh = await this.doRefresh(t)
-      if (!fresh) return false
-      return this.doToggleSaved(trackId, nextSaved, true)
-    }
-
-    if (res.status === 403) {
+    if (!res.ok) {
       log.once(
-        'spotify-toggle-scope',
-        'spotify save toggle got 403: the token lacks user-library-modify',
+        'spotify-saved-load-failed',
+        `spotify saved-library load failed with status ${res.status}`,
       )
-      this.saved = null
-      return false
+      return null
     }
 
-    if (!res.ok) return false
-
-    this.saved = nextSaved
-    this.emit('change')
-    return true
+    const body = (await res.json()) as { items?: unknown[]; total?: unknown }
+    return {
+      items: Array.isArray(body.items) ? body.items : [],
+      total: typeof body.total === 'number' ? body.total : 0,
+    }
   }
 
   /**

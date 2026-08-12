@@ -1,4 +1,4 @@
-import { createServer } from 'node:http'
+import { createServer, type Server } from 'node:http'
 import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, chmodSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -134,6 +134,22 @@ export async function refreshTokens(
   return parseTokenResponse(await postForm(body), refreshToken, now())
 }
 
+/**
+ * Closes the loopback server AND destroys any connections already open on
+ * it. `close()` alone only stops the server accepting NEW connections — an
+ * EXISTING one (the browser's keep-alive socket on the callback response)
+ * stays open and keeps the event loop alive. Measured on the live process
+ * with `lsof`: after a successful authorization, the browser held an
+ * `ESTABLISHED` socket back to this server long after `close()` ran, so the
+ * process never exited on its own. `closeAllConnections()` (Node 18.2+)
+ * destroys it immediately, on every settle path: success, error, state
+ * mismatch, bind failure, and timeout.
+ */
+function closeServer(server: Server): void {
+  server.close()
+  server.closeAllConnections()
+}
+
 /** Opens the URL in the default browser, macOS-style. A failed open is fine, because the URL is also printed to the terminal. */
 function defaultOpenUrl(url: string): void {
   execFile('/usr/bin/open', [url], () => {
@@ -182,41 +198,45 @@ export async function runAuthFlow(
     const server = createServer((req, res) => {
       const requested = new URL(req.url ?? '/', `http://127.0.0.1:${port}`)
       if (requested.pathname !== '/callback') {
-        res.writeHead(404).end()
+        // `Connection: close` on every response, including this one, tells
+        // the browser not to keep this socket open — otherwise it can
+        // outlive `closeServer()` below and hold the event loop.
+        res.writeHead(404, { Connection: 'close' }).end()
         return
       }
       const err = requested.searchParams.get('error')
       const gotCode = requested.searchParams.get('code')
       const gotState = requested.searchParams.get('state')
 
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', Connection: 'close' })
       if (err || !gotCode) {
         res.end('<h1>Authorization failed</h1><p>Return to the terminal.</p>')
         clearTimeout(timer)
-        server.close()
+        closeServer(server)
         reject(new Error(`authorization failed: ${err ?? 'no code'}`))
         return
       }
       if (gotState !== state) {
         res.end('<h1>State mismatch</h1><p>Return to the terminal.</p>')
         clearTimeout(timer)
-        server.close()
+        closeServer(server)
         reject(new Error('state mismatch. The callback did not match the request.'))
         return
       }
       res.end('<h1>deckd is connected</h1><p>You can close this tab.</p>')
       clearTimeout(timer)
-      server.close()
+      closeServer(server)
       resolve(gotCode)
     })
     server.on('error', (e) => {
       // A bind failure (e.g. `EADDRINUSE`) settles the promise too, and a
       // pending timer would otherwise keep the process alive after it does.
       clearTimeout(timer)
+      closeServer(server)
       reject(e)
     })
     timer = setTimeout(() => {
-      server.close()
+      closeServer(server)
       reject(new Error('authorization timed out after 5 minutes'))
     }, timeoutMs)
     server.listen(port, '127.0.0.1', () => {

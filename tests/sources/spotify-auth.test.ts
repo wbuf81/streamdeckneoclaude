@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, statSync, existsSync, writeFileSync, mkdirSync } f
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
+import { connect as netConnect, type Socket } from 'node:net'
 import {
   TokenStore, makeVerifier, challengeFor, buildAuthUrl, runAuthFlow,
   SCOPES, REDIRECT_URI, AUTH_PORT, parseTokenResponse,
@@ -203,5 +204,75 @@ describe('runAuthFlow', () => {
       setSpy.mockRestore()
       clearSpy.mockRestore()
     }
+  })
+
+  // Regression test for: after the timer fix above, the process STILL did
+  // not exit after a successful authorization. `lsof` on the live process
+  // showed the browser's connection to the loopback server as ESTABLISHED
+  // long after the flow resolved — `server.close()` stops the server
+  // accepting NEW connections but does not touch an EXISTING one, so the
+  // browser's keep-alive socket kept the event loop alive on its own,
+  // independent of the timer.
+  //
+  // This drives a raw `net` socket standing in for the browser, rather than
+  // `fetch`, because a real `fetch()` client may reuse a keep-alive agent
+  // under the hood and mask exactly this leak. The socket never calls
+  // `.end()` on itself — only the SERVER may close it, which is the thing
+  // that was missing. Uses the same fakes as the test above: an
+  // OS-assigned port (0) and injected `openUrl`/`fetchFn`, so this never
+  // binds 8888 and never makes a real request to Spotify.
+  it('destroys the browser-side socket and stops listening once authorization succeeds, so nothing keeps the process alive', async () => {
+    const fetchFn = vi.fn(async () => ({
+      json: async () => ({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 }),
+    })) as unknown as typeof fetch
+
+    let port = 0
+    let clientSocket: Socket | undefined
+    let socketClosed = false
+
+    const tokens = await runAuthFlow('cid', {
+      port: 0,
+      fetchFn,
+      onListening: (p) => { port = p },
+      openUrl: (url) => {
+        const state = new URL(url).searchParams.get('state')
+        clientSocket = netConnect(port, '127.0.0.1', () => {
+          clientSocket!.write(
+            `GET /callback?code=testcode&state=${state} HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${port}\r\n` +
+            `Connection: keep-alive\r\n\r\n`,
+          )
+        })
+        // A Node Socket starts in paused mode: with no `data` listener (and
+        // no `.resume()`), it never drains, so `end` — and therefore
+        // `close` — would never fire even once the server sends its FIN.
+        // `resume()` puts it in flowing mode so this test observes the
+        // close the server actually performs, rather than an artifact of
+        // an unread stream.
+        clientSocket.resume()
+        clientSocket.on('close', () => { socketClosed = true })
+      },
+    })
+
+    expect(tokens).toEqual({ accessToken: 'at', refreshToken: 'rt', expiresAt: expect.any(Number) })
+
+    // Socket teardown is a network event, one tick removed from the promise
+    // resolving above. Before the fix, this would still be false a full
+    // second later — the socket was never destroyed, just abandoned.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(socketClosed).toBe(true)
+    expect(clientSocket?.destroyed).toBe(true)
+
+    // The listener itself must also be gone: a fresh connection to the same
+    // port must be refused, not accepted, proving `server.close()` (the
+    // "stop taking new connections" half) also ran on this path.
+    await new Promise<void>((resolve, reject) => {
+      const probe = netConnect(port, '127.0.0.1')
+      probe.on('connect', () => {
+        probe.destroy()
+        reject(new Error('the port is still accepting connections after authorization succeeded'))
+      })
+      probe.on('error', () => resolve()) // ECONNREFUSED is the expected, healthy outcome.
+    })
   })
 })
