@@ -1318,7 +1318,7 @@ import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, chmodSync } from 'node:fs'
 
 async function start(): Promise<void> {
   ensureStateDir()
@@ -1886,9 +1886,17 @@ async function authSpotify(): Promise<void> {
   }
   const tokens = await runAuthFlow(clientId)
   new TokenStore().save(tokens)
-  writeFileSync(paths.configFile, JSON.stringify({ spotify: { clientId } }, null, 2), {
-    mode: 0o600,
-  })
+  // Merge, do not overwrite. The config file may already hold other settings,
+  // and a wholesale write would silently drop them.
+  let config: Record<string, any> = {}
+  try {
+    config = JSON.parse(readFileSync(paths.configFile, 'utf8'))
+  } catch {
+    // No config yet, or it is unreadable. Start from an empty object.
+  }
+  config.spotify = { ...(config.spotify ?? {}), clientId }
+  writeFileSync(paths.configFile, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
+  chmodSync(paths.configFile, 0o600)
   console.log('Spotify is connected. Restart deckd to pick it up.')
 }
 
@@ -1910,9 +1918,15 @@ Add to the switch:
 ```ts
   case 'auth':
     if (process.argv[3] === 'spotify') {
-      void authSpotify()
+      // Catch the rejection. The flow can time out, or the callback state can
+      // mismatch, and an unhandled rejection would print a stack trace instead
+      // of the reason.
+      authSpotify().catch((e) => {
+        console.error(String(e))
+        process.exit(1)
+      })
     } else {
-      console.error('usage: deckd auth spotify --client-id <ID>')
+      console.error('usage: deckd auth spotify')
       process.exit(2)
     }
     break
@@ -3217,6 +3231,27 @@ const run = promisify(execFile)
 /** Marks a wrapped statusline, so install and uninstall recognise their work. */
 export const WRAPPER_MARKER = '# deckd-wrapped'
 
+/**
+ * Finds the project root, the directory that holds `package.json`. Two reasons
+ * this cannot use the module's own directory or `process.cwd()`:
+ *
+ *   1. `tsc` compiles `.ts` and does NOT copy `.sh`, so the wrapper script never
+ *      appears next to the compiled `install.js`. It only exists in the source
+ *      tree at `src/install/statusline-wrapper.sh`.
+ *   2. This module sits at `src/install/` under `tsx` and at `dist/src/install/`
+ *      after a build, so a fixed number of parent steps is wrong for one of them.
+ */
+export function projectRoot(): string | null {
+  let dir = import.meta.dirname
+  for (let i = 0; i < 6; i++) {
+    if (existsSync(join(dir, 'package.json'))) return dir
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return null
+}
+
 export function buildPlist(
   label: string,
   nodePath: string,
@@ -3318,7 +3353,12 @@ export async function install(): Promise<void> {
 
   // 1. Copy the wrapper into the state directory, so an uninstalled repo
   //    cannot break the statusline.
-  const wrapperSrc = join(dirname(new URL(import.meta.url).pathname), 'statusline-wrapper.sh')
+  const root = projectRoot()
+  if (!root) throw new Error('cannot find the project root. Run install from the repository.')
+  const wrapperSrc = join(root, 'src', 'install', 'statusline-wrapper.sh')
+  if (!existsSync(wrapperSrc)) {
+    throw new Error(`wrapper script missing: ${wrapperSrc}`)
+  }
   const wrapperDst = join(paths.stateDir, 'statusline-wrapper.sh')
   copyFileSync(wrapperSrc, wrapperDst)
   chmodSync(wrapperDst, 0o755)
@@ -3341,7 +3381,7 @@ export async function install(): Promise<void> {
   changed.push(`wrapped statusLine in ${paths.claudeSettings}`)
 
   // 3. Write and load the launchd agent.
-  const script = join(process.cwd(), 'dist', 'bin', 'deckd.js')
+  const script = join(root, 'dist', 'bin', 'deckd.js')
   if (!existsSync(script)) {
     throw new Error(`build first: ${script} does not exist. Run npm run build.`)
   }
