@@ -3,8 +3,10 @@ import { Device, DeviceBusyError } from '../src/device.js'
 import { Daemon } from '../src/daemon.js'
 import { PageManager } from '../src/page-manager.js'
 import { ClaudePage } from '../src/pages/claude-page.js'
+import { SpotifyPage } from '../src/pages/spotify-page.js'
 import { ClaudeSource } from '../src/sources/claude.js'
 import { UsageSource } from '../src/sources/usage.js'
+import { SpotifySource } from '../src/sources/spotify.js'
 import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
@@ -22,13 +24,21 @@ async function start(): Promise<void> {
 
   const claude = new ClaudeSource()
   const usage = new UsageSource()
+  const clientId = readClientId()
+  const spotify = new SpotifySource(clientId)
   await claude.start()
   await usage.start()
+  await spotify.start()
 
   const device = new Device()
   const pages = new PageManager()
   pages.add(new ClaudePage(claude, usage, focusWindow))
+  pages.add(new SpotifyPage(spotify))
 
+  // Only now, with both pages present, may a saved index of 1 be restored.
+  // `PageManager.setIndex` silently ignores an index outside the current
+  // page count, so restoring before the Spotify page exists would strand
+  // the deck on the Claude page with no error and no log line.
   restorePage(pages)
 
   const daemon = new Daemon(device, pages)
@@ -45,6 +55,7 @@ async function start(): Promise<void> {
   // A source change redraws at once, rather than at the next tick.
   claude.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
   usage.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
+  spotify.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
 
   const shutdown = async () => {
     log.info('deckd stopping')
@@ -52,6 +63,7 @@ async function start(): Promise<void> {
     await daemon.stop()
     await claude.stop()
     await usage.stop()
+    await spotify.stop()
     await device.disconnect()
     process.exit(0)
   }
