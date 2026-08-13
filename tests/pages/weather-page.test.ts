@@ -45,6 +45,7 @@ interface Fakes {
   status: WeatherStatus
   place: string
   stale: boolean
+  updatedAt: number
 }
 
 function build(over: Partial<Fakes> = {}) {
@@ -54,6 +55,7 @@ function build(over: Partial<Fakes> = {}) {
     status: 'ok',
     place: 'Brooklyn FL',
     stale: false,
+    updatedAt: NOW - 3600,
     ...over,
   }
   const calls: string[] = []
@@ -61,6 +63,7 @@ function build(over: Partial<Fakes> = {}) {
     getDays: () => f.days,
     getConditions: () => f.conditions,
     getStatus: () => f.status,
+    getLastUpdatedAt: () => f.updatedAt,
     getPlace: () => f.place,
     isStale: () => f.stale,
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
@@ -427,6 +430,22 @@ describe('WeatherPage strip', () => {
   it('shows offline on line 2 when the source is offline', () => {
     const { page } = build({ status: 'offline' })
     expect(page.render(NOW).strip.lines[1]).toBe('offline')
+  })
+
+  it('shows the last successful fetch time, not the current render time', () => {
+    const updatedAt = NOW - 3600
+    const expected = new Intl.DateTimeFormat('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(updatedAt * 1000))
+    const { page } = build({ updatedAt })
+    expect(page.render(NOW).strip.lines[1]).toBe(`updated ${expected}`)
+  })
+
+  it('shows an unknown update time before the first successful fetch', () => {
+    const { page } = build({ status: 'empty', days: [], updatedAt: 0 })
+    expect(page.render(NOW).strip.lines[1]).toBe('updated --')
   })
 
   it('keeps both strip lines within 30 characters', () => {

@@ -100,6 +100,15 @@ describe('PageManager', () => {
     expect(m.current().name).toBe('b')
   })
 
+  it('finds and selects a page by its stable name', () => {
+    const m = new PageManager()
+    m.add(fakePage('claude'))
+    m.add(fakePage('codex'))
+    expect(m.indexOf('codex')).toBe(1)
+    m.setByName('codex')
+    expect(m.current().name).toBe('codex')
+  })
+
   it("exposes the current page's own tickMs, unset by default", () => {
     const m = new PageManager()
     m.add(fakePage('a'))

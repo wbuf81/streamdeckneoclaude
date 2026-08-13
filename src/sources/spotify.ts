@@ -176,7 +176,7 @@ export class SpotifySource extends EventEmitter {
     this.visible = visible
     if (visible) {
       this.stopped = false
-      void this.poll().then(() => this.schedule())
+      void this.pollAndSchedule()
     } else if (this.timer) {
       clearTimeout(this.timer)
       this.timer = null
@@ -194,8 +194,21 @@ export class SpotifySource extends EventEmitter {
     const base = this.state?.isPlaying ? POLL_PLAYING_MS : POLL_IDLE_MS
     const delay = Math.max(base, this.retryAfter * 1000)
     this.timer = setTimeout(() => {
-      void this.poll().then(() => this.schedule())
+      void this.pollAndSchedule()
     }, delay)
+  }
+
+  /** Keeps the visibility poll loop alive even after an unexpected failure. */
+  private async pollAndSchedule(): Promise<void> {
+    try {
+      await this.poll()
+      log.clearOnce('spotify-poll-unexpected')
+    } catch (e) {
+      log.once('spotify-poll-unexpected', `spotify poll failed unexpectedly: ${String(e)}`)
+      this.status = 'offline'
+    } finally {
+      this.schedule()
+    }
   }
 
   private async accessToken(): Promise<string | null> {
@@ -229,6 +242,7 @@ export class SpotifySource extends EventEmitter {
     try {
       const fresh = await refreshTokens(this.clientId, t.refreshToken, this.now)
       this.store.save(fresh)
+      log.clearOnce('spotify-refresh-failed')
       return fresh.accessToken
     } catch (e) {
       // This runs from the poll loop, so a persistent auth problem must not
@@ -263,6 +277,7 @@ export class SpotifySource extends EventEmitter {
       this.status = 'offline'
       return
     }
+    log.clearOnce('spotify-offline')
 
     if (res.status === 401) {
       if (retried) {
@@ -286,6 +301,7 @@ export class SpotifySource extends EventEmitter {
       log.once('spotify-rate-limited', `spotify rate limited. Waiting ${this.retryAfter} seconds.`)
       return
     }
+    log.clearOnce('spotify-rate-limited')
     this.retryAfter = 0
 
     if (res.status === 204) {
@@ -299,7 +315,16 @@ export class SpotifySource extends EventEmitter {
       return
     }
 
-    const parsed = parsePlayer(await res.json())
+    let body: unknown
+    try {
+      body = await res.json()
+      log.clearOnce('spotify-player-json')
+    } catch (e) {
+      log.once('spotify-player-json', `spotify player response is not valid JSON: ${String(e)}`)
+      this.status = 'offline'
+      return
+    }
+    const parsed = parsePlayer(body)
     this.state = parsed
     this.status = parsed ? 'ok' : 'no-device'
     this.polledAt = this.now()
@@ -360,12 +385,17 @@ export class SpotifySource extends EventEmitter {
         return false
       }
       if (!res.ok) return false
+      log.clearOnce('spotify-control-offline')
       // The API needs a moment to settle, so poll again shortly. Only while
       // the page is visible, and only after clearing any prior one, so this
       // never grows into more than one outstanding timer.
       if (this.settleTimer) clearTimeout(this.settleTimer)
       if (this.visible) {
-        this.settleTimer = setTimeout(() => void this.poll(), SETTLE_MS)
+        this.settleTimer = setTimeout(() => {
+          void this.poll().catch((e) => {
+            log.once('spotify-poll-unexpected', `spotify poll failed unexpectedly: ${String(e)}`)
+          })
+        }, SETTLE_MS)
       }
       return true
     } catch (e) {

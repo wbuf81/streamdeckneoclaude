@@ -28,6 +28,8 @@ vi.mock('node:fs', async (importOriginal) => {
 import {
   buildPlist, wrapStatusLine, unwrapStatusLine, recoverStatusLine, isInstalled, verifyWrap,
   writeAtomic, describeStatusLineOutcome,
+  snapshotFile, restoreFile,
+  parseSettingsObject,
   WRAPPER_MARKER,
 } from '../../src/install/install.js'
 
@@ -437,6 +439,56 @@ describe('writeAtomic', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('install file rollback', () => {
+  it('restores existing content and mode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-rollback-'))
+    try {
+      const file = join(dir, 'settings.json')
+      writeFileSync(file, 'before', { mode: 0o600 })
+      const snapshot = snapshotFile(file)
+      writeFileSync(file, 'after')
+      chmodSync(file, 0o644)
+
+      restoreFile(snapshot)
+      expect(readFileSync(file, 'utf8')).toBe('before')
+      expect(statSync(file).mode & 0o777).toBe(0o600)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('removes a file that did not exist before the attempted install', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-rollback-'))
+    try {
+      const file = join(dir, 'new.plist')
+      const snapshot = snapshotFile(file)
+      writeFileSync(file, 'created by failed install')
+
+      restoreFile(snapshot)
+      expect(fsModule.existsSync(file)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('install settings preflight', () => {
+  it('preserves valid settings fields', () => {
+    expect(parseSettingsObject('{"theme":"dark"}', '/tmp/settings.json'))
+      .toEqual({ theme: 'dark' })
+  })
+
+  it('rejects malformed JSON instead of treating it as empty settings', () => {
+    expect(() => parseSettingsObject('{ broken', '/tmp/settings.json'))
+      .toThrow(/no install changes were made/i)
+  })
+
+  it('rejects a valid JSON value that is not an object', () => {
+    expect(() => parseSettingsObject('[]', '/tmp/settings.json'))
+      .toThrow(/must contain a JSON object/i)
   })
 })
 

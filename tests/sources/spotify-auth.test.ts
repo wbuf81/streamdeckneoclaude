@@ -7,7 +7,7 @@ import { connect as netConnect, type Socket } from 'node:net'
 import { Server, ServerResponse } from 'node:http'
 import {
   TokenStore, makeVerifier, challengeFor, buildAuthUrl, runAuthFlow,
-  SCOPES, REDIRECT_URI, AUTH_PORT, parseTokenResponse,
+  SCOPES, REDIRECT_URI, AUTH_PORT, parseTokenResponse, refreshTokens,
 } from '../../src/sources/spotify-auth.js'
 
 describe('PKCE', () => {
@@ -58,15 +58,15 @@ describe('buildAuthUrl', () => {
     expect(u.searchParams.get('state')).toBe('st')
   })
 
-  it('requests the five scopes the deck needs, including the original three', () => {
+  it('requests only the three playback scopes the deck uses', () => {
     const u = new URL(buildAuthUrl('cid', REDIRECT_URI, 'chal', 'st'))
     const scopes = u.searchParams.get('scope')!.split(' ')
     expect(scopes).toContain('user-read-playback-state')
     expect(scopes).toContain('user-modify-playback-state')
     expect(scopes).toContain('user-read-currently-playing')
-    expect(scopes).toContain('user-library-read')
-    expect(scopes).toContain('user-library-modify')
-    expect(SCOPES).toHaveLength(5)
+    expect(scopes).not.toContain('user-library-read')
+    expect(scopes).not.toContain('user-library-modify')
+    expect(SCOPES).toHaveLength(3)
   })
 
   it('uses a loopback IP redirect, because Spotify rejects localhost', () => {
@@ -94,6 +94,11 @@ describe('parseTokenResponse', () => {
   it('throws when the response has no access token', () => {
     expect(() => parseTokenResponse({ error: 'invalid_grant' }, 'rt', 0))
       .toThrow(/access token/i)
+  })
+
+  it('throws when an initial exchange has no refresh token to store', () => {
+    expect(() => parseTokenResponse({ access_token: 'at' }, '', 0))
+      .toThrow(/refresh token/i)
   })
 })
 
@@ -158,6 +163,28 @@ describe('TokenStore', () => {
 
   it('does not throw when clear runs on a missing file', () => {
     expect(() => new TokenStore(join(dir, 'nope.json')).clear()).not.toThrow()
+  })
+})
+
+describe('token endpoint validation', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('rejects an HTTP error before storing it as tokens', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: 'invalid_grant' }),
+    })))
+    await expect(refreshTokens('cid', 'bad-token')).rejects.toThrow(/HTTP 400.*invalid_grant/i)
+  })
+
+  it('rejects a non-JSON token response clearly', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false,
+      status: 502,
+      json: async () => { throw new Error('not json') },
+    })))
+    await expect(refreshTokens('cid', 'rt')).rejects.toThrow(/invalid JSON/i)
   })
 })
 

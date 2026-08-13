@@ -6,6 +6,8 @@ import { BUTTON_RIGHT } from '../src/device.js'
 import { setDefaultSink } from '../src/log.js'
 import type { Page } from '../src/pages/types.js'
 import type { DeckFrame, KeySpec } from '../src/render/specs.js'
+import { renderKey, renderStrip } from '../src/render/canvas.js'
+import { DEFAULT_BRIGHTNESS, type LockStateReader } from '../src/daemon.js'
 
 /** Waits for every pending microtask queued so far to drain. A press's own
  * chain (`onKeyPress`, then `renderOnce`'s several awaited device writes) is
@@ -21,6 +23,8 @@ class ControlPage implements Page {
   lines = ['A']
   stripText = 'strip A'
   presses: number[] = []
+  enters = 0
+  leaves = 0
 
   render(): DeckFrame {
     const keys: KeySpec[] = Array.from({ length: 8 }, (_, i) =>
@@ -34,6 +38,35 @@ class ControlPage implements Page {
 
   onKeyPress(i: number): void {
     this.presses.push(i)
+  }
+
+  onEnter(): void {
+    this.enters += 1
+  }
+
+  onLeave(): void {
+    this.leaves += 1
+  }
+}
+
+class FakeLockState implements LockStateReader {
+  startCalls = 0
+  stopCalls = 0
+  refreshCalls = 0
+  private callbacks: (() => void)[] = []
+
+  constructor(private locked: boolean) {}
+
+  async start(): Promise<void> { this.startCalls += 1 }
+  async stop(): Promise<void> { this.stopCalls += 1 }
+  async refresh(): Promise<void> { this.refreshCalls += 1 }
+  isLocked(): boolean { return this.locked }
+  onChange(cb: () => void): void { this.callbacks.push(cb) }
+
+  setLocked(locked: boolean): void {
+    if (locked === this.locked) return
+    this.locked = locked
+    this.callbacks.forEach((cb) => cb())
   }
 }
 
@@ -129,6 +162,129 @@ describe('Daemon', () => {
     device.setKeyImage = async () => { throw new Error('usb gone') }
     await expect(daemon.renderOnce(2, 2000)).resolves.not.toThrow()
     device.setKeyImage = original
+    await daemon.stop()
+  })
+})
+
+describe('Daemon screen lock privacy', () => {
+  afterEach(() => vi.useRealTimers())
+
+  function buildWithLock(initiallyLocked: boolean, clocks?: { seconds(): number; millis(): number }) {
+    const device = new FakeDevice()
+    const page = new ControlPage()
+    const manager = new PageManager()
+    manager.add(page)
+    const lock = new FakeLockState(initiallyLocked)
+    const daemon = new Daemon(
+      device,
+      manager,
+      clocks?.seconds ?? (() => 1),
+      clocks?.millis ?? (() => 1000),
+      lock,
+    )
+    return { device, page, manager, lock, daemon }
+  }
+
+  it('starts fully blank and dark when the screen is already locked', async () => {
+    const { device, page, lock, daemon } = buildWithLock(true)
+    await daemon.start()
+
+    expect(lock.startCalls).toBe(1)
+    expect(page.leaves).toBe(1)
+    expect(device.brightness).toBe(0)
+    expect(device.keyWrites).toHaveLength(8)
+    const blank = renderKey({ kind: 'blank' })
+    for (let i = 0; i < 8; i++) expect(device.keyImages.get(i)?.equals(blank)).toBe(true)
+    expect(device.stripImage?.equals(renderStrip({ lines: [] }))).toBe(true)
+    expect(device.buttonColors.get(8)).toEqual([0, 0, 0])
+    expect(device.buttonColors.get(9)).toEqual([0, 0, 0])
+
+    await daemon.stop()
+    expect(lock.stopCalls).toBe(1)
+  })
+
+  it('blanks on lock, ignores every press, then fully repaints on unlock', async () => {
+    const { device, page, lock, daemon } = buildWithLock(false)
+    await daemon.start()
+    expect(page.enters).toBe(1) // PageManager entered it once.
+
+    device.reset()
+    lock.setLocked(true)
+    await flush()
+    expect(device.brightness).toBe(0)
+    expect(device.keyWrites).toHaveLength(8)
+    expect(page.leaves).toBe(1)
+
+    device.simulatePress(0)
+    device.simulatePress(BUTTON_RIGHT)
+    await flush()
+    expect(page.presses).toEqual([])
+
+    device.reset()
+    lock.setLocked(false)
+    await flush()
+    expect(device.brightness).toBe(DEFAULT_BRIGHTNESS)
+    expect(device.keyWrites).toHaveLength(8)
+    expect(page.enters).toBe(2)
+
+    await daemon.stop()
+  })
+
+  it('waits for an in-progress frame, then leaves the blank frame on the glass', async () => {
+    const { device, page, lock, daemon } = buildWithLock(false)
+    await daemon.start()
+    device.reset()
+    page.lines = ['sensitive']
+
+    const realSetKeyImage = device.setKeyImage.bind(device)
+    let release: (() => void) | undefined
+    let held = true
+    device.setKeyImage = async (index, image) => {
+      if (held) {
+        held = false
+        await new Promise<void>((resolve) => { release = resolve })
+      }
+      await realSetKeyImage(index, image)
+    }
+
+    const rendering = daemon.renderOnce(2, 2000)
+    await Promise.resolve()
+    lock.setLocked(true)
+    release?.()
+    await rendering
+    await flush()
+
+    const blank = renderKey({ kind: 'blank' })
+    for (let i = 0; i < 8; i++) expect(device.keyImages.get(i)?.equals(blank)).toBe(true)
+    expect(device.brightness).toBe(0)
+    await daemon.stop()
+  })
+
+  it('still turns brightness off when a pixel write fails during lock blanking', async () => {
+    const { device, lock, daemon } = buildWithLock(false)
+    await daemon.start()
+    device.setKeyImage = async () => { throw new Error('usb write failed') }
+
+    lock.setLocked(true)
+    await flush()
+
+    expect(device.brightness).toBe(0)
+    await daemon.stop()
+  })
+
+  it('re-probes after a sleep-sized clock jump and forces a full repaint', async () => {
+    vi.useFakeTimers()
+    let ms = 1000
+    const clocks = { seconds: () => Math.floor(ms / 1000), millis: () => ms }
+    const { device, lock, daemon } = buildWithLock(false, clocks)
+    await daemon.start()
+    device.reset()
+
+    ms = 12_000
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(lock.refreshCalls).toBe(1)
+    expect(device.keyWrites).toHaveLength(8)
     await daemon.stop()
   })
 })

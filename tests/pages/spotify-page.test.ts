@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
 import { renderKey } from '../../src/render/canvas.js'
@@ -298,6 +298,23 @@ describe('SpotifyPage presses', () => {
     const { page, calls } = build(player({ volumePercent: null }))
     await page.onKeyPress(3)
     expect(calls).toContain('volume:60')
+  })
+
+  it('wraps volume from the top back to zero', async () => {
+    const { page, calls } = build(player({ volumePercent: 100 }))
+    await page.onKeyPress(3)
+    expect(calls).toContain('volume:0')
+  })
+
+  it('does not read the wall clock while handling a press', async () => {
+    const now = vi.spyOn(Date, 'now')
+    try {
+      const { page } = build(player())
+      await page.onKeyPress(2)
+      expect(now).not.toHaveBeenCalled()
+    } finally {
+      now.mockRestore()
+    }
   })
 
   it('goes to the previous track on key 6', async () => {

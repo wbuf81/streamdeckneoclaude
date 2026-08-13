@@ -187,7 +187,9 @@ export class SpotifyPage implements Page {
   }
 
   async onKeyPress(index: number): Promise<void> {
-    const state = this.source.interpolate(Math.floor(Date.now() / 1000))
+    // Press handling needs playback flags and volume, not the interpolated
+    // position. A fixed clock keeps the page pure and deterministic.
+    const state = this.source.interpolate(0)
     const volume = state?.volumePercent ?? 50
 
     switch (index) {
@@ -195,7 +197,7 @@ export class SpotifyPage implements Page {
         await (state?.isPlaying ? this.source.pause() : this.source.play())
         return
       case 3:
-        await this.source.setVolume(volume + VOLUME_STEP)
+        await this.source.setVolume(volume + VOLUME_STEP > 100 ? 0 : volume + VOLUME_STEP)
         return
       case 6:
         await this.source.previous()

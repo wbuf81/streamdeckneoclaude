@@ -201,6 +201,22 @@ describe('SpotifySource', () => {
     expect(src.getState()!.title).toBe('Planet Caravan')
   })
 
+  it('treats malformed player JSON as offline and keeps the last known state', async () => {
+    const { src } = build([{ status: 200, body: PLAYER }])
+    await src.poll()
+    src.setFetchForTest((async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => { throw new Error('truncated body') },
+      arrayBuffer: async () => new ArrayBuffer(0),
+    })) as never)
+
+    await expect(src.poll()).resolves.not.toThrow()
+    expect(src.getStatus()).toBe('offline')
+    expect(src.getState()!.title).toBe('Planet Caravan')
+  })
+
   it('honours Retry-After on a 429', async () => {
     const { src } = build([{ status: 429, headers: { 'retry-after': '7' } }])
     await src.poll()
@@ -349,6 +365,38 @@ describe('SpotifySource visibility-gated polling', () => {
     const afterFirst = fetchFn.mock.calls.length
     await vi.advanceTimersByTimeAsync(3000)
     expect(fetchFn.mock.calls.length).toBeGreaterThan(afterFirst)
+  })
+
+  it('keeps scheduling after a malformed JSON response', async () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const fetchFn = vi.fn(async () => {
+      calls += 1
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => {
+          if (calls === 1) throw new Error('bad json')
+          return PLAYER
+        },
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }
+    })
+    const src = new SpotifySource(
+      'cid',
+      { load: () => tokens(), save: () => {}, clear: () => {} } as never,
+      fetchFn as never,
+      () => 1000,
+    )
+
+    src.setVisible(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(src.getStatus()).toBe('offline')
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+    expect(src.getStatus()).toBe('ok')
+    await src.stop()
   })
 
   it('stop() clears the poll timer', async () => {

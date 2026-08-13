@@ -29,8 +29,15 @@ INNER="${DECKD_INNER:-}"
 # wrapper's own stdin is left untouched so the inner command can still read
 # it directly below.
 TMPIN=$(mktemp 2>/dev/null) || TMPIN=""
+USAGE_TMP=""
+SESSION_TMP=""
 if [ -n "$TMPIN" ]; then
-  trap 'rm -f "$TMPIN"' EXIT
+  cleanup() {
+    [ -z "$TMPIN" ] || rm -f "$TMPIN"
+    [ -z "$USAGE_TMP" ] || rm -f "$USAGE_TMP"
+    [ -z "$SESSION_TMP" ] || rm -f "$SESSION_TMP"
+  }
+  trap cleanup EXIT
   cat > "$TMPIN"
 fi
 
@@ -39,11 +46,16 @@ if [ -n "$TMPIN" ] && command -v jq >/dev/null 2>&1; then
   NOW=$(date +%s)
 
   # usage.json holds the newest rate limits. The gauge keys read it.
-  jq -c --argjson ts "$NOW" \
-    '{rate_limits: (.rate_limits // {}), ts: $ts}' \
-    < "$TMPIN" \
-    > "$STATE_DIR/usage.json.tmp" 2>/dev/null \
-    && mv "$STATE_DIR/usage.json.tmp" "$STATE_DIR/usage.json" 2>/dev/null || true
+  USAGE_TMP=$(mktemp "$STATE_DIR/.usage.json.XXXXXX" 2>/dev/null) || USAGE_TMP=""
+  if [ -n "$USAGE_TMP" ]; then
+    if jq -c --argjson ts "$NOW" \
+      '{rate_limits: (.rate_limits // {}), ts: $ts}' \
+      < "$TMPIN" \
+      > "$USAGE_TMP" 2>/dev/null \
+      && mv "$USAGE_TMP" "$STATE_DIR/usage.json" 2>/dev/null; then
+      USAGE_TMP=""
+    fi
+  fi
 
   # The per-session file carries the model name. state.d does not have it.
   SID=$(jq -r '.session_id // empty' < "$TMPIN" 2>/dev/null || true)
@@ -53,14 +65,19 @@ if [ -n "$TMPIN" ] && command -v jq >/dev/null 2>&1; then
     *[!A-Za-z0-9._-]*) SID="" ;;
   esac
   if [ -n "$SID" ]; then
-    jq -c --argjson ts "$NOW" \
-      '{model: (.model.display_name // ""),
-        ctxPct: (.context_window.used_percentage // null),
-        costUsd: (.cost.total_cost_usd // null),
-        ts: $ts}' \
-      < "$TMPIN" \
-      > "$STATE_DIR/sessions/$SID.json.tmp" 2>/dev/null \
-      && mv "$STATE_DIR/sessions/$SID.json.tmp" "$STATE_DIR/sessions/$SID.json" 2>/dev/null || true
+    SESSION_TMP=$(mktemp "$STATE_DIR/sessions/.$SID.json.XXXXXX" 2>/dev/null) || SESSION_TMP=""
+    if [ -n "$SESSION_TMP" ]; then
+      if jq -c --argjson ts "$NOW" \
+        '{model: (.model.display_name // ""),
+          ctxPct: (.context_window.used_percentage // null),
+          costUsd: (.cost.total_cost_usd // null),
+          ts: $ts}' \
+        < "$TMPIN" \
+        > "$SESSION_TMP" 2>/dev/null \
+        && mv "$SESSION_TMP" "$STATE_DIR/sessions/$SID.json" 2>/dev/null; then
+        SESSION_TMP=""
+      fi
+    fi
   fi
 fi
 

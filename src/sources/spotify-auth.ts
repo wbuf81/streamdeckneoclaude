@@ -14,8 +14,6 @@ export const SCOPES = [
   'user-read-playback-state',
   'user-modify-playback-state',
   'user-read-currently-playing',
-  'user-library-read',
-  'user-library-modify',
 ]
 
 const TOKEN_URL = 'https://accounts.spotify.com/api/token'
@@ -66,6 +64,9 @@ export function parseTokenResponse(
     throw new Error(`token response has no access token: ${JSON.stringify(body)}`)
   }
   const refresh = typeof body.refresh_token === 'string' ? body.refresh_token : previousRefresh
+  if (!refresh) {
+    throw new Error('token response has no refresh token')
+  }
   const expiresIn = typeof body.expires_in === 'number' ? body.expires_in : 3600
   return { accessToken, refreshToken: refresh, expiresAt: now + expiresIn }
 }
@@ -117,7 +118,17 @@ async function postForm(
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
   })
-  return (await res.json()) as Record<string, unknown>
+  let parsed: Record<string, unknown>
+  try {
+    parsed = (await res.json()) as Record<string, unknown>
+  } catch (e) {
+    throw new Error(`Spotify token endpoint returned invalid JSON: ${String(e)}`)
+  }
+  if (res.ok === false) {
+    const code = typeof parsed.error === 'string' ? `: ${parsed.error}` : ''
+    throw new Error(`Spotify token endpoint returned HTTP ${res.status}${code}`)
+  }
+  return parsed
 }
 
 /** Exchanges a refresh token for a new access token. */

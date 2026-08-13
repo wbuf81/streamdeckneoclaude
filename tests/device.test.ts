@@ -87,3 +87,71 @@ describe('Device onDisconnect parity', () => {
     expect(fired).toBe(true)
   })
 })
+
+describe('Device loss ownership', () => {
+  it('closes a failed handle and reconnects', async () => {
+    vi.useFakeTimers()
+    try {
+      let errorHandler: ((error: Error) => void) | undefined
+      const first = {
+        ...fakeDeck(),
+        on: vi.fn((event: string, cb: (error: Error) => void) => {
+          if (event === 'error') errorHandler = cb
+        }),
+        close: vi.fn(async () => {}),
+      } as unknown as StreamDeck
+      const second = fakeDeck()
+      let opens = 0
+      const device = new Device({
+        listStreamDecks: vi.fn(async () => [{ model: DeviceModelId.NEO, path: '/fake/neo' }]),
+        openStreamDeck: vi.fn(async () => (++opens === 1 ? first : second)),
+      })
+
+      await device.connect()
+      errorHandler?.(new Error('cable moved'))
+      await Promise.resolve()
+      expect(device.isConnected()).toBe(false)
+      expect(first.close).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(device.isConnected()).toBe(true)
+      await device.disconnect()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('ignores a late error from an older handle after reconnect', async () => {
+    vi.useFakeTimers()
+    try {
+      let firstError: ((error: Error) => void) | undefined
+      const first = {
+        ...fakeDeck(),
+        on: vi.fn((event: string, cb: (error: Error) => void) => {
+          if (event === 'error') firstError = cb
+        }),
+        close: vi.fn(async () => {}),
+      } as unknown as StreamDeck
+      const second = fakeDeck()
+      let opens = 0
+      const device = new Device({
+        listStreamDecks: vi.fn(async () => [{ model: DeviceModelId.NEO, path: '/fake/neo' }]),
+        openStreamDeck: vi.fn(async () => (++opens === 1 ? first : second)),
+      })
+
+      await device.connect()
+      firstError?.(new Error('first loss'))
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(device.isConnected()).toBe(true)
+
+      firstError?.(new Error('late stale error'))
+      await Promise.resolve()
+      expect(device.isConnected()).toBe(true)
+      expect(second.close).not.toHaveBeenCalled()
+      await device.disconnect()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

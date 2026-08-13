@@ -1,6 +1,6 @@
 # Project state — handoff
 
-Last updated 2026-08-12. **Read `docs/VERIFIED-FACTS.md` and `docs/LESSONS.md` before
+Last updated 2026-08-13. **Read `docs/VERIFIED-FACTS.md` and `docs/LESSONS.md` before
 writing any code.** They hold measurements and recurring bug classes that cost real fix
 rounds to learn.
 
@@ -8,13 +8,14 @@ rounds to learn.
 
 ## What exists and runs right now
 
-A Node daemon drives an Elgato Stream Deck Neo with **four pages**, flipped with the two
+A Node daemon drives an Elgato Stream Deck Neo with **five pages**, flipped with the two
 round buttons (8 = previous, 9 = next, wrapping both ways).
 
 | Page | Contents | State |
 | --- | --- | --- |
-| **Claude** | 4 session keys (state, project, crab, model) + 4 usage gauges; press focuses that terminal | live |
-| **Spotify** | album art spanning keys 0,1,4,5; play/pause 2; next 3; read-only heart 6; volume 7 | live |
+| **Claude** | 3 session keys + dedicated animated crab + 4 usage gauges; press focuses that terminal | live |
+| **Codex** | 3 active task keys + identity/count + account limit, plan, tokens, and reset gauges | live |
+| **Spotify** | album art spanning keys 0,1,4,5; play/pause 2; volume 3; previous 6; next 7 | live |
 | **Stocks** | 8 tickers with price, daily change, sparkline, red/green. Press a ticker for a detail view across all 8 keys, BACK on key 7 | live |
 | **Weather** | 7 day tiles with colour emoji + temps + rain chance, wind tile | live |
 
@@ -76,8 +77,8 @@ Sources ──▶ Pages ──▶ Renderer ──▶ Device
 - The **Daemon** compares each key's `keyHash` against the last drawn and writes **only
   what changed**. This is why a page can render often and cost nothing.
 
-Files: `src/sources/{claude,usage,spotify,spotify-auth,stocks,weather}.ts`,
-`src/pages/{claude,spotify,stocks,weather}-page.ts`, `src/render/{specs,canvas,theme,text,sprites}.ts`,
+Files: `src/sources/{claude,codex,usage,spotify,spotify-auth,stocks,weather}.ts`,
+`src/pages/{claude,codex,spotify,stocks,weather}-page.ts`, `src/render/{specs,canvas,theme,text,sprites}.ts`,
 `src/{device,fake-device,daemon,page-manager,focus-window,log,paths}.ts`,
 `src/install/{install.ts,statusline-wrapper.sh}`, `bin/deckd.ts`.
 
@@ -94,7 +95,7 @@ Files: `src/sources/{claude,usage,spotify,spotify-auth,stocks,weather}.ts`,
 
 ---
 
-## Task ledger — 25 complete, 2 open
+## Task ledger — current product baseline
 
 Full detail is in `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck/progress.md`,
 but **that directory is git-ignored**, so this file is the durable record.
@@ -120,43 +121,115 @@ but **that directory is git-ignored**, so this file is the durable record.
 | 26 | Claude page: dedicated crab tile, 3 sessions, full-key flash | complete |
 | 27 | Spotify page: cold-load bug, volume replaces heart, idle animation | complete |
 | — | review of tasks 22–25, then all its fixes | complete, 9 fix commits |
-| 28 | blank the deck while the screen is locked | **pending, brief written** |
+| 28 | blank the deck while the screen is locked | complete and verified on the real deck |
+| 29 | end-to-end reliability sweep, CI, safe state override | complete and deployed |
+| 30 | OpenAI Codex active-task and usage page | complete and deployed |
 
 Briefs and reports for tasks 9–24 are in
 `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck-part2/`. **Git-ignored** — copy
 anything still needed before that directory is cleaned.
 
-### Remaining work — START HERE
+### Verified live on 2026-08-13
 
-Full briefs are in `docs/pending-briefs/`. Nothing is half-finished: the working tree is
-clean, 744 tests pass, and the daemon runs the current build.
+- Locking the Mac blanks all keys, the strip, and both buttons within about two seconds.
+- Pressing Escape at the lock screen leaves the deck blank.
+- Unlocking restores the full current page.
+- The measured lock property is `IOConsoleLocked`. The first implementation used the wrong
+  property and failed its live test; absence is now an unknown, logged result.
+- The Codex page reads the local user-task index and current account usage. Internal review
+  and subagent threads do not appear as user task tiles.
+- The installed statusline wrapper matches the tested source, and launchd runs the current
+  build from this working directory.
+- The validation baseline is 31 test files and 794 tests, plus typecheck, build, shell syntax,
+  and `git diff --check`.
 
-1. **Task 28 — blank the deck while the screen is locked.** The next thing to build. Brief is
-   written at `docs/pending-briefs/task-28-brief.md` and needs no further design. The user
-   confirmed from hardware: *"it stays lit and works when my screen is locked yes"* — so the
-   deck shows project names, session states and a stock watchlist to anyone passing a locked
-   machine, and presses still work behind the lock screen. This is a privacy fix.
-   Lock detection is measured: `ioreg -n Root -d1 -k CGSSessionScreenIsLocked` costs ~4 ms, and
-   the key is **absent** when unlocked. The locked output is NOT verified — that needs the
-   user's screen locked. Whether the deck survives **sleep** is also unverified.
-2. **Two review minors, deliberately skipped** as outside their agents' file ownership: the
-   new copy-on-read methods are shallow and their tests only mutate the container; and
-   `StockSource.isStale()` is now dead, replaced by `isSymbolStale`.
-3. **The `src/paths.ts` environment override.** There is none — `paths.ts` reads `homedir()`
-   directly, so any ad-hoc script that imports the daemon writes to the user's real log. One
-   did, on 2026-08-12: a stray `WARN press handler failed for index 2: Error: boom` sits in
-   `deckd.log`. `tests/setup.ts` silences logging inside vitest only. The suite itself is
-   clean, proven by hashing the log before and after a run.
-4. **Tonight's nine fix commits are themselves unreviewed** — `b43f467` through the tickMs fix.
-   The review of tasks 22–25 found eight verified Important defects that 674 passing tests all
-   missed, so this is worth doing rather than assuming.
+### Next work, in priority order
 
-### Open questions for the user
+#### P0 — Finish two short hardware checks
 
-- The BACK key on the stock detail view is a gray border with no colour. Too subtle?
-- The change in dollars renders as `-5.30`. Would `-$5.30` be better?
-- Blank **everything** while locked, or keep weather and stocks live? Blanking everything is
-  the recommendation and what the brief specifies.
+These checks still need a person at the Mac. They do not justify more code unless one fails.
+
+1. Unplug and reconnect the Stream Deck while `deckd` runs. It should reconnect and repaint
+   the full current page without a manual restart.
+2. Use Apple menu **Sleep**, then wake the Mac. This is different from pressing Escape at the
+   lock screen. The deck should stay blank while asleep and repaint after wake and unlock.
+
+Record both outcomes in this file. If either fails, keep it P0 and use `deckd.log` to identify
+the transition before changing code.
+
+#### P1 — Add `deckd status` and `deckd doctor`
+
+This is the recommended next implementation. Routine diagnosis currently requires shell
+commands and knowledge of private paths.
+
+Definition of done:
+
+- `deckd status` reports the launchd state, daemon PID, device connection, current page,
+  lock state, and source freshness in a compact form.
+- `deckd doctor` checks Node and macOS versions, Stream Deck discovery, launch plist,
+  installed wrapper identity, directory and file modes, Claude state, Codex state schema,
+  Spotify configuration, and recent bounded errors.
+- Neither command prints tokens, OAuth credentials, full task prompts, or unrelated settings.
+- Every check has a stable pass, warning, or failure result and a useful process exit code.
+- Tests inject process, file, and command readers. They do not touch the live device or home
+  directory.
+
+#### P1 — Add validated user configuration
+
+Move product choices out of source constants and into `config.json`, while keeping current
+behavior as the default.
+
+Start with weather ZIP code, stock symbols, brightness, polling intervals, and page enablement
+and order. Reject invalid values with clear messages. Preserve unknown config fields. Do not
+put secrets in the same validation output. A restart may apply changes in the first version;
+live reload is optional.
+
+#### P2 — Improve task navigation
+
+- Claude focus still cannot distinguish two Claude sessions when their terminal titles contain
+  only task summaries. The robust fix is to put a stable project or session marker in the
+  terminal title, then match that marker in `focus-window.ts`.
+- Codex task tiles are read-only. Add focus or navigation only if Codex exposes a supported
+  task URL or command. Do not build against guessed URL schemes.
+
+#### P2 — Add release and upgrade tooling
+
+Add a visible version, changelog, tagged release process, and an idempotent upgrade command.
+The upgrade path must build first, preserve live configuration and tokens, replace the wrapper
+atomically, restart only `com.wbard.deckd`, and verify the new PID and device connection.
+
+#### P3 — Product polish and small cleanup
+
+- Decide whether the stock detail BACK key needs a stronger colour.
+- Decide whether negative dollar changes should render as `-$5.30` instead of `-5.30`.
+- Make source copy-on-read results deep enough that nested values cannot be mutated by callers.
+- Remove the dead `StockSource.isStale()` method if no consumer remains.
+- Review the Codex page on the physical keys for truncation and decide whether task tiles need
+  a visual state beyond `RUNNING`.
+
+### How to resume safely
+
+1. Read this file, `docs/VERIFIED-FACTS.md`, and `docs/LESSONS.md`.
+2. Run `git status --short`; begin from a clean tree.
+3. Run `npm test`, `npm run typecheck`, and `npm run build` before changing behavior.
+4. Do not run a hardware script while launchd owns the device. Follow **Restarting the daemon**
+   above when a real-device check is required.
+5. Never print or replace `~/.local/state/deckd/spotify.json`.
+
+### Reliability sweep after Task 28
+
+- Spotify polling survives malformed JSON and always schedules its next visible-page poll.
+- Statusline cache writers use unique atomic temporary files across concurrent sessions.
+- Weather shows the last successful fetch time, not the current render time.
+- A failed USB handle closes, and a late error from an old handle cannot clear a new one.
+- Install preflights the build and wrapper, snapshots every changed file, and rolls back on
+  failure. New Spotify authorization requests playback scopes only.
+- `DECKD_STATE_DIR` isolates runtime state for tests and ad-hoc diagnostics.
+- The Spotify volume key wraps from 100% to 0%, and page presses do not read
+  the wall clock.
+- macOS CI runs typecheck, tests, and the production build on each push and pull request.
+- The Codex page reads the local task index and incrementally scans rollout lifecycle and
+  accounting events. A private-schema change degrades only that page to unavailable.
 
 ### Task 16's real limitation
 

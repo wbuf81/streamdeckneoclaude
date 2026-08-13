@@ -2,24 +2,29 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { mkdirSync, chmodSync } from 'node:fs'
 
-const home = homedir()
-const stateDir = join(home, '.local', 'state', 'deckd')
-const claudeDir = join(home, '.claude')
+/** Builds all runtime paths. Tests and ad-hoc tools can isolate deckd state. */
+export function buildPaths(home: string, stateOverride?: string) {
+  const stateDir = stateOverride || join(home, '.local', 'state', 'deckd')
+  const claudeDir = join(home, '.claude')
+  const codexDir = join(home, '.codex')
+  return {
+    stateDir,
+    sessionsDir: join(stateDir, 'sessions'),
+    usageFile: join(stateDir, 'usage.json'),
+    uiFile: join(stateDir, 'ui.json'),
+    configFile: join(stateDir, 'config.json'),
+    spotifyFile: join(stateDir, 'spotify.json'),
+    artDir: join(stateDir, 'art'),
+    logFile: join(stateDir, 'deckd.log'),
+    claudeStateDir: join(claudeDir, 'daisy-statusbar', 'state.d'),
+    claudeSettings: join(claudeDir, 'settings.json'),
+    codexStateDb: join(codexDir, 'state_5.sqlite'),
+    launchAgentLabel: 'com.wbard.deckd',
+    launchAgent: join(home, 'Library', 'LaunchAgents', 'com.wbard.deckd.plist'),
+  } as const
+}
 
-export const paths = {
-  stateDir,
-  sessionsDir: join(stateDir, 'sessions'),
-  usageFile: join(stateDir, 'usage.json'),
-  uiFile: join(stateDir, 'ui.json'),
-  configFile: join(stateDir, 'config.json'),
-  spotifyFile: join(stateDir, 'spotify.json'),
-  artDir: join(stateDir, 'art'),
-  logFile: join(stateDir, 'deckd.log'),
-  claudeStateDir: join(claudeDir, 'daisy-statusbar', 'state.d'),
-  claudeSettings: join(claudeDir, 'settings.json'),
-  launchAgentLabel: 'com.wbard.deckd',
-  launchAgent: join(home, 'Library', 'LaunchAgents', 'com.wbard.deckd.plist'),
-} as const
+export const paths = buildPaths(homedir(), process.env.DECKD_STATE_DIR)
 
 /**
  * Creates each of `dirs` and forces `mode` on it, unconditionally.

@@ -260,6 +260,11 @@ export class WeatherSource extends EventEmitter {
     return this.status
   }
 
+  /** Epoch seconds of the newest successful forecast response, or 0 before one. */
+  getLastUpdatedAt(): number {
+    return this.lastSuccessAt
+  }
+
   /** For example `Brooklyn FL`. Empty before the ZIP resolves. */
   getPlace(): string {
     return this.coords?.place ?? ''
@@ -311,10 +316,12 @@ export class WeatherSource extends EventEmitter {
       log.once('weather-zip-network', `ZIP lookup failed: ${String(e)}`)
       return null
     }
+    log.clearOnce('weather-zip-network')
     if (!res.ok) {
       log.once('weather-zip-http', `ZIP lookup failed with status ${res.status}.`)
       return null
     }
+    log.clearOnce('weather-zip-http')
     let body: unknown
     try {
       body = await res.json()
@@ -322,11 +329,13 @@ export class WeatherSource extends EventEmitter {
       log.once('weather-zip-json', `ZIP lookup response is not valid JSON: ${String(e)}`)
       return null
     }
+    log.clearOnce('weather-zip-json')
     const coords = parseZipBody(body)
     if (!coords) {
       log.once('weather-zip-parse', 'ZIP lookup response has no usable place data.')
       return null
     }
+    log.clearOnce('weather-zip-parse')
     this.coords = coords
     return coords
   }
@@ -342,10 +351,12 @@ export class WeatherSource extends EventEmitter {
       log.once('weather-points-network', `Points lookup failed: ${String(e)}`)
       return null
     }
+    log.clearOnce('weather-points-network')
     if (!res.ok) {
       log.once('weather-points-http', `Points lookup failed with status ${res.status}.`)
       return null
     }
+    log.clearOnce('weather-points-http')
     let body: unknown
     try {
       body = await res.json()
@@ -353,11 +364,13 @@ export class WeatherSource extends EventEmitter {
       log.once('weather-points-json', `Points lookup response is not valid JSON: ${String(e)}`)
       return null
     }
+    log.clearOnce('weather-points-json')
     const url = extractForecastUrl(body)
     if (!url) {
       log.once('weather-points-parse', 'Points lookup response has no forecast URL.')
       return null
     }
+    log.clearOnce('weather-points-parse')
     this.forecastUrl = url
     return url
   }
@@ -370,12 +383,16 @@ export class WeatherSource extends EventEmitter {
       log.once('weather-forecast-network', `Forecast fetch failed: ${String(e)}`)
       return undefined
     }
+    log.clearOnce('weather-forecast-network')
     if (!res.ok) {
       log.once('weather-forecast-http', `Forecast fetch failed with status ${res.status}.`)
       return undefined
     }
+    log.clearOnce('weather-forecast-http')
     try {
-      return await res.json()
+      const body = await res.json()
+      log.clearOnce('weather-forecast-json')
+      return body
     } catch (e) {
       log.once('weather-forecast-json', `Forecast response is not valid JSON: ${String(e)}`)
       return undefined
@@ -406,10 +423,11 @@ export class WeatherSource extends EventEmitter {
         const body = await this.fetchForecastBody(url)
         if (body !== undefined) {
           const parsed = parseForecast(body, this.now())
-          if (parsed.days.length > 0) {
+            if (parsed.days.length > 0) {
             this.days = parsed.days
             this.conditions = parsed.conditions
-            ok = true
+              ok = true
+              log.clearOnce('weather-forecast-parse')
           } else {
             log.once('weather-forecast-parse', 'Forecast response has no usable periods.')
           }
@@ -420,7 +438,12 @@ export class WeatherSource extends EventEmitter {
     if (ok) this.lastSuccessAt = this.now()
     this.status = ok ? 'ok' : this.days.length > 0 ? 'offline' : 'empty'
 
-    const key = JSON.stringify({ days: this.days, conditions: this.conditions, status: this.status })
+    const key = JSON.stringify({
+      days: this.days,
+      conditions: this.conditions,
+      status: this.status,
+      lastSuccessAt: this.lastSuccessAt,
+    })
     if (key === this.lastKey) return
     this.lastKey = key
     this.emit('change')

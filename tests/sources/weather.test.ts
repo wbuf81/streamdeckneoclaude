@@ -281,6 +281,7 @@ describe('WeatherSource', () => {
     expect(src.getStatus()).toBe('empty')
     expect(src.getDays()).toEqual([])
     expect(src.getConditions()).toBeNull()
+    expect(src.getLastUpdatedAt()).toBe(0)
     expect(src.isStale()).toBe(false)
   })
 
@@ -291,6 +292,7 @@ describe('WeatherSource', () => {
     expect(src.getStatus()).toBe('ok')
     expect(src.getDays()).toHaveLength(7)
     expect(src.getPlace()).toBe('Brooklyn FL')
+    expect(src.getLastUpdatedAt()).toBe(NOW)
   })
 
   it('resolves the ZIP and the points lookup only once across several refreshes', async () => {

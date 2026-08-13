@@ -12,7 +12,9 @@ export interface KeyWrite {
 /** Records every write, so a test can count them. */
 export class FakeDevice implements DeckDevice {
   keyWrites: KeyWrite[] = []
+  keyImages = new Map<number, Buffer>()
   stripWrites = 0
+  stripImage: Buffer | null = null
   buttonColors = new Map<number, Rgb>()
   brightness = 100
 
@@ -46,11 +48,13 @@ export class FakeDevice implements DeckDevice {
       throw new Error(`key index ${index} is outside 0 to 7`)
     }
     this.keyWrites.push({ index, bytes: png.length })
+    this.keyImages.set(index, Buffer.from(png))
   }
 
   async setStrip(_png: Buffer): Promise<void> {
     this.check()
     this.stripWrites += 1
+    this.stripImage = Buffer.from(_png)
   }
 
   async setButtonColor(index: number, rgb: Rgb): Promise<void> {
@@ -92,7 +96,9 @@ export class FakeDevice implements DeckDevice {
   /** Test helper. Clears every record. */
   reset(): void {
     this.keyWrites = []
+    this.keyImages.clear()
     this.stripWrites = 0
+    this.stripImage = null
     this.buttonColors.clear()
   }
 }

@@ -85,6 +85,7 @@ export interface WeatherReader {
   getDays(): DayForecast[]
   getConditions(): Conditions | null
   getStatus(): WeatherStatus
+  getLastUpdatedAt(): number
   getPlace(): string
   isStale(): boolean
   setVisible(visible: boolean): void
@@ -141,7 +142,7 @@ export class WeatherPage implements Page {
     this.source.setVisible(false)
   }
 
-  render(now: number): DeckFrame {
+  render(_now: number): DeckFrame {
     const days = this.source.getDays()
     const status = this.source.getStatus()
     const stale = this.source.isStale()
@@ -155,7 +156,7 @@ export class WeatherPage implements Page {
 
     return {
       keys,
-      strip: this.strip(now),
+      strip: this.strip(),
       buttons: [theme.gray, theme.gray],
     }
   }
@@ -219,7 +220,7 @@ export class WeatherPage implements Page {
     return key
   }
 
-  private strip(now: number): StripSpec {
+  private strip(): StripSpec {
     const place = this.source.getPlace()
     const conditions = this.source.getConditions()
     const status = this.source.getStatus()
@@ -232,7 +233,12 @@ export class WeatherPage implements Page {
       line1 = parts.join(' · ')
     }
 
-    const line2 = status === 'offline' ? 'offline' : `updated ${formatUpdated(now)}`
+    const updatedAt = this.source.getLastUpdatedAt()
+    const line2 = status === 'offline'
+      ? 'offline'
+      : updatedAt > 0
+        ? `updated ${formatUpdated(updatedAt)}`
+        : 'updated --'
 
     return { lines: [truncate(line1, STRIP_CHARS), truncate(line2, STRIP_CHARS)] }
   }

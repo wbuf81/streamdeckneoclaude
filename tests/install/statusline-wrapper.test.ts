@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -43,6 +43,25 @@ describe('statusline-wrapper.sh', () => {
         DECKD_INNER: `${inner} ${join(dir, 'seen.json')}`,
       },
       encoding: 'utf8',
+    })
+
+  const runAsync = (payload: string, seen: string): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const child = spawn('/bin/sh', [WRAPPER], {
+        env: {
+          ...process.env,
+          DECKD_STATE_DIR: dir,
+          DECKD_INNER: `${inner} ${seen}`,
+        },
+      })
+      let stderr = ''
+      child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString() })
+      child.on('error', reject)
+      child.on('close', (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(`wrapper exited ${String(code)}: ${stderr}`))
+      })
+      child.stdin.end(payload)
     })
 
   it('prints the inner statusline output unchanged', () => {
@@ -143,5 +162,26 @@ describe('statusline-wrapper.sh', () => {
     expect(existsSync(join(dir, 'evil.json'))).toBe(false)
     expect(existsSync(join(dir, 'evil.json.tmp'))).toBe(false)
     expect(existsSync(join(dir, 'sessions', 'evil.json'))).toBe(false)
+  })
+
+  it('keeps concurrent cache writes atomic and leaves no temporary files', async () => {
+    const runs = Array.from({ length: 16 }, (_, i) => {
+      const payload = JSON.stringify({
+        session_id: `session-${i}`,
+        model: { display_name: `Model ${i}` },
+        rate_limits: { five_hour: { used_percentage: i, resets_at: i } },
+      })
+      return runAsync(payload, join(dir, `seen-${i}.json`))
+    })
+
+    await Promise.all(runs)
+    const usage = JSON.parse(readFileSync(join(dir, 'usage.json'), 'utf8'))
+    expect(typeof usage.rate_limits.five_hour.used_percentage).toBe('number')
+    for (let i = 0; i < 16; i++) {
+      const session = JSON.parse(readFileSync(join(dir, 'sessions', `session-${i}.json`), 'utf8'))
+      expect(session.model).toBe(`Model ${i}`)
+    }
+    expect(readdirSync(dir).filter((name) => name.includes('.tmp'))).toEqual([])
+    expect(readdirSync(join(dir, 'sessions')).filter((name) => name.startsWith('.'))).toEqual([])
   })
 })

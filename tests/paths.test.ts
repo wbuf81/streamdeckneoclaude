@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { paths, enforceDirModes } from '../src/paths.js'
+import { paths, enforceDirModes, buildPaths } from '../src/paths.js'
 import { homedir } from 'node:os'
 import { mkdtempSync, mkdirSync, chmodSync, statSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -24,6 +24,16 @@ describe('paths', () => {
     expect(paths.launchAgent).toBe(
       `${homedir()}/Library/LaunchAgents/com.wbard.deckd.plist`,
     )
+  })
+
+  it('can isolate every deckd state file without moving Claude or launchd paths', () => {
+    const isolated = buildPaths('/Users/tester', '/tmp/deckd-test-state')
+    expect(isolated.stateDir).toBe('/tmp/deckd-test-state')
+    expect(isolated.logFile).toBe('/tmp/deckd-test-state/deckd.log')
+    expect(isolated.spotifyFile).toBe('/tmp/deckd-test-state/spotify.json')
+    expect(isolated.claudeSettings).toBe('/Users/tester/.claude/settings.json')
+    expect(isolated.codexStateDb).toBe('/Users/tester/.codex/state_5.sqlite')
+    expect(isolated.launchAgent).toBe('/Users/tester/Library/LaunchAgents/com.wbard.deckd.plist')
   })
 })
 

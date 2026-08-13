@@ -17,6 +17,10 @@ export class PageManager {
     return this.pages.length
   }
 
+  indexOf(name: string): number {
+    return this.pages.findIndex((page) => page.name === name)
+  }
+
   current(): Page {
     const p = this.pages[this.idx]
     if (!p) throw new Error('no page has been added')
@@ -36,6 +40,10 @@ export class PageManager {
     this.pages[this.idx]?.onLeave?.()
     this.idx = i
     this.pages[this.idx]?.onEnter?.()
+  }
+
+  setByName(name: string): void {
+    this.setIndex(this.indexOf(name))
   }
 
   async onKeyPress(index: number): Promise<void> {

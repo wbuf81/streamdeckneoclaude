@@ -301,6 +301,7 @@ export class StockSource extends EventEmitter {
       log.once(`stocks-network-${symbol}`, `Stock fetch for ${symbol} failed: ${String(e)}`)
       return { quote: null, period: null }
     }
+    log.clearOnce(`stocks-network-${symbol}`)
 
     if (!res.ok) {
       log.once(
@@ -309,6 +310,7 @@ export class StockSource extends EventEmitter {
       )
       return { quote: null, period: null }
     }
+    log.clearOnce(`stocks-http-${symbol}`)
 
     let body: unknown
     try {
@@ -319,10 +321,13 @@ export class StockSource extends EventEmitter {
       log.once(`stocks-json-${symbol}`, `Stock response for ${symbol} is not valid JSON: ${String(e)}`)
       return { quote: null, period: null }
     }
+    log.clearOnce(`stocks-json-${symbol}`)
 
     const quote = parseQuote(symbol, body)
     if (!quote) {
       log.once(`stocks-parse-${symbol}`, `Stock response for ${symbol} has no usable data.`)
+    } else {
+      log.clearOnce(`stocks-parse-${symbol}`)
     }
     return { quote, period: extractPeriod(body) }
   }

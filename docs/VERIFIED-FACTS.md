@@ -22,6 +22,20 @@ Firmware `1.00.011`. Serial `REDACTED-SERIAL`.
 **User-confirmed by eye:** keys 0–3 are the TOP row, 4–7 the BOTTOM row. A press
 listener confirmed every index: keys report 0–7, round buttons report 8 and 9.
 
+### Screen-lock signal
+
+Measured on this Mac on 2026-08-13: `/usr/sbin/ioreg -n Root -d1 -k
+IOConsoleLocked` exposes `"IOConsoleLocked" = No` while unlocked. The previously
+implemented `CGSSessionScreenIsLocked` query returns no such property on this
+machine; interpreting that absence as unlocked caused the first live lock test
+to fail silently. Absence is now an unknown/logged probe result, never a valid
+unlocked observation.
+
+**User-confirmed on the real deck:** after the correction, locking blanks all keys, the
+strip, and both buttons within about two seconds. Escape at the lock screen keeps it blank,
+and unlock restores the page. True system sleep/wake and USB unplug/reconnect are separate
+physical checks and are not yet recorded as verified.
+
 ### Real library methods
 
 ```
@@ -128,6 +142,26 @@ assignment prefix, `#` starting a comment, and tilde expansion.
 
 ---
 
+## OpenAI Codex desktop integration
+
+Measured locally on 2026-08-13:
+
+- `~/.codex/state_5.sqlite` contains the read-only `threads` index, including thread id,
+  title, cwd, model, rollout path, updated time, archive state, and token count.
+- User-owned tasks have `thread_source = 'user'`; internal approval-review work is stored
+  as `thread_source = 'subagent'` and must not appear as a user task tile.
+- Rollout JSONL emits `task_started` and `task_complete` lifecycle events.
+- Its repeated `token_count` events contain `total_token_usage`, account rate limits,
+  reset timestamps, and the plan type. On this account the visible limit is a 10,080
+  minute (seven-day) window.
+- A rollout can be many megabytes. The Codex source therefore establishes state once,
+  remembers its byte offset, and reads only appended bytes on later five-second polls.
+- These files are local implementation details rather than a public integration API.
+  Schema or event changes must fail closed to an unavailable Codex page and must never
+  stop the daemon or the other pages.
+
+---
+
 ## Spotify
 
 - Client id `REDACTED-CLIENT-ID`, taken from the user's own
@@ -144,7 +178,9 @@ assignment prefix, `#` starting a comment, and tilde expansion.
 
 ### The heart is READ-ONLY, and that is Spotify's restriction
 
-All five scopes are granted — confirmed from the token refresh response. Despite that,
+The existing token has all five historical scopes — confirmed from the token refresh
+response. The heart and saved-library code are now removed, so new authorization requests
+only the three playback scopes. Despite the historical library scopes,
 measured with a freshly refreshed token:
 
 | Endpoint | Status |

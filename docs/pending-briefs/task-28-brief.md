@@ -1,5 +1,9 @@
 ### Task 28: Blank the deck while the screen is locked
 
+**Implementation status:** Complete, deployed, and verified for lock, Escape-at-lock-screen,
+and unlock on the real deck. True system sleep/wake and USB reconnect remain separate physical
+checks in `docs/PROJECT-STATE.md`.
+
 **Files:** create `src/lock-state.ts`; modify `src/daemon.ts` and `bin/deckd.ts`; plus tests.
 
 ---
@@ -28,18 +32,18 @@ those calls spend the user's own credential.
 Create `src/lock-state.ts`. It polls, because macOS gives a bare `node` process no practical
 way to subscribe to lock notifications.
 
-**Measured:** `ioreg -n Root -d1 -k CGSSessionScreenIsLocked` costs about **4 ms** per call, so
-a **5 second** interval is free. Do not poll faster.
+**Corrected from the first live test:** this Mac exposes `IOConsoleLocked`, not
+`CGSSessionScreenIsLocked`. Poll the measured key every two seconds. The earlier missing-key
+query left the deck active because the parser incorrectly treated absence as unlocked.
 
-Verified on this machine while **unlocked**: the key is **absent** from the output entirely.
-The locked output was **not** verified, because verifying it means locking the user's screen.
-So handle all of these:
+Handle all of these:
 
 | Output | Meaning |
 | --- | --- |
-| key absent | unlocked |
-| `"CGSSessionScreenIsLocked" = Yes` | locked |
-| `"CGSSessionScreenIsLocked" = No` | unlocked |
+| `"IOConsoleLocked" = Yes` | locked |
+| `"IOConsoleLocked" = No` | unlocked |
+| the older `CGSSessionScreenIsLocked` spelling | compatibility fallback |
+| key absent | **unknown** |
 | anything else, or the command fails | **unknown** |
 
 **Unknown must resolve to UNLOCKED.** A detection bug that blanks the deck forever is a
@@ -122,14 +126,14 @@ Do not duplicate it.
   would fight launchd's `KeepAlive`.
 - ESM only, no `require(`. Strict TypeScript with `noUncheckedIndexedAccess`. Imports use `.js`.
 - `log.once` on every repeating path. A log call must never throw.
-- The four pages must render **identically** when unlocked. Hash a key from each before and
+- The five pages must render **identically** when unlocked. Hash a key from each before and
   after.
 - Prose in ASD-STE100 Simplified Technical English.
 
 ## Tests
 
-Cover, with an injected runner and clock: absent key reads unlocked; `= Yes` reads locked;
-`= No` reads unlocked; unparseable output reads unlocked **and** logs once, not once per poll;
+Cover, with an injected runner and clock: an absent key is unknown and fails open; `= Yes`
+reads locked; `= No` reads unlocked; unparseable output logs once, not once per poll;
 a failing command reads unlocked; `stop()` mid-poll does not arm another timer; locking blanks
 every key, the strip and both buttons, and sets brightness 0; unlocking restores brightness
 and repaints all eight keys; a press while locked reaches **no** page and **no** focus call;

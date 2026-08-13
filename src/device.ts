@@ -91,8 +91,9 @@ export class Device implements DeckDevice {
       log.once('no-device', 'no Stream Deck Neo found. Retrying every 2 seconds.')
       return
     }
+    let opened: StreamDeck
     try {
-      this.deck = await this.deps.openStreamDeck(neo.path)
+      opened = await this.deps.openStreamDeck(neo.path)
     } catch (e) {
       // An open failure almost always means another process owns the device.
       throw new DeviceBusyError(
@@ -101,22 +102,33 @@ export class Device implements DeckDevice {
           `Cause: ${String(e)}`,
       )
     }
+    this.deck = opened
     log.clearOnce('no-device')
     log.clearOnce('open-failed')
     log.clearOnce('enumerate')
+    log.clearOnce('device-error')
+    log.clearOnce('device-close-failed')
     log.info(`connected to ${this.deck.PRODUCT_NAME}`)
-    this.deck.on('down', (c) => this.pressCbs.forEach((cb) => cb(controlIndex(c))))
-    this.deck.on('up', (c) => this.releaseCbs.forEach((cb) => cb(controlIndex(c))))
-    this.deck.on('error', (e) => {
-      log.error(`device error: ${String(e)}`)
-      void this.handleLoss()
+    opened.on('down', (c) => this.pressCbs.forEach((cb) => cb(controlIndex(c))))
+    opened.on('up', (c) => this.releaseCbs.forEach((cb) => cb(controlIndex(c))))
+    opened.on('error', (e) => {
+      void this.handleLoss(opened, e)
     })
     this.connectCbs.forEach((cb) => cb())
   }
 
-  private async handleLoss(): Promise<void> {
+  private async handleLoss(failed: StreamDeck, error: unknown): Promise<void> {
+    // An older native handle can report a late error after a replacement has
+    // already connected. It must never clear or close the current handle.
+    if (this.deck !== failed) return
+    log.once('device-error', `device error: ${String(error)}`)
     this.deck = null
     this.disconnectCbs.forEach((cb) => cb())
+    try {
+      await failed.close()
+    } catch (e) {
+      log.once('device-close-failed', `failed to close lost device handle: ${String(e)}`)
+    }
     this.scheduleRetry()
   }
 

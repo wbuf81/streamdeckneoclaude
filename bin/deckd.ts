@@ -4,10 +4,12 @@ import { Device, DeviceBusyError } from '../src/device.js'
 import { Daemon } from '../src/daemon.js'
 import { PageManager } from '../src/page-manager.js'
 import { ClaudePage } from '../src/pages/claude-page.js'
+import { CodexPage } from '../src/pages/codex-page.js'
 import { SpotifyPage } from '../src/pages/spotify-page.js'
 import { StocksPage } from '../src/pages/stocks-page.js'
 import { WeatherPage } from '../src/pages/weather-page.js'
 import { ClaudeSource } from '../src/sources/claude.js'
+import { CodexSource } from '../src/sources/codex.js'
 import { UsageSource } from '../src/sources/usage.js'
 import { SpotifySource } from '../src/sources/spotify.js'
 import { StockSource } from '../src/sources/stocks.js'
@@ -16,6 +18,7 @@ import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
+import { LockState } from '../src/lock-state.js'
 import { readFileSync, writeFileSync, chmodSync } from 'node:fs'
 import { runAuthFlow, TokenStore } from '../src/sources/spotify-auth.js'
 import { install, uninstall } from '../src/install/install.js'
@@ -56,12 +59,14 @@ async function start(): Promise<void> {
 
   const claude = new ClaudeSource()
   const usage = new UsageSource()
+  const codex = new CodexSource()
   const clientId = readClientId()
   const spotify = new SpotifySource(clientId)
   const stocks = new StockSource()
   const weather = new WeatherSource()
   await claude.start()
   await usage.start()
+  await codex.start()
   await spotify.start()
   await stocks.start()
   await weather.start()
@@ -69,17 +74,19 @@ async function start(): Promise<void> {
   const device = new Device()
   const pages = new PageManager()
   pages.add(new ClaudePage(claude, usage, focusWindow))
+  pages.add(new CodexPage(codex))
   pages.add(new SpotifyPage(spotify))
   pages.add(new StocksPage(stocks))
   pages.add(new WeatherPage(weather))
 
-  // Only now, with all four pages present, may a saved index be restored.
+  // Only now, with all five pages present, may a saved page be restored.
   // `PageManager.setIndex` silently ignores an index outside the current
   // page count, so restoring before every page exists would strand the deck
   // on an earlier page with no error and no log line.
   restorePage(pages)
 
-  const daemon = new Daemon(device, pages)
+  const lockState = new LockState()
+  const daemon = new Daemon(device, pages, undefined, undefined, lockState)
   try {
     await daemon.start()
   } catch (e) {
@@ -94,6 +101,7 @@ async function start(): Promise<void> {
   const onChange = makeChangeHandler(daemon)
   claude.on('change', onChange)
   usage.on('change', onChange)
+  codex.on('change', onChange)
   spotify.on('change', onChange)
   stocks.on('change', onChange)
   weather.on('change', onChange)
@@ -104,6 +112,7 @@ async function start(): Promise<void> {
     await daemon.stop()
     await claude.stop()
     await usage.stop()
+    await codex.stop()
     await spotify.stop()
     await stocks.stop()
     await weather.stop()
@@ -114,18 +123,26 @@ async function start(): Promise<void> {
   process.on('SIGTERM', () => void shutdown())
 }
 
-function restorePage(pages: PageManager): void {
+export function restorePage(pages: PageManager): void {
   try {
-    const raw = JSON.parse(readFileSync(paths.uiFile, 'utf8')) as { page?: number }
-    if (typeof raw.page === 'number') pages.setIndex(raw.page)
+    const raw = JSON.parse(readFileSync(paths.uiFile, 'utf8')) as { page?: number; pageName?: string }
+    if (typeof raw.pageName === 'string' && pages.indexOf(raw.pageName) !== -1) {
+      pages.setByName(raw.pageName)
+      return
+    }
+    if (typeof raw.page === 'number') {
+      // ui.json predates stable page names. Its old order was Claude,
+      // Spotify, Stocks, Weather; Codex is now inserted at index 1.
+      pages.setIndex(raw.page > 0 ? raw.page + 1 : raw.page)
+    }
   } catch {
     // No saved page. Start on the first one.
   }
 }
 
-function savePage(pages: PageManager): void {
+export function savePage(pages: PageManager): void {
   try {
-    writeFileSync(paths.uiFile, JSON.stringify({ page: pages.index }))
+    writeFileSync(paths.uiFile, JSON.stringify({ page: pages.index, pageName: pages.current().name }))
   } catch {
     // A lost page index is not worth a failure.
   }
@@ -195,7 +212,10 @@ if (isMain()) {
   const cmd = process.argv[2]
   switch (cmd) {
     case 'start':
-      void start()
+      void start().catch((e: unknown) => {
+        console.error(String(e))
+        process.exit(1)
+      })
       break
     case 'install':
       install().catch((e: unknown) => {

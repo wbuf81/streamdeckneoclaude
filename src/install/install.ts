@@ -253,13 +253,41 @@ export function writeAtomic(file: string, content: string, mode = 0o644): void {
   renameSync(tmp, file)
 }
 
+export interface FileSnapshot {
+  path: string
+  content: Buffer | null
+  mode: number
+}
+
+/** Captures one file before install mutates it. Null content means absent. */
+export function snapshotFile(file: string): FileSnapshot {
+  try {
+    return { path: file, content: readFileSync(file), mode: statSync(file).mode & 0o777 }
+  } catch (e) {
+    if (e && typeof e === 'object' && 'code' in e && e.code === 'ENOENT') {
+      return { path: file, content: null, mode: 0o644 }
+    }
+    throw e
+  }
+}
+
+/** Restores a snapshot atomically, or removes a file that was absent before. */
+export function restoreFile(snapshot: FileSnapshot): void {
+  if (snapshot.content === null) {
+    if (existsSync(snapshot.path)) unlinkSync(snapshot.path)
+    return
+  }
+  writeAtomic(snapshot.path, snapshot.content.toString('utf8'), snapshot.mode)
+  chmodSync(snapshot.path, snapshot.mode)
+}
+
 export async function install(): Promise<void> {
   ensureStateDir()
   const changed: string[] = []
 
   // Refuse to run twice. Checked first, before any file is touched, so a
   // repeat run leaves the wrapper copy, the backup, and settings.json alone.
-  const settings = readSettings()
+  const settings = readSettingsForInstall()
   if (isInstalled(settings)) {
     console.log('deckd is already installed. Run `deckd uninstall` first to redo it.')
     return
@@ -274,24 +302,23 @@ export async function install(): Promise<void> {
     throw new Error(`wrapper script missing: ${wrapperSrc}`)
   }
   const wrapperDst = join(paths.stateDir, 'statusline-wrapper.sh')
-  copyFileSync(wrapperSrc, wrapperDst)
-  chmodSync(wrapperDst, 0o755)
-  changed.push(`wrote ${wrapperDst}`)
-
-  // 2. Wrap the statusline, after a backup.
   const backup = `${paths.claudeSettings}.deckd-backup`
-  if (existsSync(paths.claudeSettings)) {
-    copyFileSync(paths.claudeSettings, backup)
-    changed.push(`backed up ${paths.claudeSettings} to ${backup}`)
+  const script = join(root, 'dist', 'bin', 'deckd.js')
+  if (!existsSync(script)) {
+    throw new Error(`build first: ${script} does not exist. Run npm run build.`)
   }
-  const { statusLine, inner } = wrapStatusLine(settings.statusLine, wrapperDst)
+
+  // Verify with the source copy before any live file changes. Install copies
+  // these exact bytes to `wrapperDst` and then makes them executable.
+  const probeWrap = wrapStatusLine(settings.statusLine, wrapperSrc)
+  const finalWrap = wrapStatusLine(settings.statusLine, wrapperDst)
 
   // Prove the wrap before trusting it. This is the user's live terminal
   // statusline: if the wrapped command produces different output from the
   // original, the wrap is broken and must not be left in place. Feed both a
   // synthetic payload and compare. Throw on any difference, before anything
   // is written.
-  const probe = await verifyWrap(extractCommand(statusLine), inner)
+  const probe = await verifyWrap(extractCommand(probeWrap.statusLine), probeWrap.inner)
   if (!probe.ok) {
     throw new Error(
       'the wrapped statusline did not reproduce the original output, so nothing ' +
@@ -301,25 +328,67 @@ export async function install(): Promise<void> {
     )
   }
 
-  settings.statusLine = statusLine
-  writeAtomic(paths.claudeSettings, JSON.stringify(settings, null, 2))
-  changed.push(`wrapped statusLine in ${paths.claudeSettings}`)
+  const snapshots = [
+    snapshotFile(wrapperDst),
+    snapshotFile(backup),
+    snapshotFile(paths.claudeSettings),
+    snapshotFile(paths.launchAgent),
+  ]
 
-  // 3. Write and load the launchd agent.
-  const script = join(root, 'dist', 'bin', 'deckd.js')
-  if (!existsSync(script)) {
-    throw new Error(`build first: ${script} does not exist. Run npm run build.`)
+  try {
+    // 1. Copy the wrapper into the state directory, so removing the repository
+    //    later cannot break the statusline.
+    copyFileSync(wrapperSrc, wrapperDst)
+    chmodSync(wrapperDst, 0o755)
+    changed.push(`wrote ${wrapperDst}`)
+
+    // 2. Wrap the statusline, after a backup.
+    if (existsSync(paths.claudeSettings)) {
+      copyFileSync(paths.claudeSettings, backup)
+      changed.push(`backed up ${paths.claudeSettings} to ${backup}`)
+    }
+    settings.statusLine = finalWrap.statusLine
+    writeAtomic(paths.claudeSettings, JSON.stringify(settings, null, 2))
+    changed.push(`wrapped statusLine in ${paths.claudeSettings}`)
+
+    // 3. Write and load the launchd agent.
+    mkdirSync(dirname(paths.launchAgent), { recursive: true })
+    writeAtomic(
+      paths.launchAgent,
+      buildPlist(paths.launchAgentLabel, process.execPath, script, join(paths.stateDir, 'launchd.log')),
+    )
+    changed.push(`wrote ${paths.launchAgent}`)
+    await bootout()
+    await run('/bin/launchctl', ['bootstrap', `gui/${process.getuid?.() ?? 501}`, paths.launchAgent])
+      .catch(() => run('/bin/launchctl', ['load', '-w', paths.launchAgent]))
+    changed.push('loaded the launchd agent')
+  } catch (e) {
+    await bootout()
+    const rollbackErrors: string[] = []
+    for (const snapshot of [...snapshots].reverse()) {
+      try {
+        restoreFile(snapshot)
+      } catch (restoreError) {
+        rollbackErrors.push(`${snapshot.path}: ${String(restoreError)}`)
+      }
+    }
+    // If an agent existed before this attempt, restore its plist and load it
+    // again. This is best-effort; the original install error remains primary.
+    const oldAgent = snapshots.find((snapshot) => snapshot.path === paths.launchAgent)
+    if (oldAgent?.content) {
+      await run('/bin/launchctl', [
+        'bootstrap',
+        `gui/${process.getuid?.() ?? 501}`,
+        paths.launchAgent,
+      ]).catch((restoreError) => {
+        rollbackErrors.push(`reload prior launch agent: ${String(restoreError)}`)
+      })
+    }
+    const detail = rollbackErrors.length
+      ? ` Rollback also had errors: ${rollbackErrors.join('; ')}`
+      : ' All file changes were rolled back.'
+    throw new Error(`${String(e)}${detail}`)
   }
-  mkdirSync(dirname(paths.launchAgent), { recursive: true })
-  writeAtomic(
-    paths.launchAgent,
-    buildPlist(paths.launchAgentLabel, process.execPath, script, join(paths.stateDir, 'launchd.log')),
-  )
-  changed.push(`wrote ${paths.launchAgent}`)
-  await bootout()
-  await run('/bin/launchctl', ['bootstrap', `gui/${process.getuid?.() ?? 501}`, paths.launchAgent])
-    .catch(() => run('/bin/launchctl', ['load', '-w', paths.launchAgent]))
-  changed.push('loaded the launchd agent')
 
   console.log('deckd installed.\n')
   for (const line of changed) console.log(`  . ${line}`)
@@ -546,4 +615,24 @@ function readSettings(): Record<string, unknown> {
   } catch {
     return {}
   }
+}
+
+/** Install must not replace an unreadable settings file with an empty object. */
+function readSettingsForInstall(): Record<string, unknown> {
+  if (!existsSync(paths.claudeSettings)) return {}
+  return parseSettingsObject(readFileSync(paths.claudeSettings, 'utf8'), paths.claudeSettings)
+}
+
+/** Parses settings without allowing an install to erase malformed content. */
+export function parseSettingsObject(text: string, file: string): Record<string, unknown> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (e) {
+    throw new Error(`cannot parse ${file}; no install changes were made: ${String(e)}`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${file} must contain a JSON object; no install changes were made.`)
+  }
+  return parsed as Record<string, unknown>
 }
