@@ -165,3 +165,65 @@ Keep the schema inside one source. Read it without mutation, retain no prompt bo
 internal tasks, bound or incrementally scan large files, and preserve the last safe product
 state when reading fails. A private-schema failure may degrade its page; it must not stop the
 device, navigation, or unrelated sources.
+
+## 21. A fix aimed at the repro leaves the harm reachable by another route
+
+The dominant defect class of 2026-08-13. **Four Criticals in one day were second or third
+occurrences of a harm whose earlier fix had already "landed".**
+
+| Harm | Round 1 trigger | Later trigger |
+| --- | --- | --- |
+| Blank statusline, original unrecoverable | a lenient parse skipped the unwrap but deleted the wrapper | wrapping detected from a user-editable comment; then `uninstall` not using the ambiguity check `install` already used |
+| A ring drawn on a page it was not pressed on | flashes keyed by index, not page | page identity read **after** awaiting an async press handler |
+| The weather detail view opens the wrong day | selection keyed on array position | selection keyed on a calendar date that is **not unique** overnight |
+
+Every one of those fixes was implemented correctly. The briefs were wrong: they described the
+**trigger** a reviewer happened to find, so the implementer closed that route and no other.
+
+**A reviewer reports a repro. A repro is evidence of a broken invariant; it is not the bug.**
+
+Write the invariant instead. Not "detect the wrap by path rather than by comment", but "it must
+be impossible to delete the wrapper while the settings still reference it — here is one known
+route". Then:
+
+- **Enumerate before implementing.** List at least three other ways to reach the same harm.
+  Fix the class, or state why it is bounded. On this project the second route has existed every
+  single time.
+- **Prefer impossible to unreachable.** `uninstall` never deleting a backup ends that class
+  whatever the detection does. Capturing the page identity *before* the await removes the
+  window instead of narrowing it. Ask first whether the bad outcome can be made unreachable by
+  construction.
+- **One decision, one function.** Round 3's Critical existed because `install` and `uninstall`
+  answered "is this wrapped?" separately. Callers that reason independently about the same
+  question will diverge again.
+- **Do not prescribe an implementation you have not verified.** Every controller-authored defect
+  this day came from specifying *how*: an `immutable=1` fallback that could not be bounded, a
+  flat 24-hour staleness backstop, a null-safe ordering key implemented backwards, a
+  non-unique date identity. Label a prescription as a hypothesis and invite the implementer to
+  refute it — one did, correctly.
+
+The same disease appears one layer down, in tests. See lesson 22.
+
+## 22. A test written for the repro is a test that cannot fail
+
+Four review rounds found this shape in **six** files, and it survived being fixed twice:
+
+- geometry proofs probing a **single column** that is background for any overflow — measured, an
+  overloaded strip painted no further right than column 241 while the test probed 247
+- a caption probe that only trips at 14 characters, against a caption that is 4
+- a centring proof comparing four emoji whose ink boxes are **byte-identical**, so it compares
+  equal numbers and would pass with the wrong glyph entirely
+- a signal-forwarding test using the one command shape `bash` exec-optimises, so it passed
+  without the feature working
+- a backup-mode test that passed unfixed, because `copyFileSync` already copies the source mode
+- fixtures encoding behaviour the real tool does not have: `sqlite3 -json` prints **nothing**
+  for zero rows, never `[]`, and a weather fixture parsed to 7 days with 1 distinct date, hiding
+  a Critical
+
+These are worse than no test. They report safety that does not exist, and they are why three of
+the defects above reached hardware behind a green suite.
+
+**Assert the property, not the instance.** Probe the region rather than one column. Use the
+widest realistic content, not the example. Build fixtures from **real** captured output. And for
+any test claiming to prove a fix: break the fix and watch it fail. If it still passes, the test
+is decoration.
