@@ -1,7 +1,7 @@
 import type { DeckFrame, KeySpec, StripSpec, ImageCrop, PulseSpec } from '../render/specs.js'
 import { blankKey } from '../render/specs.js'
 import { theme } from '../render/theme.js'
-import { truncate, formatClock } from '../render/text.js'
+import { truncate, formatClock, formatEasternTime } from '../render/text.js'
 import type { Image } from '@napi-rs/canvas'
 import type { Page } from './types.js'
 import type { PlayerState, SpotifyStatus } from '../sources/spotify.js'
@@ -171,7 +171,7 @@ export class SpotifyPage implements Page {
     if (!state) {
       // Idle: a clear message plus the clock, so the strip still tells the
       // user something useful while the four art keys carry the animation.
-      return { lines: ['spotify', 'nothing playing'], right: formatWallClock(nowMs), dim: true }
+      return { lines: ['spotify', 'nothing playing'], right: formatEasternTime(nowMs), dim: true }
     }
 
     // Title on its own line, artist on the second beside the clock. The title
@@ -231,11 +231,4 @@ function volumeLabel(state: PlayerState | null): string {
 function pulseSpec(nowMs: number, phaseIndex: number): PulseSpec {
   const phase = (nowMs / PULSE_PERIOD_MS) * 2 * Math.PI + phaseIndex * PULSE_PHASE_STEP
   return { phase, bars: PULSE_BARS, color: theme.green }
-}
-
-/** `H:MM`, from the daemon's own millisecond clock — never `Date.now()`, so
- * the strip's idle clock is deterministic in a test. */
-function formatWallClock(nowMs: number): string {
-  const d = new Date(nowMs)
-  return `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`
 }

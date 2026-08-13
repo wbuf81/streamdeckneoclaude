@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { StocksPage } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
-import { renderKey, probe, KEY_SIZE } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { SYMBOLS } from '../../src/sources/stocks.js'
 import type { Quote, MarketState, StockStatus } from '../../src/sources/stocks.js'
 
@@ -221,6 +221,26 @@ describe('StocksPage strip', () => {
     const strip = page.render(NOW).strip
     expect(strip.lines[0]!.length).toBeLessThanOrEqual(30)
     expect(strip.lines[1]!.length).toBeLessThanOrEqual(30)
+  })
+
+  it('shows the as-of time in Eastern time with AM/PM, not the exchange-only 24-hour clock', () => {
+    // NOW (1786549560) is 2026-08-12 15:46 UTC, which is 11:46 AM EDT — a
+    // summer instant, so EDT is the only correct abbreviation. Fixed epoch
+    // and exact string, per docs/LESSONS.md #17: a test against "now" would
+    // break in November and on a machine in another timezone.
+    const { page } = build({ quotes: allQuotes(), marketState: 'open' })
+    expect(page.render(NOW).strip.lines[0]).toBe('MARKET OPEN · 11:46 AM EDT')
+  })
+
+  it('never draws strip text past the strip edge for the widest market label and timestamp', () => {
+    // Measured: `MARKET CLOSED · 4:05 PM EDT` is 211.3 px against the
+    // strip's 236 px usable width — verified by pixel probe here, not
+    // arithmetic, per docs/LESSONS.md #17.
+    const { page } = build({ quotes: allQuotes(), marketState: 'closed' })
+    const buffer = renderStrip(page.render(NOW).strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
   })
 })
 
@@ -466,6 +486,30 @@ describe('StocksPage detail view layout', () => {
   it('does not dim the detail view for a fresh, non-stale symbol', () => {
     const keys = detailKeys()
     for (const key of keys.slice(0, 7)) expect(key.dim).not.toBe(true)
+  })
+})
+
+describe('StocksPage detail view strip', () => {
+  it('shows the as-of time in Eastern time with AM/PM on line 2', () => {
+    // Fixed epoch (see the grid-strip test above for the same NOW value):
+    // 11:46 AM EDT, not the machine's local clock and not a hard-coded EST.
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    const { page } = build({ quotes, marketState: 'closed' })
+    page.onKeyPress(0)
+    const line2 = page.render(NOW).strip.lines[1]!
+    expect(line2).toBe('MARKET CLOSED · 11:46 AM EDT')
+  })
+
+  it('never draws detail-strip text past the strip edge', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    const { page } = build({ quotes, marketState: 'closed' })
+    page.onKeyPress(0)
+    const buffer = renderStrip(page.render(NOW).strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
   })
 })
 

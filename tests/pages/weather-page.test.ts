@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { WeatherPage, conditionTint, heatColor } from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
-import { renderKey, probe, KEY_SIZE } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
 import type { Conditions, DayForecast, WeatherStatus } from '../../src/sources/weather.js'
 
@@ -432,15 +432,15 @@ describe('WeatherPage strip', () => {
     expect(page.render(NOW).strip.lines[1]).toBe('offline')
   })
 
-  it('shows the last successful fetch time, not the current render time', () => {
+  it('shows the last successful fetch time, not the current render time, in Eastern time with AM/PM', () => {
+    // NOW - 3600 is 2026-08-12 14:46 UTC, which is 10:46 AM EDT — a summer
+    // instant, per the project's one timestamp convention (AGENTS.md).
+    // Fixed epoch and exact string, not "now": a test that formats the real
+    // clock breaks in November when the zone flips, and on any machine in
+    // another timezone (docs/LESSONS.md #17).
     const updatedAt = NOW - 3600
-    const expected = new Intl.DateTimeFormat('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).format(new Date(updatedAt * 1000))
     const { page } = build({ updatedAt })
-    expect(page.render(NOW).strip.lines[1]).toBe(`updated ${expected}`)
+    expect(page.render(NOW).strip.lines[1]).toBe('updated 10:46 AM EDT')
   })
 
   it('shows an unknown update time before the first successful fetch', () => {
@@ -453,6 +453,17 @@ describe('WeatherPage strip', () => {
     const strip = page.render(NOW).strip
     expect(strip.lines[0]!.length).toBeLessThanOrEqual(30)
     expect(strip.lines[1]!.length).toBeLessThanOrEqual(30)
+  })
+
+  it('never draws strip text past the strip edge for the "updated" timestamp', () => {
+    // Measured: `updated 4:05 PM EDT` is 148.7 px against the strip's 236 px
+    // usable width — verified by pixel probe, not arithmetic, per
+    // docs/LESSONS.md #17.
+    const { page } = build()
+    const buffer = renderStrip(page.render(NOW).strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
   })
 })
 

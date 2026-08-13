@@ -1,6 +1,6 @@
 import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
-import { truncate } from '../render/text.js'
+import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page } from './types.js'
 import type { MarketState, Quote, StockStatus } from '../sources/stocks.js'
 import { SYMBOLS, downsample } from '../sources/stocks.js'
@@ -9,9 +9,6 @@ import { SYMBOLS, downsample } from '../sources/stocks.js'
 const SPARK_BUCKETS = 12
 /** Measured limit for one strip line. See `render/canvas.ts`. */
 const STRIP_CHARS = 30
-/** The exchange timezone for every symbol on this page. All eight tickers
- * trade on a US exchange, so one timezone covers them all. */
-const EXCHANGE_TZ = 'America/New_York'
 /**
  * Candidate sizes for the detail view's numeric lines, largest first. 16 px
  * fits a 7-character price like `1234.56`; 13 and 11 extend the list
@@ -92,20 +89,13 @@ function latestAsOf(quotes: Map<string, Quote>): number | null {
   return max
 }
 
-/** `16:20 EDT` in the exchange timezone. Never throws: a formatting failure
- * is not worth losing the whole strip line over. */
+/** `4:20 PM EDT` — the exchange trades US Eastern hours, which is also the
+ * project's one timestamp zone, per `AGENTS.md`'s "Product conventions".
+ * Measured at 211.3 px for the widest case, `MARKET CLOSED · 4:05 PM EDT`,
+ * well inside the strip's 236 px usable width, so the zone abbreviation
+ * stays on. */
 function formatAsOf(epochSeconds: number): string {
-  try {
-    return new Intl.DateTimeFormat('en-US', {
-      timeZone: EXCHANGE_TZ,
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-      timeZoneName: 'short',
-    }).format(new Date(epochSeconds * 1000))
-  } catch {
-    return ''
-  }
+  return formatEasternTime(epochSeconds * 1000)
 }
 
 /** The part of `StockSource` this page needs. */

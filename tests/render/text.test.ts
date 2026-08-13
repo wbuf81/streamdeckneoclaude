@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { createCanvas } from '@napi-rs/canvas'
-import { truncate, formatDuration, formatClock, fitSize } from '../../src/render/text.js'
+import { truncate, formatDuration, formatClock, fitSize, formatEasternTime } from '../../src/render/text.js'
 import { FONT } from '../../src/render/canvas.js'
 
 /** Measures independently of `fitSize`, so the test does not just check
@@ -70,6 +70,41 @@ describe('formatClock', () => {
 
   it('handles over an hour', () => {
     expect(formatClock(3725)).toBe('62:05')
+  })
+})
+
+describe('formatEasternTime', () => {
+  // Every case below is a FIXED epoch, never `Date.now()`, so the assertion
+  // stays true on any machine and does not flip in November when the zone
+  // switches — per docs/LESSONS.md #17 and the project's "Product
+  // conventions" (AGENTS.md).
+
+  it('renders a summer instant with EDT, not a hard-coded EST', () => {
+    // 2026-07-15 20:05 UTC is 4:05 PM Eastern Daylight Time.
+    expect(formatEasternTime(1784145900000)).toBe('4:05 PM EDT')
+  })
+
+  it('renders a winter instant with EST', () => {
+    // 2026-01-15 21:05 UTC is 4:05 PM Eastern Standard Time.
+    expect(formatEasternTime(1768511100000)).toBe('4:05 PM EST')
+  })
+
+  it('renders midnight as 12:00 AM, not 0:00 AM', () => {
+    // 2026-01-15 05:00 UTC is midnight Eastern Standard Time.
+    expect(formatEasternTime(1768453200000)).toBe('12:00 AM EST')
+  })
+
+  it('renders noon as 12:00 PM', () => {
+    // 2026-01-15 17:00 UTC is noon Eastern Standard Time.
+    expect(formatEasternTime(1768496400000)).toBe('12:00 PM EST')
+  })
+
+  it('drops the zone abbreviation when asked, but keeps AM/PM', () => {
+    expect(formatEasternTime(1784145900000, { zone: false })).toBe('4:05 PM')
+  })
+
+  it('never throws, even for a nonsense timestamp', () => {
+    expect(() => formatEasternTime(Number.NaN)).not.toThrow()
   })
 })
 

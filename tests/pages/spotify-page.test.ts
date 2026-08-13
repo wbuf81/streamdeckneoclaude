@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
-import { renderKey } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
+import { theme } from '../../src/render/theme.js'
 import type { Image } from '@napi-rs/canvas'
 
 const NOW = 1786549560
@@ -258,10 +259,26 @@ describe('SpotifyPage strip', () => {
     expect(page.render(NOW).strip.lines.join(' ')).toContain('nothing playing')
   })
 
-  it('shows a wall clock beside the idle message', () => {
+  it('shows the wall clock beside the idle message, in Eastern time with AM/PM', () => {
+    // Fixed epoch, not the real clock: 1786549560000 ms is 2026-08-12 15:46
+    // UTC, which is 11:46 AM EDT — a summer instant, so the zone must read
+    // EDT, never a hard-coded EST. Exact string, per docs/LESSONS.md #17:
+    // measured at 93.9 px against the strip's 236 px usable width.
     const { page } = build(null, 'no-device')
     const strip = page.render(NOW, 1786549560000).strip
-    expect(strip.right).toMatch(/^\d{1,2}:\d{2}$/)
+    expect(strip.right).toBe('11:46 AM EDT')
+  })
+
+  it('never draws strip text past the strip edge, and the idle clock never overlaps "nothing playing"', () => {
+    // Measured: `nothing playing` is 117.4 px and the right-aligned
+    // `11:46 AM EDT` is 93.9 px, well clear of each other inside the
+    // strip's 236 px usable width — verified by pixel probe, not
+    // arithmetic, per docs/LESSONS.md #17.
+    const { page } = build(null, 'no-device')
+    const buffer = renderStrip(page.render(NOW, 1786549560000).strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
   })
 
   it('tells the user how to authorize when unauthorized', () => {

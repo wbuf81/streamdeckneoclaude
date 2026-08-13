@@ -58,3 +58,56 @@ export function formatClock(seconds: number): string {
   const s = safe % 60
   return `${m}:${String(s).padStart(2, '0')}`
 }
+
+/** The one US Eastern zone every page's wall-clock display uses. Never a
+ * fixed offset, so the switch between standard and daylight time is
+ * automatic. */
+const EASTERN_TZ = 'America/New_York'
+
+/**
+ * Formats `epochMs` as a wall-clock timestamp in US Eastern time: a 12-hour
+ * clock with `AM` or `PM`, plus the REAL zone abbreviation for that date —
+ * `EDT` in summer, `EST` in winter. This is the ONE timestamp formatter for
+ * the whole project (see `AGENTS.md`'s "Product conventions"). Every page's
+ * wall-clock display must go through it instead of hand-rolling a second
+ * one — four different ones had already grown before this rule existed.
+ *
+ * A **duration** — elapsed or remaining time, like `formatClock` or
+ * `formatDuration` — is not a timestamp and must never be passed through
+ * here or gain AM/PM.
+ *
+ * Pass `zone: false` to drop the trailing abbreviation on a key where every
+ * character counts. AM/PM stays either way, per the user's decision.
+ *
+ * Never throws: a formatting failure costs a blank string, not a lost
+ * render.
+ */
+export function formatEasternTime(epochMs: number, { zone = true }: { zone?: boolean } = {}): string {
+  try {
+    const d = new Date(epochMs)
+    const time = new Intl.DateTimeFormat('en-US', {
+      timeZone: EASTERN_TZ,
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(d)
+    return zone ? `${time} ${easternZoneAbbr(d)}` : time
+  } catch {
+    return ''
+  }
+}
+
+/** The real Eastern zone abbreviation for `d` — `EDT` or `EST`, whichever
+ * the date actually falls under. Never hard-coded: the user asked for
+ * "EST", meaning Eastern, and printing `EST` in July would be wrong. Falls
+ * back to `ET` if the platform's data omits the short name, so the string
+ * stays informative rather than going blank. */
+function easternZoneAbbr(d: Date): string {
+  const part = new Intl.DateTimeFormat('en-US', {
+    timeZone: EASTERN_TZ,
+    timeZoneName: 'short',
+  })
+    .formatToParts(d)
+    .find((p) => p.type === 'timeZoneName')
+  return part?.value ?? 'ET'
+}

@@ -1,6 +1,6 @@
 import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
-import { truncate } from '../render/text.js'
+import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page } from './types.js'
 import type { Conditions, DayForecast, WeatherStatus } from '../sources/weather.js'
 import { ZIP } from '../sources/weather.js'
@@ -109,18 +109,12 @@ function precipColor(pct: number | null): readonly [number, number, number] {
   return typeof pct === 'number' && pct >= PRECIP_HOT_THRESHOLD ? theme.blue : theme.textDim
 }
 
-/** `17:20` in the local time zone. Never throws: a formatting failure is not
- * worth losing the whole strip line over. */
+/** `4:05 PM EDT`, in US Eastern time — the project's one timestamp
+ * formatter, per `AGENTS.md`'s "Product conventions". Measured at 148.7 px
+ * for `updated 4:05 PM EDT`, well inside the strip's 236 px usable width, so
+ * the zone abbreviation stays on. */
 function formatUpdated(epochSeconds: number): string {
-  try {
-    return new Intl.DateTimeFormat('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).format(new Date(epochSeconds * 1000))
-  } catch {
-    return ''
-  }
+  return formatEasternTime(epochSeconds * 1000)
 }
 
 /**
