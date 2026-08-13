@@ -124,6 +124,12 @@ but **that directory is git-ignored**, so this file is the durable record.
 | 28 | blank the deck while the screen is locked | complete and verified on the real deck |
 | 29 | end-to-end reliability sweep, CI, safe state override | complete and deployed |
 | 30 | OpenAI Codex active-task and usage page | complete and deployed |
+| — | scoped review of install + Codex, then all its fixes | complete, 1+2 Critical and 12 Important found |
+| 31 | one shared Eastern 12-hour timestamp helper | complete, **unverified on hardware** |
+| 32 | press feedback for every key, moved into the daemon | complete, **unverified on hardware** |
+| 33 | stock detail chart shows 52 weeks, not the day | complete, **unverified on hardware** |
+| 34 | weather day-detail drill-down | complete, **unverified on hardware** |
+| 35 | Codex usage sample's own timestamp on the strip | complete, **unverified on hardware** |
 
 Briefs and reports for tasks 9–24 are in
 `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck-part2/`. **Git-ignored** — copy
@@ -154,9 +160,46 @@ anything still needed before that directory is cleaned.
 
 ### Next work, in priority order
 
-#### P0 — none open
+#### P0 — the user verifies tasks 31 to 35 on the real deck
 
-The two hardware checks are done and both pass. See the verified list above.
+Five visible changes shipped on 2026-08-13 and **none has been seen on hardware.** Every real
+defect found this session was found by the user looking at the glass, while a green suite of
+900-plus tests repeatedly missed them. So this check outranks any new code.
+
+What to look at, and what is expected:
+
+1. **Any dead key, any page.** A full-key **red** flash. White when the press does something.
+   Every key on all five pages now reports an outcome and the daemon draws the flash.
+2. **Weather — press a day tile.** A detail view: the day tile, day and night halves, wind,
+   both outlooks, rain percentages, and `◀ BACK` on key 7. **The known risk:** the strip shows
+   the day's and night's `detailedForecast` truncated to 30 characters each, so about 29
+   characters plus an ellipsis survive. That may read as useless. If so, redesign what the
+   strip carries — the tiles themselves are fine.
+3. **Stocks — drill in and read the chart caption.** It should say `52 WK`. A `1D` caption means
+   the yearly series is still loading or failed, and is deliberately labelled rather than
+   silently mislabelled. `SPCX` legitimately shows a short chart: only **42** daily closes
+   exist, because it has been listed less than a year.
+4. **Codex strip, right side.** The usage sample's own time, or `--` when the figure no longer
+   describes the current reset window.
+5. **Every timestamp** should read like `4:05 PM EDT`.
+
+Record the outcomes here. Anything wrong becomes the next task.
+
+#### P0 — two stray files need the user's go-ahead to delete
+
+`~/.local/state/deckd/sessions/baseline-probe.json` and `deckd-install-probe.json` hold the
+installer's **fabricated** payload, and the usage source reads that directory, so they can
+still feed the gauges invented numbers. `install()` now cleans them up, but running install
+against live config is not something to do casually. The repair is a two-file delete and needs
+one word from the user. **Nothing else under `~` may be deleted.**
+
+#### P1 — review the six commits from 2026-08-13
+
+`6854948` through `a825bee` are unreviewed. Today's scoped review found 3 Critical and 12
+Important defects, all behind a fully green suite, so this is not a formality. **Review the
+press-feedback commit `360508d` first:** it changed a core interface, touched the daemon and all
+five pages at once, and deleted working code from the Claude page. That is the highest-risk
+shape of change made in this project.
 
 #### P1 — Add `deckd status` and `deckd doctor`
 
