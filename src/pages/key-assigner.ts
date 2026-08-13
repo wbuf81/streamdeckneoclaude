@@ -30,7 +30,25 @@ export class KeyAssigner {
   private slots: (string | null)[] = new Array(SESSION_SLOTS).fill(null)
 
   assign(sessions: Session[]): Assignment {
-    const live = new Set(sessions.map((s) => s.sessionId))
+    // M2 — a stray or copied session-state file can produce two entries
+    // that share one `sessionId`: `ClaudeSource.getSessions` (see
+    // `sources/claude.ts`) takes the id from each file's CONTENTS, not its
+    // name, so nothing on disk stops two files from claiming the same id.
+    // The `live` Set two lines below already assumes ids are unique — an
+    // un-deduped input let one session occupy two slots (measured:
+    // `[x(ts 3), x(ts 2), y(ts 1)]` returned `slots: ['x', 'x', 'y']`),
+    // which both wastes a slot a real second session could have used and
+    // double-counts the duplicate in `ClaudePage.strip`'s `${live.length}
+    // active`. Deduped by id here, keeping whichever entry has the newest
+    // `ts`, before anything else in this method runs.
+    const bySessionId = new Map<string, Session>()
+    for (const s of sessions) {
+      const existing = bySessionId.get(s.sessionId)
+      if (!existing || s.ts > existing.ts) bySessionId.set(s.sessionId, s)
+    }
+    const deduped = [...bySessionId.values()]
+
+    const live = new Set(deduped.map((s) => s.sessionId))
 
     for (let i = 0; i < SESSION_SLOTS; i++) {
       const id = this.slots[i]!
@@ -38,7 +56,7 @@ export class KeyAssigner {
     }
 
     const held = new Set(this.slots.filter((v): v is string => v !== null))
-    const waiting = sessions
+    const waiting = deduped
       .filter((s) => !held.has(s.sessionId))
       .sort((a, b) => b.ts - a.ts)
 

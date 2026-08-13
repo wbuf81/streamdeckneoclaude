@@ -409,6 +409,27 @@ describe('StocksPage detail view layout', () => {
     expect(key.lineColors![1]).toEqual(theme.red)
   })
 
+  // M8 — a diff in (-0.005, 0) has a negative raw sign but rounds its
+  // magnitude to `0.00`; taking the sign from the raw diff printed the
+  // self-contradictory `-0.00`, a "loss" of nothing.
+  it('never shows -0.00 for a change amount that rounds to zero (M8)', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { price: 100, previousClose: 100.001 }))
+    const { page } = build({ quotes })
+    page.onKeyPress(0)
+    const key = page.render(NOW).keys[1]!
+    expect(key.lines![1]).toBe('0.00')
+  })
+
+  it('still shows a real negative change amount that does not round to zero', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { price: 100, previousClose: 100.5 }))
+    const { page } = build({ quotes })
+    page.onKeyPress(0)
+    const key = page.render(NOW).keys[1]!
+    expect(key.lines![1]).toBe('-0.50')
+  })
+
   it('key 2 shows DAY, then the day high, then the day low', () => {
     const key = detailKeys()[2]!
     expect(key.lines).toEqual(['DAY', '335.50', '323.64'])
@@ -885,12 +906,13 @@ describe('StocksPage detail view strip', () => {
   })
 
   it('never draws detail-strip text past the strip edge', () => {
-    // Test quality (I2 scan): this detail strip also carries no
-    // right-aligned field (both lines are plain text), so a single-column
-    // probe at the true edge cannot fail for ANY input — widened to a band,
-    // and driven with the longest real company name on record
-    // (docs/VERIFIED-FACTS.md's "Space Exploration Technologies Corp.") so
-    // the content is not trivially short of the margin either.
+    // Test quality (I2 scan): with the source online (the default here),
+    // this detail strip carries no right-aligned field (both lines are
+    // plain text), so a single-column probe at the true edge cannot fail
+    // for ANY input — widened to a band, and driven with the longest real
+    // company name on record (docs/VERIFIED-FACTS.md's "Space Exploration
+    // Technologies Corp.") so the content is not trivially short of the
+    // margin either.
     const quotes = allQuotes()
     quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { name: 'Space Exploration Technologies Corp.' }))
     const { page } = build({ quotes, marketState: 'closed' })
@@ -901,6 +923,35 @@ describe('StocksPage detail view strip', () => {
         expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
       }
     }
+  })
+
+  // I4 — the grid strip's own `offline` marker (see the grid-strip tests
+  // above) used to disappear entirely once a symbol's detail view was open:
+  // `MARKET CLOSED · 4:00 PM EDT` is the last TRADE time, not the last
+  // fetch, so a stale connection read as perfectly normal. Reproduced with
+  // the review's exact scenario: offline AND the market closed, so
+  // `isSymbolStale` reports false by construction and every tile stays at
+  // full brightness — `right` is the only place left for the daemon to say
+  // it has not reached Yahoo.
+  it('marks the detail strip offline when the source has gone offline, even while the market is simply closed', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    const { page } = build({ quotes, marketState: 'closed', status: 'offline' })
+    page.onKeyPress(0)
+    const strip = page.render(NOW).strip
+    expect(strip.right).toBe('offline')
+    // Both text lines stay in place — offline does not blank out the
+    // company name or the market-state line, it only adds the marker.
+    expect(strip.lines[0]).toBe('TSLA')
+    expect(strip.lines[1]).toBe('MARKET CLOSED · 11:46 AM EDT')
+  })
+
+  it('carries no right-aligned marker in the detail strip while the source is online', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    const { page } = build({ quotes, marketState: 'closed', status: 'ok' })
+    page.onKeyPress(0)
+    expect(page.render(NOW).strip.right).toBeUndefined()
   })
 })
 

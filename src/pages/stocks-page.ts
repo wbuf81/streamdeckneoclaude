@@ -92,8 +92,13 @@ function formatChangeValue(price: number | null, previousClose: number | null): 
   if (typeof price !== 'number' || typeof previousClose !== 'number') return '--'
   if (!Number.isFinite(price) || !Number.isFinite(previousClose)) return '--'
   const diff = price - previousClose
-  const sign = diff < 0 ? '-' : ''
-  return `${sign}${Math.abs(diff).toFixed(2)}`
+  const magnitude = Math.abs(diff).toFixed(2)
+  // M8 — the sign comes from the ROUNDED magnitude, not the raw diff: a diff
+  // in (-0.005, 0) has a negative raw sign but rounds its magnitude to
+  // `0.00`, and printing that combination gave `-0.00` — a "loss" of
+  // nothing, self-contradictory the same way `STALE 0m` was for I3.
+  const sign = diff < 0 && magnitude !== '0.00' ? '-' : ''
+  return `${sign}${magnitude}`
 }
 
 /** The newest `asOf` across all quotes, or null when none is known yet. */
@@ -430,6 +435,18 @@ export class StocksPage implements Page {
     }
   }
 
+  /**
+   * I4 — the grid strip's own `offline` honesty signal (see `strip` below)
+   * used to disappear entirely in detail mode: `MARKET CLOSED · 4:00 PM
+   * EDT` is the last TRADE time, not the last fetch, so a detail view left
+   * open for hours after the network dropped read as entirely normal, at
+   * full brightness, with nothing on the frame to say the daemon has not
+   * reached Yahoo since this morning. Both strip lines are already spoken
+   * for (the company name, the market state and trade time), so this
+   * mirrors weather's own fix for the identical shape (`weather-page.ts`'s
+   * `detailStrip`, its own M2): put the status in `right`, the field
+   * `StripSpec` reserves for exactly this, rather than dropping either line.
+   */
   private detailStrip(quote: Quote): StripSpec {
     const marketState = this.source.getMarketState()
     const line1 = truncate(quote.name, STRIP_CHARS)
@@ -437,7 +454,8 @@ export class StocksPage implements Page {
       `${STATE_LABELS[marketState]} · ${formatAsOfOrUnknown(quote.asOf > 0 ? quote.asOf : null)}`,
       STRIP_CHARS,
     )
-    return { lines: [line1, line2] }
+    const right = this.source.getStatus() === 'offline' ? 'offline' : undefined
+    return { lines: [line1, line2], right }
   }
 
   private strip(quotes: Map<string, Quote>): StripSpec {

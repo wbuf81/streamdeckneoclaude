@@ -93,4 +93,30 @@ describe('KeyAssigner', () => {
     expect(r.slots).not.toContain('d')
     expect(r.overflow).toBe(1)
   })
+
+  // M2 — `ClaudeSource.getSessions` takes a session's id from each STATE
+  // FILE'S CONTENTS, not the file's name, so a stray or copied file can
+  // produce two entries sharing one `sessionId`. The review's exact repro:
+  // `[x(ts 3), x(ts 2), y(ts 1)]` returned `slots: ['x', 'x', 'y']` before
+  // this fix — one session on two tiles, and a real second session (`y`)
+  // pushed to a slot it did not need to share with anything, wasting a slot
+  // a THIRD real session could otherwise have used.
+  it('dedupes a session id that appears twice, keeping the newest copy, so it never occupies two slots', () => {
+    const a = new KeyAssigner()
+    const r = a.assign([s('x', 3), s('x', 2), s('y', 1)])
+    expect(r.slots).toEqual(['x', 'y', null])
+    expect(r.overflow).toBe(0)
+    // Exactly one 'x', never two.
+    expect(r.slots.filter((id) => id === 'x')).toHaveLength(1)
+  })
+
+  it('still dedupes across calls, once a duplicated id is already held', () => {
+    const a = new KeyAssigner()
+    a.assign([s('x', 3), s('y', 1)])
+    // A second, stale copy of 'x' arrives on a later poll alongside a real
+    // new session 'z' — 'x' must not claim a SECOND slot.
+    const r = a.assign([s('x', 3), s('x', 2), s('y', 1), s('z', 5)])
+    expect(r.slots).toEqual(['x', 'y', 'z'])
+    expect(r.overflow).toBe(0)
+  })
 })
