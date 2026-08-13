@@ -123,14 +123,38 @@ async function start(): Promise<void> {
   process.on('SIGTERM', () => void shutdown())
 }
 
-export function restorePage(pages: PageManager): void {
+/**
+ * Restores the page saved by `savePage`. `readFile` is injectable so a test
+ * can supply an in-memory implementation — this must never read the real
+ * `ui.json` under `~` from a test.
+ *
+ * The legacy `+1` migration below is a ONE-SHOT correctness rule: it may run
+ * ONLY when `pageName` is entirely absent, meaning the file predates stable
+ * page names altogether (lesson 19). It must NOT run merely because a
+ * present `pageName` failed to resolve — that is a DIFFERENT case (a page
+ * renamed or removed since the file was written by today's own `savePage`),
+ * and applying the numeric shift to it silently opens a different, wrong
+ * page. `{page: 1, pageName: 'codex'}` after a hypothetical rename to
+ * `openai-codex` must fall back to the first page, not jump to Spotify at
+ * `1 + 1`.
+ */
+export function restorePage(
+  pages: PageManager,
+  readFile: (path: string, encoding: 'utf8') => string = readFileSync,
+): void {
   try {
-    const raw = JSON.parse(readFileSync(paths.uiFile, 'utf8')) as { page?: number; pageName?: string }
-    if (typeof raw.pageName === 'string' && pages.indexOf(raw.pageName) !== -1) {
-      pages.setByName(raw.pageName)
+    const raw = JSON.parse(readFile(paths.uiFile, 'utf8')) as { page?: number; pageName?: string }
+    if (typeof raw.pageName === 'string') {
+      const idx = pages.indexOf(raw.pageName)
+      // A name that does not resolve (renamed, removed, or simply unknown)
+      // falls back to whichever page is already current — page 0, since
+      // `PageManager.add` fires `onEnter` for the first page and nothing
+      // here has moved it — rather than guessing at a numeric index that
+      // means something else entirely.
+      if (idx !== -1) pages.setIndex(idx)
       return
     }
-    if (typeof raw.page === 'number') {
+    if (typeof raw.page === 'number' && Number.isInteger(raw.page)) {
       // ui.json predates stable page names. Its old order was Claude,
       // Spotify, Stocks, Weather; Codex is now inserted at index 1.
       pages.setIndex(raw.page > 0 ? raw.page + 1 : raw.page)
@@ -140,9 +164,18 @@ export function restorePage(pages: PageManager): void {
   }
 }
 
-export function savePage(pages: PageManager): void {
+/**
+ * Persists the current page's stable name (and, for the legacy reader, its
+ * current numeric index) so a later `restorePage` can find it again even if
+ * an earlier release's insertion changed everyone's numeric position.
+ * `writeFile` is injectable for the same reason `readFile` is above.
+ */
+export function savePage(
+  pages: PageManager,
+  writeFile: (path: string, data: string) => void = writeFileSync,
+): void {
   try {
-    writeFileSync(paths.uiFile, JSON.stringify({ page: pages.index, pageName: pages.current().name }))
+    writeFile(paths.uiFile, JSON.stringify({ page: pages.index, pageName: pages.current().name }))
   } catch {
     // A lost page index is not worth a failure.
   }

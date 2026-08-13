@@ -92,6 +92,15 @@ describe('PageManager', () => {
     expect(m.index).toBe(0)
   })
 
+  it('ignores a non-integer index rather than corrupting current()', () => {
+    const m = new PageManager()
+    m.add(fakePage('a'))
+    m.add(fakePage('b'))
+    m.setIndex(1.5)
+    expect(m.index).toBe(0)
+    expect(() => m.current()).not.toThrow()
+  })
+
   it('restores a saved index', () => {
     const m = new PageManager()
     m.add(fakePage('a'))

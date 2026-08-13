@@ -36,6 +36,10 @@ export class PageManager {
   }
 
   setIndex(i: number): void {
+    // A non-integer index (corrupt `ui.json`, for example `1.5`) would
+    // otherwise pass the range check below, land in `this.idx`, and make
+    // `current()` throw on the next call — array indexing does not round.
+    if (!Number.isInteger(i)) return
     if (i < 0 || i >= this.pages.length || i === this.idx) return
     this.pages[this.idx]?.onLeave?.()
     this.idx = i
