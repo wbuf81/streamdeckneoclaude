@@ -167,8 +167,10 @@ words: *"everything else works as you say it does"*.
 
 **One change requested.** The press flash was too much: *"the white and red show too long and
 are too brigt can you maybe just outline the button or something ? its a little too jarring"*.
-Task 36 replaces the full-key fill with a full-perimeter ring, dimmer colours, and about 150 ms
-instead of 250.
+Task 36 replaced the full-key fill with a full-perimeter ring, dimmer colours, and **90 ms**
+instead of 250. (An earlier draft of this note said "about 150 ms" — that number never matched
+`FLASH_MS` in `src/daemon.ts`, which has been 90 the whole time; trust the constant, not this
+paragraph, if the two ever disagree again.)
 
 Note the flash has now been wrong in **both** directions, so do not "fix" it by reverting:
 Task 16 recoloured the key **border**, which this theme draws as a **left-edge strip only** and
@@ -181,8 +183,9 @@ behaviour.
 
 What to look at, and what is expected:
 
-1. **Any dead key, any page.** A full-key **red** flash. White when the press does something.
-   Every key on all five pages now reports an outcome and the daemon draws the flash.
+1. **Any dead key, any page.** A thin perimeter **red** ring, never a full-key fill. White when
+   the press does something. Every key on all five pages now reports an outcome and the daemon
+   draws the flash.
 2. **Weather — press a day tile.** A detail view: the day tile, day and night halves, wind,
    both outlooks, rain percentages, and `◀ BACK` on key 7. **The known risk:** the strip shows
    the day's and night's `detailedForecast` truncated to 30 characters each, so about 29

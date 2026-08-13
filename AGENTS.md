@@ -47,9 +47,14 @@ These are the user's standing decisions. They apply to every page, now and in fu
   visibly rejected, because silence is indistinguishable from a press the deck never received.
 - This belongs in the **daemon**, once, not in each page. A page reports whether it handled the
   press; the daemon draws the feedback.
-- The current signal is a full-key red flash for a press with no action. If red is ever needed
-  for something else on that key, pick a different signal for the rejection — but never remove
-  it.
+- The current signal is a thin ring around the key's whole perimeter, **90 ms**, in muted
+  colours — white for a press that did something, red for one that did not. It is never a
+  full-key fill. If red is ever needed for something else on that key, pick a different signal
+  for the rejection — but never remove the ring.
+- **The flash has been wrong in both directions once already.** An earlier version recoloured
+  only the key's left-edge border strip, which the user could barely see. The version right
+  after that filled the whole key, which the user reported as "too bright" and "jarring." The
+  thin perimeter ring at 90 ms is the corrected middle ground — do not revert to either extreme.
 - This applies to gauge keys, empty slots, decorative tiles, and any page added later.
 
 ## Live-system safety
