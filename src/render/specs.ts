@@ -131,11 +131,27 @@ export interface KeySpec {
   pulseOn?: boolean
   bg?: Rgb
   bar?: BarSpec
-  /** A large centred symbol, for a transport control. */
+  /**
+   * A large symbol, for a transport control, drawn centred on its own INK
+   * rather than the arithmetic middle of the key — see `drawCenteredGlyph`
+   * in `render/canvas.ts`. Every key that sets this uses the SAME size and
+   * the SAME target position, so a row of controls (play/pause, previous,
+   * next, volume) reads as one set instead of each key inventing its own
+   * layout — task 37 fixed exactly that inconsistency on the Spotify page.
+   */
   glyph?: string
   /** Tints `glyph`. An absent value uses the default text colour. Used by the
    * Spotify heart, the one place on that page where colour earns its keep. */
   glyphColor?: Rgb
+  /**
+   * A short caption drawn beneath `glyph`, centred, in the small band every
+   * control key reserves there — for example a volume percentage. Ignored
+   * unless `glyph` is also set. The band is reserved on every control key
+   * regardless of whether THIS key uses it, so a key with no caption still
+   * positions its glyph identically to a neighbour that has one; leaving the
+   * caption unset simply leaves that band as background.
+   */
+  glyphCaption?: string
   /** A single emoji, drawn large and centred. Used by the weather page. */
   emoji?: string
   /** An already-decoded image, for example album art. `keyHash` ignores this field. */

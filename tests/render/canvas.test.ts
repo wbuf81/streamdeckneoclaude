@@ -110,7 +110,91 @@ describe('renderKey', () => {
 
   it('tints the glyph red when glyphColor is set', () => {
     const buf = renderKey({ kind: 'control', glyph: '♥', glyphColor: theme.red })
-    near(probe(buf, 48, 48), theme.red, 40)
+    // Task 37 moved the glyph's ink-centre target off the key's arithmetic
+    // middle (48, 48) to (48, 36) — see canvas.ts's GLYPH_Y — to leave room
+    // for the caption band beneath it, so the probe point moves with it.
+    near(probe(buf, 48, 36), theme.red, 40)
+  })
+})
+
+describe('renderKey glyph optical centring (task 37)', () => {
+  // Lesson 17: measure the actual rendered pixels, not the arithmetic
+  // advance box. `drawCenteredGlyph` corrects each glyph's OWN measured ink
+  // bounds onto the same target point, so every glyph this page uses —
+  // despite different shapes and advance widths — must land its ink at the
+  // same place.
+  function inkCentroid(buf: Buffer): { cx: number; cy: number } {
+    let minX = KEY_SIZE, maxX = -1, minY = KEY_SIZE, maxY = -1
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) {
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
+          if (y < minY) minY = y
+          if (y > maxY) maxY = y
+        }
+      }
+    }
+    return { cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 }
+  }
+
+  it('centres the ink of every one of the four Spotify transport glyphs at the same y, within 1px', () => {
+    const glyphs = ['▶', '▮▮', '◀◀', '▶▶', '▲']
+    const centres = glyphs.map((glyph) => inkCentroid(renderKey({ kind: 'control', glyph })))
+    const ys = centres.map((c) => c.cy)
+    for (const y of ys) {
+      expect(Math.abs(y - ys[0]!)).toBeLessThanOrEqual(1)
+    }
+  })
+
+  it('centres the ink horizontally within 1px of the key centre for every transport glyph', () => {
+    const glyphs = ['▶', '▮▮', '◀◀', '▶▶', '▲']
+    for (const glyph of glyphs) {
+      const { cx } = inkCentroid(renderKey({ kind: 'control', glyph }))
+      expect(Math.abs(cx - KEY_SIZE / 2)).toBeLessThanOrEqual(1)
+    }
+  })
+
+  it('leaves a background gap between the glyph and the caption band, then paints the caption', () => {
+    const withCaption = renderKey({ kind: 'control', glyph: '▲', glyphCaption: '55%' })
+    // A row that must sit below the glyph's own ink and above the caption's
+    // ink — background either way. Measured: the glyph's ink bottom sits
+    // around y 47 (GLYPH_Y 36 plus its own ~11px half-height) and the
+    // caption starts at GLYPH_CAPTION_Y (60).
+    for (let x = 0; x < KEY_SIZE; x++) {
+      expect(near3(probe(withCaption, x, 52), theme.bg)).toBe(true)
+    }
+    let inkInCaptionBand = false
+    for (let y = 60; y < 74 && !inkInCaptionBand; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(withCaption, x, y), theme.bg)) {
+          inkInCaptionBand = true
+          break
+        }
+      }
+    }
+    expect(inkInCaptionBand).toBe(true)
+  })
+
+  it('leaves the caption band blank when glyphCaption is absent, even though the band is reserved', () => {
+    const buf = renderKey({ kind: 'control', glyph: '▲' })
+    for (let y = 60; y < 74; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        expect(near3(probe(buf, x, y), theme.bg)).toBe(true)
+      }
+    }
+  })
+
+  it('changes the rendered pixels when glyphCaption changes, so a volume change actually redraws', () => {
+    const at55 = renderKey({ kind: 'control', glyph: '▲', glyphCaption: '55%' })
+    const at65 = renderKey({ kind: 'control', glyph: '▲', glyphCaption: '65%' })
+    expect(at55.equals(at65)).toBe(false)
+  })
+
+  it('dims the caption like every other text element', () => {
+    const bright = renderKey({ kind: 'control', glyph: '▲', glyphCaption: '55%' })
+    const dimmed = renderKey({ kind: 'control', glyph: '▲', glyphCaption: '55%', dim: true })
+    expect(bright.equals(dimmed)).toBe(false)
   })
 })
 
@@ -562,10 +646,16 @@ describe('renderKey lineSizes', () => {
     )
   })
 
-  it('renders a spotify-like key byte-identically to the pre-lineSizes snapshot', () => {
+  // This snapshot intentionally changed under task 37: the Spotify glyph
+  // path moved from arithmetic centring at (48, 48) with a fixed 28px size
+  // to ink-centred drawing at (48, 36) with GLYPH_SIZE (34px), fixing the
+  // "not all centred" defect a real user reported on the four transport
+  // keys. Frozen again at its new value, the same pattern the weather page's
+  // retired snapshot used after its own deliberate task 24 layout change.
+  it('renders a spotify-like key byte-identically to the post-task-37 glyph layout', () => {
     const buf = renderKey({ kind: 'control', glyph: '♥', glyphColor: theme.red })
     expect(sha256(buf)).toBe(
-      '20d595718c3d8d68a5569793b7563305ffb081b01c0a41feec5fff8a28c98860',
+      '5a1f8affe73ef43caa860fa0c2b26c24f24a091e29f999284373c9d851cb071f',
     )
   })
 

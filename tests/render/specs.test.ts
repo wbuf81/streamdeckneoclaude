@@ -170,6 +170,22 @@ describe('keyHash', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
+  // Task 37: the Spotify volume key's percentage moved from a `lines` tile
+  // into `glyphCaption`. Without this field in the hash, going from 55% to
+  // 65% would leave the OLD percentage on the glass — the same defect this
+  // lesson describes for `imageCrop` and `spark.label`.
+  it('differs when glyphCaption changes, even with the same glyph', () => {
+    const a: KeySpec = { kind: 'control', glyph: '▲', glyphCaption: '55%' }
+    const b: KeySpec = { kind: 'control', glyph: '▲', glyphCaption: '65%' }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('matches when glyph and glyphCaption are both equal', () => {
+    const a: KeySpec = { kind: 'control', glyph: '▲', glyphCaption: '55%' }
+    const b: KeySpec = { kind: 'control', glyph: '▲', glyphCaption: '55%' }
+    expect(keyHash(a)).toBe(keyHash(b))
+  })
+
   it('differs when a lineSizes entry changes from an array of one candidate to another', () => {
     const a: KeySpec = { kind: 'gauge', lines: ['1234.56'], lineSizes: [[24, 20, 16]] }
     const b: KeySpec = { kind: 'gauge', lines: ['1234.56'], lineSizes: [[24, 20]] }

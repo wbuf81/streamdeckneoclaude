@@ -7,6 +7,19 @@ import type { Page, PressOutcome } from './types.js'
 import type { PlayerState, SpotifyStatus } from '../sources/spotify.js'
 
 const VOLUME_STEP = 10
+/**
+ * The four transport-control glyphs, all from the Geometric Shapes Unicode
+ * block (task 37 — see `render/canvas.ts`'s `GLYPH_SIZE` comment for the
+ * measurement that picked this family and rejected the media-control block
+ * and the speaker emoji as tofu on this machine's font stack). One named
+ * constant per glyph, so trying a different variant is a one-line edit here
+ * rather than a hunt through `render(...)` below.
+ */
+const PLAY_GLYPH = '▶'
+const PAUSE_GLYPH = '▮▮'
+const PREVIOUS_GLYPH = '◀◀'
+const NEXT_GLYPH = '▶▶'
+const VOLUME_UP_GLYPH = '▲'
 /** How often the render loop should tick while the idle equaliser is
  * showing instead of album art — see the `tickMs` getter below. Matches the
  * rate already proven smooth for the Claude page's crab animation, well
@@ -110,12 +123,12 @@ export class SpotifyPage implements Page {
       keys: [
         this.primaryArtKey(state, status, art, CROP_TOP_LEFT, nowMs),
         this.spanArtKey(state, status, art, CROP_TOP_RIGHT, nowMs, 1),
-        { kind: 'control', glyph: state?.isPlaying ? '❙❙' : '▶', dim: dead },
-        { kind: 'control', lines: ['VOL +', volumeLabel(state)], align: 'center', dim: dead },
+        { kind: 'control', glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH, dim: dead },
+        { kind: 'control', glyph: VOLUME_UP_GLYPH, glyphCaption: volumeLabel(state), dim: dead },
         this.spanArtKey(state, status, art, CROP_BOTTOM_LEFT, nowMs, 2),
         this.spanArtKey(state, status, art, CROP_BOTTOM_RIGHT, nowMs, 3),
-        { kind: 'control', glyph: '◀◀', dim: dead },
-        { kind: 'control', glyph: '▶▶', dim: dead },
+        { kind: 'control', glyph: PREVIOUS_GLYPH, dim: dead },
+        { kind: 'control', glyph: NEXT_GLYPH, dim: dead },
       ],
       strip: this.strip(state, status, nowMs),
       buttons: [theme.gray, theme.gray],

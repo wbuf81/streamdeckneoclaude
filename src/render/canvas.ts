@@ -100,6 +100,41 @@ export const FLASH_RING_THICKNESS = 4
  */
 const EMOJI_SIZE = 32
 const EMOJI_Y = 38
+/**
+ * Size and target ink-centre for the Spotify page's four transport-control
+ * glyphs: play/pause, previous, next, and the volume "up" triangle.
+ *
+ * Measured (task 37, `docs/LESSONS.md` #17 and #15): the media-control
+ * Unicode block (`⏮ ⏯ ⏭ ⏪ ⏩`) and the speaker emoji (`🔊 🔈`) — both offered
+ * as candidates — render as an IDENTICAL tofu box on this machine's font
+ * stack, not the intended icon; `ctx.getImageData` over each one gave the
+ * same ink bounds regardless of which codepoint was drawn, the signature of
+ * a missing-glyph fallback, not five different icons. Those were rejected
+ * outright rather than shipped unseen.
+ *
+ * `▶`, `▮▮`, `◀◀`, `▶▶` and `▲` — all from the Geometric Shapes block — were
+ * measured instead, both with `getImageData` and with
+ * `ctx.measureText().actualBoundingBox*`. All five share IDENTICAL ascent
+ * (7.44px) and descent (13.56px) at `GLYPH_SIZE`, so one centring
+ * correction (`drawCenteredGlyph`) serves every one of them with no
+ * per-glyph special case. The glyph this replaced for pause, `❙❙`
+ * (Miscellaneous Symbols block), did NOT share that metric — its own
+ * measured ascent/descent (12.44 / 16.56) is exactly why it read heavier and
+ * lower than its neighbours on the real device.
+ */
+const GLYPH_SIZE = 34
+/** Target y for the glyph's ink centre, not the raw draw point —
+ * `drawCenteredGlyph` corrects for the gap between the two. Leaves the
+ * lower part of the key free for `GLYPH_CAPTION_Y`, reserved on every
+ * control key whether or not that particular key uses it. */
+const GLYPH_Y = 36
+/** Top of the small caption band beneath the glyph (for example the volume
+ * key's percentage). 24px below the glyph's own ink (bottom edge, at
+ * `GLYPH_Y` plus half its 21px ink height, sits at 46.5) — comfortably clear
+ * per lesson 14, with room left below for the caption's own text before the
+ * key's bottom padding. */
+const GLYPH_CAPTION_Y = 60
+const GLYPH_CAPTION_SIZE = 11
 
 function css(c: Rgb, dim = false): string {
   const f = dim ? DIM_FACTOR : 1
@@ -372,6 +407,35 @@ function resolveLineSpecs(
 }
 
 /**
+ * Draws `glyph` centred on its own INK at `(cx, cy)`, not on the arithmetic
+ * middle of its advance box. Per the Canvas 2D spec (confirmed here against
+ * @napi-rs/canvas), `ctx.measureText` reports
+ * `actualBoundingBox{Left,Right,Ascent,Descent}` — the real ink extent,
+ * measured from wherever the text is ABOUT to be drawn — so correcting for
+ * it is a plain average, not a pixel scan: the ink's centre sits
+ * `(right - left) / 2` to the right of the draw point horizontally, and
+ * `(descent - ascent) / 2` below it vertically (this file's own textBaseline
+ * is always `'middle'`). Solving for the draw point that lands the ink
+ * centre exactly on `(cx, cy)` is just the same offset applied in reverse.
+ *
+ * Falls back to drawing at `(cx, cy)` unchanged if a metric ever comes back
+ * non-finite (an environment or a future glyph this measurement cannot
+ * read), so a bad measurement degrades to the old arithmetic centring
+ * instead of throwing inside the render loop.
+ */
+function drawCenteredGlyph(ctx: SKRSContext2D, glyph: string, size: number, cx: number, cy: number): void {
+  ctx.font = `${size}px ${FONT}`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  const m = ctx.measureText(glyph)
+  const dx = (m.actualBoundingBoxRight - m.actualBoundingBoxLeft) / 2
+  const dy = (m.actualBoundingBoxDescent - m.actualBoundingBoxAscent) / 2
+  const drawX = Number.isFinite(dx) ? cx - dx : cx
+  const drawY = Number.isFinite(dy) ? cy - dy : cy
+  ctx.fillText(glyph, drawX, drawY)
+}
+
+/**
  * Draws a thin unfilled frame around the whole key perimeter, inset by
  * `FLASH_RING_INSET` from the true edge and `FLASH_RING_THICKNESS` px thick
  * on every side. Built from four `fillRect` strips rather than
@@ -428,10 +492,18 @@ export function renderKey(spec: KeySpec): Buffer {
 
   if (spec.glyph) {
     ctx.fillStyle = css(spec.glyphColor ?? theme.text, dim)
-    ctx.font = `28px ${FONT}`
+    drawCenteredGlyph(ctx, spec.glyph, GLYPH_SIZE, KEY_SIZE / 2, GLYPH_Y)
+  }
+
+  if (spec.glyphCaption) {
+    // Plain short text (a percentage, at most 4 characters) — arithmetic
+    // centring is fine here, unlike the single symbol above; there is no
+    // per-glyph bearing asymmetry worth correcting for a run of digits.
+    ctx.fillStyle = css(theme.text, dim)
+    ctx.font = `${GLYPH_CAPTION_SIZE}px ${FONT}`
     ctx.textAlign = 'center'
-    ctx.textBaseline = 'middle'
-    ctx.fillText(spec.glyph, KEY_SIZE / 2, KEY_SIZE / 2)
+    ctx.textBaseline = 'top'
+    ctx.fillText(spec.glyphCaption, KEY_SIZE / 2, GLYPH_CAPTION_Y)
   }
 
   if (spec.emoji) {

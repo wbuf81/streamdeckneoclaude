@@ -92,7 +92,7 @@ describe('SpotifyPage layout', () => {
 
   it('shows a pause glyph on key 2 while playing', () => {
     const { page } = build(player({ isPlaying: true }))
-    expect(page.render(NOW).keys[2]!.glyph).toBe('❙❙')
+    expect(page.render(NOW).keys[2]!.glyph).toBe('▮▮')
   })
 
   it('shows a play glyph on key 2 while paused', () => {
@@ -107,17 +107,27 @@ describe('SpotifyPage layout', () => {
     expect(keys[7]!.glyph).toBe('▶▶')
   })
 
-  it('shows VOL + and the current percent on key 3', () => {
-    const { page } = build(player({ volumePercent: 55 }))
+  // Task 37: the volume key moved off the `lines`/`align` text path onto the
+  // same `glyph`/`glyphCaption` path as its three neighbours, so all four
+  // control keys share one render path and one optical centring instead of
+  // the volume key alone reading as a two-line text tile.
+  it('gives key 3 a glyph, like its three neighbours, not a lines-based tile', () => {
+    const { page } = build(player())
     const key = page.render(NOW).keys[3]!
-    expect(key.lines!.join(' ')).toContain('VOL +')
-    expect(key.lines!.join(' ')).toContain('55')
+    expect(key.glyph).toBeDefined()
+    expect(key.lines).toBeUndefined()
   })
 
-  it('shows a placeholder on key 3 when the volume is unknown', () => {
+  it('shows the current percent as key 3\'s caption', () => {
+    const { page } = build(player({ volumePercent: 55 }))
+    const key = page.render(NOW).keys[3]!
+    expect(key.glyphCaption).toBe('55%')
+  })
+
+  it('shows a placeholder caption on key 3 when the volume is unknown', () => {
     const { page } = build(player({ volumePercent: null }))
     const key = page.render(NOW).keys[3]!
-    expect(key.lines!.join(' ')).not.toMatch(/\d/)
+    expect(key.glyphCaption).not.toMatch(/\d/)
   })
 
   it('dims keys 2, 3, 6 and 7 when there is no device', () => {
