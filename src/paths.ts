@@ -1,10 +1,32 @@
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, isAbsolute } from 'node:path'
 import { mkdirSync, chmodSync } from 'node:fs'
+
+/**
+ * Resolves the state directory override.
+ *
+ * A relative value would resolve against `process.cwd()`, which Lesson 3
+ * records as wrong under launchd -- the daemon's working directory is not
+ * the project, so a relative `DECKD_STATE_DIR` would silently land somewhere
+ * unrelated to what the person setting it intended. Reject it outright and
+ * fall back to the default, rather than caching into the wrong directory.
+ */
+function resolveStateDir(home: string, stateOverride?: string): string {
+  const fallback = join(home, '.local', 'state', 'deckd')
+  if (!stateOverride) return fallback
+  if (!isAbsolute(stateOverride)) {
+    console.error(
+      `DECKD_STATE_DIR must be an absolute path; ignoring relative value ` +
+        `${JSON.stringify(stateOverride)} and using ${fallback} instead.`,
+    )
+    return fallback
+  }
+  return stateOverride
+}
 
 /** Builds all runtime paths. Tests and ad-hoc tools can isolate deckd state. */
 export function buildPaths(home: string, stateOverride?: string) {
-  const stateDir = stateOverride || join(home, '.local', 'state', 'deckd')
+  const stateDir = resolveStateDir(home, stateOverride)
   const claudeDir = join(home, '.claude')
   const codexDir = join(home, '.codex')
   return {
@@ -25,6 +47,11 @@ export function buildPaths(home: string, stateOverride?: string) {
 }
 
 export const paths = buildPaths(homedir(), process.env.DECKD_STATE_DIR)
+
+/** The shape `buildPaths` returns. Install and uninstall take this as an
+ * injectable parameter, so a test can isolate every path they touch without
+ * going anywhere near the real home directory. */
+export type Paths = ReturnType<typeof buildPaths>
 
 /**
  * Creates each of `dirs` and forces `mode` on it, unconditionally.

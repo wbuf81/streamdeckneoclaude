@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { paths, enforceDirModes, buildPaths } from '../src/paths.js'
 import { homedir } from 'node:os'
 import { mkdtempSync, mkdirSync, chmodSync, statSync, rmSync } from 'node:fs'
@@ -34,6 +34,33 @@ describe('paths', () => {
     expect(isolated.claudeSettings).toBe('/Users/tester/.claude/settings.json')
     expect(isolated.codexStateDb).toBe('/Users/tester/.codex/state_5.sqlite')
     expect(isolated.launchAgent).toBe('/Users/tester/Library/LaunchAgents/com.wbard.deckd.plist')
+  })
+
+  // Finding 11: an unvalidated DECKD_STATE_DIR was joined in with no check
+  // that it was even absolute. A relative value would resolve against
+  // `process.cwd()`, which Lesson 3 records as wrong under launchd -- the
+  // daemon's working directory is not the project, so a relative override
+  // would silently cache into a directory unrelated to what was intended.
+  it('ignores a relative DECKD_STATE_DIR override and falls back to the default', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const isolated = buildPaths('/Users/tester', 'relative/state')
+      expect(isolated.stateDir).toBe('/Users/tester/.local/state/deckd')
+      expect(consoleError).toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
+  it('accepts an absolute DECKD_STATE_DIR override with no warning', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const isolated = buildPaths('/Users/tester', '/tmp/deckd-test-state')
+      expect(isolated.stateDir).toBe('/tmp/deckd-test-state')
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 })
 
