@@ -19,6 +19,22 @@ export interface ImageCrop {
   sh: number
 }
 
+export interface PulseSpec {
+  /**
+   * Radians, already advanced by both the render clock and this key's own
+   * offset. The Spotify page computes this fresh on every `render(now,
+   * nowMs)` call from `nowMs` plus a fixed per-key offset, so two renders at
+   * different clocks — or two of the four idle art keys at the SAME clock —
+   * carry different values here. That is what lets the four keys
+   * phase-shift against each other and lets time actually move the bars; a
+   * static spec would freeze after the first frame.
+   */
+  phase: number
+  /** Number of vertical bars drawn across the key. */
+  bars: number
+  color: Rgb
+}
+
 export interface SparkSpec {
   /** Oldest first. Fewer than 2 points draws nothing. */
   values: number[]
@@ -116,6 +132,16 @@ export interface KeySpec {
   imageCrop?: ImageCrop
   /** A small series drawn as vertical bars. Used by the stocks page. */
   spark?: SparkSpec
+  /**
+   * A slow-breathing equaliser animation, drawn as vertical bars, for a key
+   * with nothing else to show. Used by the Spotify page's four album-art
+   * keys while nothing is playing. `keyHash` uses this like any other
+   * field — `phase` changes on every render call, and without it in the
+   * hash the daemon's dirty-key check would see no difference and the
+   * animation would freeze after one frame, the exact defect lesson 11 in
+   * docs/LESSONS.md describes for the same four keys' `imageCrop`.
+   */
+  pulse?: PulseSpec
   dim?: boolean
 }
 

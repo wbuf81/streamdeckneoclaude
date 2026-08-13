@@ -175,6 +175,25 @@ describe('keyHash', () => {
     const b: KeySpec = { kind: 'gauge', lines: ['1234.56'], lineSizes: [[24, 20]] }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
+
+  // Task 27's idle equaliser: the Spotify page recomputes `pulse.phase` from
+  // `nowMs` on every render call, and that is the ONLY thing that changes
+  // frame to frame — bars, color and kind all stay fixed. If `phase` were
+  // ever missing from the hash, the daemon's dirty-key check would see no
+  // difference between two ticks and the animation would freeze after its
+  // first frame — lesson 11 in docs/LESSONS.md, the same defect that once
+  // hit this page's `imageCrop`.
+  it('differs when the pulse phase changes, so the daemon keeps redrawing the idle animation', () => {
+    const a: KeySpec = { kind: 'control', pulse: { phase: 0, bars: 6, color: [70, 200, 110] } }
+    const b: KeySpec = { kind: 'control', pulse: { phase: 1, bars: 6, color: [70, 200, 110] } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('matches when the pulse spec is equal', () => {
+    const a: KeySpec = { kind: 'control', pulse: { phase: 0.5, bars: 6, color: [70, 200, 110] } }
+    const b: KeySpec = { kind: 'control', pulse: { phase: 0.5, bars: 6, color: [70, 200, 110] } }
+    expect(keyHash(a)).toBe(keyHash(b))
+  })
 })
 
 describe('stripHash', () => {

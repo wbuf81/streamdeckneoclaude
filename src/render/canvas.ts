@@ -1,5 +1,5 @@
 import { createCanvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
-import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop } from './specs.js'
+import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, PulseSpec } from './specs.js'
 import { theme } from './theme.js'
 
 export const KEY_SIZE = 96
@@ -20,6 +20,11 @@ const SPARK_H = 40
  * band keeps, just stretched over the full height. */
 const SPARK_FULL_Y = 6
 const SPARK_FULL_H = 84
+/** The idle equaliser uses the same full-height band as a chart-only spark:
+ * a pulse key carries no text, so it may as well use nearly the whole tile
+ * instead of the smaller lower band a key with labels would leave for it. */
+const PULSE_Y = 6
+const PULSE_H = 84
 /**
  * Usable text width of one key: 96 − 3 border − 6 padding each side.
  * Matches docs/VERIFIED-FACTS.md's measured text budget table. Used to
@@ -151,6 +156,42 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
     }
 
     const y = bandY + (bandH - h)
+    ctx.fillRect(x, y, w, h)
+  }
+}
+
+/**
+ * Draws a slow-breathing equaliser: `bars` vertical bars, each one's height
+ * a sine wave of `phase`, offset from its neighbours so the bars do not all
+ * move in lockstep. Bars are bottom-anchored, spanning the same `x0`-to-`x1`
+ * margin `drawSpark` uses, over the `PULSE_Y`/`PULSE_H` band. `bars <= 0`
+ * draws nothing, so a bad spec cannot throw inside the render loop.
+ */
+function drawPulse(ctx: SKRSContext2D, pulse: PulseSpec, dim: boolean): void {
+  const { phase, bars, color } = pulse
+  if (bars <= 0) return
+
+  const x0 = BORDER + PAD
+  const x1 = KEY_SIZE - PAD
+  const width = x1 - x0
+  const barW = width / bars
+  const bottom = PULSE_Y + PULSE_H
+  // Never fully flat: even the quietest bar keeps a sliver, so the key reads
+  // as an equaliser "at rest" rather than something that occasionally turns
+  // off entirely.
+  const minH = PULSE_H * 0.1
+  const maxH = PULSE_H
+
+  ctx.fillStyle = css(color, dim)
+  for (let i = 0; i < bars; i++) {
+    // Each bar samples the same wave a fraction further along, so within one
+    // key the bars ripple rather than all breathing together.
+    const t = phase + i * ((2 * Math.PI) / bars)
+    const frac = 0.5 + 0.5 * Math.sin(t)
+    const h = minH + frac * (maxH - minH)
+    const x = x0 + i * barW
+    const w = Math.max(1, barW - 2)
+    const y = bottom - h
     ctx.fillRect(x, y, w, h)
   }
 }
@@ -354,6 +395,10 @@ export function renderKey(spec: KeySpec): Buffer {
 
   if (spec.spark) {
     drawSpark(ctx, spec.spark, dim)
+  }
+
+  if (spec.pulse) {
+    drawPulse(ctx, spec.pulse, dim)
   }
 
   if (spec.bar) {

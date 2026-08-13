@@ -779,6 +779,74 @@ describe('renderKey lineSizes as an array of candidates (A3: the renderer resolv
   })
 })
 
+describe('renderKey pulse (the Spotify idle equaliser)', () => {
+  it('draws something (not blank) when a pulse is present', () => {
+    const blank = renderKey({ kind: 'control' })
+    const withPulse = renderKey({ kind: 'control', pulse: { phase: 0, bars: 6, color: theme.green } })
+    expect(withPulse.equals(blank)).toBe(false)
+  })
+
+  it('draws nothing for zero bars, and does not throw', () => {
+    const blank = renderKey({ kind: 'control' })
+    expect(() =>
+      renderKey({ kind: 'control', pulse: { phase: 0, bars: 0, color: theme.green } }),
+    ).not.toThrow()
+    const buf = renderKey({ kind: 'control', pulse: { phase: 0, bars: 0, color: theme.green } })
+    expect(buf.equals(blank)).toBe(true)
+  })
+
+  it('dims the pulse bars like every other element', () => {
+    const bright = renderKey({ kind: 'control', pulse: { phase: 0.4, bars: 6, color: theme.green } })
+    const dimmed = renderKey({
+      kind: 'control', pulse: { phase: 0.4, bars: 6, color: theme.green }, dim: true,
+    })
+    expect(bright.equals(dimmed)).toBe(false)
+  })
+
+  it('renders different pixels at two different phases — an animation test that actually probes pixels', () => {
+    // Lesson 17: measure, do not reason. Two phases a quarter turn apart on a
+    // single bar move it from its mid-height rest point to its tallest point,
+    // so this is not a coincidence of floating-point noise.
+    const a = renderKey({ kind: 'control', pulse: { phase: 0, bars: 1, color: theme.green } })
+    const b = renderKey({ kind: 'control', pulse: { phase: Math.PI / 2, bars: 1, color: theme.green } })
+    expect(a.equals(b)).toBe(false)
+  })
+
+  it('reaches higher up the key at the loud point of the wave than at the quiet point, measured directly', () => {
+    const topInkRow = (buf: Buffer): number => {
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          if (!near3(probe(buf, x, y), theme.bg)) return y
+        }
+      }
+      return KEY_SIZE
+    }
+    // One bar, so `phase` alone drives its height: sin(0) = 0 (mid-height,
+    // "at rest") vs sin(pi/2) = 1 (the tallest the bar ever gets).
+    const quiet = renderKey({ kind: 'control', pulse: { phase: 0, bars: 1, color: theme.green } })
+    const loud = renderKey({ kind: 'control', pulse: { phase: Math.PI / 2, bars: 1, color: theme.green } })
+    expect(topInkRow(loud)).toBeLessThan(topInkRow(quiet))
+  })
+
+  it('gives each of several bars its own height from one phase, via the per-bar offset', () => {
+    // Distinct bar count so the per-bar phase spread (2*PI / bars) does not
+    // land every bar on an identical multiple of PI, which would make every
+    // bar the same height by coincidence rather than by proving the offset.
+    const buf = renderKey({ kind: 'control', pulse: { phase: 0.3, bars: 5, color: theme.green } })
+    const x0 = 9 // BORDER + PAD
+    const barW = (90 - 9) / 5 // x1 - x0, over 5 bars
+    const topOfBar = (i: number): number => {
+      const x = Math.floor(x0 + i * barW + 1)
+      for (let y = 0; y < KEY_SIZE; y++) {
+        if (!near3(probe(buf, x, y), theme.bg)) return y
+      }
+      return KEY_SIZE
+    }
+    const tops = [0, 1, 2, 3, 4].map(topOfBar)
+    expect(new Set(tops).size).toBeGreaterThan(1)
+  })
+})
+
 describe('measured text width', () => {
   it('fits "95°/77°" at 16 px within the 81 px usable key width', () => {
     // Per VERIFIED-FACTS.md: 77 px at 16 px, and 82 px (over budget) at
