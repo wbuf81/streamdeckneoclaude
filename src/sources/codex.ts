@@ -7,25 +7,39 @@ import { log } from '../log.js'
 
 const POLL_MS = 5000
 /** How long the last successful sqlite READ may age before the page treats
- * everything as stale. This says nothing about the accounting numbers'
- * own age — see `STALE_USAGE_SECONDS` for that, and C2 in the review this
- * fixes. */
+ * everything as stale. This says nothing about whether the accounting
+ * NUMBERS themselves are still current — see `isUsageUnknown()` for that,
+ * which checks the rate-limit window's own boundary rather than a clock. */
 export const STALE_CODEX_SECONDS = 60
-/** How long a usage SAMPLE's own timestamp (`CodexUsage.ts`, parsed from the
- * rollout event that produced it) may age before the accounting tiles mark
- * themselves stale, independent of whether the sqlite read itself keeps
- * succeeding. Matches `STALE_USAGE_SECONDS` in `src/sources/usage.ts` — same
- * bound, same reasoning: Codex only emits a fresh `token_count` event when
- * the app itself does work, not on a fixed schedule, so three quiet days
- * must not read as a live 34%. */
-export const STALE_USAGE_SECONDS = 900
+/**
+ * Backstop bound for the rare case `resets_at` is itself missing, or fails
+ * `parseLimit`'s sanity check (see `RESET_MAX_SECONDS`). This is NOT the
+ * primary rule for whether a usage sample is trustworthy — see
+ * `isUsageUnknown()`'s doc comment for why age alone is otherwise the wrong
+ * test. Deliberately a full day, so this fallback is never what actually
+ * fires against a genuinely fresh sample; it exists only for missing data.
+ */
+export const USAGE_UNKNOWN_BACKSTOP_SECONDS = 24 * 3600
 /** How long an `active` flag may outlive the thread row's own last-updated
- * time before this source stops trusting it. Bounds the "Codex died
- * mid-task, no `task_complete` line ever arrives" failure: the rollout
- * itself never says the task ended, but the thread INDEX stops moving the
- * moment the app stops touching that row. Four hours is generous — a real
- * agentic task can run long — while still recovering the tile within the
- * same working day instead of showing `RUNNING` for days. */
+ * time before this source stops trusting it.
+ *
+ * This is a DIFFERENT case from usage, not the same lens with a different
+ * number: `RUNNING` is a claim about right now, and it genuinely rots with
+ * age — the longer the thread row goes untouched, the less believable "Codex
+ * is still working on this" becomes. Usage instead stays true until its
+ * window ends (see `isUsageUnknown()`); a fixed age bound would be wrong
+ * there but is the right tool here.
+ *
+ * Bounds the "Codex died mid-task, no `task_complete` line ever arrives"
+ * failure: the rollout itself never says the task ended, but the thread
+ * INDEX stops moving the moment the app stops touching that row. Four hours
+ * is chosen wide enough to cover one legitimately long single tool call — a
+ * full test suite, a slow build — that produces no interim row update,
+ * while still recovering the tile within the same working day rather than
+ * showing `RUNNING` for days after the app quit or the thread died silently.
+ * Codex publishes no maximum task duration to derive a tighter number from,
+ * so this stays a deliberately generous, round bound rather than one
+ * measured from Codex's own behaviour. */
 const MAX_ACTIVE_TASK_AGE_SECONDS = 4 * 3600
 /** Bounds the very first read of any rollout to this many trailing bytes
  * instead of the whole file, so a multi-megabyte transcript — or several,
@@ -44,9 +58,10 @@ export const COLD_START_TAIL_BYTES = 256 * 1024
  * guessed at, so a millisecond value can never render a multi-million-day
  * countdown. */
 const RESET_MAX_SECONDS = 4_000_000_000
-/** Bounds a hung `sqlite3 -readonly` child well under the 5 s poll interval,
- * so a stuck read cannot block `stop()`'s await on `refreshing` forever and
- * delay shutdown past SIGTERM's grace window. */
+/** Bounds a hung `sqlite3` child well under the 5 s poll interval, so a
+ * stuck read cannot block `stop()`'s await on `refreshing` forever and
+ * delay shutdown past SIGTERM's grace window. Applies to both the primary
+ * and fallback attempt in `runSqlite`. */
 const SQLITE_TIMEOUT_MS = 4000
 
 export const THREAD_QUERY = `
@@ -230,15 +245,87 @@ export function readRolloutTail(file: string, requestedStart?: number): RolloutR
   }
 }
 
-export function runSqlite(database: string, query: string): Promise<string> {
+/** Turns a filesystem path into the `file:` URI form sqlite3 needs to accept
+ * `mode=ro` (and, on the fallback, `immutable=1`). Only `%`, `#`, and `?` are
+ * percent-encoded — sqlite gives those three special meaning inside a URI
+ * filename — so an ordinary absolute path passes through unchanged and a
+ * leading `/` still reads as an absolute path rather than a relative one. */
+function toReadOnlyUri(database: string, extra?: string): string {
+  const escaped = database.replace(/[%#?]/g, (char) => encodeURIComponent(char))
+  return `file:${escaped}?${extra ? `mode=ro&${extra}` : 'mode=ro'}`
+}
+
+/** A short, query-free description of an `execFile` failure, for the log.
+ * Prefers sqlite3's own stderr line (e.g. `unable to open database file
+ * (14)`), which never contains the query. Deliberately never falls back to
+ * `error.message`: Node builds that string as `Command failed: <cmd> <args
+ * joined by spaces>`, which — for this command — IS the SQL text (lesson 20
+ * requires it never reach a log). `error.code` / `error.signal` are safe,
+ * short, enum-like fields with no query content, so those are the only
+ * fallback. */
+function describeExecFailure(
+  error: Error & { killed?: boolean; code?: unknown; signal?: unknown },
+  stderr: string,
+): string {
+  const trimmed = stderr.trim()
+  if (trimmed) return trimmed
+  if (error.killed) return `sqlite3 timed out after ${SQLITE_TIMEOUT_MS}ms`
+  if (error.code !== undefined) return `sqlite3 failed (code ${String(error.code)})`
+  if (error.signal !== undefined) return `sqlite3 failed (signal ${String(error.signal)})`
+  return 'sqlite3 failed'
+}
+
+function execSqlite(uri: string, query: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       '/usr/bin/sqlite3',
-      ['-readonly', '-json', database, query],
+      ['-json', uri, query],
       { maxBuffer: 1024 * 1024, timeout: SQLITE_TIMEOUT_MS },
-      (error, stdout) => error ? reject(error) : resolve(stdout),
+      (error, stdout, stderr) => {
+        if (!error) { resolve(stdout); return }
+        reject(new Error(describeExecFailure(error, stderr ?? '')))
+      },
     )
   })
+}
+
+/**
+ * Reads the Codex sqlite database without ever opening it read-write.
+ *
+ * The primary attempt uses the URI form with `mode=ro`, which measurement
+ * against the live database showed at least as reliable as the CLI's own
+ * `-readonly` flag against a plain path — and `-readonly` against a plain
+ * path was seen to fail intermittently with `SQLITE_CANTOPEN` (error 14)
+ * against this WAL-mode database. The leading hypothesis is that a
+ * read-only connection normally wants the database's `-shm` shared-memory
+ * file and cannot create one itself, so the open fails whenever that file
+ * is momentarily absent — treat that as a working hypothesis, not a
+ * confirmed mechanism; it was not reproduced on demand.
+ *
+ * If the primary attempt fails, the fallback adds `immutable=1`, which lets
+ * sqlite read the file without an `-shm` at all. This is ONLY safe as a
+ * fallback: `immutable=1` tells sqlite the file will never change, so a
+ * concurrent writer could hand back a stale or torn read. Reaching this
+ * fallback means the primary `mode=ro` attempt — which needs an active
+ * shared-memory reader — already failed, which itself implies no such
+ * writer is live at that instant. It must never be the primary mode.
+ *
+ * Both attempts open strictly read-only (`mode=ro`); this function never
+ * opens the database read-write, and so never creates, checkpoints, or
+ * otherwise modifies anything under the user's Codex directory.
+ */
+export async function runSqlite(database: string, query: string): Promise<string> {
+  try {
+    return await execSqlite(toReadOnlyUri(database), query)
+  } catch (primaryError) {
+    const primaryDetail = primaryError instanceof Error ? primaryError.message : String(primaryError)
+    try {
+      return await execSqlite(toReadOnlyUri(database, 'immutable=1'), query)
+    } catch (fallbackError) {
+      const fallbackDetail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      throw new Error(`mode=ro failed (${primaryDetail}); immutable=1 fallback failed (${fallbackDetail})`)
+    }
+  }
 }
 
 /** Best-effort, read-only view of Codex desktop's local task index and the
@@ -376,7 +463,12 @@ export class CodexSource extends EventEmitter {
       this.setSnapshot({ tasks, usage: newestUsage })
     } catch (error) {
       this.updateAvailability(false)
-      log.once('codex-state-read', `cannot read Codex task data: ${String(error)}`)
+      // Short and query-free: `runSqlite`'s own errors already carry only
+      // sqlite3's stderr text or a code/signal, never the SQL body (see
+      // `describeExecFailure`), and a plain `Error.message` from anywhere
+      // else in this block (e.g. a `JSON.parse` failure) is already short.
+      const detail = error instanceof Error ? error.message : String(error)
+      log.once('codex-state-read', `cannot read Codex task data at ${this.database}: ${detail}`)
     }
   }
 
@@ -409,22 +501,46 @@ export class CodexSource extends EventEmitter {
   }
 
   /** True when the last successful sqlite READ is too old (or there has
-   * never been one). Says nothing about the accounting numbers' own age —
-   * see `isUsageStale()`. */
+   * never been one). Says nothing about whether the accounting numbers
+   * themselves are still true — see `isUsageUnknown()`. */
   isStale(): boolean {
     return !this.lastSuccessAt || this.now() - this.lastSuccessAt > STALE_CODEX_SECONDS
   }
 
-  /** True when the newest known usage SAMPLE's own timestamp is too old, or
-   * there is no sample at all. The sqlite read can keep succeeding every 5 s
-   * — the thread index itself is current — while the accounting numbers it
-   * carries are days stale, because Codex only emits a fresh `token_count`
-   * event when the app does work. This is what actually catches that case;
-   * `isStale()` alone cannot. */
-  isUsageStale(): boolean {
+  /** True when the newest known usage SAMPLE no longer describes the
+   * CURRENT rate-limit window, or there is no sample at all. Different from
+   * `isStale()`, which is about whether the sqlite READ itself is current —
+   * this is about whether the NUMBER that read carries is still true.
+   *
+   * A quota reading is not a live sensor: Codex only emits a fresh
+   * `token_count` event when the app itself does work, so "62% of this
+   * week's limit" can sit unchanged for hours while the user is away from
+   * Codex — and it stays TRUE the entire time. Marking it unknown on age
+   * alone would misinform in the opposite direction, telling the user to
+   * distrust a number that is still correct. What actually invalidates the
+   * figure is the WINDOW ending: once `now` moves past the sample's own
+   * `resetsAt`, the sample describes a window that no longer exists, and
+   * the true figure for whatever window replaced it is unknowable from an
+   * old sample.
+   *
+   * The check is two-sided, not just `now < resetsAt`: `now` must also sit
+   * no more than one window-length behind `resetsAt`. A one-sided check
+   * would wrongly call a sample live if `resetsAt` described a window that,
+   * from `now`'s perspective, has not even started yet — `now` would still
+   * be sitting in the window BEFORE the one the figure is actually about.
+   *
+   * `resetsAt` is occasionally absent, or already null from `parseLimit`'s
+   * own sanity check. `USAGE_UNKNOWN_BACKSTOP_SECONDS` covers only that
+   * missing-data case. */
+  isUsageUnknown(): boolean {
     const usage = this.snapshot.usage
     if (!usage) return true
-    return this.now() - usage.ts > STALE_USAGE_SECONDS
+    const limit = usage.limits[0]
+    const resetsAt = limit?.resetsAt ?? null
+    if (resetsAt === null) return this.now() - usage.ts > USAGE_UNKNOWN_BACKSTOP_SECONDS
+    const remaining = resetsAt - this.now()
+    const windowSeconds = limit!.windowMinutes * 60
+    return remaining < 0 || remaining > windowSeconds
   }
 
   async stop(): Promise<void> {

@@ -1,11 +1,38 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { log, setDefaultSink } from '../../src/log.js'
+
+// Isolated exactly the way `tests/sources/codex-run-sqlite.test.ts` isolates
+// its own `execFile` mock: `vi.mock`'s factory is hoisted above every
+// top-level statement in this file, including a plain `const`, so the mock
+// function itself must be created inside `vi.hoisted`. Mocking
+// `node:child_process` here is safe for every OTHER test in this file — all
+// of them inject their own `SqliteRunner` fake and never call the real
+// `runSqlite` at all, so they never reach `execFile` regardless of what it
+// is mocked to do.
+const { execFileMock } = vi.hoisted(() => ({
+  execFileMock: vi.fn(
+    (
+      _cmd: string,
+      _args: string[],
+      _opts: Record<string, unknown>,
+      cb: (
+        error: (Error & { killed?: boolean; code?: unknown; signal?: unknown }) | null,
+        stdout: string,
+        stderr: string,
+      ) => void,
+    ) => cb(null, '[]', ''),
+  ),
+}))
+vi.mock('node:child_process', () => ({ execFile: execFileMock }))
+
 import {
   CodexSource,
   parseRolloutTail,
   readRolloutTail,
+  runSqlite,
   COLD_START_TAIL_BYTES,
   THREAD_QUERY,
   type RolloutRead,
@@ -159,6 +186,76 @@ describe('THREAD_QUERY', () => {
   })
 })
 
+describe('runSqlite', () => {
+  beforeEach(() => {
+    execFileMock.mockReset()
+  })
+
+  it('reads via the primary mode=ro URI when it succeeds', async () => {
+    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => cb(null, '[]', ''))
+    const result = await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
+    expect(result).toBe('[]')
+    expect(execFileMock).toHaveBeenCalledTimes(1)
+    const [cmd, args] = execFileMock.mock.calls[0]!
+    expect(cmd).toBe('/usr/bin/sqlite3')
+    expect(args).toContain('-json')
+    const uri = args.find((arg) => arg.startsWith('file:'))
+    expect(uri).toContain('mode=ro')
+    expect(uri).not.toContain('immutable')
+  })
+
+  it('falls back to immutable=1 when the primary mode=ro attempt fails with error 14', async () => {
+    let call = 0
+    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => {
+      call += 1
+      if (call === 1) {
+        cb(new Error('exit 1'), '', 'Error: in prepare, unable to open database file (14)\n')
+      } else {
+        cb(null, '[]', '')
+      }
+    })
+    const result = await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
+    expect(result).toBe('[]')
+    expect(execFileMock).toHaveBeenCalledTimes(2)
+    const fallbackArgs = execFileMock.mock.calls[1]![1]
+    const fallbackUri = fallbackArgs.find((arg) => arg.startsWith('file:'))
+    expect(fallbackUri).toContain('mode=ro')
+    expect(fallbackUri).toContain('immutable=1')
+  })
+
+  it('rejects with a short, query-free error when both the primary and fallback attempts fail', async () => {
+    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => {
+      cb(new Error('exit 1'), '', 'Error: in prepare, unable to open database file (14)\n')
+    })
+    let message = ''
+    try {
+      await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
+      throw new Error('expected runSqlite to reject')
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+    expect(execFileMock).toHaveBeenCalledTimes(2)
+    expect(message).toContain('(14)')
+    expect(message).not.toContain('SELECT')
+    expect(message).not.toContain(THREAD_QUERY)
+  })
+
+  it('reports a timeout without leaking the query when both attempts are killed', async () => {
+    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => {
+      cb(Object.assign(new Error('exit 1'), { killed: true }), '', '')
+    })
+    let message = ''
+    try {
+      await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
+      throw new Error('expected runSqlite to reject')
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+    expect(message.toLowerCase()).toContain('timed out')
+    expect(message).not.toContain(THREAD_QUERY)
+  })
+})
+
 describe('CodexSource', () => {
   it('keeps only active user tasks and publishes the newest usage sample', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
@@ -257,32 +354,9 @@ describe('CodexSource', () => {
     }
   })
 
-  // C2 — the sqlite read can keep succeeding every poll while the usage
-  // SAMPLE it carries is days old, because Codex only emits a fresh
-  // token_count event when the app itself does work.
-  it('reports usage as stale by its own sample age, independent of the read succeeding', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
-    const database = join(dir, 'state.sqlite')
-    writeFileSync(database, '')
-    const sqlite = vi.fn(async () => JSON.stringify([]))
-    // The event's own timestamp is 2026-08-13T12:00:00Z (see TOKEN_EVENT),
-    // 1786622400 in epoch seconds. `now()` below is three days later.
-    const threeDaysLater = 1786622400 + 3 * 24 * 3600
-    const readTail = () => fixedRead(`${TOKEN_EVENT}\n`)
-    const source = new CodexSource(database, sqlite, readTail, () => threeDaysLater)
-    try {
-      await source.refresh()
-      expect(source.isStale()).toBe(false) // the read itself just succeeded.
-      expect(source.isUsageStale()).toBe(true) // but the sample is three days old.
-    } finally {
-      await source.stop()
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  it('reports usage as stale before any sample has ever arrived', () => {
+  it('reports usage as unknown before any sample has ever arrived', () => {
     const source = new CodexSource('/does/not/matter', async () => '[]', () => fixedRead(''), () => 0)
-    expect(source.isUsageStale()).toBe(true)
+    expect(source.isUsageUnknown()).toBe(true)
   })
 
   // I9 / lesson 8 — a refresh triggered by setVisible(true) must not arm a
@@ -336,5 +410,144 @@ describe('CodexSource', () => {
       await source.stop()
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  // Exercises the REAL `runSqlite` (the constructor's default `sqlite`
+  // param, not an injected fake), through the mocked `execFile`, so this
+  // covers the whole path: both open modes failing shows an honest unknown
+  // state rather than a fabricated number (the Critical fix commit 185bcb4
+  // established), the daemon logs exactly one line across repeated failing
+  // polls rather than filling the log every 5 s (lesson 5), that line
+  // carries no SQL body (lesson 20 — Codex's private schema, including its
+  // query, must never reach a log), and a later recovery clears the
+  // once-key so a SUBSEQUENT failure logs again instead of going silent
+  // forever.
+  it('shows an honest unknown state and logs exactly once across repeated failures when both sqlite modes fail, then logs again after a recovery and a later failure', async () => {
+    // Guards against a dedup key left "seen" by another test earlier in
+    // this file's shared `log` instance (module state is shared across all
+    // `it` blocks in one test file, even though each file gets its own).
+    log.clearOnce('codex-state-read')
+    execFileMock.mockReset()
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    const failing = (_cmd: string, _args: string[], _opts: unknown, cb: (
+      error: Error | null, stdout: string, stderr: string,
+    ) => void) => cb(new Error('exit 1'), '', 'Error: in prepare, unable to open database file (14)\n')
+    const succeeding = (_cmd: string, _args: string[], _opts: unknown, cb: (
+      error: Error | null, stdout: string, stderr: string,
+    ) => void) => cb(null, '[]', '')
+    try {
+      execFileMock.mockImplementation(failing)
+      // `sqlite` left at its default (`runSqlite`) by passing `undefined`.
+      const source = new CodexSource(database, undefined, () => fixedRead(''), () => 500)
+      await source.refresh()
+      await source.refresh()
+      await source.refresh()
+      expect(source.isAvailable()).toBe(false)
+      expect(source.getSnapshot()).toEqual({ tasks: [], usage: null }) // unknown, never fabricated.
+
+      const failureLines = lines.filter((line) => line.includes('cannot read Codex task data'))
+      expect(failureLines).toHaveLength(1) // one line across three failing polls.
+      expect(failureLines[0]).toContain(database)
+      expect(failureLines[0]).toContain('(14)')
+      expect(failureLines[0]).not.toContain('SELECT')
+      expect(failureLines[0]).not.toContain(THREAD_QUERY)
+
+      execFileMock.mockImplementation(succeeding)
+      await source.refresh()
+      expect(source.isAvailable()).toBe(true) // recovered.
+
+      execFileMock.mockImplementation(failing)
+      await source.refresh()
+      const failureLinesAfterRecovery = lines.filter((line) => line.includes('cannot read Codex task data'))
+      expect(failureLinesAfterRecovery).toHaveLength(2) // the cleared key let this one log again.
+
+      await source.stop()
+    } finally {
+      setDefaultSink(() => {})
+      log.clearOnce('codex-state-read')
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('CodexSource.isUsageUnknown', () => {
+  const WINDOW_MINUTES = 300 // A 5-hour rolling window: 18,000 seconds.
+  const WINDOW_SECONDS = WINDOW_MINUTES * 60
+
+  function usageEvent(opts: { ts: number; windowMinutes: number; resetsAt?: number }): string {
+    return JSON.stringify({
+      timestamp: new Date(opts.ts * 1000).toISOString(),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { total_tokens: 1 } },
+        rate_limits: {
+          primary: {
+            used_percent: 50,
+            window_minutes: opts.windowMinutes,
+            ...(opts.resetsAt === undefined ? {} : { resets_at: opts.resetsAt }),
+          },
+          secondary: null,
+          plan_type: 'team',
+        },
+      },
+    })
+  }
+
+  async function isUsageUnknownAt(now: number, event: string): Promise<boolean> {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    // One row so `doRefresh` actually calls `readTail` and parses `event`
+    // into `newestUsage` — a sqlite result with no rows never reaches the
+    // rollout at all. Its own `active`/task fields are irrelevant here.
+    const sqlite = vi.fn(async () => JSON.stringify([
+      { id: 'x', rollout_path: '/x.jsonl', updated_at_ms: 0, title: '', cwd: '', model: '', tokens_used: null },
+    ]))
+    const source = new CodexSource(database, sqlite, () => fixedRead(`${event}\n`), () => now)
+    try {
+      await source.refresh()
+      return source.isUsageUnknown()
+    } finally {
+      await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  it('treats a sample as unknown once the window it describes has since reset', async () => {
+    const resetsAt = 1_000
+    const event = usageEvent({ ts: resetsAt - 10, windowMinutes: WINDOW_MINUTES, resetsAt })
+    expect(await isUsageUnknownAt(resetsAt + 1, event)).toBe(true)
+  })
+
+  it('keeps a sample live shortly after the window it describes has started', async () => {
+    const resetsAt = 1_000 + WINDOW_SECONDS
+    const event = usageEvent({ ts: 1_005, windowMinutes: WINDOW_MINUTES, resetsAt })
+    expect(await isUsageUnknownAt(2_000, event)).toBe(false)
+  })
+
+  it('keeps a recent sample live when resets_at is absent, via the backstop', async () => {
+    const ts = 10_000
+    const event = usageEvent({ ts, windowMinutes: WINDOW_MINUTES })
+    expect(await isUsageUnknownAt(ts + 10, event)).toBe(false)
+  })
+
+  it('treats a four-day-old sample as unknown when resets_at is absent', async () => {
+    const ts = 10_000
+    const event = usageEvent({ ts, windowMinutes: WINDOW_MINUTES })
+    expect(await isUsageUnknownAt(ts + 4 * 24 * 3600, event)).toBe(true)
+  })
+
+  it('treats an old sample as unknown when its own resets_at describes a window that has not started yet', async () => {
+    // resets_at (30,000) describes a window starting at 30,000 - 18,000 =
+    // 12,000. `now` below (5,000) is still short of that start, so the
+    // sample belongs to whatever window preceded it, not the one resets_at
+    // names — even though resets_at itself is still ahead of `now`.
+    const event = usageEvent({ ts: 0, windowMinutes: WINDOW_MINUTES, resetsAt: 30_000 })
+    expect(await isUsageUnknownAt(5_000, event)).toBe(true)
   })
 })

@@ -13,8 +13,8 @@ const { execFileMock } = vi.hoisted(() => ({
       _cmd: string,
       _args: string[],
       _opts: Record<string, unknown>,
-      cb: (error: Error | null, stdout: string) => void,
-    ) => cb(null, '[]'),
+      cb: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => cb(null, '[]', ''),
   ),
 }))
 vi.mock('node:child_process', () => ({ execFile: execFileMock }))
@@ -22,12 +22,20 @@ vi.mock('node:child_process', () => ({ execFile: execFileMock }))
 import { runSqlite } from '../../src/sources/codex.js'
 
 describe('runSqlite', () => {
+  // The `-readonly` CLI flag against a plain path was measured to fail
+  // intermittently (SQLITE_CANTOPEN) against the live WAL-mode database, so
+  // the primary attempt now opens through the URI form with `mode=ro`
+  // instead — see `runSqlite`'s own doc comment in src/sources/codex.ts for
+  // the full reasoning and its fallback to `immutable=1`. This test only
+  // covers the primary attempt's shape and the shared timeout bound; the
+  // fallback and failure paths are covered in tests/sources/codex.test.ts.
   it('bounds stdout and bounds a hung child with a timeout (I6, I9)', async () => {
     await runSqlite('/tmp/does-not-matter.sqlite', 'SELECT 1;')
     expect(execFileMock).toHaveBeenCalledTimes(1)
     const [cmd, args, opts] = execFileMock.mock.calls[0]!
     expect(cmd).toBe('/usr/bin/sqlite3')
-    expect(args).toContain('-readonly')
+    expect(args).toContain('-json')
+    expect(args.some((arg) => arg.startsWith('file:') && arg.includes('mode=ro'))).toBe(true)
     expect(opts).toMatchObject({ maxBuffer: 1024 * 1024 })
     // A stop() that awaits an in-flight refresh must not be able to hang
     // forever behind an unresponsive sqlite3 child — see the review's I9.
