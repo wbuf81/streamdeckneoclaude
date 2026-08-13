@@ -12,14 +12,30 @@ const POLL_MS = 5000
  * which checks the rate-limit window's own boundary rather than a clock. */
 export const STALE_CODEX_SECONDS = 60
 /**
- * Backstop bound for the rare case `resets_at` is itself missing, or fails
- * `parseLimit`'s sanity check (see `RESET_MAX_SECONDS`). This is NOT the
- * primary rule for whether a usage sample is trustworthy — see
- * `isUsageUnknown()`'s doc comment for why age alone is otherwise the wrong
- * test. Deliberately a full day, so this fallback is never what actually
- * fires against a genuinely fresh sample; it exists only for missing data.
+ * CEILING for the backstop that covers a missing `resets_at` (see
+ * `RESET_MAX_SECONDS` for the sanity-check case, which nulls `resets_at` the
+ * same way). This is NOT the bound actually applied — `isUsageUnknown()`
+ * clamps it to the limit's own `windowMinutes` first, because a window
+ * shorter than a day cannot possibly still be trustworthy a day later (C2:
+ * a 300-minute, 5-hour window with no `resets_at` read as live for a full 24
+ * hours, 19 hours past its own window closing). This constant only bounds
+ * the OTHER direction: when `windowMinutes` is itself missing or absurd
+ * (see `WINDOW_MAX_MINUTES`), a backstop still has to end somewhere, and a
+ * full day is that fallback-of-a-fallback ceiling.
  */
 export const USAGE_UNKNOWN_BACKSTOP_SECONDS = 24 * 3600
+/** A `window_minutes` outside this range cannot be a real rate-limit
+ * window — the longest window on record is 10080 minutes (7 days; see
+ * `docs/VERIFIED-FACTS.md`), and even a generous monthly window sits nowhere
+ * near this bound. A value this large is far more likely to be the SAME
+ * figure in a different unit: the review's exact repro, `window_minutes:
+ * 604_800_000`, is 7 days in MILLISECONDS. Unbounded, that value both
+ * defeats `isUsageUnknown()`'s two-sided check (a month-old sample would
+ * read as live) and overruns the key's label line with a value like
+ * `420000-DAY CAP` (I4/I6). Treated as unknown, same pattern as
+ * `RESET_MAX_SECONDS` for `resets_at` — the whole limit fails closed via
+ * `parseLimit`'s existing `windowMinutes === null` branch. */
+const WINDOW_MAX_MINUTES = 366 * 24 * 60
 /** How long an `active` flag may outlive the thread row's own last-updated
  * time before this source stops trusting it.
  *
@@ -60,8 +76,8 @@ export const COLD_START_TAIL_BYTES = 256 * 1024
 const RESET_MAX_SECONDS = 4_000_000_000
 /** Bounds a hung `sqlite3` child well under the 5 s poll interval, so a
  * stuck read cannot block `stop()`'s await on `refreshing` forever and
- * delay shutdown past SIGTERM's grace window. Applies to both the primary
- * and fallback attempt in `runSqlite`. */
+ * delay shutdown past SIGTERM's grace window. Applies to `runSqlite`'s
+ * single `mode=ro` attempt — there is no fallback attempt any more (C1). */
 const SQLITE_TIMEOUT_MS = 4000
 
 export const THREAD_QUERY = `
@@ -101,7 +117,13 @@ export interface CodexUsage {
   /** `null` when the field is absent, renamed, or not a number. */
   totalTokens: number | null
   plan: string
-  ts: number
+  /** Epoch seconds the sample was taken, from the rollout event's own
+   * `timestamp`. `null` when that field is absent or not a parseable
+   * string — never a fabricated `0` (1969, lesson 18/I1). A `null` ts
+   * forces `isUsageUnknown()` true regardless of `resetsAt`: an unparseable
+   * clock on the sample is reason enough to distrust the whole reading, not
+   * just its displayed time. */
+  ts: number | null
 }
 
 export interface CodexSnapshot {
@@ -161,8 +183,10 @@ function parseLimit(value: unknown): CodexLimit | null {
   // has nothing to be a cap OF. This is the one place a missing field still
   // fails the WHOLE limit closed, rather than reporting partial unknown
   // data — the correct pattern the review found already in place for an
-  // absent `rate_limits` block.
-  if (windowMinutes === null || windowMinutes <= 0) return null
+  // absent `rate_limits` block. The upper bound (I4/I6) catches the same
+  // class of drift `RESET_MAX_SECONDS` catches for `resets_at`: a value that
+  // looks like the same figure in a smaller unit.
+  if (windowMinutes === null || windowMinutes <= 0 || windowMinutes > WINDOW_MAX_MINUTES) return null
   const usedPct = finite(raw.used_percent)
   let resetsAt = finite(raw.resets_at)
   if (resetsAt !== null && (resetsAt < 0 || resetsAt > RESET_MAX_SECONDS)) resetsAt = null
@@ -198,18 +222,36 @@ export function parseRolloutTail(
     const limits = [parseLimit(rate?.primary), parseLimit(rate?.secondary)]
       .filter((limit): limit is CodexLimit => limit !== null)
     const totalTokens = finite(info?.total_token_usage?.total_tokens)
-    const timestamp = typeof event.timestamp === 'string'
-      ? Math.floor(Date.parse(event.timestamp) / 1000)
-      : 0
+    // I1 — a missing or non-string `timestamp`, or one `Date.parse` cannot
+    // read, is UNKNOWN, never a fabricated `0` (which rendered as 7:00 PM
+    // EST 1969 beside a confident percentage). `CodexUsage.ts`'s own doc
+    // comment covers what `null` forces downstream.
+    const parsed = typeof event.timestamp === 'string' ? Math.floor(Date.parse(event.timestamp) / 1000) : NaN
     usage = {
       limits,
       totalTokens,
       plan: str(rate?.plan_type),
-      ts: Number.isFinite(timestamp) ? timestamp : 0,
+      ts: Number.isFinite(parsed) ? parsed : null,
     }
   }
 
   return { active, usage }
+}
+
+/** Orders two usage samples for `doRefresh`'s "keep the newest" comparison
+ * across rollouts. A `null` ts (I1's unparseable-timestamp case) carries no
+ * ordering information of its own — it does not mean "very old", it means
+ * "we do not know". Scoring it as the OLDEST possible sample (the previous
+ * behaviour, via a fabricated `0`) meant it could never win this comparison,
+ * so a genuinely fresher read would silently lose to an actually-older
+ * sample from a different rollout just because the fresher one's logged
+ * clock failed to parse. Scoring it as the NEWEST possible sample instead
+ * means a broken clock inside the payload never costs the page a real,
+ * current reading — the sample is still shown as `--` on the strip (see
+ * `CodexPage.usageTimeLabel`), because `usage.ts` itself stays `null`; only
+ * this internal ordering treats "unknown" differently from "old". */
+function usageOrderKey(usage: CodexUsage): number {
+  return usage.ts ?? Number.POSITIVE_INFINITY
 }
 
 /**
@@ -219,14 +261,22 @@ export function parseRolloutTail(
  * explicit `requestedStart` — including `0` — is honoured exactly, because a
  * later poll's own remembered offset must never be silently reinterpreted as
  * a fresh cold start.
+ *
+ * A `requestedStart` past the CURRENT `size` (M1: the rollout shrank —
+ * rotated or compacted out from under a remembered cursor) is treated the
+ * SAME as a cold start, bounded by `COLD_START_TAIL_BYTES`, rather than
+ * falling back to `0` and reading the whole file unbounded. The live index
+ * already references a rollout at 2.7 MB; a shrink-then-reread is exactly
+ * the case the cold-start cap exists to bound, and reusing it here needs no
+ * new logic.
  */
 export function readRolloutTail(file: string, requestedStart?: number): RolloutRead {
   const fd = openSync(file, 'r')
   try {
     const size = fstatSync(fd).size
-    const start = requestedStart === undefined
+    const start = requestedStart === undefined || requestedStart > size
       ? Math.max(0, size - COLD_START_TAIL_BYTES)
-      : (requestedStart >= 0 && requestedStart <= size ? requestedStart : 0)
+      : (requestedStart >= 0 ? requestedStart : 0)
     const buffer = Buffer.alloc(size - start)
     const bytesRead = readSync(fd, buffer, 0, buffer.length, start)
     if (bytesRead !== buffer.length) {
@@ -238,6 +288,10 @@ export function readRolloutTail(file: string, requestedStart?: number): RolloutR
         'codex-rollout-short-read',
         `short read on a Codex rollout file: expected ${buffer.length} bytes, got ${bytesRead}`,
       )
+    } else {
+      // M3 — lesson 5's second half: clear on recovery so a LATER short read
+      // logs again instead of going silent for the rest of the process.
+      log.clearOnce('codex-rollout-short-read')
     }
     return { text: buffer.toString('utf8', 0, bytesRead), size, consumedTo: start + bytesRead }
   } finally {
@@ -246,13 +300,16 @@ export function readRolloutTail(file: string, requestedStart?: number): RolloutR
 }
 
 /** Turns a filesystem path into the `file:` URI form sqlite3 needs to accept
- * `mode=ro` (and, on the fallback, `immutable=1`). Only `%`, `#`, and `?` are
- * percent-encoded — sqlite gives those three special meaning inside a URI
- * filename — so an ordinary absolute path passes through unchanged and a
- * leading `/` still reads as an absolute path rather than a relative one. */
-function toReadOnlyUri(database: string, extra?: string): string {
+ * `mode=ro`. Only `%`, `#`, and `?` are percent-encoded — sqlite gives those
+ * three special meaning inside a URI filename — so an ordinary absolute path
+ * passes through unchanged and a leading `/` still reads as an absolute path
+ * rather than a relative one. Escaping `?` specifically means a malformed
+ * `database` value (M2: one that itself contains `?mode=rwc` or similar)
+ * cannot inject a second query parameter and override `mode=ro` — it becomes
+ * a literal, harmless character in the filename instead. */
+function toReadOnlyUri(database: string): string {
   const escaped = database.replace(/[%#?]/g, (char) => encodeURIComponent(char))
-  return `file:${escaped}?${extra ? `mode=ro&${extra}` : 'mode=ro'}`
+  return `file:${escaped}?mode=ro`
 }
 
 /** A short, query-free description of an `execFile` failure, for the log.
@@ -279,7 +336,11 @@ function execSqlite(uri: string, query: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       '/usr/bin/sqlite3',
-      ['-json', uri, query],
+      // M2 — `-readonly` and the `mode=ro` URI compose; keeping both costs
+      // nothing and means a future sqlite3 build that, for whatever reason,
+      // stopped honouring URI filenames would still refuse to open
+      // read-write, rather than silently falling through to a literal path.
+      ['-readonly', '-json', uri, query],
       { maxBuffer: 1024 * 1024, timeout: SQLITE_TIMEOUT_MS },
       (error, stdout, stderr) => {
         if (!error) { resolve(stdout); return }
@@ -290,42 +351,41 @@ function execSqlite(uri: string, query: string): Promise<string> {
 }
 
 /**
- * Reads the Codex sqlite database without ever opening it read-write.
+ * Reads the Codex sqlite database without ever opening it read-write, using
+ * the URI form with `mode=ro` — the ONLY read mode this function has. There
+ * is no fallback.
  *
- * The primary attempt uses the URI form with `mode=ro`, which measurement
- * against the live database showed at least as reliable as the CLI's own
- * `-readonly` flag against a plain path — and `-readonly` against a plain
- * path was seen to fail intermittently with `SQLITE_CANTOPEN` (error 14)
- * against this WAL-mode database. The leading hypothesis is that a
- * read-only connection normally wants the database's `-shm` shared-memory
- * file and cannot create one itself, so the open fails whenever that file
- * is momentarily absent — treat that as a working hypothesis, not a
- * confirmed mechanism; it was not reproduced on demand.
+ * An earlier version fell back to `mode=ro&immutable=1` when the primary
+ * attempt failed, on the theory that reaching the fallback meant no writer
+ * could be live at that instant. Both halves of that theory were measured
+ * and refuted (C1):
  *
- * If the primary attempt fails, the fallback adds `immutable=1`, which lets
- * sqlite read the file without an `-shm` at all. This is ONLY safe as a
- * fallback: `immutable=1` tells sqlite the file will never change, so a
- * concurrent writer could hand back a stale or torn read. Reaching this
- * fallback means the primary `mode=ro` attempt — which needs an active
- * shared-memory reader — already failed, which itself implies no such
- * writer is live at that instant. It must never be the primary mode.
+ * - `immutable=1` does not read the WAL at all. Against a database with one
+ *   row checkpointed and a second left in the `-wal` file, `mode=ro` returns
+ *   both rows; `mode=ro&immutable=1` returns only the checkpointed one, exit
+ *   code 0, no warning. It is not "read-only", it is "read a stale snapshot
+ *   and call it done".
+ * - A live writer holding the database under `PRAGMA locking_mode=exclusive`
+ *   makes the primary `mode=ro` attempt fail with `database is locked (5)` —
+ *   and makes the `immutable=1` fallback SUCCEED, handing back pre-checkpoint
+ *   rows as if they were current. The exact condition that made the fallback
+ *   unsafe was also the condition that triggered it.
  *
- * Both attempts open strictly read-only (`mode=ro`); this function never
- * opens the database read-write, and so never creates, checkpoints, or
- * otherwise modifies anything under the user's Codex directory.
+ * The `-shm` hypothesis that originally justified even trying a fallback
+ * does not hold either: opening `mode=ro` against a `-wal` file with no
+ * `-shm` present succeeded and created the missing `-shm` itself, because
+ * the containing directory is writable by the daemon's own user. So a
+ * missing `-shm` was never the reason `mode=ro` could fail, and no fallback
+ * was justified by it in the first place.
+ *
+ * With the fallback gone, a failed `mode=ro` open now reports unavailable
+ * (see `doRefresh`'s catch block) instead of silently substituting old data.
+ * If a future finding shows some real, reachable case still needs a
+ * fallback, it must mark its data degraded (dimmed, logged) — never read
+ * silently, the way this one did.
  */
 export async function runSqlite(database: string, query: string): Promise<string> {
-  try {
-    return await execSqlite(toReadOnlyUri(database), query)
-  } catch (primaryError) {
-    const primaryDetail = primaryError instanceof Error ? primaryError.message : String(primaryError)
-    try {
-      return await execSqlite(toReadOnlyUri(database, 'immutable=1'), query)
-    } catch (fallbackError) {
-      const fallbackDetail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
-      throw new Error(`mode=ro failed (${primaryDetail}); immutable=1 fallback failed (${fallbackDetail})`)
-    }
-  }
+  return execSqlite(toReadOnlyUri(database), query)
 }
 
 /** Best-effort, read-only view of Codex desktop's local task index and the
@@ -341,7 +401,12 @@ export class CodexSource extends EventEmitter {
   private refreshing: Promise<void> | null = null
   private visible = false
   /** Set by `stop()`, so a refresh continuation already in flight cannot arm
-   * a new timer after shutdown (lesson 8). Checked first in `schedule()`. */
+   * a new timer after shutdown (lesson 8). Checked first in `schedule()`.
+   * One-way (M6): nothing ever sets this back to `false`. A page cycling
+   * `setVisible` on and off while the source is alive never touches this
+   * flag at all, so that path is unaffected; only a source that has already
+   * been `stop()`ped is meant to stay dead rather than being resurrected by
+   * a later `setVisible(true)`. */
   private stopped = false
   private cursors = new Map<string, {
     offset: number
@@ -367,11 +432,14 @@ export class CodexSource extends EventEmitter {
   }
 
   /** Called when the Codex page becomes visible. Refreshes at once and
-   * starts the 5 s poll loop; hidden, it costs nothing. */
+   * starts the 5 s poll loop; hidden, it costs nothing. A source that has
+   * already been `stop()`ped stays stopped (M6): this never clears
+   * `stopped`, so a stray `setVisible(true)` after shutdown cannot restart
+   * polling. */
   setVisible(visible: boolean): void {
     this.visible = visible
+    if (this.stopped) return
     if (visible) {
-      this.stopped = false
       void this.refresh().then(() => this.schedule())
     } else if (this.timer) {
       clearInterval(this.timer)
@@ -427,7 +495,7 @@ export class CodexSource extends EventEmitter {
         } catch {
           continue
         }
-        if (state.usage && (!newestUsage || state.usage.ts > newestUsage.ts)) {
+        if (state.usage && (!newestUsage || usageOrderKey(state.usage) > usageOrderKey(newestUsage))) {
           newestUsage = state.usage
         }
         if (!state.active) continue
@@ -507,10 +575,19 @@ export class CodexSource extends EventEmitter {
     return !this.lastSuccessAt || this.now() - this.lastSuccessAt > STALE_CODEX_SECONDS
   }
 
-  /** True when the newest known usage SAMPLE no longer describes the
-   * CURRENT rate-limit window, or there is no sample at all. Different from
-   * `isStale()`, which is about whether the sqlite READ itself is current —
-   * this is about whether the NUMBER that read carries is still true.
+  /** True when `usage.limits[limitIndex]` (default the primary window, index
+   * 0) no longer describes the CURRENT rate-limit window, or there is no
+   * sample at all. Different from `isStale()`, which is about whether the
+   * sqlite READ itself is current — this is about whether the NUMBER that
+   * read carries is still true.
+   *
+   * Evaluated PER LIMIT (I3/I5), never once for the whole snapshot: the
+   * primary and secondary windows carry independent `resetsAt` values, and a
+   * five-hour primary window ending soon says nothing about a seven-day
+   * secondary window that may have reset an hour ago. Reusing one boolean
+   * for both tiles let an ended secondary window render a confident,
+   * undimmed percentage under the wrong assumption that the primary
+   * window's freshness applied to it too.
    *
    * A quota reading is not a live sensor: Codex only emits a fresh
    * `token_count` event when the app itself does work, so "62% of this
@@ -521,26 +598,46 @@ export class CodexSource extends EventEmitter {
    * figure is the WINDOW ending: once `now` moves past the sample's own
    * `resetsAt`, the sample describes a window that no longer exists, and
    * the true figure for whatever window replaced it is unknowable from an
-   * old sample.
-   *
-   * The check is two-sided, not just `now < resetsAt`: `now` must also sit
-   * no more than one window-length behind `resetsAt`. A one-sided check
-   * would wrongly call a sample live if `resetsAt` described a window that,
-   * from `now`'s perspective, has not even started yet — `now` would still
-   * be sitting in the window BEFORE the one the figure is actually about.
-   *
-   * `resetsAt` is occasionally absent, or already null from `parseLimit`'s
-   * own sanity check. `USAGE_UNKNOWN_BACKSTOP_SECONDS` covers only that
-   * missing-data case. */
-  isUsageUnknown(): boolean {
+   * old sample. */
+  isUsageUnknown(limitIndex = 0): boolean {
     const usage = this.snapshot.usage
     if (!usage) return true
-    const limit = usage.limits[0]
-    const resetsAt = limit?.resetsAt ?? null
-    if (resetsAt === null) return this.now() - usage.ts > USAGE_UNKNOWN_BACKSTOP_SECONDS
+    const limit = usage.limits[limitIndex]
+    if (!limit) return true
+    // I1 — an unparseable sample timestamp is reason enough to distrust the
+    // whole reading, not just its displayed clock. This also means a `null`
+    // ts forces EVERY limit unknown, independent of that limit's own
+    // `resetsAt`, since `ts` describes the sample as a whole.
+    if (usage.ts === null) return true
+    const resetsAt = limit.resetsAt
+    if (resetsAt === null) {
+      // C2 — the backstop for a missing `resetsAt` must never outlive the
+      // window it stands in for: a 5-hour (300-minute) window's sample
+      // cannot possibly still describe "now" 20 hours later just because a
+      // flat 24-hour backstop said so. Clamping to the window's own length
+      // is what the window field is FOR. `USAGE_UNKNOWN_BACKSTOP_SECONDS`
+      // still bounds the other direction, for when `windowMinutes` itself is
+      // missing or absurd (see `WINDOW_MAX_MINUTES`, which already fails
+      // that whole limit closed before reaching here — so in practice this
+      // Math.min is almost always the window term).
+      const backstop = Math.min(USAGE_UNKNOWN_BACKSTOP_SECONDS, limit.windowMinutes * 60)
+      return this.now() - usage.ts > backstop
+    }
     const remaining = resetsAt - this.now()
-    const windowSeconds = limit!.windowMinutes * 60
-    return remaining < 0 || remaining > windowSeconds
+    const windowSeconds = limit.windowMinutes * 60
+    // The check is two-sided, not just `now < resetsAt`: `now` must also sit
+    // no more than one window-length behind `resetsAt`. A one-sided check
+    // would wrongly call a sample live if `resetsAt` described a window
+    // that, from `now`'s perspective, has not even started yet — `now`
+    // would still be sitting in the window BEFORE the one the figure is
+    // actually about.
+    //
+    // M5 — `remaining <= 0`, not `< 0`: at `resetsAt === now` the window has
+    // just ended. `formatResetIn` already reports `ELAPSED` at that exact
+    // instant (its own boundary is `remaining <= 0`), so this must agree,
+    // or the reset tile and the percentage tile disagree by one second on
+    // the same frame.
+    return remaining <= 0 || remaining > windowSeconds
   }
 
   async stop(): Promise<void> {

@@ -1,8 +1,23 @@
 import { describe, it, expect } from 'vitest'
+import { createCanvas } from '@napi-rs/canvas'
 import { CodexPage, formatTokenCount, formatResetIn, limitLabel } from '../../src/pages/codex-page.js'
 import type { CodexSnapshot, CodexTask } from '../../src/sources/codex.js'
 import { theme } from '../../src/render/theme.js'
-import { renderKey, renderStrip, probe, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
+
+/** The strip's own left/right inset, matching `render/canvas.ts`'s private
+ * `PAD` — documented in docs/VERIFIED-FACTS.md as "usable width 236 px" =
+ * 248 (`STRIP_WIDTH`) - 2 * 6. Not exported, so measured tests hardcode the
+ * same documented value rather than reasoning about it fresh. */
+const STRIP_PAD = 6
+
+/** Measures with the SAME font and size `renderStrip` draws line 1 and 2
+ * with, independently of the page. */
+function measureStrip(text: string): number {
+  const ctx = createCanvas(1, 1).getContext('2d')
+  ctx.font = `13px ${FONT}`
+  return ctx.measureText(text).width
+}
 
 const NOW = 1786622400
 
@@ -29,13 +44,19 @@ function build(
   data = snapshot(),
   available = true,
   stale = false,
-  usageUnknown = false,
+  // Either a single boolean applied to every limit index (the shape every
+  // existing test uses), or a per-index function for I5's test: the
+  // secondary tile must ask about ITS OWN index, not reuse the primary's
+  // answer, so a fake that ignores the argument entirely could not tell
+  // those two call sites apart.
+  usageUnknown: boolean | ((limitIndex?: number) => boolean) = false,
 ) {
+  const isUsageUnknown = typeof usageUnknown === 'function' ? usageUnknown : () => usageUnknown
   return new CodexPage({
     getSnapshot: () => data,
     isAvailable: () => available,
     isStale: () => stale,
-    isUsageUnknown: () => usageUnknown,
+    isUsageUnknown,
     setVisible: () => {},
   })
 }
@@ -71,6 +92,27 @@ describe('CodexPage', () => {
 
   it('uses key 5 for the plan when there is no second limit', () => {
     expect(build().render(NOW).keys[5]!.lines?.slice(0, 2)).toEqual(['PLAN', 'TEAM'])
+  })
+
+  // I3/I5 — the secondary tile must ask about ITS OWN window, never reuse
+  // the primary's unknown-ness. A fresh primary must not force a confident
+  // percentage onto a secondary window that has already ended.
+  it('renders the secondary limit as unknown independently of the primary, using its own index', () => {
+    const data = snapshot({
+      usage: {
+        limits: [
+          { usedPct: 10, windowMinutes: 300, resetsAt: NOW + 3600 }, // primary: fresh.
+          { usedPct: 96, windowMinutes: 10080, resetsAt: NOW - 3600 }, // secondary: already ended.
+        ],
+        totalTokens: 1, plan: 'team', ts: NOW,
+      },
+    })
+    const isUsageUnknown = (limitIndex?: number) => limitIndex === 1
+    const keys = build(data, true, false, isUsageUnknown).render(NOW).keys
+    expect(keys[4]!.lines).toEqual(['5-HR CAP', '10%']) // primary: known, confident.
+    expect(keys[4]!.dim).not.toBe(true)
+    expect(keys[5]!.lines).toEqual(['WEEK CAP', '--']) // secondary: unknown, never 96%.
+    expect(keys[5]!.dim).toBe(true)
   })
 
   it('shows task token usage compactly', () => {
@@ -155,8 +197,26 @@ describe('CodexPage', () => {
   it("renders the usage sample's own time on the strip, right-aligned on line 2", () => {
     // NOW (1786622400) is 2026-08-13T12:00:00Z, which is 8:00 AM EDT — a
     // summer instant, so the zone must read EDT. Exact string, per
-    // docs/LESSONS.md #17.
+    // docs/LESSONS.md #17. The sample is from the SAME Eastern day as `now`
+    // (both Aug 13), so I2's date prefix must stay absent here.
     expect(build().render(NOW).strip.right).toBe('8:00 AM EDT')
+  })
+
+  // I2 — a sample from an earlier Eastern calendar day must carry a date
+  // prefix, or a bare time-of-day string can read as being in the FUTURE
+  // relative to `now` (the review's exact scenario: yesterday lunchtime next
+  // to this morning's clock).
+  it('adds a date prefix when the usage sample is from a different Eastern calendar day than now', () => {
+    // 2026-08-12T16:00:00Z is 12:00 PM EDT on Aug 12 — the day BEFORE NOW's
+    // Aug 13.
+    const yesterdayNoon = Math.floor(Date.parse('2026-08-12T16:00:00.000Z') / 1000)
+    const data = snapshot({
+      usage: {
+        limits: [{ usedPct: 27, windowMinutes: 10080, resetsAt: NOW + 86400 }],
+        totalTokens: 1, plan: 'team', ts: yesterdayNoon,
+      },
+    })
+    expect(build(data).render(NOW).strip.right).toBe('8/12 12:00 PM EDT')
   })
 
   it('shows the explicit -- unknown state, not the timestamp, once the usage sample no longer describes the current window', () => {
@@ -173,16 +233,27 @@ describe('CodexPage', () => {
     expect(page.render(NOW).strip.right).toBe('--')
   })
 
-  it('never overlaps or clips the strip timestamp against line 2 text, for the widest realistic values', () => {
-    // The widest realistic clock string, `12:00 AM EDT` (12 chars, measured
-    // 93.9 px at 13 px Menlo), beside the widest realistic line-2 count,
-    // `3 active` (achieved with exactly TASK_SLOTS tasks and no overflow —
-    // measured 62.6 px, wider than any reachable `+N more` string, since
-    // the sqlite query caps at 10 rows and 10 - TASK_SLOTS leaves only 7).
+  it('never overlaps the strip timestamp against line 2 text, for the widest realistic values', () => {
+    // The widest realistic line-2 left text, `3 active` (achieved with
+    // exactly TASK_SLOTS tasks and no overflow — wider than any reachable
+    // `+N more` string, since the sqlite query caps at 10 rows and
+    // 10 - TASK_SLOTS leaves only 7), beside the widest realistic right
+    // label — a sample from a different Eastern day (I2), which now carries
+    // a date prefix ahead of `12:00 AM EDT`.
+    //
+    // The OLD version of this test probed only `x = STRIP_WIDTH - 1` (247):
+    // `renderStrip` right-aligns at `STRIP_WIDTH - PAD` = 242, so nothing
+    // ever draws past there BY CONSTRUCTION — the probe could not fail
+    // however badly the two strings actually collided. This version
+    // MEASURES both strings with the real canvas and font `renderStrip`
+    // itself uses, and probes a column strictly INSIDE the real gap between
+    // them, so a future change that shrinks or removes that gap makes this
+    // fail.
     const tasks = Array.from({ length: 3 }, (_, i) => task({
       threadId: String(i), title: `Task ${i}`, updatedAt: NOW - i,
     }))
-    // 2026-07-15T04:00:00Z is 12:00 AM EDT.
+    // 2026-07-15T04:00:00Z is 12:00 AM EDT, a different Eastern day than
+    // NOW's Aug 13 — so the right label carries I2's date prefix too.
     const wideTs = Math.floor(Date.parse('2026-07-15T04:00:00.000Z') / 1000)
     const data = snapshot({
       tasks,
@@ -192,10 +263,25 @@ describe('CodexPage', () => {
       },
     })
     const frame = build(data).render(NOW)
-    expect(frame.strip.right).toBe('12:00 AM EDT')
+    expect(frame.strip.right).toBe('7/15 12:00 AM EDT')
+    const line2Text = frame.strip.lines[1]!
+    expect(line2Text).toBe('3 active')
+
+    const line2End = STRIP_PAD + measureStrip(line2Text)
+    const rightStart = STRIP_WIDTH - STRIP_PAD - measureStrip(frame.strip.right!)
+    // A real, positive gap must exist between the two spans — this is the
+    // assertion the old test never made at all.
+    expect(rightStart).toBeGreaterThan(line2End)
+
+    const probeX = Math.round((line2End + rightStart) / 2)
     const buffer = renderStrip(frame.strip)
-    for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    // Line 1 (the project/title text) sits above, roughly y=4 to y=17 at
+    // this same 13 px font — starting the scan at y=20 clears its own
+    // descenders so this probe checks ONLY line 2's row and the blank
+    // space below it, not line 1's independent (and, at this column,
+    // irrelevant) ink.
+    for (let y = 20; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, probeX, y, STRIP_WIDTH)).toEqual(theme.bg)
     }
   })
 
@@ -258,6 +344,22 @@ describe('CodexPage', () => {
       },
     })
     expect(build(data).render(NOW).keys[7]!.lines?.[1]).toBe('--')
+  })
+
+  // M4 — a present limit whose own resetsAt is null showed an undimmed `--`
+  // while every other unknown tile on the same frame dims. `available`,
+  // fresh, and not `usageUnknown` — the ONLY thing wrong is `resetsAt`
+  // itself being null.
+  it('dims the reset tile when its value is -- even though the read is fresh and usage is not otherwise unknown', () => {
+    const data = snapshot({
+      usage: {
+        limits: [{ usedPct: 10, windowMinutes: 10080, resetsAt: null }],
+        totalTokens: 1, plan: 'team', ts: NOW,
+      },
+    })
+    const key = build(data, true, false, false).render(NOW).keys[7]!
+    expect(key.lines?.[1]).toBe('--')
+    expect(key.dim).toBe(true)
   })
 
   // I7 — the widest realistic values must never draw ink past the key's

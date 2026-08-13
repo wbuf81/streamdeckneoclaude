@@ -33,6 +33,16 @@ const MODEL_SIZES = [10, 9]
 /** Candidate sizes for the limit percentage and token-count value lines. */
 const PERCENT_SIZES = [28, 24, 20, 16]
 const TOKENS_SIZES = [24, 20, 16]
+/** Candidate sizes for the limit tile's label line (`5-HR CAP`, `WEEK CAP`,
+ * or a derived `N-HR CAP` / `N-DAY CAP` from `limitLabel`). The old code drew
+ * this at a bare fixed `11`, never measured — I4/I6's exact repro: a
+ * schema-drift `window_minutes` (the same value read as milliseconds)
+ * produced `420000-DAY CAP`, measured 92.7 px against the key's 81 px
+ * budget, overrunning the edge, because a plain number in `lineSizes` skips
+ * `resolveLineSpecs`'s measurement entirely. `codex.ts`'s `WINDOW_MAX_MINUTES`
+ * now bounds that input, but this line is measured regardless — the same
+ * defence every other schema-drift-exposed line on this tile already has. */
+const LABEL_SIZES = [11, 10, 9, 8]
 /** Candidate sizes for the reset countdown value line. `ELAPSED` (7 chars)
  * measures 101.1 px at 24 px and 67.4 px at 16 px, against the 81 px usable
  * width — so 24 alone, the old fixed size, would have clipped it. */
@@ -43,12 +53,15 @@ export interface CodexReader {
   isAvailable(): boolean
   /** True when the last successful sqlite read is too old. */
   isStale(): boolean
-  /** True when the newest usage SAMPLE no longer describes the CURRENT
-   * rate-limit window, or there is no sample yet — independent of
-   * `isStale()`. The figure it carries is not merely old; it is unknowable,
-   * so a caller must render an explicit unknown, never a dimmed but wrong
-   * number. See `CodexSource.isUsageUnknown`. */
-  isUsageUnknown(): boolean
+  /** True when `limits[limitIndex]` (default the primary window, index 0)
+   * no longer describes the CURRENT rate-limit window, or there is no
+   * sample yet — independent of `isStale()`. The figure it carries is not
+   * merely old; it is unknowable, so a caller must render an explicit
+   * unknown, never a dimmed but wrong number. Evaluated per limit (I3/I5):
+   * the primary and secondary windows carry independent `resetsAt` values,
+   * so the secondary tile must pass its OWN index rather than reusing the
+   * primary's answer. See `CodexSource.isUsageUnknown`. */
+  isUsageUnknown(limitIndex?: number): boolean
   setVisible(visible: boolean): void
 }
 
@@ -64,6 +77,32 @@ export function limitLabel(minutes: number): string {
   if (minutes > 0 && minutes % 1440 === 0) return `${minutes / 1440}-DAY CAP`
   if (minutes > 0 && minutes % 60 === 0) return `${minutes / 60}-HR CAP`
   return 'USAGE CAP'
+}
+
+/** The Eastern-zone identifier `formatEasternTime` itself uses privately in
+ * `render/text.ts`. Duplicated as a literal (not a formatter — see below)
+ * because this page needs to ask a DIFFERENT question that helper was never
+ * asked: whether two instants fall on the same Eastern calendar day. */
+const EASTERN_ZONE = 'America/New_York'
+
+/** A short `M/D ` prefix (with a trailing space), or `''` when `sampleMs`
+ * falls on the SAME Eastern calendar day as `nowMs` (I2). This answers only
+ * "does a date need to go in front of the time", never how to format the
+ * time itself — that stays the one shared `formatEasternTime` helper's job,
+ * per AGENTS.md's "Product conventions": one formatter for every wall-clock
+ * display, never a second one. Without this, a sample from yesterday
+ * lunchtime and one from an hour ago can print the identical time-of-day
+ * text, and the yesterday one can even read as being in the FUTURE relative
+ * to `now`. */
+function easternDatePrefix(sampleMs: number, nowMs: number): string {
+  const dayKey = new Intl.DateTimeFormat('en-US', {
+    timeZone: EASTERN_ZONE, year: 'numeric', month: 'numeric', day: 'numeric',
+  })
+  if (dayKey.format(new Date(sampleMs)) === dayKey.format(new Date(nowMs))) return ''
+  const shortDate = new Intl.DateTimeFormat('en-US', {
+    timeZone: EASTERN_ZONE, month: 'numeric', day: 'numeric',
+  })
+  return `${shortDate.format(new Date(sampleMs))} `
 }
 
 /** The reset countdown's value line. `null` means the reset time itself is
@@ -134,15 +173,18 @@ export class CodexPage implements Page {
 
     const limits = snapshot.usage?.limits ?? []
     keys.push(this.limitKey(limits[0], usageUnknown, readStale))
+    // I3/I5 — the secondary tile asks about ITS OWN window (index 1), never
+    // the primary's `usageUnknown`. A secondary window can end while the
+    // primary is still live; the two `resetsAt` values are independent.
     keys.push(limits[1]
-      ? this.limitKey(limits[1], usageUnknown, readStale)
+      ? this.limitKey(limits[1], this.source.isUsageUnknown(1), readStale)
       : this.planKey(snapshot.usage?.plan ?? '', usageUnknown || readStale))
     keys.push(this.tokensKey(snapshot.usage?.totalTokens ?? null, usageUnknown, readStale))
     keys.push(this.resetKey(limits[0], now, usageUnknown, readStale))
 
     return {
       keys,
-      strip: this.strip(snapshot, usageUnknown),
+      strip: this.strip(snapshot, usageUnknown, now),
       buttons: [theme.gray, theme.gray],
     }
   }
@@ -161,7 +203,7 @@ export class CodexPage implements Page {
       // true figure unknowable, so both render the same explicit `--`, never
       // a measured (or stale-but-dimmed) percentage with a confident bar.
       return {
-        kind: 'gauge', lines: [label, '--'], lineSizes: [11, 28],
+        kind: 'gauge', lines: [label, '--'], lineSizes: [LABEL_SIZES, 28],
         align: 'center', dim: true,
       }
     }
@@ -174,12 +216,12 @@ export class CodexPage implements Page {
     if (readStale) {
       return {
         kind: 'gauge', lines: [label, value, 'STALE'],
-        lineSizes: [11, PERCENT_SIZES, 11], align: 'center', dim: true,
+        lineSizes: [LABEL_SIZES, PERCENT_SIZES, 11], align: 'center', dim: true,
       }
     }
     return {
       kind: 'gauge', lines: [label, value],
-      lineSizes: [11, PERCENT_SIZES], align: 'center',
+      lineSizes: [LABEL_SIZES, PERCENT_SIZES], align: 'center',
       bar: { value: limit.usedPct / 100, color: barColor(limit.usedPct / 100) },
     }
   }
@@ -228,19 +270,27 @@ export class CodexPage implements Page {
       lines: ['RESETS IN', value, readStale && !unknown ? 'STALE' : ''],
       lineSizes: [11, RESET_SIZES, 11],
       align: 'center',
-      dim: !limit || unknown || readStale,
+      // M4 — a bare `--` (a present limit whose `resetsAt` itself is null)
+      // must dim like every other unknown tile. Without `value === '--'`
+      // here, that specific case fell through every other condition false
+      // and rendered undimmed, the one tile that disagreed with its
+      // neighbours about what "unknown" looks like.
+      dim: !limit || unknown || readStale || value === '--',
     }
   }
 
-  private strip(snapshot: CodexSnapshot, usageUnknown: boolean): StripSpec {
+  private strip(snapshot: CodexSnapshot, usageUnknown: boolean, now: number): StripSpec {
     if (!this.source.isAvailable()) return { lines: ['codex', 'task data unavailable'], dim: true }
     // The usage sample's own time, right-aligned on line 2 — the same slot
     // and helper the Spotify page's idle clock uses. It goes on the strip,
     // not a key: `12:00 AM EDT` measures 93.9 px at 13 px, and a limit key's
-    // usable width is only 81 px — beside a percentage there is no room. The
-    // strip's line 2 leaves comfortably over 70 px of gap either side, so it
-    // never crowds `first.project` or the active/overflow count.
-    const usageTime = this.usageTimeLabel(snapshot.usage, usageUnknown)
+    // usable width is only 81 px — beside a percentage there is no room.
+    // With I2's date prefix (widest case `12/31 12:00 AM EDT`, 18 chars),
+    // the widest realistic right label and the widest realistic line-2 left
+    // text (`3 active`) still leave a real, measured gap between them — see
+    // the "never overlaps" test in codex-page.test.ts, which measures this
+    // with the real canvas rather than assuming it.
+    const usageTime = this.usageTimeLabel(snapshot.usage, usageUnknown, now)
     if (snapshot.tasks.length === 0) return { lines: ['codex', 'no active tasks'], right: usageTime, dim: true }
     const first = snapshot.tasks[0]!
     const overflow = Math.max(0, snapshot.tasks.length - TASK_SLOTS)
@@ -259,10 +309,20 @@ export class CodexPage implements Page {
    * as current would misinform exactly like a dimmed old percentage would —
    * commit 360508d's rule, applied here too. `CodexUsage.ts` is epoch
    * SECONDS (see `parseRolloutTail`), so it is converted to epoch
-   * milliseconds before reaching `formatEasternTime`. */
-  private usageTimeLabel(usage: CodexUsage | null, usageUnknown: boolean): string {
-    if (!usage || usageUnknown) return '--'
-    return formatEasternTime(usage.ts * 1000)
+   * milliseconds before reaching `formatEasternTime`.
+   *
+   * I2 — a sample from an earlier Eastern calendar day gets an `easternDate`
+   * prefix ahead of the time-of-day text, because a bare time-of-day string
+   * from yesterday lunchtime can read as HOURS IN THE FUTURE next to `now`.
+   * The time-of-day text itself always comes from the one shared
+   * `formatEasternTime` helper (AGENTS.md's "Product conventions"); this
+   * only decides whether a date needs to go in front of it, which that
+   * helper was never asked to answer. */
+  private usageTimeLabel(usage: CodexUsage | null, usageUnknown: boolean, now: number): string {
+    if (!usage || usageUnknown || usage.ts === null) return '--'
+    const sampleMs = usage.ts * 1000
+    const datePrefix = easternDatePrefix(sampleMs, now * 1000)
+    return `${datePrefix}${formatEasternTime(sampleMs)}`
   }
 
   onKeyPress(_index: number): PressOutcome {

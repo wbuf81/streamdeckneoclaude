@@ -145,6 +145,62 @@ describe('parseRolloutTail', () => {
     })
     expect(parseRolloutTail(event).usage?.limits[0]?.resetsAt).toBeNull()
   })
+
+  // I6 — a window_minutes that looks like the same figure in milliseconds
+  // (Codex's own sqlite already writes updated_at_ms and created_at_ms that
+  // way) must not survive to defeat isUsageUnknown's two-sided check or
+  // print a multi-hundred-thousand-day label. The whole limit fails closed,
+  // the same pattern already in place for resets_at.
+  it('drops the whole limit when window_minutes looks like the same value in milliseconds', () => {
+    const event = JSON.stringify({
+      timestamp: '2026-08-13T12:00:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {},
+        rate_limits: {
+          // 604,800,000 ms is 7 days — the review's exact repro.
+          primary: { used_percent: 96, window_minutes: 604_800_000, resets_at: 1787068486 },
+          secondary: null,
+          plan_type: 'team',
+        },
+      },
+    })
+    expect(parseRolloutTail(event).usage?.limits).toEqual([])
+  })
+
+  // I1 — `usage.ts` must be `null`, never a fabricated `0` (which rendered
+  // as 7:00 PM EST 1969 beside a confident percentage), when the event's own
+  // `timestamp` is not a string.
+  it('reports ts as null, not a fabricated 0, when timestamp is not a string', () => {
+    const event = JSON.stringify({
+      timestamp: 1755000000000, // a number, not a string.
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { total_tokens: 1 } },
+        rate_limits: {
+          primary: { used_percent: 96, window_minutes: 10080, resets_at: 1787068486 },
+          secondary: null,
+          plan_type: 'team',
+        },
+      },
+    })
+    expect(parseRolloutTail(event).usage?.ts).toBeNull()
+  })
+
+  it('reports ts as null when timestamp is a string Date.parse cannot read', () => {
+    const event = JSON.stringify({
+      timestamp: 'not-a-date',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {},
+        rate_limits: { primary: { used_percent: 1, window_minutes: 10080 }, secondary: null, plan_type: 'team' },
+      },
+    })
+    expect(parseRolloutTail(event).usage?.ts).toBeNull()
+  })
 })
 
 describe('readRolloutTail', () => {
@@ -175,6 +231,51 @@ describe('readRolloutTail', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // M1 — a shrunken (rotated or compacted) rollout must still respect the
+  // cold-start cap, not fall back to an unbounded whole-file read. Before
+  // the fix, `requestedStart > size` resolved to `start = 0`.
+  it('bounds a read whose remembered offset now exceeds the shrunken file, instead of reading the whole file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const file = join(dir, 'rollout.jsonl')
+    try {
+      const filler = 'x'.repeat(COLD_START_TAIL_BYTES * 2)
+      writeFileSync(file, `${filler}\nMARKER\n`) // the file the cursor was last read at.
+      const staleOffset = filler.length * 2 // a remembered offset from BEFORE the shrink.
+      const read = readRolloutTail(file, staleOffset)
+      expect(read.text.length).toBeLessThanOrEqual(COLD_START_TAIL_BYTES)
+      expect(read.text).toContain('MARKER')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // M3 — lesson 5's second half: a full, non-short read must clear the
+  // short-read log key, so a LATER short read logs again instead of going
+  // silent for the rest of the process. A genuine short read on a local
+  // regular file is not reproducible on demand (per the code's own
+  // comment), so this seeds the "already logged" state directly through the
+  // shared `log` singleton and checks that a normal read clears it.
+  it('clears the short-read log key on a normal, full read', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const file = join(dir, 'rollout.jsonl')
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    log.clearOnce('codex-rollout-short-read')
+    try {
+      writeFileSync(file, 'hello\n')
+      log.once('codex-rollout-short-read', 'seed-message') // simulate a prior short read already logged.
+      expect(lines).toHaveLength(1)
+      readRolloutTail(file, 0) // a normal, full, non-short read.
+      log.once('codex-rollout-short-read', 'after-clear-message')
+      expect(lines).toHaveLength(2) // logged again: the key was cleared.
+      expect(lines[1]).toContain('after-clear-message')
+    } finally {
+      setDefaultSink(() => {})
+      log.clearOnce('codex-rollout-short-read')
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('THREAD_QUERY', () => {
@@ -191,7 +292,7 @@ describe('runSqlite', () => {
     execFileMock.mockReset()
   })
 
-  it('reads via the primary mode=ro URI when it succeeds', async () => {
+  it('reads via mode=ro with -readonly, and never mentions immutable', async () => {
     execFileMock.mockImplementation((_cmd, _args, _opts, cb) => cb(null, '[]', ''))
     const result = await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
     expect(result).toBe('[]')
@@ -199,31 +300,40 @@ describe('runSqlite', () => {
     const [cmd, args] = execFileMock.mock.calls[0]!
     expect(cmd).toBe('/usr/bin/sqlite3')
     expect(args).toContain('-json')
+    // M2 — `-readonly` and the URI's own `mode=ro` compose; keeping both
+    // costs nothing and is a second guarantee if a future sqlite3 build
+    // ever stopped honouring URI filenames.
+    expect(args).toContain('-readonly')
     const uri = args.find((arg) => arg.startsWith('file:'))
     expect(uri).toContain('mode=ro')
     expect(uri).not.toContain('immutable')
   })
 
-  it('falls back to immutable=1 when the primary mode=ro attempt fails with error 14', async () => {
-    let call = 0
+  // C1 — the review's exact refutation: the `immutable=1` fallback is GONE.
+  // A `mode=ro` failure — for any reason, including the review's measured
+  // "database is locked (5)" from a live exclusive-locking writer — must
+  // reject outright. There is no second attempt that could hand back a
+  // stale pre-checkpoint snapshot while reporting success.
+  it('never retries or falls back when mode=ro fails, even for the exact "database is locked" error a live writer produces', async () => {
     execFileMock.mockImplementation((_cmd, _args, _opts, cb) => {
-      call += 1
-      if (call === 1) {
-        cb(new Error('exit 1'), '', 'Error: in prepare, unable to open database file (14)\n')
-      } else {
-        cb(null, '[]', '')
-      }
+      cb(new Error('exit 1'), '', 'Error: in prepare, database is locked (5)\n')
     })
-    const result = await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
-    expect(result).toBe('[]')
-    expect(execFileMock).toHaveBeenCalledTimes(2)
-    const fallbackArgs = execFileMock.mock.calls[1]![1]
-    const fallbackUri = fallbackArgs.find((arg) => arg.startsWith('file:'))
-    expect(fallbackUri).toContain('mode=ro')
-    expect(fallbackUri).toContain('immutable=1')
+    let message = ''
+    try {
+      await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
+      throw new Error('expected runSqlite to reject')
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+    // Exactly one attempt: no fallback call was ever made.
+    expect(execFileMock).toHaveBeenCalledTimes(1)
+    expect(message).toContain('(5)')
+    expect(message).not.toContain('SELECT')
+    expect(message).not.toContain(THREAD_QUERY)
+    expect(message).not.toContain('immutable')
   })
 
-  it('rejects with a short, query-free error when both the primary and fallback attempts fail', async () => {
+  it('rejects with a short, query-free error when mode=ro fails with SQLITE_CANTOPEN', async () => {
     execFileMock.mockImplementation((_cmd, _args, _opts, cb) => {
       cb(new Error('exit 1'), '', 'Error: in prepare, unable to open database file (14)\n')
     })
@@ -234,13 +344,13 @@ describe('runSqlite', () => {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error)
     }
-    expect(execFileMock).toHaveBeenCalledTimes(2)
+    expect(execFileMock).toHaveBeenCalledTimes(1)
     expect(message).toContain('(14)')
     expect(message).not.toContain('SELECT')
     expect(message).not.toContain(THREAD_QUERY)
   })
 
-  it('reports a timeout without leaking the query when both attempts are killed', async () => {
+  it('reports a timeout without leaking the query when the single attempt is killed', async () => {
     execFileMock.mockImplementation((_cmd, _args, _opts, cb) => {
       cb(Object.assign(new Error('exit 1'), { killed: true }), '', '')
     })
@@ -251,8 +361,27 @@ describe('runSqlite', () => {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error)
     }
+    expect(execFileMock).toHaveBeenCalledTimes(1)
     expect(message.toLowerCase()).toContain('timed out')
     expect(message).not.toContain(THREAD_QUERY)
+  })
+
+  // M2 — a malformed `database` path cannot escape `mode=ro` by injecting a
+  // second query parameter. `?` is percent-encoded, so an attempt to smuggle
+  // `?mode=rwc` in through the path becomes a literal, harmless filename
+  // character instead of a second URI parameter.
+  it('percent-encodes a `?` in the database path so it cannot inject a second mode parameter', async () => {
+    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => cb(null, '[]', ''))
+    await runSqlite('/tmp/evil.sqlite?mode=rwc', THREAD_QUERY)
+    const args = execFileMock.mock.calls[0]![1]
+    const uri = args.find((arg) => arg.startsWith('file:'))!
+    // Exactly one literal, un-escaped `?` in the whole URI — the one this
+    // function appends for its own query. The path's OWN `?` was
+    // percent-encoded away, so it cannot introduce a second `?mode=` that
+    // would override the real one.
+    expect(uri.split('?')).toHaveLength(2)
+    expect(uri.endsWith('?mode=ro')).toBe(true)
+    expect(uri).toContain('%3Fmode=rwc')
   })
 })
 
@@ -302,6 +431,54 @@ describe('CodexSource', () => {
       expect(source.getSnapshot().tasks).toEqual([])
     } finally {
       await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // C1 — the review's exact reachability scenario: a live writer holds the
+  // database under an exclusive lock, so `mode=ro` fails with `database is
+  // locked (5)`. With the `immutable=1` fallback removed, this must report
+  // UNAVAILABLE — never silently substitute a stale pre-checkpoint
+  // snapshot with `available = true`. No task rows or usage sample ever
+  // reach the snapshot from this failure.
+  it('reports unavailable, never a stale substitute, when the sqlite injector fails with the exact "database is locked" error a live writer produces', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const source = new CodexSource(
+      database,
+      async () => { throw new Error('in prepare, database is locked (5)') },
+    )
+    try {
+      await source.refresh()
+      expect(source.isAvailable()).toBe(false)
+      expect(source.getSnapshot()).toEqual({ tasks: [], usage: null })
+    } finally {
+      await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // M6 — `stopped` is a one-way latch: once `stop()` has run, a later
+  // `setVisible(true)` must not resurrect polling.
+  it('does not restart polling when setVisible(true) is called after stop()', async () => {
+    vi.useFakeTimers()
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const sqlite = vi.fn(async () => '[]')
+    const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
+    try {
+      source.setVisible(true)
+      await vi.advanceTimersByTimeAsync(0)
+      const callsBeforeStop = sqlite.mock.calls.length
+      await source.stop()
+      source.setVisible(true) // must be a no-op: the source is permanently stopped.
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(sqlite.mock.calls.length).toBe(callsBeforeStop)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
       rmSync(dir, { recursive: true, force: true })
     }
   })
@@ -478,9 +655,14 @@ describe('CodexSource.isUsageUnknown', () => {
   const WINDOW_MINUTES = 300 // A 5-hour rolling window: 18,000 seconds.
   const WINDOW_SECONDS = WINDOW_MINUTES * 60
 
-  function usageEvent(opts: { ts: number; windowMinutes: number; resetsAt?: number }): string {
+  function usageEvent(opts: {
+    ts: number | 'bad'
+    windowMinutes: number
+    resetsAt?: number
+    secondary?: { windowMinutes: number; resetsAt?: number }
+  }): string {
     return JSON.stringify({
-      timestamp: new Date(opts.ts * 1000).toISOString(),
+      timestamp: opts.ts === 'bad' ? 'not-a-date' : new Date(opts.ts * 1000).toISOString(),
       type: 'event_msg',
       payload: {
         type: 'token_count',
@@ -491,14 +673,20 @@ describe('CodexSource.isUsageUnknown', () => {
             window_minutes: opts.windowMinutes,
             ...(opts.resetsAt === undefined ? {} : { resets_at: opts.resetsAt }),
           },
-          secondary: null,
+          secondary: opts.secondary
+            ? {
+              used_percent: 96,
+              window_minutes: opts.secondary.windowMinutes,
+              ...(opts.secondary.resetsAt === undefined ? {} : { resets_at: opts.secondary.resetsAt }),
+            }
+            : null,
           plan_type: 'team',
         },
       },
     })
   }
 
-  async function isUsageUnknownAt(now: number, event: string): Promise<boolean> {
+  async function isUsageUnknownAt(now: number, event: string, limitIndex = 0): Promise<boolean> {
     const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
     const database = join(dir, 'state.sqlite')
     writeFileSync(database, '')
@@ -511,7 +699,7 @@ describe('CodexSource.isUsageUnknown', () => {
     const source = new CodexSource(database, sqlite, () => fixedRead(`${event}\n`), () => now)
     try {
       await source.refresh()
-      return source.isUsageUnknown()
+      return source.isUsageUnknown(limitIndex)
     } finally {
       await source.stop()
       rmSync(dir, { recursive: true, force: true })
@@ -530,6 +718,16 @@ describe('CodexSource.isUsageUnknown', () => {
     expect(await isUsageUnknownAt(2_000, event)).toBe(false)
   })
 
+  // M5 — the window boundary is inclusive: AT resets_at, the window has just
+  // ended, matching `formatResetIn`'s own `remaining <= 0` → `ELAPSED`
+  // boundary. Before the fix, `remaining < 0` left this one second
+  // disagreeing with the reset tile on the very same frame.
+  it('treats a sample as unknown exactly at its own resets_at, matching formatResetIn\'s ELAPSED boundary', async () => {
+    const resetsAt = 1_000 + WINDOW_SECONDS
+    const event = usageEvent({ ts: 1_005, windowMinutes: WINDOW_MINUTES, resetsAt })
+    expect(await isUsageUnknownAt(resetsAt, event)).toBe(true)
+  })
+
   it('keeps a recent sample live when resets_at is absent, via the backstop', async () => {
     const ts = 10_000
     const event = usageEvent({ ts, windowMinutes: WINDOW_MINUTES })
@@ -542,6 +740,30 @@ describe('CodexSource.isUsageUnknown', () => {
     expect(await isUsageUnknownAt(ts + 4 * 24 * 3600, event)).toBe(true)
   })
 
+  // C2 — the review's exact repro: a 300-minute (5-hour) window with no
+  // resets_at must not stay "known" for the old flat 24-hour backstop. It
+  // must be bounded by its OWN window length (18,000 s = 5 h), so a sample
+  // well inside the old 10 s/4-day test range — 15 hours old, comfortably
+  // under 24 hours — must already read unknown.
+  it('treats a sample older than its own window length as unknown, even though it is still under the old 24-hour backstop', async () => {
+    const ts = 10_000
+    const event = usageEvent({ ts, windowMinutes: WINDOW_MINUTES }) // resets_at absent.
+    const fifteenHoursLater = ts + 15 * 3600
+    expect(await isUsageUnknownAt(fifteenHoursLater, event)).toBe(true)
+  })
+
+  it('keeps a sample live right up to its own window length when resets_at is absent', async () => {
+    const ts = 10_000
+    const event = usageEvent({ ts, windowMinutes: WINDOW_MINUTES })
+    expect(await isUsageUnknownAt(ts + WINDOW_SECONDS - 1, event)).toBe(false)
+  })
+
+  it('treats a sample as unknown one second past its own window length when resets_at is absent', async () => {
+    const ts = 10_000
+    const event = usageEvent({ ts, windowMinutes: WINDOW_MINUTES })
+    expect(await isUsageUnknownAt(ts + WINDOW_SECONDS + 1, event)).toBe(true)
+  })
+
   it('treats an old sample as unknown when its own resets_at describes a window that has not started yet', async () => {
     // resets_at (30,000) describes a window starting at 30,000 - 18,000 =
     // 12,000. `now` below (5,000) is still short of that start, so the
@@ -549,5 +771,33 @@ describe('CodexSource.isUsageUnknown', () => {
     // names — even though resets_at itself is still ahead of `now`.
     const event = usageEvent({ ts: 0, windowMinutes: WINDOW_MINUTES, resetsAt: 30_000 })
     expect(await isUsageUnknownAt(5_000, event)).toBe(true)
+  })
+
+  // I1 — an unparseable sample timestamp forces the WHOLE reading unknown,
+  // regardless of what resets_at claims, because the sample as a whole
+  // cannot be trusted once its own clock fails to parse.
+  it('forces usage unknown when the sample timestamp is unparseable, even though resets_at looks fine', async () => {
+    const resetsAt = 1_000 + WINDOW_SECONDS
+    const event = usageEvent({ ts: 'bad', windowMinutes: WINDOW_MINUTES, resetsAt })
+    expect(await isUsageUnknownAt(2_000, event)).toBe(true)
+  })
+
+  // I3/I5 — each limit's freshness is its own question. A primary window
+  // still comfortably live must not force the SECONDARY tile to also read
+  // known just because index 0 does — and the reverse must hold too.
+  it('evaluates the secondary limit independently of the primary, so an ended secondary window reads unknown while the primary stays live', async () => {
+    // A realistic, well-positive `now` — a `resetsAt` an hour BEHIND `now`
+    // must itself stay positive, or `parseLimit`'s own `resetsAt < 0` sanity
+    // check would null it out and mask this scenario behind the backstop
+    // branch instead of the two-sided window check this test targets.
+    const now = 100_000
+    const event = usageEvent({
+      ts: now - 995,
+      windowMinutes: WINDOW_MINUTES,
+      resetsAt: now + 3600, // primary: an hour from ending, still live.
+      secondary: { windowMinutes: 10080, resetsAt: now - 3600 }, // secondary: ended an hour ago.
+    })
+    expect(await isUsageUnknownAt(now, event, 0)).toBe(false)
+    expect(await isUsageUnknownAt(now, event, 1)).toBe(true)
   })
 })

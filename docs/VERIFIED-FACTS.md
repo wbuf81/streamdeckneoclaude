@@ -180,6 +180,38 @@ Measured locally on 2026-08-13:
   stop the daemon or the other pages. A field that is absent or renamed must render as
   unknown (`--`), never as a measured `0` — that failure mode reached shipped code once
   already and is why this line is here.
+- **`mode=ro` is the ONLY read mode; there is no `immutable=1` fallback, and this
+  supersedes the earlier `-shm`-absence hypothesis below.** A prior version of this
+  source fell back to `mode=ro&immutable=1` on the theory that reaching the fallback
+  proved no writer could be live. Both halves were measured and refuted:
+  - `immutable=1` does not read the WAL at all. Against a WAL database with one row
+    checkpointed into the main file and a second left only in `-wal`, `mode=ro` returns
+    both rows; `mode=ro&immutable=1` returns only the checkpointed row, exit code 0, no
+    warning on stderr. It reads a stale snapshot and reports success.
+  - A live writer holding the database under `PRAGMA locking_mode=exclusive` makes the
+    primary `mode=ro` attempt fail with `Error: in prepare, database is locked (5)` — and
+    makes the `immutable=1` fallback SUCCEED, handing back the pre-checkpoint rows as
+    current. The exact condition that made the fallback unsafe was also the condition
+    that triggered it.
+  - **The earlier `-shm`-absence hypothesis for the original intermittent
+    `SQLITE_CANTOPEN` (error 14) failures does not hold.** Opening `mode=ro` against a
+    `-wal` file with its `-shm` deliberately absent still succeeded and created the
+    missing `-shm` itself, because the containing directory is writable by the daemon's
+    own user. A missing `-shm` was never a reason `mode=ro` could fail, so it was never a
+    valid justification for a fallback in the first place.
+  - Consequence: with the fallback removed, a `mode=ro` failure for ANY reason —
+    including a live writer's exclusive lock — makes the source report unavailable. The
+    page shows the honest unknown state; it never substitutes an old snapshot while
+    claiming success, and never opens the database read-write.
+- `window_minutes` needs the same sanity bound `resets_at` already had: a value at or
+  beyond roughly a year of minutes is far more likely to be the same figure in
+  milliseconds (Codex's own sqlite already writes `updated_at_ms`/`created_at_ms` that
+  way) than a real plan window, and is treated as unknown, failing that limit closed.
+- A `token_count` event whose own `timestamp` does not parse renders `ts` as `null`
+  (never a fabricated `0`, which previously displayed as 7:00 PM EST 1969 beside a live
+  percentage) and forces that whole usage sample unknown, regardless of what its
+  `resets_at` claims — an unparseable clock on the sample is reason enough to distrust
+  the reading as a whole, not only its displayed time.
 
 ---
 
