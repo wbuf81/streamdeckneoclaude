@@ -76,8 +76,11 @@ const IDLE_TICK_MS = 100
  * This ONE constant is the whole switch between them — change it here, no
  * other file needs to know. The user picks the shipped default, not the
  * agent; see the task's preview images.
+ *
+ * The user chose `'rain'` from the previews on 2026-08-13: "i like the
+ * matrix one that is sick".
  */
-const IDLE_VARIANT: IdleVariant = 'grid'
+const IDLE_VARIANT: IdleVariant = 'rain'
 /**
  * Coarse, character-count pre-limits — NOT the thing that guarantees a fit.
  * `renderStrip` (`src/render/canvas.ts`) is what actually measures both
