@@ -160,11 +160,24 @@ anything still needed before that directory is cleaned.
 
 ### Next work, in priority order
 
-#### P0 — the user verifies tasks 31 to 35 on the real deck
+#### DONE — tasks 31 to 35 are VERIFIED on the real deck
 
-Five visible changes shipped on 2026-08-13 and **none has been seen on hardware.** Every real
-defect found this session was found by the user looking at the glass, while a green suite of
-900-plus tests repeatedly missed them. So this check outranks any new code.
+The user checked all five on 2026-08-13 and confirmed every one behaves as described. Their
+words: *"everything else works as you say it does"*.
+
+**One change requested.** The press flash was too much: *"the white and red show too long and
+are too brigt can you maybe just outline the button or something ? its a little too jarring"*.
+Task 36 replaces the full-key fill with a full-perimeter ring, dimmer colours, and about 150 ms
+instead of 250.
+
+Note the flash has now been wrong in **both** directions, so do not "fix" it by reverting:
+Task 16 recoloured the key **border**, which this theme draws as a **left-edge strip only** and
+the user could barely see; Task 32 overcorrected to a full-key fill, which is what they called
+jarring. The ring must be independent drawing on all four sides. The middle ground was the
+answer both times.
+
+The original expectations are kept below, since they are still the description of correct
+behaviour.
 
 What to look at, and what is expected:
 
