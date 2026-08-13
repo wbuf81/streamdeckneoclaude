@@ -117,29 +117,46 @@ but **that directory is git-ignored**, so this file is the durable record.
 | 24 | weather tile overlap + tint | complete |
 | — | all 9 deferred minors | complete, commits `1b4ddca` `5c6f7d0` `d59e325` `09c3fc4` |
 | 25 | stock detail drill-down (`slice`, `fitSize`) | complete |
-| 26 | Claude page: dedicated crab tile, 3 sessions, full-key flash | **pending** |
-| 27 | Spotify page: cold-load bug, volume replaces heart, idle animation | **pending** |
+| 26 | Claude page: dedicated crab tile, 3 sessions, full-key flash | complete |
+| 27 | Spotify page: cold-load bug, volume replaces heart, idle animation | complete |
+| — | review of tasks 22–25, then all its fixes | complete, 9 fix commits |
+| 28 | blank the deck while the screen is locked | **pending, brief written** |
 
 Briefs and reports for tasks 9–24 are in
 `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck-part2/`. **Git-ignored** — copy
 anything still needed before that directory is cleaned.
 
-### Remaining work
+### Remaining work — START HERE
 
-Full briefs are preserved in `docs/pending-briefs/`. Both items below come from the user's
-own reports on real hardware, so take them literally.
+Full briefs are in `docs/pending-briefs/`. Nothing is half-finished: the working tree is
+clean, 744 tests pass, and the daemon runs the current build.
 
-1. **Task 26** — the animated crab draws OVER its own tile's text. The user chose the fix:
-   keys 0–2 become three text-only session tiles, key 3 becomes a permanent crab tile with
-   no text. The crab shows the most urgent state across all sessions
-   (`permission > tool > thinking > done > idle`). A fourth session becomes invisible, and
-   that is intended. Also: the press flash recolours the **border**, which this theme draws
-   as a left-edge strip, so the user cannot see it — fill the whole key instead, at 250 ms.
-2. **Task 27** — three items. The Spotify page does not paint when nothing is playing until
-   the user flips away and back; **reproduce it with a failing test before fixing it**, and
-   report the real cause. The heart is removed and volume replaces it: key 2 play/pause,
-   key 3 volume, key 6 previous, key 7 next, and `previous()` does not exist yet. Plus a
-   procedural idle animation across the four art keys, each with its own phase.
+1. **Task 28 — blank the deck while the screen is locked.** The next thing to build. Brief is
+   written at `docs/pending-briefs/task-28-brief.md` and needs no further design. The user
+   confirmed from hardware: *"it stays lit and works when my screen is locked yes"* — so the
+   deck shows project names, session states and a stock watchlist to anyone passing a locked
+   machine, and presses still work behind the lock screen. This is a privacy fix.
+   Lock detection is measured: `ioreg -n Root -d1 -k CGSSessionScreenIsLocked` costs ~4 ms, and
+   the key is **absent** when unlocked. The locked output is NOT verified — that needs the
+   user's screen locked. Whether the deck survives **sleep** is also unverified.
+2. **Two review minors, deliberately skipped** as outside their agents' file ownership: the
+   new copy-on-read methods are shallow and their tests only mutate the container; and
+   `StockSource.isStale()` is now dead, replaced by `isSymbolStale`.
+3. **The `src/paths.ts` environment override.** There is none — `paths.ts` reads `homedir()`
+   directly, so any ad-hoc script that imports the daemon writes to the user's real log. One
+   did, on 2026-08-12: a stray `WARN press handler failed for index 2: Error: boom` sits in
+   `deckd.log`. `tests/setup.ts` silences logging inside vitest only. The suite itself is
+   clean, proven by hashing the log before and after a run.
+4. **Tonight's nine fix commits are themselves unreviewed** — `b43f467` through the tickMs fix.
+   The review of tasks 22–25 found eight verified Important defects that 674 passing tests all
+   missed, so this is worth doing rather than assuming.
+
+### Open questions for the user
+
+- The BACK key on the stock detail view is a gray border with no colour. Too subtle?
+- The change in dollars renders as `-5.30`. Would `-$5.30` be better?
+- Blank **everything** while locked, or keep weather and stocks live? Blanking everything is
+  the recommendation and what the brief specifies.
 
 ### Task 16's real limitation
 
