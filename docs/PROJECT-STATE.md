@@ -125,11 +125,16 @@ but **that directory is git-ignored**, so this file is the durable record.
 | 29 | end-to-end reliability sweep, CI, safe state override | complete and deployed |
 | 30 | OpenAI Codex active-task and usage page | complete and deployed |
 | — | scoped review of install + Codex, then all its fixes | complete, 1+2 Critical and 12 Important found |
-| 31 | one shared Eastern 12-hour timestamp helper | complete, **unverified on hardware** |
-| 32 | press feedback for every key, moved into the daemon | complete, **unverified on hardware** |
-| 33 | stock detail chart shows 52 weeks, not the day | complete, **unverified on hardware** |
-| 34 | weather day-detail drill-down | complete, **unverified on hardware** |
-| 35 | Codex usage sample's own timestamp on the strip | complete, **unverified on hardware** |
+| 31 | one shared Eastern 12-hour timestamp helper | complete, verified on the deck |
+| 32 | press feedback for every key, moved into the daemon | complete, verified on the deck |
+| 33 | stock detail chart shows 52 weeks, not the day | complete, verified on the deck |
+| 34 | weather day-detail drill-down | complete, verified on the deck |
+| 35 | Codex usage sample's own timestamp on the strip | complete, verified on the deck |
+| 36 | press flash softened to a ring, 90 ms, cleared on time | complete, verified on the deck |
+| — | **review round 2**: four scoped reviewers over `3b5fb67..HEAD` | complete, **1 Critical + 17 Important** found |
+| — | all four review-2 fix batches | complete |
+| — | Codex sqlite degraded fallback (`e0ce088`) | complete |
+| 37 | Spotify control keys: emoji set, thumping volume | in progress |
 
 Briefs and reports for tasks 9–24 are in
 `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck-part2/`. **Git-ignored** — copy
@@ -146,8 +151,19 @@ anything still needed before that directory is cleaned.
   and subagent threads do not appear as user task tiles.
 - The installed statusline wrapper matches the tested source, and launchd runs the current
   build from this working directory.
-- The validation baseline is 31 test files and 794 tests, plus typecheck, build, shell syntax,
-  and `git diff --check`.
+- The validation baseline is **34 test files and 1043 tests**, plus typecheck, build, shell
+  syntax, and `git diff --check`.
+- **`tsconfig.json` now typechecks `tests/` too**, and a separate `tsconfig.build.json`
+  excludes them for emitting. So `npm run build` uses the build config — building with
+  `tsconfig.json` would compile the test suite into `dist/`. Bringing tests into typecheck
+  surfaced six pre-existing errors, including a press-outcome interface that ten test files
+  were quietly violating.
+- **The installed wrapper was refreshed on 2026-08-13** with `deckd refresh-wrapper`, with the
+  user's approval. Verified: the installed file's sha256 now matches
+  `src/install/statusline-wrapper.sh` (`443d3b5f…`, was `eb96d3ba…`), the syntax parses, the
+  state directory and `sessions/` are both 0700, and `usage.json` advanced within 20 seconds,
+  proving the live statusline writes through the new script. The three wrapper hardening fixes
+  reach an already-installed user **only** through that command — `install()` returns early.
 - **Both P0 hardware checks PASS**, confirmed by the user on the real deck:
   1. Unplug and reconnect while `deckd` runs — the device reconnects and repaints the full
      current page with no manual restart.
@@ -209,13 +225,32 @@ still feed the gauges invented numbers. `install()` now cleans them up, but runn
 against live config is not something to do casually. The repair is a two-file delete and needs
 one word from the user. **Nothing else under `~` may be deleted.**
 
-#### P1 — review the six commits from 2026-08-13
+#### DONE — review round 2, and what it taught
 
-`6854948` through `a825bee` are unreviewed. Today's scoped review found 3 Critical and 12
-Important defects, all behind a fully green suite, so this is not a formality. **Review the
-press-feedback commit `360508d` first:** it changed a core interface, touched the daemon and all
-five pages at once, and deleted working code from the Claude page. That is the highest-risk
-shape of change made in this project.
+Four scoped reviewers covered `3b5fb67..HEAD` — core, install, Codex, and the data pages — and
+found **1 Critical and 17 Important** defects behind a fully green suite. All fixed. Two
+patterns are worth carrying forward:
+
+1. **A fix for a Critical deserves MORE scrutiny than the original code, not less.** Install's
+   new Critical reproduced the previous pass's exact harm through a different trigger, because
+   the first fix addressed the symptom: whether the statusline was wrapped was decided by a
+   user-editable `# deckd-wrapped` **comment** rather than the wrapper's path. Delete the
+   comment, run `uninstall`, and it deleted the wrapper and the backup while reporting success.
+2. **Tests that cannot fail hid three real defects.** Three independent reviewers found the
+   same shape: a geometry test probing a **single column** that is background for any overflow.
+   That is why a 22 px Spotify strip overlap and a 30 px Claude strip clip both survived. Probe
+   the region and assert the text, never one column.
+
+Four defects came from instructions written by the controller, not from implementer error: the
+`immutable=1` fallback, the flat 24-hour usage backstop, the 15-minute staleness bound, and
+three flash-timing bugs. **A review checks the code; nothing checks the brief.** Read a fix
+brief as sceptically as the code it targets.
+
+#### P0 — unreviewed again
+
+Everything after `a825bee` — the review-2 fixes themselves, the flash ring, the Codex degraded
+fallback, and the Spotify control keys — has not been reviewed. Given the rate above, assume
+defects are present.
 
 #### P1 — Add `deckd status` and `deckd doctor`
 
