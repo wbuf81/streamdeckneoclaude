@@ -1,12 +1,13 @@
 import {
   readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync,
-  existsSync, chmodSync, mkdirSync, statSync,
+  existsSync, chmodSync, mkdirSync, statSync, mkdtempSync, rmSync,
 } from 'node:fs'
 import { join, dirname } from 'node:path'
+import { tmpdir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
-import { paths, ensureStateDir } from '../paths.js'
+import { paths, enforceDirModes, type Paths } from '../paths.js'
 
 const run = promisify(execFile)
 
@@ -96,12 +97,23 @@ interface WrapResult {
  * value is `~/.claude/statusline.sh`, whose leading tilde only resolves under a
  * shell. A direct exec would fail with ENOENT.
  *
+ * `stateDir` is embedded as a `DECKD_STATE_DIR=` assignment alongside
+ * `DECKD_INNER`. Without it, the wrapper falls back to `$HOME/.local/state/deckd`
+ * at render time, independent of whatever directory install actually used --
+ * survivable when they happen to be the same path, but fragile in general, and
+ * the exact gap a temporary probe state directory (see `install`) would fall
+ * into if this were omitted. Embedding it here means the installed wrapper
+ * always caches to the directory this install actually used, regardless of the
+ * render-time environment under launchd.
+ *
  * `verifyWrap` still proves the wrap end to end before `install` trusts it.
  */
-export function wrapStatusLine(current: unknown, wrapperPath: string): WrapResult {
+export function wrapStatusLine(current: unknown, wrapperPath: string, stateDir: string): WrapResult {
   const inner = extractCommand(current)
   const encoded = JSON.stringify({ original: current ?? null })
-  const command = `DECKD_INNER=${shellQuote(inner)} ${shellQuote(wrapperPath)} ${WRAPPER_MARKER} ${encoded}`
+  const command =
+    `DECKD_STATE_DIR=${shellQuote(stateDir)} DECKD_INNER=${shellQuote(inner)} ` +
+    `${shellQuote(wrapperPath)} ${WRAPPER_MARKER} ${encoded}`
 
   if (current && typeof current === 'object') {
     return { statusLine: { ...(current as object), command }, inner }
@@ -211,9 +223,9 @@ function shellQuote(s: string): string {
 /**
  * Writes a file through a temporary name, so a crash cannot truncate it.
  *
- * The target's own mode, when it already exists, is resolved BEFORE
- * anything is written, and the temp file is created at that mode from the
- * very start -- not written loose and tightened afterwards. Two defects
+ * By default, the target's own mode, when it already exists, is resolved
+ * BEFORE anything is written, and the temp file is created at that mode from
+ * the very start -- not written loose and tightened afterwards. Two defects
  * shaped this:
  *
  *   - The temp file used to be created at the caller's `mode` default
@@ -233,17 +245,36 @@ function shellQuote(s: string): string {
  *     case rather than relying on the random suffix alone -- the same
  *     belt-and-braces the mode itself needed.
  *
+ * `opts.preserveExistingMode` (default `true`) is what gives that
+ * "preserve the current mode" behaviour. Pass `false` when the caller
+ * needs to FORCE `mode` regardless of whatever mode the file currently has
+ * -- `restoreFile` is the one caller that does, because during a rollback
+ * the file's CURRENT mode is the mutated one, not the mode being restored
+ * to, and probing it would silently reopen the exact window this function
+ * exists to close.
+ *
+ * `content` accepts a `Buffer` as well as a `string`, so a caller restoring
+ * an arbitrary snapshot never has to round-trip through `toString('utf8')`,
+ * which is lossy for any byte sequence that is not valid UTF-8.
+ *
  * Exported so a test can drive it directly against a temporary file,
- * without going through `install()`/`uninstall()`, which hard-code the
- * real paths under `~` and must never run in a test.
+ * without going through `install()`/`uninstall()`, which default to the
+ * real paths under `~` and must never do so in a test.
  */
-export function writeAtomic(file: string, content: string, mode = 0o644): void {
+export function writeAtomic(
+  file: string,
+  content: string | Buffer,
+  mode = 0o644,
+  opts: { preserveExistingMode?: boolean } = {},
+): void {
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   let targetMode = mode
-  try {
-    targetMode = statSync(file).mode & 0o777
-  } catch {
-    // The target does not exist yet. Use the requested mode.
+  if (opts.preserveExistingMode !== false) {
+    try {
+      targetMode = statSync(file).mode & 0o777
+    } catch {
+      // The target does not exist yet. Use the requested mode.
+    }
   }
   writeFileSync(tmp, content, { mode: targetMode })
   // `mode` on `writeFileSync` applies only at creation (Lesson 1). The
@@ -271,23 +302,113 @@ export function snapshotFile(file: string): FileSnapshot {
   }
 }
 
-/** Restores a snapshot atomically, or removes a file that was absent before. */
+/**
+ * Restores a snapshot atomically, or removes a file that was absent before.
+ *
+ * Forces `preserveExistingMode: false` on the `writeAtomic` call. Without
+ * that, `writeAtomic` would resolve the mode by stat-ing the file as it
+ * currently sits -- during a rollback, that is the MUTATED file, not the
+ * snapshot -- so the temp file would be created and renamed at the wrong
+ * mode, and only the trailing `chmodSync` would fix it, reopening exactly
+ * the "loose for an instant" window `writeAtomic`'s own docblock says is
+ * closed. Passing the snapshot's mode straight through, unconditionally,
+ * means the restored file is never visible at any mode but the one it is
+ * being restored to.
+ */
 export function restoreFile(snapshot: FileSnapshot): void {
   if (snapshot.content === null) {
     if (existsSync(snapshot.path)) unlinkSync(snapshot.path)
     return
   }
-  writeAtomic(snapshot.path, snapshot.content.toString('utf8'), snapshot.mode)
-  chmodSync(snapshot.path, snapshot.mode)
+  writeAtomic(snapshot.path, snapshot.content, snapshot.mode, { preserveExistingMode: false })
 }
 
-export async function install(): Promise<void> {
-  ensureStateDir()
+/** Controls the previous launch agent's load state during rollback. Real
+ * launchctl calls in production; a test double records calls instead of
+ * ever invoking the real binary. */
+export interface LaunchAgentController {
+  /** True only if `label` is actually loaded right now -- NOT merely
+   * whether a plist file for it exists on disk (finding 4). */
+  isLoaded(label: string): Promise<boolean>
+  /** Stops `label` if loaded. Resolves without error if it was not. */
+  bootout(label: string): Promise<void>
+  /** Loads the plist at `plistPath` under `label`. */
+  bootstrap(label: string, plistPath: string): Promise<void>
+}
+
+function uid(): number {
+  return process.getuid?.() ?? 501
+}
+
+/** The real controller. Never used by a test -- the hard rule for this
+ * project is that nothing under test may invoke `launchctl` at all. */
+export const systemLaunchAgentController: LaunchAgentController = {
+  async isLoaded(label) {
+    try {
+      await run('/bin/launchctl', ['list', label])
+      return true
+    } catch {
+      return false
+    }
+  },
+  async bootout(label) {
+    await run('/bin/launchctl', ['bootout', `gui/${uid()}/${label}`]).catch(() => {
+      // Not loaded. Nothing to stop.
+    })
+  },
+  async bootstrap(label, plistPath) {
+    await run('/bin/launchctl', ['bootstrap', `gui/${uid()}`, plistPath])
+      .catch(() => run('/bin/launchctl', ['load', '-w', plistPath]))
+  },
+}
+
+export interface InstallOptions {
+  /** Defaults to the real paths under `~`. A test injects an isolated set
+   * built with `buildPaths`, so nothing it does can touch the real home
+   * directory. */
+  paths?: Paths
+  /** Defaults to `systemLaunchAgentController`. A test injects a double, so
+   * nothing it does ever calls the real `launchctl`. */
+  controller?: LaunchAgentController
+  /** Overrides the compiled entry point used for the build preflight and as
+   * the plist's launchd target. Only a test sets this, so the preflight
+   * check can run against a small synthetic script instead of depending on
+   * the repository's real `dist` build being present and current. */
+  script?: string
+}
+
+/** The two probe files an earlier version of `verifyWrap` left behind in the
+ * LIVE sessions directory (finding I2), because it ran the probe with no
+ * `DECKD_STATE_DIR` override at all. Named here once, so both the repair
+ * step below and its test refer to the same literal names. */
+const STRAY_PROBE_FILES = ['deckd-install-probe.json', 'baseline-probe.json']
+
+export async function install(opts: InstallOptions = {}): Promise<void> {
+  const p = opts.paths ?? paths
+  const controller = opts.controller ?? systemLaunchAgentController
+  enforceDirModes([p.stateDir, p.sessionsDir, p.artDir])
+
+  // I2 repair: earlier versions of the probe below wrote fabricated usage
+  // data straight into the live sessions directory, because `verifyWrap` ran
+  // with no `DECKD_STATE_DIR` override and fell back to the real one. This
+  // removes exactly those two known files, and only those -- never anything
+  // else under `~` -- so a user who already installed once is repaired
+  // rather than left with permanently fabricated usage on the deck.
+  for (const name of STRAY_PROBE_FILES) {
+    const stray = join(p.sessionsDir, name)
+    try {
+      if (existsSync(stray)) unlinkSync(stray)
+    } catch {
+      // Best-effort repair. A leftover probe file is not worth blocking
+      // install over.
+    }
+  }
+
   const changed: string[] = []
 
   // Refuse to run twice. Checked first, before any file is touched, so a
   // repeat run leaves the wrapper copy, the backup, and settings.json alone.
-  const settings = readSettingsForInstall()
+  const settings = readSettingsForInstall(p)
   if (isInstalled(settings)) {
     console.log('deckd is already installed. Run `deckd uninstall` first to redo it.')
     return
@@ -301,24 +422,37 @@ export async function install(): Promise<void> {
   if (!existsSync(wrapperSrc)) {
     throw new Error(`wrapper script missing: ${wrapperSrc}`)
   }
-  const wrapperDst = join(paths.stateDir, 'statusline-wrapper.sh')
-  const backup = `${paths.claudeSettings}.deckd-backup`
-  const script = join(root, 'dist', 'bin', 'deckd.js')
-  if (!existsSync(script)) {
-    throw new Error(`build first: ${script} does not exist. Run npm run build.`)
-  }
+  const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
+  const backup = `${p.claudeSettings}.deckd-backup`
+  const script = opts.script ?? join(root, 'dist', 'bin', 'deckd.js')
+  await preflightBuild(script)
 
-  // Verify with the source copy before any live file changes. Install copies
-  // these exact bytes to `wrapperDst` and then makes them executable.
-  const probeWrap = wrapStatusLine(settings.statusLine, wrapperSrc)
-  const finalWrap = wrapStatusLine(settings.statusLine, wrapperDst)
+  // This is the wrap install actually uses: it points at `wrapperDst`, and
+  // it embeds `p.stateDir` -- the real directory this install is targeting
+  // -- so the render-time wrapper never has to guess it from an ambient
+  // environment variable launchd will not set (finding 11).
+  const finalWrap = wrapStatusLine(settings.statusLine, wrapperDst, p.stateDir)
 
   // Prove the wrap before trusting it. This is the user's live terminal
   // statusline: if the wrapped command produces different output from the
   // original, the wrap is broken and must not be left in place. Feed both a
   // synthetic payload and compare. Throw on any difference, before anything
   // is written.
-  const probe = await verifyWrap(extractCommand(probeWrap.statusLine), probeWrap.inner)
+  //
+  // The probe runs against a throwaway temporary directory, never the real
+  // state directory (finding I2): the probe's own wrap embeds
+  // `probeStateDir` instead of `p.stateDir`, so the fabricated usage and
+  // per-session probe files this necessarily writes land somewhere disposed
+  // of in the `finally` below, and never anywhere the daemon or the deck
+  // will ever read from.
+  const probeStateDir = mkdtempSync(join(tmpdir(), 'deckd-install-probe-'))
+  let probe: WrapProbe
+  try {
+    const probeWrap = wrapStatusLine(settings.statusLine, wrapperSrc, probeStateDir)
+    probe = await verifyWrap(extractCommand(probeWrap.statusLine), probeWrap.inner)
+  } finally {
+    rmSync(probeStateDir, { recursive: true, force: true })
+  }
   if (!probe.ok) {
     throw new Error(
       'the wrapped statusline did not reproduce the original output, so nothing ' +
@@ -331,9 +465,21 @@ export async function install(): Promise<void> {
   const snapshots = [
     snapshotFile(wrapperDst),
     snapshotFile(backup),
-    snapshotFile(paths.claudeSettings),
-    snapshotFile(paths.launchAgent),
+    snapshotFile(p.claudeSettings),
+    snapshotFile(p.launchAgent),
   ]
+
+  // Record whether the daemon is actually loaded right now, BEFORE this
+  // attempt changes anything (finding 4). A plist file existing on disk is
+  // not the same fact -- `docs/DEPLOYMENT.md` has the user run
+  // `launchctl bootout` before a hardware check, leaving the plist in place
+  // but the agent stopped on purpose. Rollback must restore exactly the
+  // state recorded here, not infer one from file presence.
+  const wasLoaded = await controller.isLoaded(p.launchAgentLabel)
+  // True only once this attempt has actually issued a launchd call. A
+  // failure before that point has nothing to roll back on the launchd side,
+  // and must not stop -- or start -- anything there.
+  let touchedLaunchd = false
 
   try {
     // 1. Copy the wrapper into the state directory, so removing the repository
@@ -343,28 +489,39 @@ export async function install(): Promise<void> {
     changed.push(`wrote ${wrapperDst}`)
 
     // 2. Wrap the statusline, after a backup.
-    if (existsSync(paths.claudeSettings)) {
-      copyFileSync(paths.claudeSettings, backup)
-      changed.push(`backed up ${paths.claudeSettings} to ${backup}`)
+    if (existsSync(p.claudeSettings)) {
+      copyFileSync(p.claudeSettings, backup)
+      // `copyFileSync` keeps an EXISTING destination's mode (finding 6). A
+      // stale backup left at a looser mode by an earlier version, an
+      // unzip, or a restore would otherwise receive a fresh copy of a
+      // possibly 0600, secrets-bearing settings file and stay loose. Force
+      // the backup to the live file's current mode every time.
+      chmodSync(backup, statSync(p.claudeSettings).mode & 0o777)
+      changed.push(`backed up ${p.claudeSettings} to ${backup}`)
     }
     settings.statusLine = finalWrap.statusLine
-    writeAtomic(paths.claudeSettings, JSON.stringify(settings, null, 2))
-    changed.push(`wrapped statusLine in ${paths.claudeSettings}`)
+    writeAtomic(p.claudeSettings, JSON.stringify(settings, null, 2))
+    changed.push(`wrapped statusLine in ${p.claudeSettings}`)
 
     // 3. Write and load the launchd agent.
-    mkdirSync(dirname(paths.launchAgent), { recursive: true })
+    mkdirSync(dirname(p.launchAgent), { recursive: true })
     writeAtomic(
-      paths.launchAgent,
-      buildPlist(paths.launchAgentLabel, process.execPath, script, join(paths.stateDir, 'launchd.log')),
+      p.launchAgent,
+      buildPlist(p.launchAgentLabel, process.execPath, script, join(p.stateDir, 'launchd.log')),
     )
-    changed.push(`wrote ${paths.launchAgent}`)
-    await bootout()
-    await run('/bin/launchctl', ['bootstrap', `gui/${process.getuid?.() ?? 501}`, paths.launchAgent])
-      .catch(() => run('/bin/launchctl', ['load', '-w', paths.launchAgent]))
+    changed.push(`wrote ${p.launchAgent}`)
+
+    touchedLaunchd = true
+    await controller.bootout(p.launchAgentLabel)
+    await controller.bootstrap(p.launchAgentLabel, p.launchAgent)
     changed.push('loaded the launchd agent')
   } catch (e) {
-    await bootout()
     const rollbackErrors: string[] = []
+    if (touchedLaunchd) {
+      await controller.bootout(p.launchAgentLabel).catch((stopError: unknown) => {
+        rollbackErrors.push(`stop the partially-installed agent: ${String(stopError)}`)
+      })
+    }
     for (const snapshot of [...snapshots].reverse()) {
       try {
         restoreFile(snapshot)
@@ -372,15 +529,13 @@ export async function install(): Promise<void> {
         rollbackErrors.push(`${snapshot.path}: ${String(restoreError)}`)
       }
     }
-    // If an agent existed before this attempt, restore its plist and load it
-    // again. This is best-effort; the original install error remains primary.
-    const oldAgent = snapshots.find((snapshot) => snapshot.path === paths.launchAgent)
-    if (oldAgent?.content) {
-      await run('/bin/launchctl', [
-        'bootstrap',
-        `gui/${process.getuid?.() ?? 501}`,
-        paths.launchAgent,
-      ]).catch((restoreError) => {
+    // Restore exactly the load state recorded before this attempt touched
+    // anything (finding 4): only if launchd was actually touched, and only
+    // if the agent was actually loaded beforehand. A deliberate
+    // `launchctl bootout` run in another terminal before a hardware check
+    // must not be undone by a failed install here.
+    if (touchedLaunchd && wasLoaded) {
+      await controller.bootstrap(p.launchAgentLabel, p.launchAgent).catch((restoreError: unknown) => {
         rollbackErrors.push(`reload prior launch agent: ${String(restoreError)}`)
       })
     }
@@ -394,6 +549,52 @@ export async function install(): Promise<void> {
   for (const line of changed) console.log(`  . ${line}`)
   console.log('\nThe deck starts now, and at every login.')
   console.log('macOS may ask to allow automation. Approve it, so window focus works.')
+}
+
+export interface RefreshWrapperResult {
+  path: string
+}
+
+/**
+ * Re-copies the wrapper script from the repository into the state directory
+ * and re-verifies it, without touching settings.json or launchd (finding
+ * 13). `install()` returns early once `isInstalled` is true, so it never
+ * re-copies the wrapper once one exists, and the only documented recovery
+ * for a drifted wrapper was a full `uninstall` followed by `install` --
+ * which is exactly the path C1 lived on. This gives an already-installed
+ * user a narrow, safe repair for a wrapper that has drifted from the
+ * repository (a hand edit, a partial copy, a bad restore).
+ */
+export async function refreshWrapper(opts: InstallOptions = {}): Promise<RefreshWrapperResult> {
+  const p = opts.paths ?? paths
+  const root = projectRoot()
+  if (!root) throw new Error('cannot find the project root. Run this from the repository.')
+  const wrapperSrc = join(root, 'src', 'install', 'statusline-wrapper.sh')
+  if (!existsSync(wrapperSrc)) throw new Error(`wrapper script missing: ${wrapperSrc}`)
+  const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
+
+  const settings = readSettingsForInstall(p)
+  if (!isInstalled(settings)) {
+    throw new Error('deckd is not installed. Run `deckd install` first.')
+  }
+
+  const probeStateDir = mkdtempSync(join(tmpdir(), 'deckd-refresh-probe-'))
+  try {
+    const probeWrap = wrapStatusLine(settings.statusLine, wrapperSrc, probeStateDir)
+    const probe = await verifyWrap(extractCommand(probeWrap.statusLine), probeWrap.inner)
+    if (!probe.ok) {
+      throw new Error(
+        `the wrapper at ${wrapperSrc} did not reproduce the original output, so nothing ` +
+          `was changed.\nreason: ${probe.reason}`,
+      )
+    }
+  } finally {
+    rmSync(probeStateDir, { recursive: true, force: true })
+  }
+
+  copyFileSync(wrapperSrc, wrapperDst)
+  chmodSync(wrapperDst, 0o755)
+  return { path: wrapperDst }
 }
 
 /** A representative statusline payload, used only to prove the wrap works. */
@@ -422,6 +623,17 @@ const DEFAULT_PROBE_TIMEOUT_MS = 10_000
 /** Distinguishes "the command never exited" from every other failure, so
  * `verifyWrap` can apply a different policy to it (see below). */
 class ProbeTimeoutError extends Error {}
+
+/** Distinguishes a clean, fast, nonzero exit from every other kind of
+ * failure (a timeout, a spawn error), so `verifyWrap` can tell "the original
+ * and the wrapped command failed the same way" from "the wrapper introduced
+ * a different failure" (finding 3). */
+class ProbeExitError extends Error {
+  constructor(public readonly code: number | null, stderr: string) {
+    super(`exit ${String(code)}: ${stderr}`)
+    this.name = 'ProbeExitError'
+  }
+}
 
 /**
  * Runs one shell command, feeding it `input` on stdin and collecting stdout.
@@ -473,7 +685,7 @@ function runWithStdin(cmd: string, input: string, timeoutMs = DEFAULT_PROBE_TIME
       if (settled) return
       settled = true
       clearTimeout(timer)
-      if (code !== 0) reject(new Error(`exit ${String(code)}: ${err}`))
+      if (code !== 0) reject(new ProbeExitError(code, err))
       else resolve(out)
     })
     child.stdin.write(input)
@@ -492,16 +704,30 @@ function runWithStdin(cmd: string, input: string, timeoutMs = DEFAULT_PROBE_TIME
  * every render and anything slower is already broken -- but is a parameter so
  * a test can inject a short one instead of actually waiting.
  *
- * Timeout policy is deliberately NOT the same as the existing "original
- * already fails" rule, and that asymmetry is the point, not an oversight:
+ * Timeout policy is deliberately NOT the same as the "original already
+ * fails" rule below, and that asymmetry is the point, not an oversight: a
+ * command that HANGS cannot be compared at all -- there is no output to diff
+ * against, and the wrapped form would hang for the identical reason, since it
+ * runs the same inner command at the end -- so a timeout on EITHER side means
+ * `ok: false` immediately, without bothering to run the other side too.
  *
- *   - A command that FAILS FAST is fine to wrap. Wrapping does not make it
- *     worse, and the fast failure is itself the comparison result.
- *   - A command that HANGS cannot be compared at all -- there is no output to
- *     diff against -- so proceeding would mean installing unverified, which
- *     defeats the reason `verifyWrap` exists. So a timeout on EITHER side
- *     means `ok: false`, even when it is the original that hung. Do not
- *     "simplify" this into reusing the already-failing-original branch.
+ * A command that FAILS FAST, by contrast, is not skipped on either side
+ * (finding 3, fixed here): the ORIGINAL failing fast used to make this return
+ * `ok: true` without ever running the WRAPPED command, on the theory that
+ * "wrapping a failing command changes nothing" -- true for the comparison,
+ * false for the wrapper's own failure modes, which that branch never
+ * exercised. Now both sides always run when the failure is not a timeout,
+ * and the two outcomes are compared:
+ *
+ *   - Both fail, with the SAME exit code: the wrapper faithfully reproduced
+ *     the original's own failure. That is the user's business, not the
+ *     wrapper's, so this is `ok: true`.
+ *   - Both fail, but DIFFERENTLY (or only the wrapped side fails): the
+ *     wrapper itself may be broken -- non-executable, a syntax error, wrong
+ *     permissions -- and none of that is safe to install unverified. `ok:
+ *     false`.
+ *   - The original fails but the wrapped side runs to completion anyway:
+ *     the wrapper mechanism works. `ok: true`.
  */
 export async function verifyWrap(
   wrapped: string,
@@ -512,6 +738,8 @@ export async function verifyWrap(
 
   let before = ''
   let after = ''
+  let innerError: unknown
+
   try {
     before = await runProbe(inner)
   } catch (e) {
@@ -525,17 +753,43 @@ export async function verifyWrap(
         after,
       }
     }
-    // The ORIGINAL command already fails, quickly. That is not ours to fix,
-    // and wrapping it changes nothing, so allow the install to continue.
-    return { ok: true, reason: `original command failed: ${String(e)}`, before, after }
+    // The original command failed, quickly. Do not return yet: the wrapped
+    // form still has to run, on its own, before install can trust it.
+    innerError = e
   }
+
   try {
     after = await runProbe(wrapped)
   } catch (e) {
     if (e instanceof ProbeTimeoutError) {
       return { ok: false, reason: `wrapped command timed out: ${e.message}`, before, after }
     }
+    if (innerError instanceof ProbeExitError && e instanceof ProbeExitError && innerError.code === e.code) {
+      return {
+        ok: true,
+        reason: `original command failed (exit ${String(e.code)}); the wrapper reproduced the same failure`,
+        before,
+        after,
+      }
+    }
+    if (innerError !== undefined) {
+      return {
+        ok: false,
+        reason:
+          `the original command failed (${String(innerError)}) and the wrapped command failed ` +
+          `differently (${String(e)}); the wrapper itself may be broken`,
+        before,
+        after,
+      }
+    }
     return { ok: false, reason: `wrapped command failed: ${String(e)}`, before, after }
+  }
+
+  if (innerError !== undefined) {
+    // The original failed, but the wrapper ran to completion anyway. The
+    // wrapper mechanism works; wrapping it changes nothing about the
+    // original's own failure.
+    return { ok: true, reason: `original command failed: ${String(innerError)}`, before, after }
   }
 
   if (before !== after) {
@@ -545,11 +799,49 @@ export async function verifyWrap(
 }
 
 /**
+ * Proves the compiled entry point actually loads, not merely that the file
+ * exists (finding 12). `existsSync` alone passes for a `dist` that throws at
+ * import time; launchd's `KeepAlive` then restarts the crashing process
+ * forever while the deck stays dark, and rollback never triggers, because
+ * `bootstrap` itself returned 0.
+ *
+ * Running `node <script>` with no subcommand is safe to do here: `bin/deckd.ts`'s
+ * own dispatch prints a usage line and exits 2 for that case, WITHOUT opening
+ * the Stream Deck or touching launchd -- both only happen after a real
+ * `start` argument reaches it. Any other outcome -- a different exit code, a
+ * hang, an uncaught import-time exception (which Node reports as exit 1) --
+ * means the build itself is broken, and install must not proceed.
+ */
+export async function preflightBuild(script: string, timeoutMs = 10_000): Promise<void> {
+  if (!existsSync(script)) {
+    throw new Error(`build first: ${script} does not exist. Run npm run build.`)
+  }
+  let exitedZero = false
+  try {
+    await run(process.execPath, [script], { timeout: timeoutMs })
+    exitedZero = true
+  } catch (e) {
+    const code = (e as { code?: unknown }).code
+    if (code === 2) return
+    throw new Error(
+      `build preflight failed: running ${script} with no arguments should print usage and ` +
+        `exit 2, but it did not: ${String(e)}. The build may be broken.`,
+    )
+  }
+  if (exitedZero) {
+    throw new Error(
+      `build preflight failed: running ${script} with no arguments exited 0; expected the ` +
+        'usage message and exit code 2. The build may be broken.',
+    )
+  }
+}
+
+/**
  * Describes what `uninstall` actually did with the recovered statusLine
  * value, for the printed summary. A separate, exported function so a test
  * can check the wording directly against a synthetic `RecoverResult`,
- * without running the whole of `uninstall()`, which hard-codes the real
- * `paths.claudeSettings` and must never run in a test.
+ * without running the whole of `uninstall()`, which defaults to the real
+ * `paths.claudeSettings`.
  *
  * `recoverStatusLine` can report `source: 'backup'` or `'embedded'` while
  * still giving back `statusLine: undefined` -- both sources can recover a
@@ -570,69 +862,126 @@ export function describeStatusLineOutcome(recovered: RecoverResult, settingsPath
     : `restored statusLine in ${settingsPath}`
 }
 
-export async function uninstall(): Promise<void> {
+export interface UninstallOptions {
+  /** Defaults to the real paths under `~`. A test injects an isolated set
+   * built with `buildPaths`, so nothing it does can touch the real home
+   * directory. */
+  paths?: Paths
+  /** Defaults to `systemLaunchAgentController`. A test injects a double, so
+   * nothing it does ever calls the real `launchctl`. */
+  controller?: LaunchAgentController
+}
+
+export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
+  const p = opts.paths ?? paths
+  const controller = opts.controller ?? systemLaunchAgentController
   const removed: string[] = []
 
-  await bootout()
-  if (existsSync(paths.launchAgent)) {
-    unlinkSync(paths.launchAgent)
-    removed.push(`removed ${paths.launchAgent}`)
+  // C1: refuse outright when settings.json will not parse, BEFORE touching
+  // launchd, the plist, or anything else. The old lenient reader returned
+  // {} on any parse error, which skipped the unwrap below but let execution
+  // reach the wrapper delete anyway -- stranding a live reference to a file
+  // about to be removed, with no deckd command left able to fix it. Doing
+  // this read first, as a pure read with no side effect, means a settings
+  // file this cannot parse leaves every file and every launchd state
+  // completely untouched.
+  const settings = readSettingsForUninstall(p)
+
+  await controller.bootout(p.launchAgentLabel)
+  if (existsSync(p.launchAgent)) {
+    unlinkSync(p.launchAgent)
+    removed.push(`removed ${p.launchAgent}`)
   }
 
-  const settings = readSettings()
   if (isInstalled(settings)) {
-    const backupPath = `${paths.claudeSettings}.deckd-backup`
+    const backupPath = `${p.claudeSettings}.deckd-backup`
     const recovered = recoverStatusLine(settings.statusLine, backupPath)
     if (recovered.warning) console.warn(recovered.warning)
     if (recovered.statusLine === undefined) delete settings.statusLine
     else settings.statusLine = recovered.statusLine
-    writeAtomic(paths.claudeSettings, JSON.stringify(settings, null, 2))
-    removed.push(describeStatusLineOutcome(recovered, paths.claudeSettings))
+    writeAtomic(p.claudeSettings, JSON.stringify(settings, null, 2))
+    removed.push(describeStatusLineOutcome(recovered, p.claudeSettings))
+
+    // Verify the unwrap actually landed on disk before deleting the file
+    // the old command pointed at. This is the exact ordering C1 found
+    // missing: unwrap, verify the unwrap, and only THEN delete -- never
+    // delete first, and never delete on the strength of an assumption that
+    // the write above worked.
+    if (isInstalled(readSettingsForUninstall(p))) {
+      throw new Error(
+        `${p.claudeSettings} still references the deckd wrapper after writing the unwrap. ` +
+          'Refusing to delete the wrapper script, so nothing is stranded. Check the file by ' +
+          'hand, then run `deckd uninstall` again.',
+      )
+    }
   }
 
-  const wrapper = join(paths.stateDir, 'statusline-wrapper.sh')
+  const wrapper = join(p.stateDir, 'statusline-wrapper.sh')
   if (existsSync(wrapper)) {
     unlinkSync(wrapper)
     removed.push(`removed ${wrapper}`)
   }
 
+  // Finding 6: deckd made this backup; deckd removes it. Leaving it behind
+  // forever meant a secrets-bearing duplicate of settings.json persisted
+  // indefinitely with no cleanup path at all.
+  const backupPath = `${p.claudeSettings}.deckd-backup`
+  if (existsSync(backupPath)) {
+    unlinkSync(backupPath)
+    removed.push(`removed ${backupPath}`)
+  }
+
   console.log('deckd uninstalled.\n')
   for (const line of removed) console.log(`  . ${line}`)
-  console.log(`\nThe state directory remains: ${paths.stateDir}`)
+  console.log(`\nThe state directory remains: ${p.stateDir}`)
   console.log('It holds your Spotify token. Delete it by hand if you want it gone.')
 }
 
-async function bootout(): Promise<void> {
-  const uid = process.getuid?.() ?? 501
-  await run('/bin/launchctl', ['bootout', `gui/${uid}/${paths.launchAgentLabel}`]).catch(() => {
-    // Not loaded. Nothing to stop.
-  })
+/** Install must not replace an unreadable settings file with an empty object. */
+function readSettingsForInstall(p: Paths): Record<string, unknown> {
+  if (!existsSync(p.claudeSettings)) return {}
+  return parseSettingsObject(readFileSync(p.claudeSettings, 'utf8'), p.claudeSettings, 'install')
 }
 
-function readSettings(): Record<string, unknown> {
+/**
+ * Uninstall must not delete the wrapper it cannot prove nothing still
+ * references (C1). Where `readSettingsForInstall` can just let its generic
+ * parse error propagate -- an install that never started needs no special
+ * recovery advice -- an uninstall failing here can leave a user with a
+ * broken statusline and no other deckd command able to help, so the thrown
+ * message says exactly what is wrong and exactly what to do about it.
+ */
+function readSettingsForUninstall(p: Paths): Record<string, unknown> {
+  if (!existsSync(p.claudeSettings)) return {}
   try {
-    return JSON.parse(readFileSync(paths.claudeSettings, 'utf8')) as Record<string, unknown>
-  } catch {
-    return {}
+    return parseSettingsObject(readFileSync(p.claudeSettings, 'utf8'), p.claudeSettings, 'uninstall')
+  } catch (e) {
+    const backupPath = `${p.claudeSettings}.deckd-backup`
+    const repair = existsSync(backupPath)
+      ? `A pre-install backup exists at ${backupPath}. Fix the syntax error in ` +
+        `${p.claudeSettings} by hand (or restore it from that backup), then run ` +
+        "'deckd uninstall' again."
+      : `Fix the syntax error in ${p.claudeSettings} by hand, then run 'deckd uninstall' ` +
+        'again. No pre-install backup was found to fall back to.'
+    throw new Error(`${String(e)} ${repair}`)
   }
 }
 
-/** Install must not replace an unreadable settings file with an empty object. */
-function readSettingsForInstall(): Record<string, unknown> {
-  if (!existsSync(paths.claudeSettings)) return {}
-  return parseSettingsObject(readFileSync(paths.claudeSettings, 'utf8'), paths.claudeSettings)
-}
-
-/** Parses settings without allowing an install to erase malformed content. */
-export function parseSettingsObject(text: string, file: string): Record<string, unknown> {
+/** Parses settings without allowing install or uninstall to erase malformed
+ * content. `action` only changes the wording of the thrown message. */
+export function parseSettingsObject(
+  text: string,
+  file: string,
+  action: 'install' | 'uninstall' = 'install',
+): Record<string, unknown> {
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch (e) {
-    throw new Error(`cannot parse ${file}; no install changes were made: ${String(e)}`)
+    throw new Error(`cannot parse ${file}; no ${action} changes were made: ${String(e)}`)
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`${file} must contain a JSON object; no install changes were made.`)
+    throw new Error(`${file} must contain a JSON object; no ${action} changes were made.`)
   }
   return parsed as Record<string, unknown>
 }
