@@ -144,6 +144,22 @@ describe('wrapStatusLine', () => {
     expect(JSON.stringify(r.statusLine)).toContain('DECKD_STATE_DIR=')
     expect(JSON.stringify(r.statusLine)).toContain('/custom/state/dir')
   })
+
+  // M-3: `typeof [] === 'object'` is true, so an array statusLine used to
+  // take the object-spread branch and come out as `{"0":"a","1":"b",
+  // "command":"..."}"} -- a shape Claude Code's settings schema does not
+  // recognise as a command object, and an artifact of `typeof`, not a
+  // deliberate one. It must be wrapped like every other non-object value
+  // instead: the plain command string, with no numeric-key spread.
+  it("M-3: wraps an array statusLine as a plain string, not a spread object with numeric keys", () => {
+    const r = wrapStatusLine(['a', 'b'], WRAPPER, STATE_DIR)
+    // A plain string, not the array-spread artifact `{"0":"a","1":"b",
+    // "command":"..."}` -- `typeof [] === 'object'` is true, which is
+    // exactly why this needed an explicit `Array.isArray` guard rather
+    // than being caught by the ordinary object check.
+    expect(typeof r.statusLine).toBe('string')
+    expect(Array.isArray(r.statusLine)).toBe(false)
+  })
 })
 
 describe('isInstalled', () => {
@@ -262,6 +278,21 @@ describe('verifyWrap', () => {
     expect(r.ok).toBe(false)
     expect(r.reason).toContain('differently')
   })
+
+  // M-9: the old truncation sliced with `.length` (UTF-16 code units) and
+  // labelled the result "bytes" regardless -- wrong for any non-ASCII
+  // stderr. "é" is one UTF-16 code unit but two UTF-8 bytes, so 150 of them
+  // is 150 JS characters (under the old, wrong measure) but 300 real bytes
+  // (over the 200-byte display limit either way). The reported count must
+  // be the real byte count.
+  it('M-9: truncates a failing command\'s stderr by real UTF-8 bytes, not UTF-16 code units', async () => {
+    const stderrText = 'é'.repeat(150)
+    const byteCount = Buffer.byteLength(stderrText, 'utf8')
+    expect(byteCount).toBe(300) // sanity: genuinely more bytes than characters
+    const r = await verifyWrap(`printf '${stderrText}' 1>&2; exit 3`, "printf 'STATUS OK\\n'")
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain(`${String(byteCount)} bytes total, truncated`)
+  })
 })
 
 describe('unwrapStatusLine', () => {
@@ -291,6 +322,18 @@ describe('unwrapStatusLine', () => {
     const original = { type: 'command', command: '~/.claude/statusline.sh' }
     const r = wrapStatusLine(original, WRAPPER, STATE_DIR)
     expect(unwrapStatusLine(r.statusLine)).toEqual(original)
+  })
+
+  // M-2: `null` is a legitimate statusLine value some settings.json can
+  // hold, distinct from "there was no statusLine key at all" (the absent
+  // case above, which round-trips to `undefined`). The old `?? null` /
+  // `?? undefined` pair collapsed both into the same encoded value, so an
+  // explicitly `null` original came back as `undefined` -- which
+  // `uninstall` then treats as "delete the key", destroying a distinction
+  // the settings file actually made.
+  it('M-2: round-trips an explicit null statusLine as null, not as absent', () => {
+    const r = wrapStatusLine(null, WRAPPER, STATE_DIR)
+    expect(unwrapStatusLine(r.statusLine)).toBeNull()
   })
 })
 
@@ -581,6 +624,77 @@ describe('writeAtomic', () => {
       expect(capturedTmp).toContain('.tmp')
       expect(actual.existsSync(capturedTmp)).toBe(false)
       expect(actual.existsSync(f)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // I-4: `renameSync(tmp, file)` replaces whatever inode sits at `file` --
+  // for a symlink, that is the LINK itself, not whatever it points to.
+  // Symlinking `~/.claude/settings.json` into a dotfiles repository is
+  // ordinary practice, and the old, unconditional rename silently replaced
+  // that link with a plain file holding the new content, breaking the link
+  // with no warning anywhere. This proves the link survives and the REAL
+  // target receives the new content instead.
+  it('I-4: writes through a symlink, leaving the link itself untouched', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-symlink-'))
+    try {
+      const real = join(dir, 'real-settings.json')
+      const link = join(dir, 'settings.json')
+      writeFileSync(real, '{"before":true}', { mode: 0o600 })
+      fsModule.symlinkSync(real, link)
+
+      writeAtomic(link, '{"after":true}')
+
+      expect(fsModule.lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(fsModule.readlinkSync(link)).toBe(real)
+      expect(readFileSync(real, 'utf8')).toBe('{"after":true}')
+      expect(readFileSync(link, 'utf8')).toBe('{"after":true}')
+      expect(statSync(real).mode & 0o777).toBe(0o600)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // I-4: a symlink whose target does not exist at all cannot be resolved to
+  // anywhere safe to write. Refusing, rather than guessing, means this
+  // never silently creates a file at whatever path the dangling link
+  // happens to name, and never silently treats the link itself as an
+  // ordinary file either.
+  it('I-4: refuses to write through a dangling symlink, and changes nothing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-dangling-'))
+    try {
+      const missing = join(dir, 'does-not-exist.json')
+      const link = join(dir, 'settings.json')
+      fsModule.symlinkSync(missing, link)
+
+      expect(() => writeAtomic(link, '{"after":true}')).toThrow(/dangling/)
+
+      expect(fsModule.lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(fsModule.readlinkSync(link)).toBe(missing)
+      expect(existsSync(missing)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // I-4: a chain of symlinks (a -> b -> c, with c the real file) must
+  // resolve all the way through, not just one hop.
+  it('I-4: follows a chain of symlinks all the way to the real file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-chain-'))
+    try {
+      const real = join(dir, 'c-real.json')
+      const b = join(dir, 'b-link.json')
+      const a = join(dir, 'a-link.json')
+      writeFileSync(real, '{"before":true}', { mode: 0o600 })
+      fsModule.symlinkSync(real, b)
+      fsModule.symlinkSync(b, a)
+
+      writeAtomic(a, '{"after":true}')
+
+      expect(fsModule.lstatSync(a).isSymbolicLink()).toBe(true)
+      expect(fsModule.lstatSync(b).isSymbolicLink()).toBe(true)
+      expect(readFileSync(real, 'utf8')).toBe('{"after":true}')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -947,19 +1061,36 @@ describe('install() and uninstall()', () => {
   // inside another.
   it('C-1: refuses to wrap a statusLine that already looks like a DIFFERENT deckd wrap', async () => {
     const p = makeTestPaths(dir)
+    const otherWrapperPath = join(dir, 'some-other-state-dir', 'statusline-wrapper.sh')
     const otherWrap = wrapStatusLine(
       "printf 'STATUS OK\\n'",
-      join(dir, 'some-other-state-dir', 'statusline-wrapper.sh'),
+      otherWrapperPath,
       join(dir, 'some-other-state-dir'),
     )
     writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: otherWrap.statusLine }))
     const before = readFileSync(p.claudeSettings, 'utf8')
 
-    await expect(
-      install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) }),
-    ).rejects.toThrow(/already looks like a deckd wrap/)
+    let thrown: unknown
+    try {
+      await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+    } catch (e) {
+      thrown = e
+    }
 
-    // Refused, changing nothing: no wrapper copied, no plist written.
+    expect((thrown as Error).message).toMatch(/already looks like a deckd wrap/)
+    // M-14: names the wrapper path the AMBIGUOUS wrap actually invokes,
+    // not just the path this install expected -- turning a three-step
+    // diagnosis (read settings.json by hand, find statusLine, find the
+    // wrapper path inside it) into a one-step one. Not a secret: it is a
+    // path deckd itself wrote.
+    expect((thrown as Error).message).toContain(otherWrapperPath)
+    // M-1: enforceDirModes and the I-2 stray-probe repair already ran by
+    // this point, so the message must say so rather than claim the
+    // refusal changed nothing at all.
+    expect((thrown as Error).message).toMatch(/state directory setup/)
+
+    // Refused, changing nothing IN SETTINGS.JSON, THE WRAPPER, OR LAUNCHD:
+    // no wrapper copied, no plist written.
     expect(readFileSync(p.claudeSettings, 'utf8')).toBe(before)
     expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
     expect(existsSync(p.launchAgent)).toBe(false)
@@ -1017,6 +1148,46 @@ describe('install() and uninstall()', () => {
     expect(controller.calls.filter((c) => c === 'bootout' || c === 'bootstrap')).toEqual([])
   })
 
+  // M-10: `probe.before`/`probe.after` used to be embedded in this message
+  // with NO bound at all, while the exact same command's stderr
+  // (`ProbeExitError`) was already capped at 200 bytes -- two channels of
+  // the same kind of user-controlled text on two different policies. The
+  // statusline command below is deliberately NON-deterministic (it counts
+  // its own invocations into a file) so `before` and `after` are guaranteed
+  // to differ, and each one is padded well past the 200-byte display limit.
+  it('M-10: bounds probe.before/after in the failed-verify message, sharing the stderr policy', async () => {
+    const p = makeTestPaths(dir)
+    const counterFile = join(dir, 'counter')
+    writeFileSync(counterFile, '0')
+    const innerScript = join(dir, 'inner-nondeterministic.sh')
+    writeFileSync(
+      innerScript,
+      [
+        '#!/bin/sh',
+        `N=$(cat ${JSON.stringify(counterFile)})`,
+        'N=$((N + 1))',
+        `echo "$N" > ${JSON.stringify(counterFile)}`,
+        'i=0',
+        'while [ "$i" -lt 40 ]; do printf "PADDING-%s-" "$N"; i=$((i + 1)); done',
+        '',
+      ].join('\n'),
+    )
+    chmodSync(innerScript, 0o755)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: innerScript }))
+
+    let thrown: unknown
+    try {
+      await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBeInstanceOf(Error)
+    const message = (thrown as Error).message
+    expect(message).toMatch(/did not reproduce the original output/)
+    expect(message).toMatch(/bytes total, truncated/)
+  })
+
   // M-5: install() creates settings.json when the file did not exist at
   // all beforehand. The default `writeAtomic` mode (0644) would leave it
   // world-readable even though nothing had a chance to loosen it first --
@@ -1028,6 +1199,29 @@ describe('install() and uninstall()', () => {
     await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
 
     expect(statSync(p.claudeSettings).mode & 0o777).toBe(0o600)
+  })
+
+  // I-4: the review's own repro. Symlinking `~/.claude/settings.json` into a
+  // dotfiles repository (managed with `stow`, `chezmoi`, or a bare `ln -s`)
+  // is ordinary practice. Before the fix, `writeAtomic`'s `renameSync`
+  // replaced the LINK with a plain file holding the wrapped content, so the
+  // dotfiles repo's own copy never saw the change and the next `stow` or
+  // `git checkout` there would silently restore the unwrapped original.
+  it('I-4: install writes through a symlinked settings.json, leaving the dotfiles link itself untouched', async () => {
+    const p = makeTestPaths(dir)
+    const dotfilesCopy = join(dir, 'dotfiles-settings.json')
+    writeFileSync(dotfilesCopy, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    // p.claudeSettings does not exist as a real file at all -- it is a
+    // symlink into a separate "dotfiles repository", exactly like a real
+    // `stow`/`chezmoi`-managed checkout.
+    fsModule.symlinkSync(dotfilesCopy, p.claudeSettings)
+
+    await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+
+    expect(fsModule.lstatSync(p.claudeSettings).isSymbolicLink()).toBe(true)
+    expect(fsModule.readlinkSync(p.claudeSettings)).toBe(dotfilesCopy)
+    const settings = JSON.parse(readFileSync(dotfilesCopy, 'utf8'))
+    expect(isInstalled(settings, p.stateDir + '/statusline-wrapper.sh')).toBe(true)
   })
 
   // M-6: the backup write itself must be atomic, like every other write in
@@ -1112,6 +1306,95 @@ describe('install() and uninstall()', () => {
     )
   })
 
+  // Review round 4, finding I-1: `install` was given a concurrent-write
+  // guard in an earlier round (see the "I-1" tests above), but `uninstall`
+  // never got it -- lesson 21, the same harm reachable by the OTHER verb.
+  // `uninstall` reads settings.json, then `await controller.bootout(...)` --
+  // a real `launchctl` subprocess -- then writes the whole in-memory object
+  // back. This stands in for Claude Code itself persisting a
+  // `permissions.allow` entry into settings.json while `bootout` is in
+  // flight: the fake controller's own `bootout` performs the concurrent
+  // write, landing it squarely inside the window a real subprocess call
+  // would leave open. The fix must detect the change and abort, leaving the
+  // concurrent write intact and settings.json still fully wrapped -- not
+  // silently discarded by the stale in-memory copy.
+  it('I-1: aborts, and does not clobber, when settings.json changes during the bootout await window', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    const baseController = fakeController()
+    await install({ paths: p, controller: baseController, script: writeGoodScript(dir) })
+    baseController.calls.length = 0
+    const wrapperPath = p.stateDir + '/statusline-wrapper.sh'
+
+    const racingController: LaunchAgentController = {
+      isLoaded: (label) => baseController.isLoaded(label),
+      bootstrap: (label, plistPath) => baseController.bootstrap(label, plistPath),
+      async bootout(label) {
+        // Stands in for Claude Code itself persisting a write while
+        // `launchctl bootout` -- a real subprocess -- is in flight.
+        const s = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as Record<string, unknown>
+        s.permissions = { allow: ['Bash(rm:*)'] }
+        writeFileSync(p.claudeSettings, JSON.stringify(s))
+        return baseController.bootout(label)
+      },
+    }
+
+    await expect(uninstall({ paths: p, controller: racingController })).rejects.toThrow(
+      /changed while uninstall was running/,
+    )
+
+    const settings = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as Record<string, unknown>
+    // The concurrent write survived, untouched by uninstall -- proof this
+    // is an abort, not a silent overwrite.
+    expect(settings.permissions).toEqual({ allow: ['Bash(rm:*)'] })
+    // Still fully wrapped: uninstall never got far enough to unwrap it.
+    expect(isInstalled(settings, wrapperPath)).toBe(true)
+    // The wrapper itself must not be stranded by the abort either.
+    expect(existsSync(wrapperPath)).toBe(true)
+  })
+
+  // Review round 4, finding I-5: a failed uninstall used to leave the agent
+  // stopped and the plist deleted, reporting only a bare filesystem error
+  // (e.g. `EACCES ... .tmp`) that names a temp file the user has never
+  // heard of. Every failure exit from uninstall must say exactly what state
+  // the system is already in, and what to do next. Read-only `.claude`
+  // reproduces the review's own driver: bootout and the plist delete both
+  // succeed (they touch different directories), but writeAtomic's temp file
+  // creation for settings.json fails with EACCES.
+  it('I-5: a failed uninstall states what already happened and how to recover, and does not strand the wrapper', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    const controller = fakeController({ initialLoaded: true })
+    await install({ paths: p, controller, script: writeGoodScript(dir) })
+    controller.calls.length = 0
+    const wrapperPath = p.stateDir + '/statusline-wrapper.sh'
+    const claudeDir = join(dir, 'home', '.claude')
+
+    chmodSync(claudeDir, 0o500) // read + execute, no write: can read settings.json, cannot create a temp file in the directory
+    let thrown: unknown
+    try {
+      await uninstall({ paths: p, controller })
+    } catch (e) {
+      thrown = e
+    } finally {
+      chmodSync(claudeDir, 0o700)
+    }
+
+    expect(thrown).toBeInstanceOf(Error)
+    const message = (thrown as Error).message
+    // States what already happened...
+    expect(message).toMatch(/launch agent .* has already been stopped/)
+    expect(message).toMatch(/plist at .* has already been removed/)
+    expect(message).toMatch(/was NOT modified by this attempt/)
+    // ...and what command recovers it.
+    expect(message).toMatch(/deckd uninstall/)
+    // The wrapper is only ever deleted after the settings write succeeds
+    // and the re-read proves the unwrap took -- a failure this early must
+    // not strand it.
+    expect(existsSync(wrapperPath)).toBe(true)
+    expect(existsSync(p.launchAgent)).toBe(false)
+  })
+
   it('a settings.json that parses but whose wrapper file is already missing recovers cleanly', async () => {
     // This is the state a user was left in by the OLD, buggy uninstall:
     // settings.json still parses and still points at the wrapper, but the
@@ -1154,6 +1437,26 @@ describe('install() and uninstall()', () => {
     expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
     expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
     expect(readFileSync(`${p.claudeSettings}.deckd-backup`, 'utf8')).toBe(backupBefore)
+  })
+
+  // M-2: the review's own measured repro. `{"statusLine":null,"keepMe":1}`
+  // used to come back as `{"keepMe":1}` after install then uninstall --
+  // the `statusLine` key itself was gone, not merely `null` again. A
+  // `null` statusLine is a legitimate value some settings.json can hold,
+  // distinct from never having had the key at all; deckd should not
+  // quietly delete a key it did not put there.
+  it('M-2: round-trips an explicit null statusLine through a full install/uninstall cycle', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: null, keepMe: 1 }))
+    const controller = fakeController()
+
+    await install({ paths: p, controller, script: writeGoodScript(dir) })
+    await uninstall({ paths: p, controller })
+
+    const settings = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as Record<string, unknown>
+    expect(settings.keepMe).toBe(1)
+    expect('statusLine' in settings).toBe(true)
+    expect(settings.statusLine).toBeNull()
   })
 
   // C-1, THE critical finding's round-2 repro: the user (or an agent
@@ -1352,18 +1655,21 @@ describe('install() and uninstall()', () => {
     expect(statSync(`${p.claudeSettings}.deckd-backup`).mode & 0o777).toBe(0o600)
   })
 
-  // I-6: the test above passes even with install's own `chmodSync(backup,
-  // ...)` line deleted, because on this platform `copyFileSync` already
-  // copies the SOURCE's mode onto an existing destination -- the premise
-  // "copyFileSync keeps an EXISTING destination's mode" the old comment
-  // stated is false here, so the explicit chmodSync was a no-op the whole
-  // time and nothing would notice if it regressed. This test forces the
-  // discriminating case directly: it makes `copyFileSync` behave as if it
-  // preserved the destination's stale mode (by re-loosening it right after
-  // the real copy runs, simulating the platform the original comment
-  // assumed), so the assertion can only pass if install's own explicit
-  // `chmodSync` call actually runs afterward and corrects it.
-  it('I6: an explicit chmodSync call forces the backup mode, independent of what copyFileSync itself leaves behind', async () => {
+  // Review round 4, finding I-3: this test used to sabotage `copyFileSync`
+  // for the backup path, but the backup has been written by `writeAtomic`
+  // (not `copyFileSync`) since the M-6 change above -- `install`'s only
+  // `copyFileSync` call is for the WRAPPER script, never the backup. The
+  // sabotage branch (`String(args[1]) === backupPath`) could therefore
+  // never execute, so the assertion passed purely because `writeAtomic`
+  // forces the mode regardless, proving nothing: a test that cannot fail
+  // (lesson 22). Rewritten against the mechanism the backup actually uses
+  // today: `writeAtomic` resolves the target mode itself, then writes the
+  // temp file with that mode AND unconditionally `chmodSync`s it before the
+  // rename (see `writeAtomic`'s own docblock). This sabotages the FIRST of
+  // those two -- `writeFileSync`'s own `mode` option, for the backup's temp
+  // file specifically -- so the assertion can only pass if `writeAtomic`'s
+  // own explicit `chmodSync` call is the thing that actually corrects it.
+  it('I-3: writeAtomic\'s own chmodSync call forces the backup mode, independent of what writeFileSync\'s mode option leaves behind', async () => {
     const p = makeTestPaths(dir)
     writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }), { mode: 0o600 })
     chmodSync(p.claudeSettings, 0o600)
@@ -1372,23 +1678,25 @@ describe('install() and uninstall()', () => {
     chmodSync(backupPath, 0o644)
 
     const actual = actualRef.current!
-    const copyMock = vi.mocked(fsModule.copyFileSync)
-    copyMock.mockImplementation((...args: Parameters<typeof fsModule.copyFileSync>) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = (actual.copyFileSync as any)(...args)
-      if (String(args[1]) === backupPath) {
-        // Simulate a platform where copyFileSync does NOT touch an
-        // existing destination's mode: force it back to the stale 0644
-        // right after the real copy, so only install's own explicit
-        // chmodSync call (not copyFileSync itself) can correct it.
-        actual.chmodSync(backupPath, 0o644)
+    const writeMock = vi.mocked(fsModule.writeFileSync)
+    writeMock.mockImplementation((...args: Parameters<typeof fsModule.writeFileSync>) => {
+      const target = String(args[0])
+      if (target.startsWith(`${backupPath}.`) && target.endsWith('.tmp')) {
+        // Simulate a runtime where writeFileSync's `mode` option is
+        // silently ignored on creation, so the fresh temp file lands at
+        // whatever the default is (not the requested 0600) -- only
+        // writeAtomic's OWN unconditional `chmodSync(tmp, targetMode)`
+        // call, not the `mode` option passed alongside the content, can
+        // still land it at 0600 before the rename.
+        return actual.writeFileSync(args[0], args[1])
       }
-      return result
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (actual.writeFileSync as any)(...args)
     })
     try {
       await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
     } finally {
-      copyMock.mockImplementation(actual.copyFileSync)
+      writeMock.mockImplementation(actual.writeFileSync)
     }
 
     expect(statSync(backupPath).mode & 0o777).toBe(0o600)

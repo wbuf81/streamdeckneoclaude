@@ -1,6 +1,6 @@
 import {
   readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync,
-  existsSync, chmodSync, mkdirSync, statSync, mkdtempSync, rmSync,
+  existsSync, chmodSync, mkdirSync, statSync, lstatSync, realpathSync, mkdtempSync, rmSync,
 } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -34,6 +34,24 @@ export function projectRoot(): string | null {
   }
   return null
 }
+
+/**
+ * M-12: the message both `install()` and `refreshWrapper()` throw when
+ * `projectRoot()` returns `null`. The old wording on both -- "Run install
+ * from the repository" / "Run this from the repository" -- blamed the
+ * current working directory, which `projectRoot()` never even looks at
+ * (deliberately, per lesson 3: `process.cwd()` is wrong under launchd).
+ * The real cause is always that no `package.json` sits within six parent
+ * directories of THIS MODULE's own location -- normally because the
+ * compiled `dist/bin/deckd.js` this ships as ended up nested deeper below
+ * the repository root than that walk expects.
+ */
+const PROJECT_ROOT_NOT_FOUND_MESSAGE =
+  'cannot find the project root: no package.json was found within 6 parent directories of ' +
+  "this module. This does not depend on the current working directory -- it looks for " +
+  'package.json starting from where this file itself is on disk. This usually means the ' +
+  'compiled entry point is nested deeper below the repository root than expected. Run from a ' +
+  'normal checkout of the repository, or reinstall it.'
 
 /** Escapes the five XML special characters. `nodePath`, `scriptPath`, and
  * `logPath` all come from filesystem paths, which can legally contain `&`,
@@ -107,15 +125,33 @@ interface WrapResult {
  * render-time environment under launchd.
  *
  * `verifyWrap` still proves the wrap end to end before `install` trusts it.
+ *
+ * M-2: encodes `{ original: current }`, NOT `{ original: current ?? null }`.
+ * `JSON.stringify` drops a property whose value is `undefined` entirely, so
+ * "statusLine was absent" now encodes as `{}` (no `original` key at all),
+ * while "statusLine was explicitly `null`" encodes as `{"original":null}` --
+ * two different, round-trippable shapes. The old `?? null` collapsed both
+ * into the exact same encoded value, so a legitimately `null` statusLine
+ * and an absent one became indistinguishable the moment they were wrapped,
+ * and `uninstall` would delete the key `null` should have kept. The decode
+ * side (`tryUnwrapStatusLine`/`tryUnwrapWrapped` below) checks for the
+ * key's PRESENCE, not its value, to tell the two apart on the way back out.
  */
 export function wrapStatusLine(current: unknown, wrapperPath: string, stateDir: string): WrapResult {
   const inner = extractCommand(current)
-  const encoded = JSON.stringify({ original: current ?? null })
+  const encoded = JSON.stringify({ original: current })
   const command =
     `DECKD_STATE_DIR=${shellQuote(stateDir)} DECKD_INNER=${shellQuote(inner)} ` +
     `${shellQuote(wrapperPath)} ${WRAPPER_MARKER} ${encoded}`
 
-  if (current && typeof current === 'object') {
+  // M-3: excludes an array. `{...current, command}` on an array produces an
+  // object with numeric string keys (`{"0":"a","1":"b","command":"..."}"`),
+  // not a shape Claude Code's settings schema recognises as a command
+  // object -- an artifact of `typeof [] === 'object'` being true, not a
+  // deliberate shape. Falling through to the plain command-string branch
+  // below, exactly like every other non-object value, avoids writing that
+  // artifact into settings.json at all.
+  if (current && typeof current === 'object' && !Array.isArray(current)) {
     return { statusLine: { ...(current as object), command }, inner }
   }
   return { statusLine: command, inner }
@@ -132,14 +168,28 @@ interface UnwrapAttempt {
   value: unknown
 }
 
+/**
+ * M-2: decodes the embedded `{ original: ... }` blob, treating the
+ * `original` key's PRESENCE, not its value, as what distinguishes "the
+ * wrapped statusLine was absent" (no key at all, since `wrapStatusLine`
+ * no longer encodes `undefined` as `null`) from "the wrapped statusLine
+ * was explicitly `null`" (the key is present, with value `null`). The old
+ * `parsed.original ?? undefined` treated both the same way, so a
+ * legitimately `null` original came back as `undefined` and got DELETED
+ * from settings.json on uninstall instead of restored as `null`.
+ */
+function decodeOriginal(parsed: { original?: unknown }): unknown {
+  return 'original' in parsed ? parsed.original : undefined
+}
+
 function tryUnwrapStatusLine(current: unknown): UnwrapAttempt {
   const command = extractCommand(current)
   const at = command.indexOf(WRAPPER_MARKER)
   if (at === -1) return { ok: true, value: current }
   try {
     const blob = command.slice(at + WRAPPER_MARKER.length).trim()
-    const parsed = JSON.parse(blob) as { original: unknown }
-    return { ok: true, value: parsed.original ?? undefined }
+    const parsed = JSON.parse(blob) as { original?: unknown }
+    return { ok: true, value: decodeOriginal(parsed) }
   } catch {
     return { ok: false, value: undefined }
   }
@@ -177,8 +227,8 @@ function tryUnwrapWrapped(current: unknown, wrapperPath: string): UnwrapAttempt 
   if (at === -1) return { ok: false, value: undefined }
   try {
     const blob = command.slice(at + WRAPPER_MARKER.length).trim()
-    const parsed = JSON.parse(blob) as { original: unknown }
-    return { ok: true, value: parsed.original ?? undefined }
+    const parsed = JSON.parse(blob) as { original?: unknown }
+    return { ok: true, value: decodeOriginal(parsed) }
   } catch {
     return { ok: false, value: undefined }
   }
@@ -267,6 +317,14 @@ export type WrapKind =
 
 export interface WrapDetection {
   kind: WrapKind
+  /** The raw statusLine command string this decision was made from (`''`
+   * when statusLine is absent or not a recognised shape). M-14: exists so
+   * a caller refusing an `'ambiguous'` wrap can name what the CURRENTLY
+   * installed wrap actually invokes, not just the path this invocation
+   * expected -- turning a three-step diagnosis (read settings.json by
+   * hand, find statusLine, find the wrapper path inside it) into a
+   * one-step one. This is not a secret: it is a path deckd itself wrote. */
+  command: string
 }
 
 /**
@@ -299,13 +357,13 @@ export interface WrapDetection {
  *     produces, whichever direction it is guessed in.
  */
 export function detectWrap(settings: unknown, wrapperPath: string): WrapDetection {
-  if (!settings || typeof settings !== 'object') return { kind: 'none' }
+  if (!settings || typeof settings !== 'object') return { kind: 'none', command: '' }
   const sl = (settings as Record<string, unknown>).statusLine
-  if (sl === undefined) return { kind: 'none' }
+  if (sl === undefined) return { kind: 'none', command: '' }
   const command = extractCommand(sl)
-  if (command.includes(wrapperPath)) return { kind: 'this' }
-  if (looksWrapped(command)) return { kind: 'ambiguous' }
-  return { kind: 'none' }
+  if (command.includes(wrapperPath)) return { kind: 'this', command }
+  if (looksWrapped(command)) return { kind: 'ambiguous', command }
+  return { kind: 'none', command }
 }
 
 /**
@@ -318,15 +376,50 @@ export function isInstalled(settings: unknown, wrapperPath: string): boolean {
   return detectWrap(settings, wrapperPath).kind === 'this'
 }
 
-/** The message every caller uses to refuse an ambiguous wrap, changing
- * nothing. One wording, so install, uninstall, and refreshWrapper cannot
- * drift apart on what they tell the user about the exact same situation. */
-function ambiguousWrapMessage(wrapperPath: string): string {
+/** M-14: pulls the wrapper path the AMBIGUOUS command actually invokes out
+ * of it, so the refusal message can name it directly instead of sending
+ * the user to go read settings.json by hand. The command embeds the path
+ * single-quoted (`shellQuote`), so that is what this looks for; if the
+ * shape does not match (a hand edit, an unexpected quoting), this falls
+ * back to a short, bounded slice of the raw command rather than nothing at
+ * all -- still enough to recognise, never enough to be a paragraph. */
+function extractWrapperHint(command: string): string {
+  const m = /'([^']*statusline-wrapper\.sh)'/.exec(command)
+  if (m?.[1] !== undefined) return m[1]
+  return command.length > 120 ? `${command.slice(0, 120)}…` : command
+}
+
+/** M-1: the exact phrase `readSettingsForInstall`'s own parse-error message
+ * already uses. `install` and `refreshWrapper` both run `enforceDirModes`
+ * (and install's stray-probe repair) BEFORE they ever reach a refusal
+ * decided here, so "nothing was changed" is not quite true for them --
+ * measured: a refused `refresh-wrapper` left a freshly created `art/` and
+ * `sessions/` at 0700 behind. Sharing this one phrase means every caller
+ * that needs it says the same honest thing, rather than each inventing its
+ * own wording that could quietly drift out of sync with what actually ran. */
+const STATE_DIR_SETUP_CAVEAT =
+  " Deckd's own state directory setup, if any was needed, already ran and is safe to keep."
+
+/** The message every caller uses to refuse an ambiguous wrap. One wording,
+ * so install, uninstall, and refreshWrapper cannot drift apart on what
+ * they tell the user about the exact same situation.
+ *
+ * `currentCommand` is the ambiguous statusLine's own command string
+ * (`WrapDetection.command`), used only to name the wrapper it actually
+ * invokes (M-14). `dirSetupMayHaveRun` is true only for a caller whose OWN
+ * side effects (directory creation/mode enforcement) already ran before it
+ * reached this decision (M-1) -- `uninstall` never runs any of that, so its
+ * call site leaves this `false` and the base sentence stays literally true.
+ */
+function ambiguousWrapMessage(wrapperPath: string, currentCommand: string, dirSetupMayHaveRun = false): string {
+  const hint = extractWrapperHint(currentCommand)
   return (
     'statusLine already looks like a deckd wrap, but not the one at ' +
     `${wrapperPath} (for example, DECKD_STATE_DIR may differ from the install that set this ` +
-    'up, or the wrapper moved). Refusing to guess which wrap is the right one -- nothing was ' +
-    'changed. Check DECKD_STATE_DIR, or fix statusLine in settings.json by hand, then retry.'
+    `up, or the wrapper moved). The installed statusLine currently runs: ${hint}. Refusing to ` +
+    'guess which wrap is the right one -- nothing in settings.json, the wrapper, or launchd was ' +
+    `changed.${dirSetupMayHaveRun ? STATE_DIR_SETUP_CAVEAT : ''} Check DECKD_STATE_DIR, or fix ` +
+    'statusLine in settings.json by hand, then retry.'
   )
 }
 
@@ -394,6 +487,21 @@ function shellQuote(s: string): string {
  * `mktemp` leftovers, which the shell script prunes by age. The random
  * suffix already makes `tmp` practically unique per call, so cleaning it up
  * on this one failure path cannot delete anything another call created.
+ *
+ * I-4: if `file` is itself a SYMLINK, the temp file is renamed onto the
+ * link's REAL target instead, so the link itself is never touched. `rename(2)`
+ * replaces whatever inode currently sits at its destination path -- for an
+ * ordinary file that is the file itself, but for a symlink it is the LINK,
+ * not whatever the link points to. Verified: symlinking `~/.claude/settings.json`
+ * into a dotfiles repository (`stow`, `chezmoi`, a bare `ln -s`) is ordinary
+ * practice, and the old, unconditional `renameSync(tmp, file)` silently
+ * replaced that link with a plain file holding the wrapped content -- the
+ * dotfiles repo's own copy never saw the change, and the next `stow` or
+ * `git checkout` in it would restore the ORIGINAL, unwrapped command and
+ * silently go stale with no error anywhere. `resolveWriteTarget` below
+ * finds the real path to write to instead, so the link stays exactly where
+ * it was, still pointing at the (now correctly updated) file it always
+ * pointed at.
  */
 export function writeAtomic(
   file: string,
@@ -401,11 +509,12 @@ export function writeAtomic(
   mode = 0o644,
   opts: { preserveExistingMode?: boolean } = {},
 ): void {
-  const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  const target = resolveWriteTarget(file)
+  const tmp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   let targetMode = mode
   if (opts.preserveExistingMode !== false) {
     try {
-      targetMode = statSync(file).mode & 0o777
+      targetMode = statSync(target).mode & 0o777
     } catch {
       // The target does not exist yet. Use the requested mode.
     }
@@ -416,7 +525,7 @@ export function writeAtomic(
     // random suffix above means `tmp` is always newly created in practice,
     // but this does not depend on that being true.
     chmodSync(tmp, targetMode)
-    renameSync(tmp, file)
+    renameSync(tmp, target)
   } catch (e) {
     try {
       if (existsSync(tmp)) unlinkSync(tmp)
@@ -425,6 +534,41 @@ export function writeAtomic(
       // matters to the caller.
     }
     throw e
+  }
+}
+
+/**
+ * I-4: resolves the path `writeAtomic` should actually rename its temp file
+ * onto -- `file` itself, unless `file` is a symlink, in which case this
+ * follows the link to whatever it really points at.
+ *
+ * `lstatSync` (not `statSync`) is required for the symlink check itself:
+ * `statSync` follows a link automatically and would report the TARGET's
+ * type, never telling this apart from an ordinary file at all.
+ *
+ * `realpathSync` follows the WHOLE chain in one call -- a symlink to a
+ * symlink to a file resolves correctly, not just one hop. A symlink whose
+ * target does not exist at all (`realpathSync` throwing `ENOENT`) cannot be
+ * resolved to anywhere safe to write: refuse outright rather than guess --
+ * silently creating whatever the dangling link happened to name, or
+ * silently ignoring the link and writing over it as if it were an ordinary
+ * file, are both surprises this function must not produce on its own.
+ */
+function resolveWriteTarget(file: string): string {
+  let st
+  try {
+    st = lstatSync(file)
+  } catch {
+    return file // Does not exist yet, so it cannot be a symlink either.
+  }
+  if (!st.isSymbolicLink()) return file
+  try {
+    return realpathSync(file)
+  } catch {
+    throw new Error(
+      `${file} is a symlink that does not resolve to a real file (it may be dangling, or part ` +
+        'of a broken chain). Refusing to write through it. Fix or remove the link by hand, then retry.',
+    )
   }
 }
 
@@ -572,13 +716,17 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
     // reproduces the original output byte for byte, so it would go live
     // unverified, and a later `uninstall` would restore the OLD wrap as
     // "the original" and strand it.
-    throw new Error(ambiguousWrapMessage(wrapperDst))
+    //
+    // M-1: `dirSetupMayHaveRun: true` -- `enforceDirModes` and the I-2
+    // stray-probe repair above have already run by this point, so the
+    // message must not claim this refusal changed nothing at all.
+    throw new Error(ambiguousWrapMessage(wrapperDst, detection.command, true))
   }
 
   // 1. Copy the wrapper into the state directory, so an uninstalled repo
   //    cannot break the statusline.
   const root = projectRoot()
-  if (!root) throw new Error('cannot find the project root. Run install from the repository.')
+  if (!root) throw new Error(PROJECT_ROOT_NOT_FOUND_MESSAGE)
   const wrapperSrc = join(root, 'src', 'install', 'statusline-wrapper.sh')
   if (!existsSync(wrapperSrc)) {
     throw new Error(`wrapper script missing: ${wrapperSrc}`)
@@ -614,11 +762,17 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
     rmSync(probeStateDir, { recursive: true, force: true })
   }
   if (!probe.ok) {
+    // M-10: `probe.before`/`probe.after` are the user's own statusline
+    // output, printed with NO bound at all here previously, while the same
+    // command's stderr (`ProbeExitError`) was already capped -- two
+    // channels of the same kind of text on two different policies.
+    // `truncateForDisplay` is the ONE shared policy now (see there: this is
+    // volume control, not a secret boundary, for either channel).
     throw new Error(
       'the wrapped statusline did not reproduce the original output, so nothing ' +
         `was changed.\nreason: ${probe.reason}\n` +
-        `original output: ${JSON.stringify(probe.before)}\n` +
-        `wrapped output:  ${JSON.stringify(probe.after)}`,
+        `original output: ${JSON.stringify(truncateForDisplay(probe.before))}\n` +
+        `wrapped output:  ${JSON.stringify(truncateForDisplay(probe.after))}`,
     )
   }
 
@@ -811,7 +965,7 @@ export interface RefreshWrapperResult {
 export async function refreshWrapper(opts: InstallOptions = {}): Promise<RefreshWrapperResult> {
   const p = opts.paths ?? paths
   const root = projectRoot()
-  if (!root) throw new Error('cannot find the project root. Run this from the repository.')
+  if (!root) throw new Error(PROJECT_ROOT_NOT_FOUND_MESSAGE)
   const wrapperSrc = join(root, 'src', 'install', 'statusline-wrapper.sh')
   if (!existsSync(wrapperSrc)) throw new Error(`wrapper script missing: ${wrapperSrc}`)
   const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
@@ -838,7 +992,10 @@ export async function refreshWrapper(opts: InstallOptions = {}): Promise<Refresh
     throw new Error('deckd is not installed. Run `deckd install` first.')
   }
   if (detection.kind === 'ambiguous') {
-    throw new Error(ambiguousWrapMessage(wrapperDst))
+    // M-1: `dirSetupMayHaveRun: true` -- `enforceDirModes` above has already
+    // run by this point, so the message must not claim this refusal
+    // changed nothing at all.
+    throw new Error(ambiguousWrapMessage(wrapperDst, detection.command, true))
   }
 
   // I-2: `settings.statusLine` here is the ALREADY-INSTALLED, already-wrapped
@@ -857,10 +1014,13 @@ export async function refreshWrapper(opts: InstallOptions = {}): Promise<Refresh
   const backupPath = `${p.claudeSettings}.deckd-backup`
   const recovered = tryUnwrapWrapped(settings.statusLine, wrapperDst)
   if (!recovered.ok) {
+    // M-1: does not claim "nothing was changed" -- `enforceDirModes` above
+    // already ran by this point.
     throw new Error(
       'could not recover the original statusLine command from the installed wrap (the ' +
         'embedded marker is missing or unreadable), so the wrapper cannot be safely ' +
-        `re-verified. Nothing was changed. A pre-install backup may exist at ${backupPath} -- ` +
+        're-verified. Nothing in settings.json, the wrapper, or launchd was changed by this ' +
+        `attempt.${STATE_DIR_SETUP_CAVEAT} A pre-install backup may exist at ${backupPath} -- ` +
         "check it by hand, or run 'deckd uninstall' then 'deckd install' again.",
     )
   }
@@ -918,8 +1078,35 @@ const DEFAULT_PROBE_TIMEOUT_MS = 10_000
  * `verifyWrap` can apply a different policy to it (see below). */
 class ProbeTimeoutError extends Error {}
 
-/** How much of the probed command's own stderr `ProbeExitError` keeps. */
-const PROBE_STDERR_LIMIT = 200
+/** How much of any probe-derived text (a probed command's stderr, or its
+ * stdout in a failed-verify report) install ever prints or throws with.
+ *
+ * M-9/M-10: this is VOLUME control, not a secret boundary -- a bearer token
+ * sitting in the first `PROBE_TEXT_LIMIT` bytes of a user's own statusline
+ * output or stderr still reaches the console in full, truncation or not.
+ * Do not rely on this to hide anything sensitive; it exists only so a
+ * runaway or binary-garbage command cannot flood the terminal. Both
+ * channels -- the probed command's stderr (`ProbeExitError` below) and its
+ * stdout (`install`'s failed-verify message) -- share this ONE limit and
+ * ONE truncation function, so they cannot drift onto two different
+ * policies for what is, functionally, the same kind of text. */
+const PROBE_TEXT_LIMIT = 200
+
+/**
+ * Truncates `s` for display, counting real UTF-8 BYTES rather than UTF-16
+ * code units (M-9). The old stderr-only version sliced with `.length` and
+ * labelled the result "bytes", which was wrong for any non-ASCII text, and
+ * could split a surrogate PAIR in two, leaving a lone surrogate in the
+ * truncated string. Slicing the encoded byte buffer instead means a
+ * multi-byte sequence cut in half decodes to a single replacement
+ * character, never a raw lone surrogate, and the reported count is the
+ * real byte count.
+ */
+function truncateForDisplay(s: string, limit = PROBE_TEXT_LIMIT): string {
+  const buf = Buffer.from(s, 'utf8')
+  if (buf.length <= limit) return s
+  return `${buf.subarray(0, limit).toString('utf8')}… (${String(buf.length)} bytes total, truncated)`
+}
 
 /** Distinguishes a clean, fast, nonzero exit from every other kind of
  * failure (a timeout, a spawn error), so `verifyWrap` can tell "the original
@@ -928,17 +1115,12 @@ const PROBE_STDERR_LIMIT = 200
  *
  * M-4: `stderr` is the USER'S OWN statusline command's error output, and
  * `install` folds this whole message into what it prints and throws on a
- * failed probe. A statusline that calls an authenticated API can put a
- * bearer token, or anything else, into its own stderr -- this is not
- * deckd's data to print in full. Truncated to a fixed, small budget, with
- * the original byte count kept so nothing is silently pretended away. */
+ * failed probe. Truncated to a small, fixed volume budget (see
+ * `truncateForDisplay` -- NOT a secret-hygiene measure, just a bound on how
+ * much of the user's own output reaches the console at once). */
 class ProbeExitError extends Error {
   constructor(public readonly code: number | null, stderr: string) {
-    const trimmed =
-      stderr.length > PROBE_STDERR_LIMIT
-        ? `${stderr.slice(0, PROBE_STDERR_LIMIT)}… (${String(stderr.length)} bytes total, truncated)`
-        : stderr
-    super(`exit ${String(code)}: ${trimmed}`)
+    super(`exit ${String(code)}: ${truncateForDisplay(stderr)}`)
     this.name = 'ProbeExitError'
   }
 }
@@ -1180,6 +1362,31 @@ export interface UninstallOptions {
   controller?: LaunchAgentController
 }
 
+/**
+ * I-5: states plainly what an uninstall attempt has already done to the
+ * live system by the time a LATER step fails, and whether settings.json
+ * itself was touched. Unlike a failed `install`, a failed `uninstall` never
+ * rolls back: the launch agent it already stopped stays stopped, and a
+ * plist it already deleted stays deleted. A bare filesystem error naming a
+ * temp file the user has never heard of leaves them unable to tell which
+ * half of the uninstall actually happened, or what is safe to do next.
+ */
+function describeUninstallState(
+  p: Paths,
+  plistRemoved: boolean,
+  opts: { settingsWritten?: boolean } = {},
+): string {
+  const daemon = plistRemoved
+    ? ` The launch agent ${p.launchAgentLabel} has already been stopped, and its plist at ` +
+      `${p.launchAgent} has already been removed.`
+    : ` The launch agent ${p.launchAgentLabel} has already been stopped; there was no plist ` +
+      'file to remove.'
+  const settingsNote = opts.settingsWritten
+    ? ` ${p.claudeSettings} WAS updated by this attempt.`
+    : ` ${p.claudeSettings} was NOT modified by this attempt.`
+  return `${daemon}${settingsNote}`
+}
+
 export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
   const p = opts.paths ?? paths
   const controller = opts.controller ?? systemLaunchAgentController
@@ -1195,7 +1402,18 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
   // this read first, as a pure read with no side effect, means a settings
   // file this cannot parse leaves every file and every launchd state
   // completely untouched.
-  const settings = readSettingsForUninstall(p)
+  //
+  // I-1: `initialRaw` is kept alongside the parsed object, exactly like
+  // `readSettingsForInstall` gives `install`, so the write far below can
+  // re-read the file as raw TEXT immediately before it would overwrite it,
+  // and abort on any mismatch. `await controller.bootout` below is a real
+  // `launchctl` subprocess call, and settings.json is a file Claude Code
+  // itself rewrites while a session runs (persisting an approved
+  // `permissions.allow` entry, for one) -- so a read-modify-write spanning
+  // that whole window would otherwise silently discard whatever landed in
+  // it. `install` was given exactly this discipline in an earlier round;
+  // this applies it to the verb that did not get it (lesson 21).
+  const { settings, raw: initialRaw } = readSettingsForUninstall(p)
 
   // C-1, THE critical finding, round 3: decided by the SAME shared
   // `detectWrap` `install` and `refreshWrapper` use -- not by `isInstalled`
@@ -1208,20 +1426,24 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
   // kept invoking a wrapper this invocation never touched. Checked here,
   // as a pure decision with no side effect yet, BEFORE launchd or the
   // plist are touched: refusing changes nothing at all, exactly like
-  // `install`'s mirror-image check.
+  // `install`'s mirror-image check. `dirSetupMayHaveRun` stays `false` --
+  // unlike `install`/`refreshWrapper`, nothing above this line has touched
+  // anything, so the base message is already literally true (M-1).
   const detection = detectWrap(settings, wrapper)
   if (detection.kind === 'ambiguous') {
     throw new Error(
-      `${ambiguousWrapMessage(wrapper)} (this invocation resolved the state directory to ` +
-        `${p.stateDir} -- if that is not where the wrap was installed, set DECKD_STATE_DIR to ` +
-        'the correct one and retry.)',
+      `${ambiguousWrapMessage(wrapper, detection.command)} (this invocation resolved the state ` +
+        `directory to ${p.stateDir} -- if that is not where the wrap was installed, set ` +
+        'DECKD_STATE_DIR to the correct one and retry.)',
     )
   }
 
   await controller.bootout(p.launchAgentLabel)
+  let plistRemoved = false
   if (existsSync(p.launchAgent)) {
     unlinkSync(p.launchAgent)
     removed.push(`removed ${p.launchAgent}`)
+    plistRemoved = true
   }
 
   // `detection.kind === 'this'` is the only branch that unwraps anything.
@@ -1233,7 +1455,37 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
     if (recovered.warning) console.warn(recovered.warning)
     if (recovered.statusLine === undefined) delete settings.statusLine
     else settings.statusLine = recovered.statusLine
-    writeAtomic(p.claudeSettings, JSON.stringify(settings, null, 2))
+
+    // I-1: re-read settings.json as raw TEXT and compare it against
+    // `initialRaw`, immediately before the write below -- everything slow
+    // (the `bootout` await above) has already happened by this point, and
+    // nothing between here and the write touches settings.json at all, so
+    // this shrinks the window as far as it will go, exactly like `install`.
+    // Comparing TEXT, not the parsed object, catches every kind of
+    // concurrent edit, including one to a key this code never parses into
+    // anything at all.
+    const currentRaw = existsSync(p.claudeSettings) ? readFileSync(p.claudeSettings, 'utf8') : ''
+    if (currentRaw !== initialRaw) {
+      throw new Error(
+        `${p.claudeSettings} changed while uninstall was running (most likely Claude Code ` +
+          'itself writing to it). Refusing to overwrite a newer version of the file with a ' +
+          `decision made from a stale read.${describeUninstallState(p, plistRemoved)} Confirm ` +
+          'settings.json is what you expect, then run `deckd uninstall` again; it is safe to retry.',
+      )
+    }
+
+    // I-5: a write failure here (a full disk, a permissions error) must not
+    // surface as a bare filesystem error -- the launch agent above may
+    // already be stopped and its plist already gone, and this message is
+    // the only place that says so.
+    try {
+      writeAtomic(p.claudeSettings, JSON.stringify(settings, null, 2))
+    } catch (e) {
+      throw new Error(
+        `${String(e)}${describeUninstallState(p, plistRemoved)} Fix whatever is blocking the ` +
+          'write (free disk space, fix file permissions), then run `deckd uninstall` again.',
+      )
+    }
     removed.push(describeStatusLineOutcome(recovered, p.claudeSettings))
 
     // Half one's positive guarantee: read the file back and confirm it no
@@ -1247,11 +1499,12 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
     // reference, just to a DIFFERENT wrapper than the one being deleted.
     // Never delete on the strength of an assumption that the write above
     // worked; only on having just read the proof back off disk.
-    if (detectWrap(readSettingsForUninstall(p), wrapper).kind !== 'none') {
+    if (detectWrap(readSettingsForUninstall(p).settings, wrapper).kind !== 'none') {
       throw new Error(
         `${p.claudeSettings} still references a deckd wrapper after writing the unwrap. ` +
-          'Refusing to delete the wrapper script, so nothing is stranded. Check the file by ' +
-          'hand, then run `deckd uninstall` again.',
+          'Refusing to delete the wrapper script, so nothing is stranded.' +
+          `${describeUninstallState(p, plistRemoved, { settingsWritten: true })} Check the file ` +
+          'by hand, then run `deckd uninstall` again.',
       )
     }
   }
@@ -1329,11 +1582,24 @@ function readSettingsForInstall(p: Paths): { settings: Record<string, unknown>; 
  * recovery advice -- an uninstall failing here can leave a user with a
  * broken statusline and no other deckd command able to help, so the thrown
  * message says exactly what is wrong and exactly what to do about it.
+ *
+ * I-1: returns the parsed object AND the exact raw text it was parsed from,
+ * for the same reason `readSettingsForInstall` does -- the write far below
+ * in `uninstall` re-reads the file and compares it, as raw TEXT, against
+ * this exact moment, immediately before it would otherwise overwrite
+ * whatever is there. `uninstall` awaits a real `launchctl bootout`
+ * subprocess between this read and that write, and `settings.json` is a
+ * file Claude Code itself rewrites while a session runs (persisting an
+ * approved `permissions.allow` entry, for one) -- so without the compare,
+ * that window silently discards whatever landed in it. `install` was given
+ * this exact discipline in an earlier round; this applies it to the verb
+ * that did not get it (lesson 21).
  */
-function readSettingsForUninstall(p: Paths): Record<string, unknown> {
-  if (!existsSync(p.claudeSettings)) return {}
+function readSettingsForUninstall(p: Paths): { settings: Record<string, unknown>; raw: string } {
+  if (!existsSync(p.claudeSettings)) return { settings: {}, raw: '' }
+  const raw = readFileSync(p.claudeSettings, 'utf8')
   try {
-    return parseSettingsObject(readFileSync(p.claudeSettings, 'utf8'), p.claudeSettings, 'uninstall')
+    return { settings: parseSettingsObject(raw, p.claudeSettings, 'uninstall'), raw }
   } catch (e) {
     const backupPath = `${p.claudeSettings}.deckd-backup`
     const repair = existsSync(backupPath)
