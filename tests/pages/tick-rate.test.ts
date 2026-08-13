@@ -36,7 +36,7 @@ describe('pages that must keep the default 1000 ms render interval', () => {
       getQuotes: () => new Map(),
       getStatus: () => 'ok',
       getMarketState: () => 'closed',
-      isStale: () => false,
+      isSymbolStale: () => false,
       setVisible: () => {},
     } as unknown as StockReader
     const page = new StocksPage(fake)

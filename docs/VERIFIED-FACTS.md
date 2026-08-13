@@ -180,6 +180,24 @@ Send `User-Agent: Mozilla/5.0` or it can be rejected.
 - **`SPCX` is a real ticker**: `Space Exploration Technologies Corp.` on NasdaqGS.
 - The eight symbols: `TSLA MSFT NVDA NOW SOFI HIMS SPCX AMZN`.
 
+### Task 25: the detail view's `meta` fields, verified on TSLA
+
+Probed live from the same chart endpoint. These feed `Quote.dayHigh`,
+`dayLow`, `week52High`, `week52Low` and `volume`, each `number | null`, parsed
+with the existing `numberOrNull` helper — absent renders as `--`, never `0`:
+
+| `meta` field | Value |
+| --- | --- |
+| `regularMarketDayHigh` | `335.5` |
+| `regularMarketDayLow` | `323.64` |
+| `fiftyTwoWeekHigh` | `498.83` |
+| `fiftyTwoWeekLow` | `297.38` |
+| `regularMarketVolume` | `27695899` |
+
+No second endpoint was fetched — every one of these already comes back on
+the same `chart` response the source already requests for the spark and the
+price.
+
 ---
 
 ## Weather

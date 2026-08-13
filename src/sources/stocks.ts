@@ -29,6 +29,14 @@ export interface Quote {
   currency: string
   /** Epoch seconds of the last regular-market trade. */
   asOf: number
+  /** Today's high and low. Absent renders as `--`, never `0`. */
+  dayHigh: number | null
+  dayLow: number | null
+  /** The 52-week high and low. Absent renders as `--`, never `0`. */
+  week52High: number | null
+  week52Low: number | null
+  /** Today's share volume. Absent renders as `--`, never `0`. */
+  volume: number | null
 }
 
 const BASE_URL = 'https://query1.finance.yahoo.com/v8/finance/chart'
@@ -114,6 +122,11 @@ export function parseQuote(symbol: string, body: unknown): Quote | null {
     spark: extractCloses(body),
     currency: typeof meta.currency === 'string' ? meta.currency : '',
     asOf: typeof meta.regularMarketTime === 'number' ? meta.regularMarketTime : 0,
+    dayHigh: numberOrNull(meta.regularMarketDayHigh),
+    dayLow: numberOrNull(meta.regularMarketDayLow),
+    week52High: numberOrNull(meta.fiftyTwoWeekHigh),
+    week52Low: numberOrNull(meta.fiftyTwoWeekLow),
+    volume: numberOrNull(meta.regularMarketVolume),
   }
 }
 

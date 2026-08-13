@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { Image } from '@napi-rs/canvas'
 import { keyHash, stripHash, blankKey } from '../../src/render/specs.js'
-import type { KeySpec } from '../../src/render/specs.js'
+import type { KeySpec, Rgb } from '../../src/render/specs.js'
 
 describe('keyHash', () => {
   it('matches for two equal specs', () => {
@@ -43,6 +43,34 @@ describe('keyHash', () => {
     const a: KeySpec = { kind: 'gauge', spark: { values: [1, 2, 3], color: [70, 200, 110] } }
     const b: KeySpec = { kind: 'gauge', spark: { values: [3, 2, 1], color: [70, 200, 110] } }
     expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  // Keys 4, 5 and 6 on the stock detail view all share one series and one
+  // imageKey-like identity: only `slice.index` tells them apart. If it were
+  // missing from the hash, two of the three slices would never redraw on a
+  // price move — the exact defect that hit the Spotify 2x2 album art
+  // (lesson 11 in docs/LESSONS.md), now for a spark instead of an image crop.
+  it('differs when the spark slice index changes, even with the same values and color', () => {
+    const values = [1, 2, 3, 4, 5, 6]
+    const color: Rgb = [70, 200, 110]
+    const a: KeySpec = { kind: 'gauge', spark: { values, color, slice: { index: 0, count: 3 } } }
+    const b: KeySpec = { kind: 'gauge', spark: { values, color, slice: { index: 1, count: 3 } } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('differs for all three slice indices used by the stock detail chart', () => {
+    const values = [1, 2, 3, 4, 5, 6]
+    const color: Rgb = [70, 200, 110]
+    const hashes = [0, 1, 2].map((index) =>
+      keyHash({ kind: 'gauge', spark: { values, color, slice: { index, count: 3 } } }),
+    )
+    expect(new Set(hashes).size).toBe(3)
+  })
+
+  it('matches when slice is absent on both sides, keeping the single-key sparkline path untouched', () => {
+    const a: KeySpec = { kind: 'gauge', spark: { values: [1, 2, 3], color: [70, 200, 110] } }
+    const b: KeySpec = { kind: 'gauge', spark: { values: [1, 2, 3], color: [70, 200, 110] } }
+    expect(keyHash(a)).toBe(keyHash(b))
   })
 
   it('differs when a line colour changes', () => {

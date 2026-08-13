@@ -288,6 +288,100 @@ describe('renderKey spark', () => {
     expect(withSpark.equals(blank)).toBe(true)
   })
 
+  describe('slice (the stock detail chart spanning 3 keys)', () => {
+    const values = Array.from({ length: 24 }, (_, i) => Math.sin(i / 2) * 10 + i)
+
+    it('draws different pixels for each of the three slice indices of the same series', () => {
+      const bufs = [0, 1, 2].map((index) =>
+        renderKey({
+          kind: 'gauge',
+          spark: { values, color: theme.green, slice: { index, count: 3 } },
+        }),
+      )
+      expect(bufs[0]!.equals(bufs[1]!)).toBe(false)
+      expect(bufs[1]!.equals(bufs[2]!)).toBe(false)
+      expect(bufs[0]!.equals(bufs[2]!)).toBe(false)
+    })
+
+    it('draws something (not blank) for every slice index', () => {
+      const blank = renderKey({ kind: 'gauge' })
+      for (const index of [0, 1, 2]) {
+        const buf = renderKey({
+          kind: 'gauge',
+          spark: { values, color: theme.green, slice: { index, count: 3 } },
+        })
+        expect(buf.equals(blank)).toBe(false)
+      }
+    })
+
+    it('draws nothing for a slice with fewer than 2 values, same as the non-sliced path', () => {
+      const blank = renderKey({ kind: 'gauge' })
+      const buf = renderKey({
+        kind: 'gauge',
+        spark: { values: [7], color: theme.green, slice: { index: 0, count: 3 } },
+      })
+      expect(buf.equals(blank)).toBe(true)
+    })
+
+    it('normalises min and max over the WHOLE series, not just the visible slice', () => {
+      // A monotonically increasing series: slice 0 sees only its own low
+      // values. If it normalised against just its own slice, its tallest bar
+      // would reach the top. Against the whole series, it must not.
+      const rising = Array.from({ length: 30 }, (_, i) => i)
+      const wholeKey = renderKey({ kind: 'gauge', spark: { values: rising, color: theme.green } })
+      const sliceZero = renderKey({
+        kind: 'gauge',
+        spark: { values: rising, color: theme.green, slice: { index: 0, count: 3 } },
+      })
+      // Different geometry (only a third of the bars, over a third of the
+      // width), so the buffers differ, but slice 0 alone must not paint a
+      // full-height bar the way the whole, self-normalised key does at its
+      // OWN tallest point — proven indirectly: slice 0's tallest bar sits
+      // lower than SPARK_Y (48), because its own local max (index 9 of 0..29)
+      // is far below the series max (29).
+      expect(sliceZero.equals(wholeKey)).toBe(false)
+      let topInkRow = -1
+      for (let y = 0; y < KEY_SIZE && topInkRow < 0; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          if (!near3(probe(sliceZero, x, y), theme.bg)) {
+            topInkRow = y
+            break
+          }
+        }
+      }
+      // SPARK_Y is 48; a bar normalised to the whole series' max (29) from a
+      // local max of only 9 cannot reach anywhere near the top of the spark
+      // band. If it wrongly self-normalised to fill the band, ink would start
+      // at 48 - 40 = 8. Requiring it start no earlier than row 40 proves the
+      // full series' max, not the slice's own max, set the scale.
+      expect(topInkRow).toBeGreaterThanOrEqual(40)
+    })
+  })
+
+  // The regression guard the task brief demands: the grid's single-key
+  // sparkline (no `slice`) must render byte-identically to the hash captured
+  // BEFORE `slice` support was added to `drawSpark`, the same way Task 23
+  // proved `lineSizes` did not disturb the pages that never set it.
+  it('renders a single-key spark byte-identically to the pre-slice snapshot (8 points)', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      spark: { values: [1, 5, 2, 8, 3, 6, 9, 4], color: theme.green },
+    })
+    expect(sha256(buf)).toBe(
+      'c1790257f8b27077f656deff392c0c31afb6a864ebc7ed884109f0b73a2cc748',
+    )
+  })
+
+  it('renders a single-key spark byte-identically to the pre-slice snapshot (12 points)', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      spark: { values: [1, 5, 2, 8, 3, 6, 9, 4, 7, 2, 5, 1], color: theme.red },
+    })
+    expect(sha256(buf)).toBe(
+      'e412e112d97f631eb7217b7300a232dcdb9d0edefc41d5624fee776f58515605',
+    )
+  })
+
   it('dims the spark like every other element', () => {
     const bright = renderKey({
       kind: 'gauge',

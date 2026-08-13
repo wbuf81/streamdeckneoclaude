@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest'
-import { truncate, formatDuration, formatClock } from '../../src/render/text.js'
+import { createCanvas } from '@napi-rs/canvas'
+import { truncate, formatDuration, formatClock, fitSize } from '../../src/render/text.js'
+import { FONT } from '../../src/render/canvas.js'
+
+/** Measures independently of `fitSize`, so the test does not just check
+ * that `fitSize` agrees with itself. */
+function measure(text: string, size: number): number {
+  const ctx = createCanvas(1, 1).getContext('2d')
+  ctx.font = `${size}px ${FONT}`
+  return ctx.measureText(text).width
+}
 
 describe('truncate', () => {
   it('leaves a short string alone', () => {
@@ -60,5 +70,40 @@ describe('formatClock', () => {
 
   it('handles over an hour', () => {
     expect(formatClock(3725)).toBe('62:05')
+  })
+})
+
+describe('fitSize', () => {
+  const USABLE_WIDTH = 81
+
+  it('picks the largest candidate that actually measures within the budget', () => {
+    // "9.99" is short: the largest candidate, 24, must measure within budget.
+    const size = fitSize('9.99', [24, 20, 16], USABLE_WIDTH)
+    expect(size).toBe(24)
+    expect(measure('9.99', size)).toBeLessThanOrEqual(USABLE_WIDTH)
+  })
+
+  it('drops to a smaller size when the largest candidate would clip a six-character price', () => {
+    // Per VERIFIED-FACTS.md, a 6-character price at 24 px measures over 81 px.
+    expect(measure('327.51', 24)).toBeGreaterThan(USABLE_WIDTH)
+    const size = fitSize('327.51', [24, 20, 16], USABLE_WIDTH)
+    expect(size).toBeLessThan(24)
+    expect(measure('327.51', size)).toBeLessThanOrEqual(USABLE_WIDTH)
+  })
+
+  it('drops to the smallest candidate for a seven-character price', () => {
+    const size = fitSize('1234.56', [24, 20, 16], USABLE_WIDTH)
+    expect(measure('1234.56', size)).toBeLessThanOrEqual(USABLE_WIDTH)
+  })
+
+  it('falls back to the smallest candidate when nothing measures inside the budget', () => {
+    // An absurdly small budget: even the smallest candidate overflows it, so
+    // the function must still return a defined size rather than throwing.
+    const size = fitSize('a very long line of text indeed', [24, 20, 16], 1)
+    expect(size).toBe(16)
+  })
+
+  it('measures with canvas rather than the advance table, for a candidate list of one', () => {
+    expect(fitSize('x', [11], USABLE_WIDTH)).toBe(11)
   })
 })

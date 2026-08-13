@@ -71,6 +71,36 @@ describe('parseQuote', () => {
     expect(q.asOf).toBe(NOW)
   })
 
+  it('reads dayHigh, dayLow, week52High, week52Low and volume from the same fixture', () => {
+    const q = parseQuote('TSLA', chartBody())!
+    expect(q.dayHigh).toBe(252)
+    expect(q.dayLow).toBe(248)
+    expect(q.week52High).toBe(300)
+    expect(q.week52Low).toBe(150)
+    expect(q.volume).toBe(12345678)
+  })
+
+  it('gives dayHigh, dayLow, week52High, week52Low and volume as null, never 0, when absent', () => {
+    const q = parseQuote(
+      'TSLA',
+      chartBody(
+        {},
+        {
+          regularMarketDayHigh: undefined,
+          regularMarketDayLow: undefined,
+          fiftyTwoWeekHigh: undefined,
+          fiftyTwoWeekLow: undefined,
+          regularMarketVolume: undefined,
+        },
+      ),
+    )!
+    expect(q.dayHigh).toBeNull()
+    expect(q.dayLow).toBeNull()
+    expect(q.week52High).toBeNull()
+    expect(q.week52Low).toBeNull()
+    expect(q.volume).toBeNull()
+  })
+
   it('gives a negative changePercent when price is below previousClose', () => {
     const q = parseQuote('TSLA', chartBody({}, { regularMarketPrice: 200 }))!
     expect(q.changePercent!).toBeLessThan(0)

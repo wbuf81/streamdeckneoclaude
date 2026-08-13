@@ -23,6 +23,14 @@ export interface SparkSpec {
   /** Oldest first. Fewer than 2 points draws nothing. */
   values: number[]
   color: Rgb
+  /**
+   * Draws one horizontal slice of a chart that spans `count` keys, instead
+   * of the whole series on one key. `index` (0-based) picks which slice this
+   * key draws. Absent, the series draws whole on one key, exactly as before
+   * this field existed — the stocks grid depends on that being
+   * byte-identical, see `renderKey`'s `drawSpark`.
+   */
+  slice?: { index: number; count: number }
 }
 
 export interface KeySpec {

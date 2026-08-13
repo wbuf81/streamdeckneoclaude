@@ -6,7 +6,9 @@ export const KEY_SIZE = 96
 export const STRIP_WIDTH = 248
 export const STRIP_HEIGHT = 58
 
-const FONT = 'Menlo'
+/** Exported so `text.ts` can measure with the exact same font the renderer
+ * uses. Two different font names would make a measurement meaningless. */
+export const FONT = 'Menlo'
 const PAD = 6
 const BORDER = 3
 const BAR_Y = 66
@@ -70,15 +72,35 @@ function drawBar(
  * and maximum. A flat series (`range === 0`) draws every bar at half height,
  * which reads as a centred horizontal line, rather than dividing by zero.
  * Fewer than 2 values draws nothing at all.
+ *
+ * With `slice`, the series lays out across `slice.count` key widths instead
+ * of one, and this call draws only the portion belonging to `slice.index`.
+ * The min and max still come from the WHOLE series (never just the visible
+ * slice), so the three keys of one chart share one scale and a bar's height
+ * means the same thing on every one of them. A bar that straddles a slice
+ * boundary is clipped to this key's own margin rather than bleeding into the
+ * border — the physical gap between two real keys already loses that sliver,
+ * this only keeps the maths from painting over the padding.
+ *
+ * Absent `slice`, `sliceStart` is 0 and `virtualWidth` equals the plain
+ * single-key `width`, so every computed position matches the pre-`slice`
+ * code exactly — the grid's single-key sparkline depends on that being
+ * byte-identical.
  */
 function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
-  const { values, color } = spark
+  const { values, color, slice } = spark
   if (values.length < 2) return
 
   const x0 = BORDER + PAD
   const x1 = KEY_SIZE - PAD
   const width = x1 - x0
-  const barW = width / values.length
+
+  const count = slice && slice.count > 0 ? slice.count : 1
+  const index = slice?.index ?? 0
+  const virtualWidth = width * count
+  const barW = virtualWidth / values.length
+  const sliceStart = index * width
+  const sliceEnd = sliceStart + width
 
   const min = Math.min(...values)
   const max = Math.max(...values)
@@ -86,12 +108,26 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
 
   ctx.fillStyle = css(color, dim)
   for (let i = 0; i < values.length; i++) {
+    const virtualX = i * barW
+    // Entirely outside this slice's span: nothing of this bar lands here.
+    if (virtualX + barW <= sliceStart || virtualX >= sliceEnd) continue
+
     const v = values[i]!
     const frac = range === 0 ? 0.5 : (v - min) / range
     const h = frac * SPARK_H
-    const x = x0 + i * barW
+    if (h <= 0) continue
+
+    let x = x0 + (virtualX - sliceStart)
+    let w = Math.max(1, barW - 1)
+    if (x < x0) {
+      w -= x0 - x
+      x = x0
+    }
+    if (x + w > x1) w = x1 - x
+    if (w <= 0) continue
+
     const y = SPARK_Y + (SPARK_H - h)
-    if (h > 0) ctx.fillRect(x, y, Math.max(1, barW - 1), h)
+    ctx.fillRect(x, y, w, h)
   }
 }
 

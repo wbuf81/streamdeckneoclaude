@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
+import { createCanvas } from '@napi-rs/canvas'
 import { StocksPage } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
+import { FONT } from '../../src/render/canvas.js'
 import { SYMBOLS } from '../../src/sources/stocks.js'
 import type { Quote, MarketState, StockStatus } from '../../src/sources/stocks.js'
 
@@ -16,6 +18,11 @@ function quote(symbol: string, over: Partial<Quote> = {}): Quote {
     spark: [],
     currency: 'USD',
     asOf: NOW,
+    dayHigh: 105,
+    dayLow: 95,
+    week52High: 150,
+    week52Low: 60,
+    volume: 1_000_000,
     ...over,
   }
 }
@@ -31,7 +38,8 @@ interface Fakes {
   quotes: Map<string, Quote>
   status: StockStatus
   marketState: MarketState
-  stale: boolean
+  /** Symbols `isSymbolStale` reports true for. */
+  staleSymbols: Set<string>
 }
 
 function build(over: Partial<Fakes> = {}) {
@@ -39,7 +47,7 @@ function build(over: Partial<Fakes> = {}) {
     quotes: new Map(),
     status: 'ok',
     marketState: 'open',
-    stale: false,
+    staleSymbols: new Set(),
     ...over,
   }
   const calls: string[] = []
@@ -47,7 +55,7 @@ function build(over: Partial<Fakes> = {}) {
     getQuotes: () => f.quotes,
     getStatus: () => f.status,
     getMarketState: () => f.marketState,
-    isStale: () => f.stale,
+    isSymbolStale: (symbol: string) => f.staleSymbols.has(symbol),
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
   }
   return { page: new StocksPage(source as never), calls, f }
@@ -124,10 +132,11 @@ describe('StocksPage layout', () => {
     expect(key.dim).toBe(true)
   })
 
-  it('dims every key when the source reports stale', () => {
-    const { page } = build({ quotes: allQuotes(), stale: true })
+  it('dims only the ticker isSymbolStale reports, not the others', () => {
+    const { page } = build({ quotes: allQuotes(), staleSymbols: new Set([SYMBOLS[2]!]) })
     const keys = page.render(NOW).keys
-    expect(keys.every((k) => k.dim === true)).toBe(true)
+    expect(keys[2]!.dim).toBe(true)
+    expect(keys.filter((k) => k.dim === true)).toHaveLength(1)
   })
 
   it('does not dim a fresh, known key', () => {
@@ -216,11 +225,48 @@ describe('StocksPage strip', () => {
   })
 })
 
-describe('StocksPage presses', () => {
-  it('does nothing on any press', () => {
+describe('StocksPage presses: entering and leaving detail mode', () => {
+  it('selecting a key with a quote enters detail mode for that symbol', () => {
     const { page } = build({ quotes: allQuotes() })
-    expect(page.onKeyPress(0)).toBeUndefined()
-    expect(page.onKeyPress(7)).toBeUndefined()
+    page.onKeyPress(2)
+    const key0 = page.render(NOW).keys[0]!
+    expect(key0.lines![0]).toBe(SYMBOLS[2])
+  })
+
+  it('BACK (key 7) returns to the grid', () => {
+    const { page } = build({ quotes: allQuotes() })
+    page.onKeyPress(2)
+    page.onKeyPress(7)
+    const keys = page.render(NOW).keys
+    expect(keys).toHaveLength(8)
+    keys.forEach((k, i) => expect(k.lines![0]).toBe(SYMBOLS[i]))
+  })
+
+  it('does nothing when pressing a key with no quote behind it at all', () => {
+    const { page } = build({ quotes: new Map() })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    // Still the grid, not detail: 8 keys, each still labelled by symbol.
+    expect(keys).toHaveLength(8)
+    expect(keys[0]!.lines![0]).toBe(SYMBOLS[0])
+    expect(keys[0]!.lines![1]).toBe('--')
+  })
+
+  it('keys 0 to 6 do nothing while a symbol is selected', () => {
+    const { page } = build({ quotes: allQuotes() })
+    page.onKeyPress(1)
+    const before = page.render(NOW)
+    page.onKeyPress(3)
+    const after = page.render(NOW)
+    expect(after).toEqual(before)
+  })
+
+  it('leaving the page clears the selection, so it always reopens on the grid', () => {
+    const { page } = build({ quotes: allQuotes() })
+    page.onKeyPress(1)
+    page.onLeave!()
+    const keys = page.render(NOW).keys
+    keys.forEach((k, i) => expect(k.lines![0]).toBe(SYMBOLS[i]))
   })
 })
 
@@ -230,5 +276,148 @@ describe('StocksPage visibility', () => {
     page.onEnter!()
     page.onLeave!()
     expect(calls).toEqual(['visible:true', 'visible:false'])
+  })
+})
+
+/** The exact figures from the task brief's verified TSLA measurement, so the
+ * detail layout can be checked against numbers a human already sanity-checked. */
+function tslaLikeQuote(): Quote {
+  return quote(SYMBOLS[0]!, {
+    price: 327.51,
+    previousClose: 332.81,
+    changePercent: -1.5926, // (327.51 - 332.81) / 332.81 * 100
+    dayHigh: 335.5,
+    dayLow: 323.64,
+    week52High: 498.83,
+    week52Low: 297.38,
+    spark: Array.from({ length: 24 }, (_, i) => 320 + i),
+  })
+}
+
+describe('StocksPage detail view layout', () => {
+  function detailKeys() {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    const { page } = build({ quotes })
+    page.onKeyPress(0)
+    return page.render(NOW).keys
+  }
+
+  it('key 0 shows the symbol, then the price', () => {
+    const key = detailKeys()[0]!
+    expect(key.lines).toEqual(['TSLA', '327.51'])
+  })
+
+  it('key 1 shows the change percent with the down arrow, then the change amount, both trend-red', () => {
+    const key = detailKeys()[1]!
+    expect(key.lines![0]).toContain('▼')
+    expect(key.lines![0]).toContain('1.59%')
+    expect(key.lines![1]).toBe('-5.30')
+    expect(key.lineColors![0]).toEqual(theme.red)
+    expect(key.lineColors![1]).toEqual(theme.red)
+  })
+
+  it('key 2 shows DAY, then the day high, then the day low', () => {
+    const key = detailKeys()[2]!
+    expect(key.lines).toEqual(['DAY', '335.50', '323.64'])
+  })
+
+  it('key 3 shows 52 WK, then the 52-week high, then the 52-week low', () => {
+    const key = detailKeys()[3]!
+    expect(key.lines).toEqual(['52 WK', '498.83', '297.38'])
+  })
+
+  it('keys 4, 5 and 6 share one spark series, sliced into 3 consecutive parts', () => {
+    const keys = detailKeys()
+    const [k4, k5, k6] = [keys[4]!, keys[5]!, keys[6]!]
+    expect(k4.spark!.slice).toEqual({ index: 0, count: 3 })
+    expect(k5.spark!.slice).toEqual({ index: 1, count: 3 })
+    expect(k6.spark!.slice).toEqual({ index: 2, count: 3 })
+    expect(k4.spark!.values).toEqual(k5.spark!.values)
+    expect(k5.spark!.values).toEqual(k6.spark!.values)
+  })
+
+  it('key 7 shows BACK with a gray border, distinct from the trend-coloured data tiles', () => {
+    const key = detailKeys()[7]!
+    expect(key.lines!.join('')).toContain('BACK')
+    expect(key.border).toEqual(theme.gray)
+  })
+
+  it('every data tile (0-6) carries the trend colour as its border; key 7 does not', () => {
+    const keys = detailKeys()
+    for (const key of keys.slice(0, 7)) {
+      expect(key.border).toEqual(theme.red)
+    }
+    expect(keys[7]!.border).not.toEqual(theme.red)
+  })
+
+  it('shows -- for a day/52-week field that is null, never 0', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, {
+      price: 100, previousClose: 100, changePercent: 0,
+      dayHigh: null, dayLow: null, week52High: null, week52Low: null,
+    }))
+    const { page } = build({ quotes })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    expect(keys[2]!.lines).toEqual(['DAY', '--', '--'])
+    expect(keys[3]!.lines).toEqual(['52 WK', '--', '--'])
+  })
+
+  it('dims the data tiles (0-6) when the selected symbol is per-symbol stale, but not BACK', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    const { page } = build({ quotes, staleSymbols: new Set([SYMBOLS[0]!]) })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    for (const key of keys.slice(0, 7)) expect(key.dim).toBe(true)
+    expect(keys[7]!.dim).not.toBe(true)
+  })
+
+  it('does not dim the detail view for a fresh, non-stale symbol', () => {
+    const keys = detailKeys()
+    for (const key of keys.slice(0, 7)) expect(key.dim).not.toBe(true)
+  })
+})
+
+describe('StocksPage detail view text fits the usable key width', () => {
+  const USABLE_WIDTH = 81
+
+  function measure(text: string, size: number): number {
+    const ctx = createCanvas(1, 1).getContext('2d')
+    ctx.font = `${size}px ${FONT}`
+    return ctx.measureText(text).width
+  }
+
+  // Every real symbol, across prices spanning a single digit dollar up to a
+  // four-digit one (NOW trades near $1000), the exact stress case the brief
+  // calls out: a clipped price has already shipped twice in this project.
+  it.each(SYMBOLS)('fits every line on keys 0-3 for %s at $9.99, $327.51 and $1234.56', (symbol) => {
+    for (const price of [9.99, 327.51, 1234.56]) {
+      const quotes = allQuotes()
+      quotes.set(
+        symbol,
+        quote(symbol, {
+          price,
+          previousClose: price + 5.3,
+          changePercent: -1.59,
+          dayHigh: price + 8.12,
+          dayLow: price - 8.12,
+          week52High: price + 171.32,
+          week52Low: Math.max(0.01, price - 30.5),
+        }),
+      )
+      const { page } = build({ quotes })
+      const index = SYMBOLS.indexOf(symbol)
+      page.onKeyPress(index)
+      const keys = page.render(NOW).keys
+
+      for (const key of keys.slice(0, 4)) {
+        key.lines?.forEach((line, i) => {
+          const size = key.lineSizes?.[i] ?? 11
+          expect(measure(line, size)).toBeLessThanOrEqual(USABLE_WIDTH)
+        })
+      }
+    }
   })
 })

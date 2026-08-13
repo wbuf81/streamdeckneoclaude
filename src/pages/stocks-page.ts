@@ -1,6 +1,6 @@
 import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
-import { truncate } from '../render/text.js'
+import { truncate, fitSize } from '../render/text.js'
 import type { Page } from './types.js'
 import type { MarketState, Quote, StockStatus } from '../sources/stocks.js'
 import { SYMBOLS, downsample } from '../sources/stocks.js'
@@ -12,6 +12,20 @@ const STRIP_CHARS = 30
 /** The exchange timezone for every symbol on this page. All eight tickers
  * trade on a US exchange, so one timezone covers them all. */
 const EXCHANGE_TZ = 'America/New_York'
+/** Measured usable width of one key: 96 - 3 border - 6 padding each side.
+ * See docs/VERIFIED-FACTS.md. */
+const USABLE_WIDTH = 81
+/** `fitSize` candidates for the detail view's numeric lines, largest first.
+ * 16 px is required to fit a 7-character price like `1234.56`. */
+const PRICE_SIZES = [24, 20, 16]
+/** Fixed size for the detail view's symbol and label lines. Every symbol is
+ * at most 4 characters and every label ("DAY", "52 WK") is short, so these
+ * never need `fitSize` — they are measured once, here, not per render. */
+const SYMBOL_SIZE = 24
+const LABEL_SIZE = 16
+const BACK_SIZE = 16
+/** How many of the detail view's tiles the intraday chart spans. */
+const CHART_SPAN = 3
 
 const STATE_LABELS: Record<MarketState, string> = {
   open: 'MARKET OPEN',
@@ -53,6 +67,16 @@ function formatChange(changePercent: number | null, trend: Trend): string {
   return `${trendArrow(trend)} ${Math.abs(changePercent).toFixed(2)}%`
 }
 
+/** `price - previousClose` as a signed currency string: `-5.30`, `5.30`
+ * (flat needs no sign), `12.00`. `null` when either side is unknown. */
+function formatChangeValue(price: number | null, previousClose: number | null): string {
+  if (typeof price !== 'number' || typeof previousClose !== 'number') return '--'
+  if (!Number.isFinite(price) || !Number.isFinite(previousClose)) return '--'
+  const diff = price - previousClose
+  const sign = diff < 0 ? '-' : ''
+  return `${sign}${Math.abs(diff).toFixed(2)}`
+}
+
 /** The newest `asOf` across all quotes, or null when none is known yet. */
 function latestAsOf(quotes: Map<string, Quote>): number | null {
   let max: number | null = null
@@ -83,17 +107,26 @@ export interface StockReader {
   getQuotes(): Map<string, Quote>
   getStatus(): StockStatus
   getMarketState(): MarketState
-  isStale(): boolean
+  /** True when THIS symbol's own quote has gone stale. Drives dimming for
+   * both the grid tile and the detail view, so one lagging ticker dims on
+   * its own instead of the whole board dimming for it. */
+  isSymbolStale(symbol: string): boolean
   setVisible(visible: boolean): void
 }
 
 /**
  * One ticker per key, eight keys, eight symbols, no empty key and no
- * overflow. The whole key dims when the shared quote snapshot is stale, so a
- * stale price never presents as current.
+ * overflow. Pressing a ticker enters a detail mode for that one symbol,
+ * spread across all eight keys, with BACK on key 7. A key dims when ITS OWN
+ * symbol's quote has gone stale, so one lagging ticker never dims tiles that
+ * are still fresh.
  */
 export class StocksPage implements Page {
   readonly name = 'stocks'
+
+  /** The symbol shown in detail mode, or null on the grid. `onLeave` always
+   * clears this, so the page reopens on the grid every time. */
+  private selected: string | null = null
 
   constructor(private readonly source: StockReader) {}
 
@@ -102,14 +135,24 @@ export class StocksPage implements Page {
   }
 
   onLeave(): void {
+    this.selected = null
     this.source.setVisible(false)
   }
 
   render(now: number): DeckFrame {
     const quotes = this.source.getQuotes()
-    const stale = this.source.isStale()
-    const keys = SYMBOLS.map((symbol) => this.tickerKey(quotes.get(symbol), symbol, stale))
 
+    if (this.selected !== null) {
+      const quote = quotes.get(this.selected)
+      if (quote) return this.detailFrame(this.selected, quote, now)
+      // The selected symbol's quote vanished. This should not happen — quotes
+      // are only ever added, never removed — but a page must never throw, so
+      // fall back to the grid rather than render a detail view with nothing
+      // behind it.
+      this.selected = null
+    }
+
+    const keys = SYMBOLS.map((symbol) => this.tickerKey(quotes.get(symbol), symbol))
     return {
       keys,
       strip: this.strip(quotes, now),
@@ -117,9 +160,10 @@ export class StocksPage implements Page {
     }
   }
 
-  private tickerKey(quote: Quote | undefined, symbol: string, sourceStale: boolean): KeySpec {
+  private tickerKey(quote: Quote | undefined, symbol: string): KeySpec {
     const trend = trendOf(quote?.changePercent ?? null)
     const unknown = !quote || quote.price === null
+    const stale = this.source.isSymbolStale(symbol)
 
     const key: KeySpec = {
       kind: 'gauge',
@@ -135,9 +179,120 @@ export class StocksPage implements Page {
       key.spark = { values: spark, color: trendColor(trend) }
     }
 
-    if (sourceStale || unknown) key.dim = true
+    if (stale || unknown) key.dim = true
 
     return key
+  }
+
+  /**
+   * The detail view for one symbol, spread across all eight keys. Every data
+   * tile (0 to 6) shares one border colour — the symbol's trend — so BACK's
+   * fixed gray border reads as visibly different, not as more data.
+   */
+  private detailFrame(symbol: string, quote: Quote, now: number): DeckFrame {
+    const trend = trendOf(quote.changePercent)
+    const border = trendColor(trend)
+    const dim = this.source.isSymbolStale(symbol) || quote.price === null
+
+    const keys: KeySpec[] = [
+      this.priceKey(quote, border, dim),
+      this.changeKey(quote, trend, border, dim),
+      this.rangeKey('DAY', quote.dayHigh, quote.dayLow, border, dim),
+      this.rangeKey('52 WK', quote.week52High, quote.week52Low, border, dim),
+      this.chartKey(quote, trend, border, dim, 0),
+      this.chartKey(quote, trend, border, dim, 1),
+      this.chartKey(quote, trend, border, dim, 2),
+      this.backKey(),
+    ]
+
+    return {
+      keys,
+      strip: this.detailStrip(quote, now),
+      buttons: [theme.gray, theme.gray],
+    }
+  }
+
+  /** Key 0: the symbol, then the price sized to fit whatever width the
+   * actual digits need — measured, not assumed, per docs/LESSONS.md #17. */
+  private priceKey(quote: Quote, border: Rgb, dim: boolean): KeySpec {
+    const priceText = formatPrice(quote.price)
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: [quote.symbol, priceText],
+      lineSizes: [SYMBOL_SIZE, fitSize(priceText, PRICE_SIZES, USABLE_WIDTH)],
+      border,
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Key 1: the change percent (with the existing trend arrow), then the
+   * change amount. Both lines carry the trend colour. */
+  private changeKey(quote: Quote, trend: Trend, border: Rgb, dim: boolean): KeySpec {
+    const pctText = formatChange(quote.changePercent, trend)
+    const valText = formatChangeValue(quote.price, quote.previousClose)
+    const color = trendColor(trend)
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: [pctText, valText],
+      lineSizes: [fitSize(pctText, PRICE_SIZES, USABLE_WIDTH), fitSize(valText, PRICE_SIZES, USABLE_WIDTH)],
+      lineColors: [color, color],
+      border,
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Keys 2 and 3: a label, then the high, then the low. Used for both the
+   * day range and the 52-week range — the only difference is the label and
+   * which two fields feed it. */
+  private rangeKey(label: string, high: number | null, low: number | null, border: Rgb, dim: boolean): KeySpec {
+    const highText = formatPrice(high)
+    const lowText = formatPrice(low)
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: [label, highText, lowText],
+      lineSizes: [
+        LABEL_SIZE,
+        fitSize(highText, PRICE_SIZES, USABLE_WIDTH),
+        fitSize(lowText, PRICE_SIZES, USABLE_WIDTH),
+      ],
+      border,
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Keys 4, 5 and 6: one intraday chart, spanning all three. Each key draws
+   * only its own slice of the SAME series, so the three stay in scale with
+   * each other — see `SparkSpec.slice` in `render/specs.ts`. */
+  private chartKey(quote: Quote, trend: Trend, border: Rgb, dim: boolean, index: number): KeySpec {
+    const key: KeySpec = { kind: 'gauge', border }
+    if (quote.spark.length >= 2) {
+      key.spark = { values: quote.spark, color: trendColor(trend), slice: { index, count: CHART_SPAN } }
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Key 7: BACK. A gray border and no trend colour, on purpose, so it never
+   * reads as one more data tile. */
+  private backKey(): KeySpec {
+    return {
+      kind: 'control',
+      lines: ['◀ BACK'],
+      lineSizes: [BACK_SIZE],
+      align: 'center',
+      border: theme.gray,
+    }
+  }
+
+  private detailStrip(quote: Quote, now: number): StripSpec {
+    const marketState = this.source.getMarketState()
+    const asOf = quote.asOf > 0 ? quote.asOf : now
+    const line1 = truncate(quote.name, STRIP_CHARS)
+    const line2 = truncate(`${STATE_LABELS[marketState]} · ${formatAsOf(asOf)}`, STRIP_CHARS)
+    return { lines: [line1, line2] }
   }
 
   private strip(quotes: Map<string, Quote>, now: number): StripSpec {
@@ -163,7 +318,23 @@ export class StocksPage implements Page {
     return { lines: [line1, truncate(line2, STRIP_CHARS)] }
   }
 
-  onKeyPress(_index: number): void {
-    // Read-only for now. No refresh-on-press, no browser.
+  onKeyPress(index: number): void {
+    if (this.selected === null) {
+      const symbol = SYMBOLS[index]
+      if (!symbol) return
+      // No quote at all for this key yet: nothing to show a detail view for.
+      // The grid can hold fewer than eight known symbols before the first
+      // successful refresh, and an empty key must not open detail for a
+      // symbol that does not exist.
+      if (!this.source.getQuotes().has(symbol)) return
+      this.selected = symbol
+      return
+    }
+
+    if (index === 7) {
+      this.selected = null
+    }
+    // Keys 0 to 6 do nothing while a symbol is selected. Read-only: no
+    // refresh-on-press, no browser.
   }
 }
