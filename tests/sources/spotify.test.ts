@@ -537,150 +537,6 @@ describe('SpotifySource.getArt', () => {
   })
 })
 
-/**
- * Builds a `SpotifySource` whose `fetchFn` branches by URL rather than by
- * call order, because `setVisible(true)` fires the player poll and the
- * saved-library load concurrently, and their actual interleaving is an
- * implementation detail this suite should not need to pin down. `/me/player`
- * always answers with `PLAYER`. `/me/tracks?` (the bulk saved-library
- * endpoint, distinct from the removed per-track `/me/tracks/contains` and
- * `/me/tracks?ids=`) is served from `pages`, indexed by how many bulk calls
- * have happened so far, so a test can hand it exactly the page sequence it
- * wants to exercise.
- */
-function buildSaved(pages: Array<{ status: number; body?: unknown; headers?: Record<string, string> }>) {
-  const calls: string[] = []
-  let bulkCalls = 0
-  const fetchFn = vi.fn(async (url: string) => {
-    calls.push(url)
-    if (url.includes('/me/player')) {
-      return {
-        ok: true, status: 200, headers: { get: () => null },
-        json: async () => PLAYER, arrayBuffer: async () => new ArrayBuffer(0),
-      }
-    }
-    const r = pages[Math.min(bulkCalls, pages.length - 1)]!
-    bulkCalls++
-    return {
-      ok: r.status >= 200 && r.status < 300,
-      status: r.status,
-      headers: { get: (k: string) => r.headers?.[k.toLowerCase()] ?? null },
-      json: async () => r.body ?? {},
-      arrayBuffer: async () => new ArrayBuffer(0),
-    }
-  })
-  const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
-  const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
-  return { src, fetchFn, calls, store }
-}
-
-describe('SpotifySource saved-library', () => {
-  it('does not load the saved library at construction — only setVisible(true) starts it', () => {
-    const { fetchFn } = buildSaved([{ status: 200, body: { items: [], total: 0 } }])
-    expect(fetchFn).not.toHaveBeenCalled()
-  })
-
-  it('returns null before the saved library has loaded, then a boolean once it has', async () => {
-    const { src } = buildSaved([{ status: 200, body: { items: [{ track: { id: 'track-1' } }], total: 1 } }])
-    await src.poll() // Sets state.trackId. Polling alone never starts the bulk load.
-    expect(src.isSaved()).toBeNull()
-    src.setVisible(true)
-    await new Promise((r) => setTimeout(r, 20))
-    expect(src.isSaved()).toBe(true)
-    await src.stop()
-  })
-
-  it('pages through the saved-library endpoint sequentially and builds the id set', async () => {
-    const { src, fetchFn } = buildSaved([
-      { status: 200, body: { items: [{ track: { id: 'track-1' } }, { track: { id: 'b' } }], total: 60 } },
-      { status: 200, body: { items: [{ track: { id: 'c' } }], total: 60 } },
-    ])
-    src.setVisible(true)
-    await new Promise((r) => setTimeout(r, 20))
-    const bulkCalls = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
-    expect(bulkCalls).toBe(2)
-    // 'track-1' (PLAYER's trackId) is in the first page, 'b' and 'c' are not
-    // the current track but prove the set spans both pages.
-    expect(src.isSaved()).toBe(true)
-    await src.stop()
-  })
-
-  it('fetches saved-library pages sequentially, never in parallel', async () => {
-    const order: string[] = []
-    let resolveFirstPage!: (v: unknown) => void
-    const fetchFn = vi.fn((url: string) => {
-      if (url.includes('/me/player')) {
-        return Promise.resolve({
-          ok: true, status: 200, headers: { get: () => null },
-          json: async () => PLAYER, arrayBuffer: async () => new ArrayBuffer(0),
-        })
-      }
-      order.push(url)
-      if (order.length === 1) {
-        // The first page never resolves until the test says so below.
-        return new Promise((resolve) => { resolveFirstPage = resolve })
-      }
-      return Promise.resolve({
-        ok: true, status: 200, headers: { get: () => null },
-        json: async () => ({ items: [], total: 0 }), arrayBuffer: async () => new ArrayBuffer(0),
-      })
-    })
-    const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
-    const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
-
-    src.setVisible(true)
-    await Promise.resolve()
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(order).toHaveLength(1) // The second page must not be requested while the first is still pending.
-
-    resolveFirstPage({
-      ok: true, status: 200, headers: { get: () => null },
-      json: async () => ({ items: [{ track: { id: 'x' } }], total: 60 }),
-      arrayBuffer: async () => new ArrayBuffer(0),
-    })
-    await new Promise((r) => setTimeout(r, 20))
-    expect(order).toHaveLength(2) // Only after the first resolves does the second fire.
-    await src.stop()
-  })
-
-  it('leaves the saved state unknown and logs exactly once, without retrying, on a 403', async () => {
-    const onceSpy = vi.spyOn(log, 'once')
-    try {
-      const { src, fetchFn } = buildSaved([{ status: 403 }])
-      src.setVisible(true)
-      await new Promise((r) => setTimeout(r, 20))
-      expect(src.isSaved()).toBeNull()
-      const bulkCalls = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
-      expect(bulkCalls).toBe(1) // Never retried.
-      expect(onceSpy).toHaveBeenCalledTimes(1)
-      expect(onceSpy.mock.calls[0]![0]).toBe('spotify-saved-scope')
-      await src.stop()
-    } finally {
-      onceSpy.mockRestore()
-    }
-  })
-
-  it('loads the saved library only once, even across several visibility toggles', async () => {
-    const { src, fetchFn } = buildSaved([
-      { status: 200, body: { items: [{ track: { id: 'track-1' } }], total: 1 } },
-    ])
-    src.setVisible(true)
-    await new Promise((r) => setTimeout(r, 20))
-    const afterFirst = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
-    expect(afterFirst).toBe(1)
-
-    src.setVisible(false)
-    src.setVisible(true)
-    src.setVisible(false)
-    src.setVisible(true)
-    await new Promise((r) => setTimeout(r, 20))
-    const afterMore = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
-    expect(afterMore).toBe(1) // Never re-fetched.
-    await src.stop()
-  })
-})
-
 describe('SpotifySource cold-load bug: the first setVisible(true) never dead-ends', () => {
   it('emits change after the very first completed poll, even when nothing is playing', async () => {
     // Guards the leading hypothesis for the reported cold-load bug: that a
@@ -698,21 +554,24 @@ describe('SpotifySource cold-load bug: the first setVisible(true) never dead-end
   })
 
   // Regression coverage for the REAL cause, found by testing the hypothesis
-  // above (it held) and then tracing what is actually different between a
-  // cold `setVisible(true)` and a later one: only the FIRST call also starts
-  // `loadSavedIds()`, concurrently with the poll. If the stored token is due
-  // for a refresh at that moment, both the poll and the saved-library load
-  // read the same about-to-expire token and each call `refreshTokens`
-  // independently. Spotify rotates the refresh token on use, so whichever
-  // request lands second is already using a stale one and fails. Before the
-  // fix, that failure's handler set `status` to `'unauthorized'` — even when
-  // the OTHER caller's poll had just found "nothing playing" correctly —
-  // because the two refreshes shared one `status` field with no
-  // coordination. A second `setVisible(true)` (leave the page, come back)
-  // never re-triggers `loadSavedIds`, so it never raced, which is exactly
-  // the workaround the user found. The fix shares one in-flight refresh
-  // across every concurrent caller instead of starting a second one.
-  it('does not let a concurrent saved-library refresh corrupt the poll status on the first setVisible(true)', async () => {
+  // above (it held) and then tracing what was actually different between a
+  // cold `setVisible(true)` and a later one: at the time this bug was fixed,
+  // only the FIRST call also started a one-time saved-library load (since
+  // removed along with the heart it fed), concurrently with the poll. If the
+  // stored token was due for a refresh at that moment, both the poll and
+  // that load read the same about-to-expire token and each called
+  // `refreshTokens` independently. Spotify rotates the refresh token on use,
+  // so whichever request landed second was already using a stale one and
+  // failed. Before the fix, that failure's handler set `status` to
+  // `'unauthorized'` — even when the OTHER caller's poll had just found
+  // "nothing playing" correctly — because the two refreshes shared one
+  // `status` field with no coordination. The fix, `doRefresh`'s
+  // `refreshPromise` dedup, shares one in-flight refresh across EVERY
+  // concurrent caller, not just the pair that used to race. This test keeps
+  // that guard alive using the two concurrent callers that still exist
+  // post-cleanup: the player poll and a control command (`next`), both
+  // needing a refresh in the same tick.
+  it('does not let two concurrent callers needing a refresh corrupt each other', async () => {
     let tokenCalls = 0
     const fetchFn = vi.fn(async (url: string) => {
       if (url.includes('/api/token')) {
@@ -732,16 +591,11 @@ describe('SpotifySource cold-load bug: the first setVisible(true) never dead-end
           arrayBuffer: async () => new ArrayBuffer(0),
         }
       }
-      if (url.includes('/me/player')) {
-        return {
-          ok: true, status: 204, headers: { get: () => null },
-          json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0),
-        }
-      }
-      // '/me/tracks?', the saved-library page.
+      // Both '/me/player' (the poll) and '/me/player/next' (the control
+      // command) answer the same way here — only the token path matters.
       return {
-        ok: true, status: 200, headers: { get: () => null },
-        json: async () => ({ items: [], total: 0 }), arrayBuffer: async () => new ArrayBuffer(0),
+        ok: true, status: 204, headers: { get: () => null },
+        json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0),
       }
     })
     vi.stubGlobal('fetch', fetchFn) // refreshTokens() always uses the global fetch.
@@ -752,8 +606,9 @@ describe('SpotifySource cold-load bug: the first setVisible(true) never dead-end
     }
     const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
 
-    src.setVisible(true) // Starts the poll AND the one-time saved-library load together.
-    await new Promise((r) => setTimeout(r, 20))
+    // Two callers, in the same tick, both needing a refresh: the player poll
+    // and a control command.
+    await Promise.all([src.poll(), src.next()])
 
     expect(tokenCalls).toBe(1) // One refresh serves both callers.
     expect(src.getStatus()).toBe('no-device') // Not corrupted to 'unauthorized'.
@@ -778,16 +633,13 @@ describe('SpotifySource stop() during an in-flight poll', () => {
     const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
     const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
 
-    src.setVisible(true) // Starts a poll AND the one-time saved-library load.
+    src.setVisible(true) // Starts the player poll.
     // `accessToken()` resolves through a couple of microtask ticks before
-    // either reaches its fetch call. Flush those first.
+    // it reaches its fetch call. Flush those first.
     await Promise.resolve()
     await Promise.resolve()
     await Promise.resolve()
-    // Two callers, both blocked on the same unresolved fetch: the player
-    // poll, and the saved-library load that `setVisible(true)` also starts
-    // on the very first visit.
-    expect(fetchFn).toHaveBeenCalledTimes(2)
+    expect(fetchFn).toHaveBeenCalledTimes(1)
 
     await src.stop() // stop() runs while that poll is still in flight.
 
