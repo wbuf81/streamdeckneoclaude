@@ -88,6 +88,17 @@ export interface CodexReader {
    * `STALE`, which stays meaningful now that "degraded" itself is the
    * rarer case. */
   staleForSeconds(): number | null
+  /** True when the MOST RECENT read came back via the `immutable=1`
+   * fallback rather than a primary `mode=ro` open (`CodexSource.isDegraded`,
+   * already exposed there for exactly this). I3: `staleForSeconds()` alone
+   * cannot tell a genuinely OLD primary read from a fallback read that
+   * happened moments ago but could not see the `-wal` — a degraded read
+   * leaves `lastSuccessAt` untouched, so its age describes an EARLIER
+   * primary success, not what is actually wrong with the current data. This
+   * lets `staleAgeLine` print `PARTIAL` for the fallback case instead of the
+   * self-contradictory `STALE 0m` a small, coincidentally-recent
+   * `lastSuccessAt` used to produce. */
+  isDegraded(): boolean
   setVisible(visible: boolean): void
 }
 
@@ -201,15 +212,43 @@ export class CodexPage implements Page {
     // treatment the accounting tiles already had, or a schema-drift or quit
     // failure leaves `RUNNING` on the glass indefinitely.
     const taskDim = dataUnavailable || readStale
+    // I2 — an unavailable read is the STRONGER of the two failures, and a
+    // task tile must say so in words, not just a shade darker: `RUNNING`
+    // and `${count} ACTIVE`, dimmed only, used to read as confident data on
+    // the exact frame the strip called the read unavailable outright. Both
+    // words fall back to the same explicit-unknown convention the
+    // accounting tiles already use for `dataUnavailable` (a plain `--`),
+    // rather than asserting a fact — "running", "N active" — the page can
+    // no longer see.
+    const taskWord = dataUnavailable ? 'UNKNOWN' : 'RUNNING'
+    const activeWord = dataUnavailable ? '--' : `${snapshot.tasks.length} ACTIVE`
     // I3 — dimming alone used to be the ONLY staleness cue a task tile
     // carried, and dimming cannot say anything when it is the PERMANENT
     // resting state: Codex normally has the database open, so a genuinely
-    // degraded fallback read (`CodexSource.isDegraded`, folded into
-    // `readStale`) is the everyday path, not a rare one, and a task that
-    // finished minutes ago kept reading `RUNNING` with no textual tell at
-    // all. `null` when the read is not stale, so a fresh tile draws its
-    // normal four lines with no fifth line reserved.
-    const staleLine = readStale ? this.staleAgeLine() : null
+    // degraded fallback read is the everyday path, not a rare one, and a
+    // task that finished minutes ago kept reading `RUNNING` with no textual
+    // tell at all. `null` when the read is not stale, so a fresh tile draws
+    // its normal four lines with no fifth line reserved.
+    //
+    // I2 — `UNAVAILABLE` wins over every other word: "no current data at
+    // all" is the strongest of the reasons a task tile's data cannot be
+    // trusted, the same priority `usageUnknown` already gives
+    // `dataUnavailable` over `readStale` for the accounting tiles.
+    //
+    // I3 — the mirror case, degraded but still available: `staleForSeconds`
+    // measures the age of the last EXACT read, but a genuinely degraded
+    // fallback read leaves `lastSuccessAt` untouched (see `isDegraded`'s own
+    // doc comment on the reader interface), so its age describes an EARLIER
+    // primary success, not what is wrong with the CURRENT data — printing
+    // it as `STALE 0m` read as self-contradictory (stale by zero minutes)
+    // and, worse, as a measurement of the wrong thing entirely. `PARTIAL`
+    // names the real condition instead, with no borrowed number attached.
+    const degraded = this.source.isDegraded()
+    const staleLine = dataUnavailable
+      ? 'UNAVAILABLE'
+      : readStale
+        ? (degraded ? 'PARTIAL' : this.staleAgeLine())
+        : null
     const keys: KeySpec[] = []
 
     for (let i = 0; i < TASK_SLOTS; i++) {
@@ -217,8 +256,8 @@ export class CodexPage implements Page {
       keys.push(task ? {
         kind: 'session',
         lines: staleLine
-          ? ['RUNNING', task.project, task.title, task.model, staleLine]
-          : ['RUNNING', task.project, task.title, task.model],
+          ? [taskWord, task.project, task.title, task.model, staleLine]
+          : [taskWord, task.project, task.title, task.model],
         lineSizes: [11, PROJECT_SIZES, TITLE_SIZES, MODEL_SIZES, STALE_AGE_SIZES],
         border: theme.green,
         dim: taskDim,
@@ -227,7 +266,7 @@ export class CodexPage implements Page {
 
     keys.push({
       kind: 'session',
-      lines: ['OPENAI', 'CODEX', `${snapshot.tasks.length} ACTIVE`],
+      lines: ['OPENAI', 'CODEX', activeWord],
       lineSizes: [11, 22, 11],
       lineColors: [theme.textDim, theme.green, theme.textDim],
       align: 'center',
@@ -244,7 +283,16 @@ export class CodexPage implements Page {
     // has no current data for either window.
     keys.push(limits[1]
       ? this.limitKey(limits[1], this.source.isUsageUnknown(1) || dataUnavailable, readStale)
-      : this.planKey(snapshot.usage?.plan ?? '', usageUnknown || readStale))
+      // I7 — `usageUnknown` alone, not `usageUnknown || readStale`: PLAN
+      // used to be the only tile that folded staleness INTO its own idea of
+      // "unknown", which made it print a retained value under a `STALE`
+      // label in the exact `dataUnavailable` frame where its neighbours
+      // (`tokensKey`, this same `limitKey`) render a plain `--` instead —
+      // one frame, two different answers to "what does unknown look like".
+      // It was also the only tile that could print the word `STALE` when
+      // `readStale` was actually `false`, because that word came from the
+      // MERGED flag rather than from `readStale` itself.
+      : this.planKey(snapshot.usage?.plan ?? '', usageUnknown, readStale))
     keys.push(this.tokensKey(snapshot.usage?.totalTokens ?? null, usageUnknown, readStale))
     keys.push(this.resetKey(limits[0], now, usageUnknown, readStale))
 
@@ -303,13 +351,25 @@ export class CodexPage implements Page {
     }
   }
 
-  private planKey(plan: string, stale: boolean): KeySpec {
+  private planKey(plan: string, unknown: boolean, readStale: boolean): KeySpec {
+    if (unknown) {
+      // I7 — the same explicit `--` `tokensKey` and `limitKey` already
+      // render for an unknowable figure, never the last retained plan name
+      // dimmed under a STALE label pretending the read is merely lagging.
+      return {
+        kind: 'gauge',
+        lines: ['PLAN', '--'],
+        lineSizes: [11, [20, 16, 13]],
+        align: 'center',
+        dim: true,
+      }
+    }
     return {
       kind: 'gauge',
-      lines: ['PLAN', plan ? plan.toUpperCase() : '--', stale ? 'STALE' : ''],
+      lines: ['PLAN', plan ? plan.toUpperCase() : '--', readStale ? 'STALE' : ''],
       lineSizes: [11, [20, 16, 13], 11],
       align: 'center',
-      dim: !plan || stale,
+      dim: !plan || readStale,
     }
   }
 

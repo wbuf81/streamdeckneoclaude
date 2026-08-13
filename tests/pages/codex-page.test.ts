@@ -11,17 +11,62 @@ import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '
  * same documented value rather than reasoning about it fresh. */
 const STRIP_PAD = 6
 
-/** I6 — the furthest column a LEFT-ALIGNED key line can ever legitimately
- * reach: `render/canvas.ts`'s private `BORDER` (3) + `PAD` (6) +
- * `TEXT_MAX_WIDTH` (81, itself `KEY_SIZE - BORDER - PAD * 2`). A probe past
- * this column (the old test used 95, five pixels beyond it) can never fail,
- * however badly a line overflows — `shrinkToFit` guarantees every measured
- * line stops at or before this column BY CONSTRUCTION, so nothing short of
- * a change to those constants themselves could ever paint past it. Probing
- * AT the boundary instead means a real overflow bug — a candidate array
- * that stops measuring, or a bare size given text too wide for it — has
- * somewhere to show up. */
+/** I6 (round 3) / I5 (this round) — the furthest column a LEFT-ALIGNED key
+ * line can ever legitimately reach: `render/canvas.ts`'s private `BORDER`
+ * (3) + `PAD` (6) + `TEXT_MAX_WIDTH` (81, itself `KEY_SIZE - BORDER -
+ * PAD * 2`). `KEY_TEXT_RIGHT_BAND_END` is the key's own last column
+ * (`KEY_SIZE - 1` = 95). A probe past the band (the round-3 test used 95
+ * alone, five pixels beyond `KEY_TEXT_RIGHT_EDGE`) can never fail, however
+ * badly a line overflows — `shrinkToFit` guarantees every measured line
+ * stops at or before `KEY_TEXT_RIGHT_EDGE` BY CONSTRUCTION.
+ *
+ * I5 — a SINGLE column at `KEY_TEXT_RIGHT_EDGE` is not enough either, for
+ * CENTRED text: measured, sweeping candidate sizes 11-28 and lengths 4-24
+ * against exactly the pair of columns the round-3 test checked (90 and its
+ * mirror, 6) turned up 90 combinations that overflow the key while BOTH
+ * probed columns stay background — narrow glyphs put the outermost columns
+ * inside the inter-glyph gap. Every probe below now sweeps the whole band,
+ * `KEY_TEXT_RIGHT_EDGE` to `KEY_TEXT_RIGHT_BAND_END`, matching the pattern
+ * stocks-page.test.ts and weather-page.test.ts already use. */
 const KEY_TEXT_RIGHT_EDGE = 90
+const KEY_TEXT_RIGHT_BAND_END = 95
+
+/** True when no pixel in the row `y`, columns `KEY_TEXT_RIGHT_EDGE` to
+ * `KEY_TEXT_RIGHT_BAND_END`, differs from the background — the left-aligned
+ * right-margin band every task tile's text must never reach into (I5). */
+function rightBandIsBackground(buf: Buffer, y: number): boolean {
+  for (let x = KEY_TEXT_RIGHT_EDGE; x <= KEY_TEXT_RIGHT_BAND_END; x++) {
+    if (!colorsEqual(probe(buf, x, y), theme.bg)) return false
+  }
+  return true
+}
+
+/** `render/canvas.ts`'s private `BORDER`: every key with a `border` colour
+ * fills a solid strip across columns `0` to `BORDER - 1` down the LEFT edge
+ * ONLY (`ctx.fillRect(0, 0, BORDER, KEY_SIZE)`) — not a full rectangle, and
+ * not on the right edge at all, per AGENTS.md's "Press feedback" history
+ * ("An earlier version recoloured only the key's left-edge border strip").
+ * That strip is legitimate, permanent ink with nothing to do with text
+ * overflow, so the left mirror band below starts just past it. */
+const LEFT_BORDER_WIDTH = 3
+
+/** The mirror band on the LEFT edge, for centred text (I5): the same
+ * distance from the true left edge that `rightBandIsBackground` checks from
+ * the true right edge, clamped to start just past `LEFT_BORDER_WIDTH` — the
+ * border strip's own solid ink is not text and must not be mistaken for an
+ * overflow. */
+function leftBandIsBackground(buf: Buffer, y: number): boolean {
+  const start = Math.max(LEFT_BORDER_WIDTH, 95 - KEY_TEXT_RIGHT_BAND_END)
+  const end = 95 - KEY_TEXT_RIGHT_EDGE
+  for (let x = start; x <= end; x++) {
+    if (!colorsEqual(probe(buf, x, y), theme.bg)) return false
+  }
+  return true
+}
+
+function colorsEqual(a: readonly number[], b: readonly number[]): boolean {
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2]
+}
 
 /** Measures with the SAME font and size `renderStrip` draws line 1 and 2
  * with, independently of the page. */
@@ -66,6 +111,11 @@ function build(
   // "stale" without a further age to report. Tests that care about the
   // printed age pass a number explicitly.
   staleForSeconds: number | null = null,
+  // I3 — a genuinely degraded (immutable fallback) read, distinct from a
+  // merely OLD primary read even though both make `isStale()` true. Default
+  // `false` matches every pre-existing test's assumption (a normal, aged
+  // staleness, not a fallback one).
+  degraded = false,
 ) {
   const isUsageUnknown = typeof usageUnknown === 'function' ? usageUnknown : () => usageUnknown
   return new CodexPage({
@@ -74,6 +124,7 @@ function build(
     isStale: () => stale,
     isUsageUnknown,
     staleForSeconds: () => staleForSeconds,
+    isDegraded: () => degraded,
     setVisible: () => {},
   })
 }
@@ -109,6 +160,29 @@ describe('CodexPage', () => {
 
   it('uses key 5 for the plan when there is no second limit', () => {
     expect(build().render(NOW).keys[5]!.lines?.slice(0, 2)).toEqual(['PLAN', 'TEAM'])
+  })
+
+  // I7 — the mirror case that stayed correct: a merely lagging sqlite read,
+  // with the usage SAMPLE itself still describing the current window, keeps
+  // showing the retained plan name under a STALE label. This is the ONE
+  // case that should still look like the old behaviour.
+  it('still shows the plan name under a STALE label when only the sqlite read is lagging, not the usage sample', () => {
+    const key = build(snapshot(), true, true, false).render(NOW).keys[5]!
+    expect(key.lines).toEqual(['PLAN', 'TEAM', 'STALE'])
+    expect(key.dim).toBe(true)
+  })
+
+  // I7 — PLAN used to fold `usageUnknown || readStale` into one flag, which
+  // made it the only tile that could print the word STALE for a reason that
+  // was not staleness: here `readStale` itself is `false`, and only
+  // `isUsageUnknown()` is `true`, yet the OLD code still passed a merged
+  // `true` into `planKey` and printed `STALE`. It must render the explicit
+  // `--` its neighbours already use for an unknowable figure instead, with
+  // no STALE label attached to the wrong reason.
+  it('renders -- for PLAN, never a STALE label, once the usage sample no longer describes the current window', () => {
+    const key = build(snapshot(), true, false, true).render(NOW).keys[5]!
+    expect(key.lines).toEqual(['PLAN', '--'])
+    expect(key.dim).toBe(true)
   })
 
   // I3/I5 — the secondary tile must ask about ITS OWN window, never reuse
@@ -174,6 +248,27 @@ describe('CodexPage', () => {
     // asked for, across every tile on the page, not just the limit gauges.
     expect(frame.keys[0]!.dim).toBe(true)
     expect(frame.keys[3]!.dim).toBe(true)
+  })
+
+  // I2 — the review's exact repro: `isAvailable() -> false`, `isStale() ->
+  // false`. Before the fix, task tiles kept reading `RUNNING` and the
+  // identity tile kept reading `N ACTIVE`, dimmed only, on the very frame
+  // the strip called the read unavailable outright — the strongest failure
+  // got the weakest cue. Both must now say so in as many words as the
+  // accounting tiles already do for the same condition.
+  it('renders the task and identity tiles as unknown in words, not just a shade, when the source is unavailable', () => {
+    const frame = build(snapshot(), false, false, false).render(NOW)
+    expect(frame.keys[0]!.lines?.[0]).toBe('UNKNOWN')
+    expect(frame.keys[3]!.lines).toEqual(['OPENAI', 'CODEX', '--'])
+  })
+
+  // I7 — PLAN must get the SAME `dataUnavailable` treatment as its
+  // neighbours (`tokensKey`, `limitKey`): a plain `--`, never the retained
+  // plan name under a STALE label that implies the read is merely lagging.
+  it('renders -- for PLAN too when the source is unavailable, never the retained plan name', () => {
+    const key = build(snapshot(), false, false, false).render(NOW).keys[5]!
+    expect(key.lines).toEqual(['PLAN', '--'])
+    expect(key.dim).toBe(true)
   })
 
   // The secondary limit tile must get the SAME treatment through its own
@@ -268,6 +363,17 @@ describe('CodexPage', () => {
     expect(key.lines?.[4]).toBe('STALE 11m')
   })
 
+  // I3 — the review's exact repro: a genuinely degraded (immutable
+  // fallback) read leaves `lastSuccessAt` untouched, so `staleForSeconds`
+  // describes an EARLIER primary success, not what is wrong with the
+  // CURRENT data. Printing that as `STALE 0m` reads as self-contradictory
+  // ("stale by zero minutes") on exactly the path I3 was built for.
+  // `PARTIAL` must appear instead, with no borrowed number attached.
+  it('shows PARTIAL rather than a self-contradictory STALE 0m on a genuinely degraded read', () => {
+    const key = build(snapshot(), true, true, false, 0, true).render(NOW).keys[0]!
+    expect(key.lines?.[4]).toBe('PARTIAL')
+  })
+
   it('adds no fifth line to a task tile at all when the read is fresh', () => {
     const key = build(snapshot(), true, false, false, 5).render(NOW).keys[0]!
     expect(key.lines).toHaveLength(4)
@@ -285,7 +391,7 @@ describe('CodexPage', () => {
     expect(key.lines?.[4]).toBe('STALE 3d2h')
     const buffer = renderKey(key)
     for (let y = 0; y < 96; y++) {
-      expect(probe(buffer, KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
+      expect(rightBandIsBackground(buffer, y)).toBe(true)
     }
   })
 
@@ -473,8 +579,9 @@ describe('CodexPage', () => {
   // furthest column a left-aligned line can ever legitimately reach
   // (`KEY_TEXT_RIGHT_EDGE` = 90; see its own doc comment). Nothing could
   // ever draw that far out, so the probe could not fail however badly the
-  // layout broke. Moved to the real boundary, where an actual overflow —
-  // a candidate array that stops measuring — has somewhere to show up.
+  // layout broke. I5 (this round) — a single column even AT that boundary
+  // is not proof enough in general (see `KEY_TEXT_RIGHT_EDGE`'s own updated
+  // comment); this sweeps the whole band instead.
   it('never draws task-tile text past the key edge for the widest realistic values', () => {
     const wide = task({
       project: 'a-fairly-long-project-directory-name-for-a-real-repo',
@@ -484,7 +591,7 @@ describe('CodexPage', () => {
     const key = build(snapshot({ tasks: [wide] })).render(NOW).keys[0]!
     const buffer = renderKey(key)
     for (let y = 0; y < 96; y++) {
-      expect(probe(buffer, KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
+      expect(rightBandIsBackground(buffer, y)).toBe(true)
     }
   })
 
@@ -514,9 +621,15 @@ describe('CodexPage', () => {
   // warns against relying on going forward. This locks the claim in with
   // the real canvas. All of them draw centered (`align: 'center'`), so an
   // overflow shows up symmetrically around the key's own horizontal centre
-  // (x=48) — checking the SAME column `KEY_TEXT_RIGHT_EDGE` uses for
-  // left-aligned lines, and its mirror on the left, catches either
-  // direction.
+  // (x=48).
+  //
+  // I5 (this round) — the round-3 version of this test checked only the
+  // single mirrored pair of columns (90 and its mirror, 6). Measured:
+  // sweeping candidate sizes 11-28 and lengths 4-24 against exactly that
+  // pair turned up 90 combinations where the key overflows while BOTH
+  // probed columns stay background — narrow glyphs put the outermost
+  // columns inside the inter-glyph gap. This sweeps the whole band on both
+  // sides instead.
   it('keeps every bare-size centered label and value line within the key edge, for every key that draws one', () => {
     // `usage: null` routes key 4 through `limitKey`'s `!limit` branch
     // (`USAGE CAP` / `--`, bare), key 5 through `planKey` (`PLAN` / `--`,
@@ -529,8 +642,8 @@ describe('CodexPage', () => {
     for (const index of [3, 4, 5, 6, 7]) {
       const buffer = renderKey(frame.keys[index]!)
       for (let y = 0; y < 96; y++) {
-        expect(probe(buffer, KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
-        expect(probe(buffer, 96 - KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
+        expect(rightBandIsBackground(buffer, y)).toBe(true)
+        expect(leftBandIsBackground(buffer, y)).toBe(true)
       }
     }
   })
