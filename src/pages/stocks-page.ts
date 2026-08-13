@@ -2,7 +2,7 @@ import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
-import type { MarketState, Quote, StockStatus } from '../sources/stocks.js'
+import type { MarketState, Quote, StockStatus, YearlyState } from '../sources/stocks.js'
 import { SYMBOLS, downsample } from '../sources/stocks.js'
 
 /** How many buckets the intraday series downsamples to for the tile. */
@@ -108,6 +108,12 @@ export interface StockReader {
    * its own instead of the whole board dimming for it. */
   isSymbolStale(symbol: string): boolean
   setVisible(visible: boolean): void
+  /** Read-only. Never triggers a fetch — see `requestYearly`. */
+  getYearlyState(symbol: string): YearlyState
+  /** Kicks off a lazy, cached fetch of the 52-week series for one symbol.
+   * The page calls this once, at the moment a symbol is selected for the
+   * detail view — never on every render, and never for all eight symbols. */
+  requestYearly(symbol: string): void
 }
 
 /**
@@ -189,15 +195,16 @@ export class StocksPage implements Page {
     const trend = trendOf(quote.changePercent)
     const border = trendColor(trend)
     const dim = this.source.isSymbolStale(symbol) || quote.price === null
+    const chart = this.chartSeries(symbol, quote)
 
     const keys: KeySpec[] = [
       this.priceKey(quote, border, dim),
       this.changeKey(quote, trend, border, dim),
       this.rangeKey('DAY', quote.dayHigh, quote.dayLow, border, dim),
       this.rangeKey('52 WK', quote.week52High, quote.week52Low, border, dim),
-      this.chartKey(quote, trend, border, dim, 0),
-      this.chartKey(quote, trend, border, dim, 1),
-      this.chartKey(quote, trend, border, dim, 2),
+      this.chartKey(chart, trend, border, dim, 0),
+      this.chartKey(chart, trend, border, dim, 1),
+      this.chartKey(chart, trend, border, dim, 2),
       this.backKey(),
     ]
 
@@ -206,6 +213,24 @@ export class StocksPage implements Page {
       strip: this.detailStrip(quote, now),
       buttons: [theme.gray, theme.gray],
     }
+  }
+
+  /**
+   * Picks what the wide chart (keys 4, 5 and 6) draws: the 52-week daily
+   * series once `requestYearly` has loaded it, or the intraday series —
+   * clearly labelled either way — while that fetch is still loading, has
+   * never succeeded for this symbol, or the symbol simply has no yearly data
+   * yet. Never hands back the intraday series under the `52 WK` label: the
+   * label always matches the values it goes with, so a still-loading or
+   * failed yearly fetch shows the grid's own honest range instead of
+   * silently mislabelling a day as a year.
+   */
+  private chartSeries(symbol: string, quote: Quote): { values: number[]; label: string } {
+    const yearly = this.source.getYearlyState(symbol)
+    if (yearly.status === 'ok' && yearly.values.length >= 2) {
+      return { values: yearly.values, label: '52 WK' }
+    }
+    return { values: quote.spark, label: '1D' }
   }
 
   /** Key 0: the symbol, then the price sized to fit whatever width the
@@ -266,20 +291,33 @@ export class StocksPage implements Page {
   }
 
   /**
-   * Keys 4, 5 and 6: one intraday chart, spanning all three. Each key draws
-   * only its own slice of the SAME series, so the three stay in scale with
-   * each other — see `SparkSpec.slice` in `render/specs.ts`. These three
-   * keys carry no text, so the chart uses `fullHeight` (M4) to own the
-   * whole tile instead of just the default lower band.
+   * Keys 4, 5 and 6: one chart, spanning all three — the 52-week series
+   * (`chart.label` is `52 WK`) once it has loaded, otherwise the intraday
+   * series labelled `1D`, per `chartSeries`. Each key draws only its own
+   * slice of the SAME series, so the three stay in scale with each other —
+   * see `SparkSpec.slice` in `render/specs.ts`. These three keys carry no
+   * text lines, so the chart uses `fullHeight` (M4) to own most of the
+   * tile; `labelBand` reserves a strip at the top for the caption, applied
+   * identically on all three keys so the bars still line up at the seams,
+   * and `label` itself is set only on index 0 so the caption is not
+   * repeated three times.
    */
-  private chartKey(quote: Quote, trend: Trend, border: Rgb, dim: boolean, index: number): KeySpec {
+  private chartKey(
+    chart: { values: number[]; label: string },
+    trend: Trend,
+    border: Rgb,
+    dim: boolean,
+    index: number,
+  ): KeySpec {
     const key: KeySpec = { kind: 'gauge', border }
-    if (quote.spark.length >= 2) {
+    if (chart.values.length >= 2) {
       key.spark = {
-        values: quote.spark,
+        values: chart.values,
         color: trendColor(trend),
         slice: { index, count: CHART_SPAN },
         fullHeight: true,
+        labelBand: true,
+        label: index === 0 ? chart.label : undefined,
       }
     }
     if (dim) key.dim = true
@@ -342,6 +380,11 @@ export class StocksPage implements Page {
       // symbol that does not exist.
       if (!this.source.getQuotes().has(symbol)) return 'ignored'
       this.selected = symbol
+      // Lazily kicks off the 52-week fetch for THIS symbol only, right at
+      // the moment its detail view opens — never for all eight symbols on
+      // every poll. `requestYearly` is itself a no-op when a fresh cache,
+      // an in-flight fetch, or a failure cooldown already covers it.
+      this.source.requestYearly(symbol)
       return 'handled'
     }
 

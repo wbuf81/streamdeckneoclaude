@@ -55,6 +55,26 @@ export interface SparkSpec {
    * its original band, exactly as before this field existed.
    */
   fullHeight?: boolean
+  /**
+   * Reserves a short text band at the top of a `fullHeight` chart, so the
+   * bars start lower and never grow tall enough to reach it. Set this the
+   * SAME on every key of one `slice` group, even the ones that draw no
+   * `label` themselves — otherwise their bar geometry (`bandY`/`bandH` in
+   * `render/canvas.ts`) would differ from the labelled key's, and the chart
+   * would show a visible step where the bars change height at the seam
+   * between two keys. Ignored when `fullHeight` is absent, because the
+   * default band already leaves the top half free.
+   */
+  labelBand?: boolean
+  /**
+   * A short caption drawn inside the band `labelBand` reserves, left-aligned
+   * at this key's own top edge — for example `52 WK` or `1D`, so the stocks
+   * detail chart tells the user which range it is showing. Meant for ONE key
+   * of a `slice` group (the stocks page uses index 0); the other keys still
+   * set `labelBand: true` to match the reserved space but leave `label`
+   * unset, so nothing draws there.
+   */
+  label?: string
 }
 
 export interface KeySpec {

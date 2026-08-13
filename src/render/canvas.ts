@@ -20,6 +20,14 @@ const SPARK_H = 40
  * band keeps, just stretched over the full height. */
 const SPARK_FULL_Y = 6
 const SPARK_FULL_H = 84
+/**
+ * A `fullHeight` chart with `labelBand` set reserves this many px at its top
+ * for the `label` caption instead of letting bars use the whole band. 18 px
+ * comfortably fits an 11 px line (VERIFIED-FACTS.md: 11 px gives 12 chars,
+ * and the longest caption here, `52 WK`, is 5) with room above and below so
+ * the text never touches the bars.
+ */
+const SPARK_LABEL_BAND_H = 18
 /** The idle equaliser uses the same full-height band as a chart-only spark:
  * a pulse key carries no text, so it may as well use nearly the whole tile
  * instead of the smaller lower band a key with labels would leave for it. */
@@ -103,16 +111,24 @@ function drawBar(
  * single-key `width`, so every computed position matches the pre-`slice`
  * code exactly — the grid's single-key sparkline depends on that being
  * byte-identical.
+ *
+ * `labelBand` (only meaningful with `fullHeight`) reserves `SPARK_LABEL_BAND_H`
+ * px at the top of THIS key's band, so a `label` drawn there never touches a
+ * bar. It must be set the same on every key of a `slice` group even when
+ * only one of them carries `label` text — otherwise the bars on the
+ * labelled key would use a shorter band than its neighbours and visibly step
+ * at the seam between keys.
  */
 function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
-  const { values, color, slice, fullHeight } = spark
+  const { values, color, slice, fullHeight, labelBand, label } = spark
   if (values.length < 2) return
 
   const x0 = BORDER + PAD
   const x1 = KEY_SIZE - PAD
   const width = x1 - x0
-  const bandY = fullHeight ? SPARK_FULL_Y : SPARK_Y
-  const bandH = fullHeight ? SPARK_FULL_H : SPARK_H
+  const reserve = fullHeight && labelBand ? SPARK_LABEL_BAND_H : 0
+  const bandY = (fullHeight ? SPARK_FULL_Y : SPARK_Y) + reserve
+  const bandH = (fullHeight ? SPARK_FULL_H : SPARK_H) - reserve
 
   const count = slice && slice.count > 0 ? slice.count : 1
   const index = slice?.index ?? 0
@@ -157,6 +173,17 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
 
     const y = bandY + (bandH - h)
     ctx.fillRect(x, y, w, h)
+  }
+
+  // Drawn last, so it sits on top of any bar that (despite the reserved
+  // band above) painted this far up — it never should, but text winning a
+  // pixel fight beats a silently lost caption.
+  if (label) {
+    ctx.fillStyle = css(theme.text, dim)
+    ctx.font = `11px ${FONT}`
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'top'
+    ctx.fillText(label, x0, fullHeight ? SPARK_FULL_Y : SPARK_Y)
   }
 }
 

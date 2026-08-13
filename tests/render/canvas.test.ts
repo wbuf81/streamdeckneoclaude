@@ -651,6 +651,168 @@ describe('renderKey lineY', () => {
 // `tests/pages/weather-page.test.ts`, under "day tile: rendered band
 // geometry has no overlap, for every condition".
 
+describe('renderKey spark labelBand and label (the stocks 52-week chart caption)', () => {
+  // Monotonically increasing, so the tallest bar (the last value) reaches
+  // the full band height — the worst case for an accidental overlap between
+  // the bars and the reserved caption band above them.
+  const rising = Array.from({ length: 30 }, (_, i) => i)
+
+  function topInkRow(buf: Buffer): number {
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) return y
+      }
+    }
+    return KEY_SIZE
+  }
+
+  it('reserves a band at the top so no bar paints into it, even at its tallest', () => {
+    const withLabel = renderKey({
+      kind: 'gauge',
+      spark: { values: rising, color: theme.green, fullHeight: true, labelBand: true },
+    })
+    // Lesson 14: assert the gap is background, not just that the bars moved.
+    // Row 10 sits inside the reserved band (rows 6 to 23) regardless of the
+    // series' own values, because the reservation is a fixed geometry
+    // change, not something the data can push into.
+    for (let x = 0; x < KEY_SIZE; x++) {
+      expect(near3(probe(withLabel, x, 10), theme.bg)).toBe(true)
+    }
+    // The tallest bar still paints somewhere, just lower down than without
+    // the reservation.
+    const withoutLabel = renderKey({
+      kind: 'gauge',
+      spark: { values: rising, color: theme.green, fullHeight: true },
+    })
+    expect(topInkRow(withLabel)).toBeGreaterThan(topInkRow(withoutLabel))
+  })
+
+  it('draws the caption inside the reserved band when label is set', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      spark: { values: rising, color: theme.green, fullHeight: true, labelBand: true, label: '52 WK' },
+    })
+    let inkInBand = false
+    for (let y = 6; y < 24 && !inkInBand; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) {
+          inkInBand = true
+          break
+        }
+      }
+    }
+    expect(inkInBand).toBe(true)
+  })
+
+  it('draws nothing extra for labelBand with no label — reserves the space but leaves it blank', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      spark: { values: rising, color: theme.green, fullHeight: true, labelBand: true },
+    })
+    for (let y = 0; y < 24; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        expect(near3(probe(buf, x, y), theme.bg)).toBe(true)
+      }
+    }
+  })
+
+  it('affects the hash, matching keyHash — a caption change must redraw', () => {
+    const a = renderKey({
+      kind: 'gauge',
+      spark: { values: [1, 5, 2], color: theme.green, fullHeight: true, labelBand: true, label: '1D' },
+    })
+    const b = renderKey({
+      kind: 'gauge',
+      spark: { values: [1, 5, 2], color: theme.green, fullHeight: true, labelBand: true, label: '52 WK' },
+    })
+    expect(a.equals(b)).toBe(false)
+  })
+
+  it('leaves fullHeight rendering completely unchanged when labelBand is absent', () => {
+    // Regression guard: a page that never sets labelBand (none did, before
+    // this task) must render byte-identically to before these fields
+    // existed. Same pattern as the lineSizes/lineY absent-field guards
+    // elsewhere in this file.
+    const a = renderKey({ kind: 'gauge', spark: { values: rising, color: theme.green, fullHeight: true } })
+    const b = renderKey({
+      kind: 'gauge',
+      spark: { values: rising, color: theme.green, fullHeight: true, labelBand: false },
+    })
+    expect(a.equals(b)).toBe(true)
+  })
+})
+
+// Task 33's real measurement (docs/VERIFIED-FACTS.md): TSLA's `range=1y&interval=1d`
+// gave 251 points, no null holes. A prior review (M1, see the "81 points"
+// describe block above) found the slice clip logic broke above 81 values on
+// a single key; this proves the SAME code path at the real 52-week point
+// count, sliced across 3 keys the way the stocks detail chart actually does
+// it, not just at the smaller counts the earlier tests used.
+describe('renderKey spark at the real 52-week point count (251, measured live)', () => {
+  const values = Array.from({ length: 251 }, (_, i) => i)
+
+  it('does not throw for any of the three slice indices', () => {
+    for (const index of [0, 1, 2]) {
+      expect(() =>
+        renderKey({
+          kind: 'gauge',
+          spark: { values, color: theme.green, slice: { index, count: 3 }, fullHeight: true, labelBand: true, label: index === 0 ? '52 WK' : undefined },
+        }),
+      ).not.toThrow()
+    }
+  })
+
+  it('draws visibly different pixels for each of the three slices', () => {
+    const bufs = [0, 1, 2].map((index) =>
+      renderKey({
+        kind: 'gauge',
+        spark: { values, color: theme.green, slice: { index, count: 3 }, fullHeight: true, labelBand: true, label: index === 0 ? '52 WK' : undefined },
+      }),
+    )
+    expect(bufs[0]!.equals(bufs[1]!)).toBe(false)
+    expect(bufs[1]!.equals(bufs[2]!)).toBe(false)
+    expect(bufs[0]!.equals(bufs[2]!)).toBe(false)
+  })
+
+  it('still draws a visible last bar near the right edge of the final slice (the M1 guarantee, at the real count)', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      spark: { values, color: theme.green, slice: { index: 2, count: 3 }, fullHeight: true, labelBand: true },
+    })
+    let inkNearRightEdge = false
+    for (let x = 85; x < 90 && !inkNearRightEdge; x++) {
+      for (let y = 0; y < KEY_SIZE; y++) {
+        if (!near3(probe(buf, x, y), theme.bg)) {
+          inkNearRightEdge = true
+          break
+        }
+      }
+    }
+    expect(inkNearRightEdge).toBe(true)
+  })
+
+  it('keeps the caption clear of the bars at the real point count too', () => {
+    // The caption itself (white-ish `theme.text`) DOES paint ink in the
+    // reserved band — that is the point of it. What must never happen is a
+    // BAR (`theme.green`) reaching up into that band. Colour, not mere
+    // "not background", is what tells the two apart here.
+    const buf = renderKey({
+      kind: 'gauge',
+      spark: { values, color: theme.green, slice: { index: 0, count: 3 }, fullHeight: true, labelBand: true, label: '52 WK' },
+    })
+    let barInk = false
+    for (let y = 0; y < 24 && !barInk; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (near3(probe(buf, x, y), theme.green)) {
+          barInk = true
+          break
+        }
+      }
+    }
+    expect(barInk).toBe(false)
+  })
+})
+
 describe('renderKey spark fullHeight', () => {
   it('uses more of the key height than the default band, for a chart-only key', () => {
     const values = Array.from({ length: 20 }, (_, i) => i)

@@ -524,3 +524,194 @@ describe('SYMBOLS', () => {
     expect(SYMBOLS).toEqual(['TSLA', 'MSFT', 'NVDA', 'NOW', 'SOFI', 'HIMS', 'SPCX', 'AMZN'])
   })
 })
+
+describe('StockSource yearly series (the detail chart\'s 52-week data)', () => {
+  // Reuses `chartBody` from the `parseQuote` fixtures above: the yearly
+  // response is the SAME `chart.result[0]` shape as the intraday one
+  // (measured live on 2026-08-13, docs/VERIFIED-FACTS.md), just `range=1y`
+  // with more points. `extractCloses` already reads it generically.
+
+  it('reports unknown for a symbol nobody has ever selected', () => {
+    const src = new StockSource(SYMS, undefined, () => NOW)
+    expect(src.getYearlyState('AAA')).toEqual({ status: 'unknown' })
+  })
+
+  it('fetches the yearly series once requested, and reports it as ok', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      expect(url).toContain('range=1y&interval=1d')
+      expect(url).toContain('AAA')
+      return { ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }) }
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    const state = src.getYearlyState('AAA')
+    expect(state.status).toBe('ok')
+    if (state.status === 'ok') expect(state.values).toEqual([248.1, 249.3, 250.5])
+  })
+
+  it('sends the User-Agent header, same as the intraday fetch', async () => {
+    const fetchFn = vi.fn(async (_url: string, init?: Record<string, unknown>) => {
+      expect((init?.headers as Record<string, string>)?.['User-Agent']).toBe('Mozilla/5.0')
+      return { ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }) }
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports loading while the first fetch is in flight, before it resolves', async () => {
+    let resolveFetch!: (v: unknown) => void
+    const fetchFn = vi.fn(() => new Promise((resolve) => { resolveFetch = resolve }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    expect(src.getYearlyState('AAA')).toEqual({ status: 'loading' })
+
+    resolveFetch({ ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }) })
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(src.getYearlyState('AAA').status).toBe('ok')
+  })
+
+  it('does not start a second fetch while one is already in flight for the same symbol', async () => {
+    const fetchFn = vi.fn(() => new Promise(() => {})) // never resolves within this test
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+
+    src.requestYearly('AAA')
+    src.requestYearly('AAA')
+    src.requestYearly('AAA')
+    await Promise.resolve()
+
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not refetch a fresh cache within the refresh interval', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+
+    src.requestYearly('AAA') // still fresh: no second network call
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('refetches once the cached success is older than the refresh interval', async () => {
+    let now = NOW
+    const fetchFn = vi.fn(async () => ({
+      ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => now)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+
+    now += 7 * 60 * 60 // past the 6-hour refresh interval
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+  })
+
+  // Lesson 10 in docs/LESSONS.md, exactly: a guard cleared on failure (for
+  // example in a `finally`) is not a guard, it is a request storm. A failed
+  // yearly fetch must wait out a cooldown, not retry on the very next call.
+  it('does not retry immediately after a failure — a cooldown, not a guard cleared in finally', async () => {
+    let now = NOW
+    const fetchFn = vi.fn(async () => { throw new Error('ENOTFOUND') })
+    const src = new StockSource(SYMS, fetchFn as never, () => now)
+
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    expect(src.getYearlyState('AAA')).toEqual({ status: 'error' })
+
+    // Simulates a render loop calling requestYearly again on every render
+    // tick while the symbol stays selected — the exact shape of the album-art
+    // request storm. Time has not moved, so the cooldown must still be active.
+    for (let i = 0; i < 5; i++) src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+
+    now += 6 * 60 // past the 5-minute cooldown
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the last known good series when a later refresh fails, rather than discarding it', async () => {
+    let now = NOW
+    let fail = false
+    const fetchFn = vi.fn(async () => {
+      if (fail) throw new Error('ENOTFOUND')
+      return { ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }) }
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => now)
+
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    const firstState = src.getYearlyState('AAA')
+    expect(firstState.status).toBe('ok')
+
+    now += 7 * 60 * 60 // stale enough to trigger a refetch
+    fail = true
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // The failed refresh must not have blanked or errored the existing cache.
+    expect(src.getYearlyState('AAA')).toEqual(firstState)
+  })
+
+  it('reports error, never a fabricated ok, for a symbol that has never once succeeded', async () => {
+    const fetchFn = vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(src.getYearlyState('AAA')).toEqual({ status: 'error' })
+  })
+
+  it('fetches each symbol independently — one symbol\'s state never leaks into another\'s', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.includes('AAA')) return { ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }) }
+      return { ok: false, status: 404, json: async () => ({}) }
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    src.requestYearly('BBB')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(src.getYearlyState('AAA').status).toBe('ok')
+    expect(src.getYearlyState('BBB').status).toBe('error')
+  })
+})

@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest'
+import { createHash } from 'node:crypto'
 import { StocksPage } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { SYMBOLS } from '../../src/sources/stocks.js'
-import type { Quote, MarketState, StockStatus } from '../../src/sources/stocks.js'
+import type { Quote, MarketState, StockStatus, YearlyState } from '../../src/sources/stocks.js'
 
 const NOW = 1786549560
 
@@ -39,6 +40,10 @@ interface Fakes {
   marketState: MarketState
   /** Symbols `isSymbolStale` reports true for. */
   staleSymbols: Set<string>
+  /** Per-symbol 52-week state. A symbol absent here reports `'unknown'`,
+   * matching the real source before `requestYearly` has ever been called
+   * for it. */
+  yearlyStates: Map<string, YearlyState>
 }
 
 function build(over: Partial<Fakes> = {}) {
@@ -47,17 +52,21 @@ function build(over: Partial<Fakes> = {}) {
     status: 'ok',
     marketState: 'open',
     staleSymbols: new Set(),
+    yearlyStates: new Map(),
     ...over,
   }
   const calls: string[] = []
+  const yearlyRequests: string[] = []
   const source = {
     getQuotes: () => f.quotes,
     getStatus: () => f.status,
     getMarketState: () => f.marketState,
     isSymbolStale: (symbol: string) => f.staleSymbols.has(symbol),
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
+    getYearlyState: (symbol: string): YearlyState => f.yearlyStates.get(symbol) ?? { status: 'unknown' },
+    requestYearly: (symbol: string) => { yearlyRequests.push(symbol) },
   }
-  return { page: new StocksPage(source as never), calls, f }
+  return { page: new StocksPage(source as never), calls, f, yearlyRequests }
 }
 
 describe('StocksPage layout', () => {
@@ -411,6 +420,102 @@ describe('StocksPage detail view layout', () => {
     }
   })
 
+  describe('the chart shows the 52-week series once loaded, and the intraday series — always honestly labelled — until then', () => {
+    // Distinct from tslaLikeQuote's intraday `spark` (320..343), so a test
+    // can tell "the chart is drawing the yearly series" apart from "the
+    // chart is drawing the intraday one" by the VALUES, not just the label.
+    const yearlyValues = [10, 20, 30, 40, 50]
+
+    it('requests the yearly series for the symbol at the moment it is selected', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[2]!, tslaLikeQuote())
+      const { page, yearlyRequests } = build({ quotes })
+      page.onKeyPress(2)
+      expect(yearlyRequests).toEqual([SYMBOLS[2]])
+    })
+
+    it('does not re-request on every render — only on selection', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const { page, yearlyRequests } = build({ quotes })
+      page.onKeyPress(0)
+      page.render(NOW)
+      page.render(NOW)
+      page.render(NOW)
+      expect(yearlyRequests).toEqual([SYMBOLS[0]])
+    })
+
+    it.each(['unknown', 'loading', 'error'] as const)(
+      'falls back to the intraday series, labelled 1D, while the yearly state is %s',
+      (status) => {
+        const quotes = allQuotes()
+        quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+        const { page } = build({
+          quotes,
+          yearlyStates: new Map([[SYMBOLS[0]!, { status }]]),
+        })
+        page.onKeyPress(0)
+        const keys = page.render(NOW).keys
+        const [k4, k5, k6] = [keys[4]!, keys[5]!, keys[6]!]
+        expect(k4.spark!.values).toEqual(tslaLikeQuote().spark)
+        expect(k4.spark!.label).toBe('1D')
+        // Only the first key of the group carries the caption text — the
+        // other two still share its band geometry via labelBand.
+        expect(k5.spark!.label).toBeUndefined()
+        expect(k6.spark!.label).toBeUndefined()
+      },
+    )
+
+    it('draws the 52-week series, labelled 52 WK, once the yearly state is ok', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: yearlyValues }]]),
+      })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      const [k4, k5, k6] = [keys[4]!, keys[5]!, keys[6]!]
+      expect(k4.spark!.values).toEqual(yearlyValues)
+      expect(k5.spark!.values).toEqual(yearlyValues)
+      expect(k6.spark!.values).toEqual(yearlyValues)
+      expect(k4.spark!.label).toBe('52 WK')
+      // Never both: a set of values is either the yearly series with its
+      // own label, or the intraday series with ITS own label — the two
+      // must never pair up wrong.
+      expect(k4.spark!.values).not.toEqual(tslaLikeQuote().spark)
+    })
+
+    it('reserves the same labelBand on all three chart keys regardless of which one carries text', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: yearlyValues }]]),
+      })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      for (const key of [keys[4]!, keys[5]!, keys[6]!]) {
+        expect(key.spark!.labelBand).toBe(true)
+      }
+    })
+
+    it('falls back to 1D when the yearly series is ok but empty (fewer than 2 points)', () => {
+      // Guards the honesty rule literally: an 'ok' status with unusable data
+      // must not get labelled 52 WK just because the status says ok.
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: [42] }]]),
+      })
+      page.onKeyPress(0)
+      const key = page.render(NOW).keys[4]!
+      expect(key.spark!.label).toBe('1D')
+      expect(key.spark!.values).toEqual(tslaLikeQuote().spark)
+    })
+  })
+
   it('actually uses more of the key height for the chart than the default band (M4, measured)', () => {
     // A custom oscillating series, not `tslaLikeQuote`'s monotonic one:
     // slice 0 of a strictly increasing series only ever sees the SMALLEST
@@ -511,6 +616,24 @@ describe('StocksPage detail view layout', () => {
   it('does not dim the detail view for a fresh, non-stale symbol', () => {
     const keys = detailKeys()
     for (const key of keys.slice(0, 7)) expect(key.dim).not.toBe(true)
+  })
+})
+
+describe('StocksPage grid rendering, before and after the 52-week detail chart change', () => {
+  // Task 33 adds a 52-week chart to the DETAIL view only. The grid keeps its
+  // intraday sparkline untouched. This hash was captured from `renderKey`
+  // against this exact grid key BEFORE task 33 touched any source file, and
+  // must still match after — proof, not assertion, that the grid path was
+  // never edited.
+  it('renders the grid ticker key byte-identically to the pre-task-33 snapshot', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    const { page } = build({ quotes })
+    const key = page.render(NOW).keys[0]!
+    const buf = renderKey(key)
+    expect(createHash('sha256').update(buf).digest('hex')).toBe(
+      'fec8075230a539849e863956e7e9d6768962ff59d78b3b49a35be3d837df7bac',
+    )
   })
 })
 

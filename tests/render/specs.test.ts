@@ -194,6 +194,34 @@ describe('keyHash', () => {
     const b: KeySpec = { kind: 'control', pulse: { phase: 0.5, bars: 6, color: [70, 200, 110] } }
     expect(keyHash(a)).toBe(keyHash(b))
   })
+
+  // Task 33's 52-week detail chart: without `label` in the hash, switching
+  // the caption from `1D` to `52 WK` once the yearly fetch resolves would
+  // leave the OLD caption on the glass — the same defect lesson 11 already
+  // caught for `imageCrop` and `pulse.phase`, now for a spark caption.
+  it('differs when spark.label changes, even with the same values and colour', () => {
+    const values = [1, 2, 3]
+    const color: Rgb = [70, 200, 110]
+    const a: KeySpec = { kind: 'gauge', spark: { values, color, fullHeight: true, labelBand: true, label: '1D' } }
+    const b: KeySpec = { kind: 'gauge', spark: { values, color, fullHeight: true, labelBand: true, label: '52 WK' } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('differs when spark.label goes from absent to present', () => {
+    const values = [1, 2, 3]
+    const color: Rgb = [70, 200, 110]
+    const a: KeySpec = { kind: 'gauge', spark: { values, color, fullHeight: true, labelBand: true } }
+    const b: KeySpec = { kind: 'gauge', spark: { values, color, fullHeight: true, labelBand: true, label: '52 WK' } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('differs when spark.labelBand changes, even with the same values, colour and no label', () => {
+    const values = [1, 2, 3]
+    const color: Rgb = [70, 200, 110]
+    const a: KeySpec = { kind: 'gauge', spark: { values, color, fullHeight: true } }
+    const b: KeySpec = { kind: 'gauge', spark: { values, color, fullHeight: true, labelBand: true } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
 })
 
 describe('stripHash', () => {

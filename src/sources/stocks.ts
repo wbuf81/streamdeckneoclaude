@@ -46,9 +46,27 @@ const POLL_OPEN_MS = 60_000
 const POLL_CLOSED_MS = 15 * 60 * 1000
 /** A quote older than this, while the market is open, counts as stale. */
 const STALE_SECONDS = 15 * 60
+/**
+ * The yearly series is daily-interval data, so it does not need to be as
+ * fresh as the intraday poll. Measured live on 2026-08-13 (see
+ * docs/VERIFIED-FACTS.md "Stocks"): a full year of TSLA gave 251 points, one
+ * per trading day, no `null` holes. A cache this long avoids re-fetching a
+ * series that only grows by one point per trading day.
+ */
+const YEARLY_REFRESH_SECONDS = 6 * 60 * 60
+/**
+ * Lesson 10 in docs/LESSONS.md: a guard cleared on failure is a request
+ * storm, not a guard. A failed yearly fetch waits this long before the next
+ * attempt, instead of retrying on every selection or render.
+ */
+const YEARLY_COOLDOWN_SECONDS = 5 * 60
 
 function urlFor(symbol: string): string {
   return `${BASE_URL}/${encodeURIComponent(symbol)}?range=1d&interval=5m`
+}
+
+function urlForYearly(symbol: string): string {
+  return `${BASE_URL}/${encodeURIComponent(symbol)}?range=1y&interval=1d`
 }
 
 function numberOrNull(v: unknown): number | null {
@@ -185,6 +203,29 @@ interface FetchResult {
 }
 
 /**
+ * The 52-week detail chart's own state for one symbol. `'unknown'` means
+ * nobody has asked for this symbol yet. `'loading'` means a fetch is in
+ * flight and no cached series exists yet. `'ok'` carries at least 2 daily
+ * closes, oldest first. `'error'` means the last attempt failed and no
+ * successful fetch has EVER landed for this symbol — a symbol with older
+ * good data keeps reporting `'ok'` with that data while a background retry
+ * is in cooldown, per docs/LESSONS.md lesson 10.
+ */
+export type YearlyState =
+  | { status: 'unknown' }
+  | { status: 'loading' }
+  | { status: 'ok'; values: number[] }
+  | { status: 'error' }
+
+interface YearlyEntry {
+  status: 'ok' | 'error'
+  /** Closes, oldest first, null holes filtered. Empty when status is 'error'. */
+  values: number[]
+  /** Epoch seconds of the last SUCCESSFUL fetch. 0 when never successful. */
+  updatedAt: number
+}
+
+/**
  * Reads daily price movement for a fixed list of tickers from Yahoo's public
  * chart endpoint. It polls only while the page is visible, at 60 seconds
  * while the market is open and 15 minutes otherwise, so a closed market and
@@ -204,6 +245,15 @@ export class StockSource extends EventEmitter {
    * result instead of starting a second round of eight requests. */
   private inFlight: Promise<void> | null = null
   private lastKey = ''
+
+  /** The 52-week series, cached per symbol. Fetched lazily — see
+   * `requestYearly` — never for all eight symbols on every poll. */
+  private yearly = new Map<string, YearlyEntry>()
+  /** Symbols with a fetch in flight right now. */
+  private yearlyInFlight = new Set<string>()
+  /** Epoch seconds before which a failed symbol will not be retried. A
+   * cooldown, not a guard cleared in `finally` — see docs/LESSONS.md #10. */
+  private yearlyCooldownUntil = new Map<string, number>()
 
   constructor(
     private readonly symbols: readonly string[] = SYMBOLS,
@@ -376,6 +426,111 @@ export class StockSource extends EventEmitter {
     if (key === this.lastKey) return
     this.lastKey = key
     this.emit('change')
+  }
+
+  /**
+   * The 52-week series for one symbol, or its current fetch/failure state.
+   * Read-only: never triggers a fetch. The detail view calls this on every
+   * render, so it must stay a plain lookup with no side effect.
+   */
+  getYearlyState(symbol: string): YearlyState {
+    const entry = this.yearly.get(symbol)
+    if (entry?.status === 'ok') return { status: 'ok', values: entry.values }
+    if (this.yearlyInFlight.has(symbol)) return { status: 'loading' }
+    if (entry?.status === 'error') return { status: 'error' }
+    return { status: 'unknown' }
+  }
+
+  /**
+   * Fetches the 52-week series for one symbol, but only when there is a real
+   * reason to: no cached success yet, or the cached success is older than
+   * `YEARLY_REFRESH_SECONDS`, and no cooldown from a recent failure is
+   * active, and no fetch for this symbol is already in flight. The stocks
+   * page calls this once, when a symbol is selected for the detail view —
+   * never for all eight symbols on every poll.
+   *
+   * Fire-and-forget: the caller reads the result later through
+   * `getYearlyState`, the same pattern `setVisible` uses for the intraday
+   * poll.
+   */
+  requestYearly(symbol: string): void {
+    if (this.stopped) return
+    if (this.yearlyInFlight.has(symbol)) return
+
+    const now = this.now()
+    const entry = this.yearly.get(symbol)
+    if (entry?.status === 'ok' && now - entry.updatedAt < YEARLY_REFRESH_SECONDS) return
+    const cooldownUntil = this.yearlyCooldownUntil.get(symbol) ?? 0
+    if (now < cooldownUntil) return
+
+    this.yearlyInFlight.add(symbol)
+    void this.doFetchYearly(symbol).finally(() => {
+      this.yearlyInFlight.delete(symbol)
+    })
+  }
+
+  private async doFetchYearly(symbol: string): Promise<void> {
+    let res
+    try {
+      res = await this.fetchFn(urlForYearly(symbol), {
+        headers: { 'User-Agent': USER_AGENT },
+      })
+    } catch (e) {
+      // Runs on every failed attempt while a symbol keeps failing, so this
+      // must log once per symbol, not once per attempt.
+      log.once(`stocks-yearly-network-${symbol}`, `Yearly fetch for ${symbol} failed: ${String(e)}`)
+      this.failYearly(symbol)
+      return
+    }
+    if (this.stopped) return
+
+    if (!res.ok) {
+      log.once(
+        `stocks-yearly-http-${symbol}`,
+        `Yearly fetch for ${symbol} failed with status ${res.status}.`,
+      )
+      this.failYearly(symbol)
+      return
+    }
+    log.clearOnce(`stocks-yearly-network-${symbol}`)
+    log.clearOnce(`stocks-yearly-http-${symbol}`)
+
+    let body: unknown
+    try {
+      body = await res.json()
+    } catch (e) {
+      log.once(`stocks-yearly-json-${symbol}`, `Yearly response for ${symbol} is not valid JSON: ${String(e)}`)
+      this.failYearly(symbol)
+      return
+    }
+    if (this.stopped) return
+
+    const values = extractCloses(body)
+    if (values.length < 2) {
+      log.once(`stocks-yearly-parse-${symbol}`, `Yearly response for ${symbol} has no usable series.`)
+      this.failYearly(symbol)
+      return
+    }
+    log.clearOnce(`stocks-yearly-json-${symbol}`)
+    log.clearOnce(`stocks-yearly-parse-${symbol}`)
+
+    this.yearly.set(symbol, { status: 'ok', values, updatedAt: this.now() })
+    this.yearlyCooldownUntil.delete(symbol)
+  }
+
+  /**
+   * Records a failed yearly fetch. Sets a cooldown so the NEXT call to
+   * `requestYearly` for this symbol waits rather than retrying immediately
+   * (docs/LESSONS.md #10). A symbol with an existing successful cache keeps
+   * that cache and reports `'ok'` — a transient failure must not discard
+   * good data that is merely a little older than the refresh interval.
+   */
+  private failYearly(symbol: string): void {
+    this.yearlyCooldownUntil.set(symbol, this.now() + YEARLY_COOLDOWN_SECONDS)
+    const entry = this.yearly.get(symbol)
+    if (!entry || entry.status !== 'ok') {
+      this.yearly.set(symbol, { status: 'error', values: [], updatedAt: entry?.updatedAt ?? 0 })
+    }
   }
 
   async start(): Promise<void> {

@@ -255,6 +255,33 @@ No second endpoint was fetched — every one of these already comes back on
 the same `chart` response the source already requests for the spark and the
 price.
 
+### Task 33: the 52-week chart's own request, verified live on 2026-08-13
+
+A second request, on the SAME keyless endpoint and the SAME `User-Agent`:
+`https://query1.finance.yahoo.com/v8/finance/chart/<SYMBOL>?range=1y&interval=1d`
+
+| Symbol | Points | `null` holes | Note |
+| --- | --- | --- | --- |
+| `TSLA` | 251 | 0 | full year of trading days |
+| `HIMS` | 251 | 0 | |
+| `SOFI` | 251 | 0 | |
+| `SPCX` | 42 | 0 | listed under a year ago — `firstTradeDate` limits it |
+
+- **The `meta` shape is the SAME `chart.result[0].meta` block**, so the
+  existing `extractMeta`/`extractCloses` helpers need no change to read it.
+  `fiftyTwoWeekHigh`, `fiftyTwoWeekLow`, `regularMarketPrice` and
+  `regularMarketVolume` are all still present.
+- **`meta.previousClose` is ABSENT on the yearly response** (present on the
+  intraday one). Only `chartPreviousClose` is there. This does not affect the
+  chart, which only reads `indicators.quote[0].close`, but it means the
+  yearly body must never be used as a substitute for the intraday one for any
+  price-derived field.
+- `meta.marketState` still does not exist here either, consistent with the
+  intraday endpoint.
+- A short-history symbol (`SPCX`, 42 points, not 251) is a real, expected
+  shape, not a malformed response — the chart must render correctly with far
+  fewer than 252 points too.
+
 ---
 
 ## Weather
