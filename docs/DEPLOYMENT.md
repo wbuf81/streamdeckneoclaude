@@ -30,9 +30,12 @@ the wrapper script changes on an already-installed machine.
   ever see a truncated script mid-copy.
 - It re-verifies the wrap against the recovered original command, using a disposable
   temporary directory. It never writes to the live state directory during that check.
-- It refuses, and changes nothing, if it cannot recover the original command from the
-  installed wrap (for example, a hand edit removed the embedded blob and there is no usable
-  backup).
+- It refuses if it cannot recover the original command from the installed wrap (for example,
+  a hand edit removed the embedded blob and there is no usable backup). This does not touch
+  `settings.json`, the wrapper, or launchd — but it does not necessarily change literally
+  nothing on disk: `enforceDirModes` and the stray-probe repair run before this decision, so
+  a state directory that did not exist yet may already have been created. That directory
+  setup is deckd's own and safe to keep either way.
 - It is safe to run more than once. Each run re-copies and re-verifies from the same source.
 
 Before `refresh-wrapper` existed, the only way to update an installed wrapper was
@@ -40,10 +43,11 @@ Before `refresh-wrapper` existed, the only way to update an installed wrapper wa
 `refresh-wrapper` for a wrapper-only change.
 
 `install` and `refresh-wrapper` also run the user's real statusline command as part of their
-own verification (`verifyWrap`), with a synthetic payload. This runs the real command an
-extra time per install, and twice more per `refresh-wrapper`. A statusline that keeps its own
-per-session cache could see it disturbed by this synthetic run. This has not been observed on
-this machine's own statusline, but is a known, latent property of how verification works.
+own verification (`verifyWrap`), with a synthetic payload. Both run it TWICE, the same way:
+once as the plain original command, and once more nested inside the wrapped form. A statusline
+that keeps its own per-session cache could see it disturbed by this synthetic run. This has not
+been observed on this machine's own statusline, but is a known, latent property of how
+verification works.
 
 ## Uninstalling
 
@@ -62,6 +66,31 @@ wrap, but not at the expected path, do not force it. This means the installed wr
 a different state directory than this invocation resolved (a changed `DECKD_STATE_DIR`, or a
 moved wrapper). Check `DECKD_STATE_DIR` and retry with the correct value, or fix `statusLine`
 in `settings.json` by hand.
+
+## Verified facts about the wrapper's `set -m` and its kill line
+
+Two measurements about `src/install/statusline-wrapper.sh` that a future edit could break
+without any test failing loudly, unless the change also touches the other line named below.
+Restated here (not only in the wrapper's own header comments) so a later contradiction between
+a plan and this file cannot form silently — see lesson 16.
+
+- **`set -m` is load-bearing for stdin fidelity, not only for signalling.** Measured directly,
+  with `set -m` removed and nothing else changed: the no-mktemp fallback path handed the inner
+  command 0 bytes of stdin instead of the real payload (10 bytes, in the measured case). POSIX
+  assigns `/dev/null` to an asynchronous command's stdin when job control is off, and that
+  fallback path exists specifically to preserve the payload when caching is impossible.
+- **The process-group kill (`kill -TERM -"$INNER_PID"`) only reaches a compound inner command
+  because of a bash-specific builtin behaviour**, not POSIX `kill` semantics. For
+  `cat "$TMPIN" | sh -c "$INNER" &`, `$!` is the pid of the LAST process in the pipeline
+  (`sh -c`), not the job's process-group id (`cat`'s pid) — the group form only works because
+  bash's builtin `kill` looks the pid up in its own job table and calls `killpg` on the real
+  group. A strict POSIX `/bin/sh` (dash, for example) would just report no such process,
+  leaving a compound inner command's children orphaned.
+
+**Do not "simplify" either line on its own.** `set -m` and the process-group `kill` line are a
+pair: removing or rewriting one without re-measuring the other can silently reopen either the
+blanked-stdin failure or the orphaned-child failure. This project is macOS-only, and macOS's
+`/bin/sh` is bash 3.2, which is why the pairing works in production today.
 
 ## Restart the daemon
 
