@@ -142,20 +142,21 @@ anything still needed before that directory is cleaned.
   build from this working directory.
 - The validation baseline is 31 test files and 794 tests, plus typecheck, build, shell syntax,
   and `git diff --check`.
+- **Both P0 hardware checks PASS**, confirmed by the user on the real deck:
+  1. Unplug and reconnect while `deckd` runs — the device reconnects and repaints the full
+     current page with no manual restart.
+  2. Apple menu **Sleep**, then wake — the deck stays blank while asleep and repaints after
+     wake and unlock.
+
+  So no reconnect or sleep work is outstanding. Re-check both after any change to
+  `src/device.ts`, `src/lock-state.ts`, or the daemon's repaint path, because these two paths
+  have no automated coverage that can replace a person at the Mac.
 
 ### Next work, in priority order
 
-#### P0 — Finish two short hardware checks
+#### P0 — none open
 
-These checks still need a person at the Mac. They do not justify more code unless one fails.
-
-1. Unplug and reconnect the Stream Deck while `deckd` runs. It should reconnect and repaint
-   the full current page without a manual restart.
-2. Use Apple menu **Sleep**, then wake the Mac. This is different from pressing Escape at the
-   lock screen. The deck should stay blank while asleep and repaint after wake and unlock.
-
-Record both outcomes in this file. If either fails, keep it P0 and use `deckd.log` to identify
-the transition before changing code.
+The two hardware checks are done and both pass. See the verified list above.
 
 #### P1 — Add `deckd status` and `deckd doctor`
 
