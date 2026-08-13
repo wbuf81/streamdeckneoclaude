@@ -159,6 +159,22 @@ describe('keyHash', () => {
     const b: KeySpec = { kind: 'control', glyph: '♥', glyphColor: [230, 60, 60] }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
+
+  // Lesson 11: a new field must affect keyHash, or the daemon never redraws
+  // a key whose only change was that field, leaving stale pixels.
+  it('differs when spark.fullHeight changes, even with the same values and colour', () => {
+    const values = [1, 2, 3]
+    const color: Rgb = [70, 200, 110]
+    const a: KeySpec = { kind: 'gauge', spark: { values, color } }
+    const b: KeySpec = { kind: 'gauge', spark: { values, color, fullHeight: true } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('differs when a lineSizes entry changes from an array of one candidate to another', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['1234.56'], lineSizes: [[24, 20, 16]] }
+    const b: KeySpec = { kind: 'gauge', lines: ['1234.56'], lineSizes: [[24, 20]] }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
 })
 
 describe('stripHash', () => {

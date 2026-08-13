@@ -31,6 +31,14 @@ export interface SparkSpec {
    * byte-identical, see `renderKey`'s `drawSpark`.
    */
   slice?: { index: number; count: number }
+  /**
+   * Draws the bars across the whole key height instead of the default lower
+   * band. Only correct for a key that carries no text lines — the stocks
+   * detail chart's three keys are chart-only, so the chart may as well own
+   * the full tile instead of wasting the top half. Absent, the spark keeps
+   * its original band, exactly as before this field existed.
+   */
+  fullHeight?: boolean
 }
 
 export interface KeySpec {
@@ -44,13 +52,28 @@ export interface KeySpec {
    */
   lineColors?: (Rgb | undefined)[]
   /**
-   * Font size per line, in pixels, aligned by index with `lines`. A missing
-   * entry, or an index past the end of this array, uses the default size.
-   * Absent altogether, every line keeps the original 11 px size and the
-   * original fixed line advance, so a page that never sets this field
-   * renders exactly as it did before this field existed.
+   * Font size per line, aligned by index with `lines`. A missing entry, or
+   * an index past the end of this array, uses the default size. Absent
+   * altogether, every line keeps the original 11 px size and the original
+   * fixed line advance, so a page that never sets this field renders exactly
+   * as it did before this field existed.
+   *
+   * Each entry is either:
+   * - a plain `number`: a fixed size, drawn as given, never measured. Use
+   *   this when the page already knows the text always fits (a short fixed
+   *   label, for example).
+   * - an `array` of candidate sizes, largest first or in any order: the page
+   *   declares intent ("try to fit this line at one of these sizes") and
+   *   `renderKey` measures with the real canvas and picks the largest
+   *   candidate that fits the key's usable width, shrinking further than the
+   *   smallest candidate (by truncating the text) rather than ever clipping
+   *   past the edge. Pages stay pure — no canvas — because the measuring
+   *   happens here, in the renderer, not in the page. Consecutive lines that
+   *   pass the SAME candidate array (by value) are sized as one unit: the
+   *   renderer picks one size that fits every line in the group, so a pair
+   *   like a range's high and low never ends up two different sizes.
    */
-  lineSizes?: number[]
+  lineSizes?: (number | number[])[]
   /**
    * Explicit top-edge y for one line, aligned by index with `lines`. A
    * missing entry, or an index past the end of this array, keeps the running

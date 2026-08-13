@@ -15,6 +15,18 @@ const BAR_Y = 66
 const BAR_H = 8
 const SPARK_Y = 48
 const SPARK_H = 40
+/** A chart-only key (no text lines) can use the whole tile instead of the
+ * default lower band. Leaves the same top and bottom margin the default
+ * band keeps, just stretched over the full height. */
+const SPARK_FULL_Y = 6
+const SPARK_FULL_H = 84
+/**
+ * Usable text width of one key: 96 − 3 border − 6 padding each side.
+ * Matches docs/VERIFIED-FACTS.md's measured text budget table. Used to
+ * resolve a `lineSizes` candidate-array entry to a concrete size that
+ * actually fits, at draw time — see `resolveLineSpecs`.
+ */
+const TEXT_MAX_WIDTH = KEY_SIZE - BORDER - PAD * 2
 /** Baseline of the strip's second text line. */
 const STRIP_LINE_2_Y = 21
 /** Dims a colour, or a colour emoji's `globalAlpha`, to this fraction. One
@@ -88,12 +100,14 @@ function drawBar(
  * byte-identical.
  */
 function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
-  const { values, color, slice } = spark
+  const { values, color, slice, fullHeight } = spark
   if (values.length < 2) return
 
   const x0 = BORDER + PAD
   const x1 = KEY_SIZE - PAD
   const width = x1 - x0
+  const bandY = fullHeight ? SPARK_FULL_Y : SPARK_Y
+  const bandH = fullHeight ? SPARK_FULL_H : SPARK_H
 
   const count = slice && slice.count > 0 ? slice.count : 1
   const index = slice?.index ?? 0
@@ -114,7 +128,7 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
 
     const v = values[i]!
     const frac = range === 0 ? 0.5 : (v - min) / range
-    const h = frac * SPARK_H
+    const h = frac * bandH
     if (h <= 0) continue
 
     let x = x0 + (virtualX - sliceStart)
@@ -123,10 +137,20 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
       w -= x0 - x
       x = x0
     }
-    if (x + w > x1) w = x1 - x
     if (w <= 0) continue
+    if (x >= x1) continue
+    // Clip a bar that runs past this key's own margin — but never below the
+    // 1 px floor above. Above 81 values `barW < 1`, so a strict clip would
+    // shrink the last bar to a sub-pixel sliver that renders as nothing,
+    // where the pre-slice code always drew at least 1 px. A few values run
+    // slightly into the padding instead: a visible bar beats an invisible
+    // one, and the padding itself has nothing else drawn in it.
+    if (x + w > x1) {
+      const clipped = x1 - x
+      if (clipped >= 1) w = clipped
+    }
 
-    const y = SPARK_Y + (SPARK_H - h)
+    const y = bandY + (bandH - h)
     ctx.fillRect(x, y, w, h)
   }
 }
@@ -162,6 +186,83 @@ function drawCroppedImage(ctx: SKRSContext2D, img: Image, crop?: ImageCrop): voi
     KEY_SIZE,
     KEY_SIZE,
   )
+}
+
+/** Shrinks `text` one character at a time, replacing the tail with an
+ * ellipsis, until it measures at or under `maxWidth` at the context's
+ * CURRENT font. Used only as the last resort, when even the smallest
+ * `lineSizes` candidate does not fit — truncating is a smaller defect than
+ * drawing past the key's edge. */
+function shrinkToFit(ctx: SKRSContext2D, text: string, maxWidth: number): string {
+  if (ctx.measureText(text).width <= maxWidth) return text
+  for (let n = text.length - 1; n > 0; n--) {
+    const candidate = text.slice(0, n) + '…'
+    if (ctx.measureText(candidate).width <= maxWidth) return candidate
+  }
+  return '…'
+}
+
+function sameSizeCandidates(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i])
+}
+
+/**
+ * Resolves each line's `lineSizes` entry to a concrete size and the exact
+ * text to draw. A plain `number` is used as given, unmeasured — the legacy
+ * path, and the path for any page that already knows its text fits. An
+ * `array` is a set of candidates: this measures with the SAME context and
+ * font `renderKey` draws with, and picks the largest one that fits
+ * `maxWidth`. Consecutive lines that pass the identical candidate array (by
+ * value) are resolved as ONE group, sized to whichever member of the group
+ * needs the smallest size to fit — so a range's high and low, which always
+ * pass the same candidate list, end up the same size instead of the low
+ * rendering bigger than the high above it.
+ *
+ * `lineSizes` entirely absent returns every line at the fixed legacy size,
+ * 11, with no measuring at all — byte-identical to before this function
+ * existed, for the pages that have never set it.
+ */
+function resolveLineSpecs(
+  ctx: SKRSContext2D,
+  lines: string[],
+  lineSizes: (number | number[])[] | undefined,
+  maxWidth: number,
+): { size: number; text: string }[] {
+  if (!lineSizes) return lines.map((text) => ({ size: 11, text }))
+
+  const out: { size: number; text: string }[] = []
+  let i = 0
+  while (i < lines.length) {
+    const spec = lineSizes[i]
+    if (Array.isArray(spec)) {
+      let j = i + 1
+      while (j < lines.length) {
+        const next = lineSizes[j]
+        if (!Array.isArray(next) || !sameSizeCandidates(next, spec)) break
+        j++
+      }
+      const groupTexts = lines.slice(i, j)
+      const sorted = [...spec].sort((a, b) => b - a)
+      let chosen: number | null = null
+      for (const size of sorted) {
+        ctx.font = `${size}px ${FONT}`
+        if (groupTexts.every((t) => ctx.measureText(t).width <= maxWidth)) {
+          chosen = size
+          break
+        }
+      }
+      const size = chosen ?? sorted[sorted.length - 1] ?? 11
+      ctx.font = `${size}px ${FONT}`
+      for (let k = i; k < j; k++) {
+        out.push({ size, text: shrinkToFit(ctx, lines[k]!, maxWidth) })
+      }
+      i = j
+    } else {
+      out.push({ size: typeof spec === 'number' ? spec : 11, text: lines[i]! })
+      i++
+    }
+  }
+  return out
 }
 
 /**
@@ -225,15 +326,19 @@ export function renderKey(spec: KeySpec): Buffer {
     ctx.textAlign = centered ? 'center' : 'left'
     ctx.textBaseline = 'top'
     const x = centered ? KEY_SIZE / 2 : BORDER + PAD
+    // Resolved once, up front: a candidate-array entry may need to look at
+    // OTHER lines in its group (see `resolveLineSpecs`), which the
+    // line-by-line draw loop below cannot do after it has already moved on.
+    const resolved = resolveLineSpecs(ctx, spec.lines, spec.lineSizes, TEXT_MAX_WIDTH)
     let y = PAD
-    for (let i = 0; i < spec.lines.length; i++) {
+    for (let i = 0; i < resolved.length; i++) {
+      const { size, text } = resolved[i]!
       // `lineSizes` is opt-in per key. Its absence takes the exact legacy
       // path: 11 px text on a fixed 14 px advance, so every page that has
       // never set it (Spotify, stocks, weather) renders pixel-for-pixel as
       // it did before this field existed. A present array switches to
       // size-driven spacing, because a 28 px line needs more room below it
       // than an 11 px one — a fixed advance would let two lines overlap.
-      const size = spec.lineSizes ? spec.lineSizes[i] ?? 11 : 11
       const advance = spec.lineSizes ? size + 4 : 14
       ctx.font = `${size}px ${FONT}`
       const color = spec.lineColors?.[i] ?? theme.text
@@ -242,7 +347,7 @@ export function renderKey(spec: KeySpec): Buffer {
       // (the case for every page except the new weather layout) keeps the
       // running automatic position, so nothing else changes.
       const drawY = spec.lineY?.[i] ?? y
-      ctx.fillText(spec.lines[i]!, x, drawY)
+      ctx.fillText(text, x, drawY)
       y = drawY + advance
     }
   }

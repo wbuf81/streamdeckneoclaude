@@ -103,7 +103,15 @@ describe('fitSize', () => {
     expect(size).toBe(16)
   })
 
-  it('measures with canvas rather than the advance table, for a candidate list of one', () => {
-    expect(fitSize('x', [11], USABLE_WIDTH)).toBe(11)
+  it('measures each candidate rather than assuming the largest always fits', () => {
+    // T1 from the review: a single-candidate list is vacuous — it returns
+    // that candidate under ANY implementation, including one that never
+    // measures anything at all. A string that fits at 16 px but not at
+    // 24 px (both verified below, independently of fitSize) forces the
+    // function to actually measure and REJECT the larger candidate before
+    // it can return the smaller one.
+    expect(measure('1234.56', 24)).toBeGreaterThan(USABLE_WIDTH)
+    expect(measure('1234.56', 16)).toBeLessThanOrEqual(USABLE_WIDTH)
+    expect(fitSize('1234.56', [24, 16], USABLE_WIDTH)).toBe(16)
   })
 })

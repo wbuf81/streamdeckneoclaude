@@ -493,6 +493,27 @@ describe('renderKey lineSizes', () => {
     }
     expect(firstInkRow).toBeGreaterThanOrEqual(6)
     expect(firstInkRow).toBeLessThan(21)
+
+    // T2 from the review: the check above only ever finds LINE 0's ink,
+    // because it scans from y=0 upward and line 0 always paints first. A
+    // bug that used the wrong running `y` for line 1 (for example
+    // `y = y + advance` instead of `y = drawY + advance`) would still pass
+    // it. Scanning strictly AFTER line 0's own ink has ended isolates line
+    // 1 and pins its start to the correct automatic position, 21.
+    const inkAt = (y: number) => {
+      for (let x = 9; x < 90; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) return true
+      }
+      return false
+    }
+    expect(inkAt(17)).toBe(false) // line 0 (11 px, starts y 6) has finished
+    let line1Start = -1
+    for (let y = 18; y < 30 && line1Start < 0; y++) {
+      if (inkAt(y)) line1Start = y
+    }
+    // Measured: line 1 (28 px) starts painting ink at row 23.
+    expect(line1Start).toBeGreaterThanOrEqual(21)
+    expect(line1Start).toBeLessThan(26)
   })
 
   it('does not overlap three lines at 11, 24 and 11 px: gaps stay background, lines carry ink', () => {
@@ -576,73 +597,185 @@ describe('renderKey lineY', () => {
     // advance landed — 3 + 14 = 17 — not from the original default start of
     // 6, and not by resetting to some other fixed value.
     const buf = renderKey({ kind: 'gauge', lines: ['A', 'B'], lineY: [3] })
+    const inkAt = (y: number) => {
+      for (let x = 9; x < 90; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) return true
+      }
+      return false
+    }
     let firstInkRow = -1
     for (let y = 0; y < 30 && firstInkRow < 0; y++) {
-      for (let x = 9; x < 90; x++) {
+      if (inkAt(y)) firstInkRow = y
+    }
+    expect(firstInkRow).toBeGreaterThanOrEqual(3)
+    expect(firstInkRow).toBeLessThan(17)
+
+    // T2 from the review: the check above only ever finds LINE 0's ink
+    // (drawn at explicit y 3), so a bug that used the wrong running `y` for
+    // line 1 — for example `y = y + advance` (landing on the ORIGINAL
+    // default start, 6 + 14 = 20) instead of `y = drawY + advance` (the
+    // correct 3 + 14 = 17) — would still pass it. Scanning strictly after
+    // line 0's own ink has ended isolates line 1 and pins its start to the
+    // correct value, not the buggy one.
+    expect(inkAt(12)).toBe(false) // line 0 (starts y 3) has finished by here
+    let line1Start = -1
+    for (let y = 13; y < 25 && line1Start < 0; y++) {
+      if (inkAt(y)) line1Start = y
+    }
+    // Measured: the correct automatic advance paints line 1's first ink at
+    // row 18. The buggy alternative above would land several rows later.
+    expect(line1Start).toBeGreaterThanOrEqual(17)
+    expect(line1Start).toBeLessThan(20)
+  })
+
+  it('does not affect rendering when lineY is absent, matching the automatic advance exactly', () => {
+    // T1 from the review: comparing a spec to itself twice is vacuous — it
+    // passes for any implementation, including one that ignores lineY
+    // entirely. Comparing lineY-ABSENT against an EXPLICIT lineY that
+    // matches the known automatic positions (PAD=6 for line 0, then
+    // 6 + (11+4) = 21 for line 1) proves the two paths truly agree, not
+    // just that rendering is deterministic.
+    const spec = { kind: 'gauge' as const, lines: ['5-HR CAP', '20%'], lineSizes: [11, 28] }
+    const withoutLineY = renderKey(spec)
+    const withMatchingLineY = renderKey({ ...spec, lineY: [6, 21] })
+    expect(withoutLineY.equals(withMatchingLineY)).toBe(true)
+  })
+})
+
+// T3 from the review: a "no overlap" proof used to live here, hand-writing
+// the weather page's own lineSizes/lineY/bg constants rather than rendering
+// its real output — decoupled, so it could not have caught finding A4 (the
+// empty-tile placeholder that skipped the banded layout entirely). That
+// geometric proof now renders `WeatherPage`'s actual `dayKey` output,
+// across all eight condition tints (T4), in
+// `tests/pages/weather-page.test.ts`, under "day tile: rendered band
+// geometry has no overlap, for every condition".
+
+describe('renderKey spark fullHeight', () => {
+  it('uses more of the key height than the default band, for a chart-only key', () => {
+    const values = Array.from({ length: 20 }, (_, i) => i)
+    const short = renderKey({ kind: 'gauge', spark: { values, color: theme.green } })
+    const full = renderKey({ kind: 'gauge', spark: { values, color: theme.green, fullHeight: true } })
+    // The default band's tallest possible bar starts no earlier than
+    // SPARK_Y (48). A full-height chart must paint ink above that.
+    let shortTop = -1
+    let fullTop = -1
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (shortTop < 0 && !near3(probe(short, x, y), theme.bg)) shortTop = y
+        if (fullTop < 0 && !near3(probe(full, x, y), theme.bg)) fullTop = y
+      }
+      if (shortTop >= 0 && fullTop >= 0) break
+    }
+    expect(shortTop).toBeGreaterThanOrEqual(8)
+    expect(fullTop).toBeLessThan(shortTop)
+  })
+
+  it('affects the hash, so a page toggling it redraws', () => {
+    const a = { kind: 'gauge' as const, spark: { values: [1, 5, 2], color: theme.green } }
+    const b = { kind: 'gauge' as const, spark: { values: [1, 5, 2], color: theme.green, fullHeight: true } }
+    expect(sha256(renderKey(a))).not.toBe(sha256(renderKey(b)))
+  })
+})
+
+describe('renderKey spark: M1, a visible last bar above 81 points', () => {
+  it('draws a visible last bar even where barW < 1, restoring the pre-slice guarantee of at least 1 px', () => {
+    // Above 81 values on the 81 px-wide band, barW < 1. The clamp added for
+    // slice-boundary clipping used to shrink the last bar to a sub-pixel
+    // sliver that vanished — verified by the review against the
+    // pre-55b7713 renderKey, which always drew at least 1 px.
+    const values = Array.from({ length: 100 }, (_, i) => i)
+    const buf = renderKey({ kind: 'gauge', spark: { values, color: theme.green } })
+    let inkNearRightEdge = false
+    for (let x = 85; x < 90 && !inkNearRightEdge; x++) {
+      for (let y = 0; y < KEY_SIZE; y++) {
         if (!near3(probe(buf, x, y), theme.bg)) {
-          firstInkRow = y
+          inkNearRightEdge = true
           break
         }
       }
     }
-    expect(firstInkRow).toBeGreaterThanOrEqual(3)
-    expect(firstInkRow).toBeLessThan(17)
+    expect(inkNearRightEdge).toBe(true)
   })
 
-  it('does not affect rendering when lineY is absent, matching the legacy path exactly', () => {
-    const a = renderKey({ kind: 'gauge', lines: ['5-HR CAP', '20%'], lineSizes: [11, 28] })
-    const b = renderKey({ kind: 'gauge', lines: ['5-HR CAP', '20%'], lineSizes: [11, 28] })
-    expect(a.equals(b)).toBe(true)
+  it('still clips a bar that runs well past the slice margin, when there is room to shrink it', () => {
+    // The clamp still does its original job: a bar whose UNCLIPPED width
+    // would land far past x1 is cut down, not just left alone.
+    const values = Array.from({ length: 3 }, (_, i) => i)
+    const buf = renderKey({
+      kind: 'gauge',
+      spark: { values, color: theme.green, slice: { index: 2, count: 3 } },
+    })
+    // Slice index 2 of 3 for a 3-value series: this key's own slice sits
+    // entirely past its own span for most bars, so it draws little to
+    // nothing — proving no throw and no bleed past the key's own width.
+    expect(() => renderKey({ kind: 'gauge', spark: { values, color: theme.green, slice: { index: 2, count: 3 } } })).not.toThrow()
+    expect(buf.length).toBeGreaterThan(0)
   })
 })
 
-describe('renderKey weather band layout: no overlap', () => {
-  // This is the geometric proof the user's real-device complaint demands:
-  // a label, an emoji, a coloured temperature line and a coloured rain-chance
-  // line, laid out exactly as `WeatherPage.dayKey` builds it, with none of
-  // the bands touching another.
-  function weatherLikeKey() {
-    return renderKey({
-      kind: 'gauge',
-      lines: ['THU', '95°/77°', '47%'],
-      lineSizes: [12, 16, 20],
-      lineY: [3, 54, 74],
-      lineColors: [undefined, theme.red, theme.blue],
-      align: 'center',
-      emoji: '☀️',
-      bg: [34, 27, 18],
-    })
-  }
+describe('renderKey lineSizes as an array of candidates (A3: the renderer resolves, measured at draw time)', () => {
+  it('picks the largest candidate that fits, just like a plain number would have', () => {
+    const asNumber = renderKey({ kind: 'gauge', lines: ['9.99'], lineSizes: [24] })
+    const asArray = renderKey({ kind: 'gauge', lines: ['9.99'], lineSizes: [[24, 20, 16]] })
+    expect(asNumber.equals(asArray)).toBe(true)
+  })
 
-  const inkOnRow = (buf: Buffer, y: number) => {
-    for (let x = 9; x < 90; x++) {
-      if (!near3(probe(buf, x, y), [34, 27, 18])) return true
+  it('drops to a smaller candidate rather than clipping, for a wide value', () => {
+    // The review's exact repro: `▲ 150.00%` measures 86.7 px at 16 px,
+    // clipping past the 81 px usable width. A candidate array must let the
+    // renderer shrink further than the smallest fixed size a page used to
+    // be limited to.
+    const wide = renderKey({ kind: 'gauge', lines: ['▲ 150.00%'], lineSizes: [[16]] })
+    const withSmaller = renderKey({ kind: 'gauge', lines: ['▲ 150.00%'], lineSizes: [[16, 13, 11]] })
+    expect(wide.equals(withSmaller)).toBe(false)
+    // No ink at or past the right margin (x = 90) for the version with room
+    // to shrink.
+    let clipped = false
+    for (let y = 0; y < KEY_SIZE; y++) {
+      if (!near3(probe(withSmaller, 90, y), theme.bg)) clipped = true
     }
-    return false
-  }
-
-  it('paints ink inside band 1 (the day label, y 3 to 15)', () => {
-    expect(inkOnRow(weatherLikeKey(), 10)).toBe(true)
+    expect(clipped).toBe(false)
   })
 
-  it('paints ink inside band 3 (the temperature line, y 54 to 70)', () => {
-    expect(inkOnRow(weatherLikeKey(), 60)).toBe(true)
+  it('truncates rather than overflows, when even the smallest candidate does not fit', () => {
+    const buf = renderKey({
+      kind: 'gauge',
+      lines: ['a very long line of text indeed'],
+      lineSizes: [[24, 20, 16]],
+    })
+    let clipped = false
+    for (let y = 0; y < KEY_SIZE; y++) {
+      if (!near3(probe(buf, 90, y), theme.bg)) clipped = true
+    }
+    expect(clipped).toBe(false)
   })
 
-  it('paints ink inside band 4 (the rain chance, y 74 to 88)', () => {
-    expect(inkOnRow(weatherLikeKey(), 80)).toBe(true)
-  })
+  it('sizes a group of consecutive lines that pass the SAME candidate array as one unit (M3)', () => {
+    // A range's high (short) and low (long) must not end up two different
+    // sizes — shaped like the review's 52-week example: '498.83' alone
+    // would fit the largest candidate (24), but paired with '1234.56' (which
+    // needs 16 to fit), the GROUP must share the smaller size.
+    const grouped = renderKey({
+      kind: 'gauge',
+      lines: ['498.83', '1234.56'],
+      lineSizes: [[24, 20, 16], [24, 20, 16]],
+    })
+    const standaloneAt16 = renderKey({ kind: 'gauge', lines: ['498.83'], lineSizes: [16] })
+    const standaloneAt24 = renderKey({ kind: 'gauge', lines: ['498.83'], lineSizes: [24] })
 
-  it('leaves the gap between band 1 and the emoji background, at y 16', () => {
-    expect(inkOnRow(weatherLikeKey(), 16)).toBe(false)
-  })
-
-  it('leaves the gap between the emoji and band 3 background, at y 52', () => {
-    expect(inkOnRow(weatherLikeKey(), 52)).toBe(false)
-  })
-
-  it('leaves the gap between band 3 and band 4 background, at y 72', () => {
-    expect(inkOnRow(weatherLikeKey(), 72)).toBe(false)
+    // Compare only the rows line 0 occupies (well before line 1 starts), so
+    // line 1's own text does not affect the comparison.
+    const rowsEqual = (a: Buffer, b: Buffer, yFrom: number, yTo: number): boolean => {
+      for (let y = yFrom; y < yTo; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          if (!probe(a, x, y).every((v, i) => v === probe(b, x, y)[i])) return false
+        }
+      }
+      return true
+    }
+    expect(rowsEqual(grouped, standaloneAt16, 0, 18)).toBe(true)
+    expect(rowsEqual(grouped, standaloneAt24, 0, 18)).toBe(false)
   })
 })
 
