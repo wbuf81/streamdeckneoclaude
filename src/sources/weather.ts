@@ -19,6 +19,18 @@ const STALE_SECONDS = 2 * 60 * 60
 export interface DayForecast {
   /** Short label for the key, for example `THU`. `NOW` for the current period. */
   label: string
+  /**
+   * A stable calendar-date identity for this day tile, `YYYY-MM-DD`, taken
+   * from the anchor period's own `startTime`. Per docs/LESSONS.md lesson 19:
+   * the array this came from is rebuilt from scratch on every poll, and its
+   * length and contents shift as periods expire (the period at `label` "NOW"
+   * changes which real day it is every time the current period ends). A page
+   * that keeps only the array INDEX of the day the user opened would silently
+   * follow whatever day slides into that index next, not the day the user
+   * actually selected. `date` never changes for the same real day, so it is
+   * what a page should persist across a poll instead of the index.
+   */
+  date: string
   emoji: string
   high: number | null
   low: number | null
@@ -128,6 +140,13 @@ function strOf(period: unknown, key: string): string {
   return typeof v === 'string' ? v : ''
 }
 
+/** The `YYYY-MM-DD` portion of a period's `startTime`, for example
+ * `"2026-08-14T18:00:00-04:00"` becomes `"2026-08-14"`. Empty when `period`
+ * carries no usable `startTime` — never throws, never fabricates a date. */
+function dateOf(period: unknown): string {
+  return strOf(period, 'startTime').slice(0, 10)
+}
+
 function boolOf(period: unknown, key: string): boolean {
   return asObj(period)[key] === true
 }
@@ -205,6 +224,7 @@ function buildDay(label: string, day: unknown | null, night: unknown | null): Da
   const shortForecast = strOf(anchor, 'shortForecast')
   return {
     label,
+    date: dateOf(anchor),
     emoji: weatherEmoji(shortForecast),
     high,
     low,

@@ -9,6 +9,17 @@ import {
 
 const NOW = 1_755_000_000
 
+/**
+ * Test quality: a source's fetch parameter must never fall back to the real
+ * global `fetch` inside the suite — that is one edit away from live network
+ * I/O, per the review's exact finding. A test that genuinely never expects a
+ * call passes this instead of `undefined`, so the constructor's own default
+ * parameter (`fetch as unknown as FetchLike`) never kicks in.
+ */
+const neverFetch = (): Promise<never> => {
+  throw new Error('test: fetch must not be called')
+}
+
 /** A window relative to NOW, in seconds. */
 function windowAround(now: number, offsetStart: number, offsetEnd: number) {
   return { start: now + offsetStart, end: now + offsetEnd, timezone: 'EDT', gmtoffset: -14400 }
@@ -243,7 +254,7 @@ afterEach(() => {
 
 describe('StockSource', () => {
   it('reports empty before the first successful refresh', () => {
-    const src = new StockSource(SYMS, undefined, () => NOW)
+    const src = new StockSource(SYMS, neverFetch as never, () => NOW)
     expect(src.getStatus()).toBe('empty')
     expect(src.getQuotes().size).toBe(0)
   })
@@ -532,7 +543,7 @@ describe('StockSource yearly series (the detail chart\'s 52-week data)', () => {
   // with more points. `extractCloses` already reads it generically.
 
   it('reports unknown for a symbol nobody has ever selected', () => {
-    const src = new StockSource(SYMS, undefined, () => NOW)
+    const src = new StockSource(SYMS, neverFetch as never, () => NOW)
     expect(src.getYearlyState('AAA')).toEqual({ status: 'unknown' })
   })
 
@@ -713,5 +724,101 @@ describe('StockSource yearly series (the detail chart\'s 52-week data)', () => {
     await Promise.resolve()
     expect(src.getYearlyState('AAA').status).toBe('ok')
     expect(src.getYearlyState('BBB').status).toBe('error')
+  })
+
+  // M4: `doFetchYearly` used to cache whatever the response held purely
+  // under the REQUESTED symbol, with no check that the body was actually
+  // for it — unlike `parseQuote`, which already resolves `meta.symbol` for
+  // the intraday body. The reviewer marked this "suspect" (no evidence Yahoo
+  // aliases any of the eight real tickers), so this proves the gap in the
+  // CODE, not a live alias: a same-shaped response that just carries a
+  // different `meta.symbol` must not be cached and reported as `ok`.
+  it('reports error, not ok, when the response body is for a different symbol than requested (M4)', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => chartBody({}, { symbol: 'ZZZ' }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(src.getYearlyState('AAA')).toEqual({ status: 'error' })
+  })
+
+  it('reports ok normally when the response carries no meta.symbol at all (nothing to cross-check)', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => chartBody({}, { symbol: undefined }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(src.getYearlyState('AAA').status).toBe('ok')
+  })
+
+  // Test quality: neither the page tests nor these source tests previously
+  // exercised a yearly-length (251-point) or short-series (43-point)
+  // response — every fixture reused the 3-point intraday `chartBody` close
+  // array. `extractCloses` is generic, but this proves the fetch-and-cache
+  // path itself (JSON parse, meta cross-check, caching) handles both real
+  // shapes end to end, not just the downstream chart geometry.
+  it('caches a full 251-point yearly series end to end', async () => {
+    const closes = Array.from({ length: 251 }, (_, i) => 100 + i * 0.5)
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        chart: {
+          result: [
+            {
+              meta: { ...chartBody().chart.result[0]!.meta, symbol: 'AAA' },
+              indicators: { quote: [{ close: closes }] },
+            },
+          ],
+        },
+      }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    const state = src.getYearlyState('AAA')
+    expect(state.status).toBe('ok')
+    if (state.status === 'ok') {
+      expect(state.values).toHaveLength(251)
+      expect(state.updatedAt).toBe(NOW)
+    }
+  })
+
+  it('caches a short (43-point) yearly series end to end, the same shape a recently-listed symbol gives', async () => {
+    const closes = Array.from({ length: 43 }, (_, i) => 50 + i)
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        chart: {
+          result: [
+            {
+              meta: { ...chartBody().chart.result[0]!.meta, symbol: 'AAA' },
+              indicators: { quote: [{ close: closes }] },
+            },
+          ],
+        },
+      }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    const state = src.getYearlyState('AAA')
+    expect(state.status).toBe('ok')
+    if (state.status === 'ok') expect(state.values).toHaveLength(43)
   })
 })

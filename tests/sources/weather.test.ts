@@ -10,6 +10,17 @@ import {
 const NOW = 1_755_000_000
 const FORECAST_URL = 'https://api.weather.gov/gridpoints/OKX/33,37/forecast'
 
+/**
+ * Test quality: a source's fetch parameter must never fall back to the real
+ * global `fetch` inside the suite — that is one edit away from live network
+ * I/O. A test that genuinely never expects a call passes this instead of
+ * `undefined`, so the constructor's own default parameter
+ * (`fetch as unknown as FetchLike`) never kicks in.
+ */
+const neverFetch = (): Promise<never> => {
+  throw new Error('test: fetch must not be called')
+}
+
 // ---------------------------------------------------------------------------
 // weatherEmoji
 // ---------------------------------------------------------------------------
@@ -358,7 +369,7 @@ afterEach(() => {
 
 describe('WeatherSource', () => {
   it('reports empty before the first successful refresh', () => {
-    const src = new WeatherSource(ZIP, undefined, () => NOW)
+    const src = new WeatherSource(ZIP, neverFetch as never, () => NOW)
     expect(src.getStatus()).toBe('empty')
     expect(src.getDays()).toEqual([])
     expect(src.getConditions()).toBeNull()

@@ -53,7 +53,7 @@ const STALE_SECONDS = 15 * 60
  * per trading day, no `null` holes. A cache this long avoids re-fetching a
  * series that only grows by one point per trading day.
  */
-const YEARLY_REFRESH_SECONDS = 6 * 60 * 60
+export const YEARLY_REFRESH_SECONDS = 6 * 60 * 60
 /**
  * Lesson 10 in docs/LESSONS.md: a guard cleared on failure is a request
  * storm, not a guard. A failed yearly fetch waits this long before the next
@@ -206,15 +206,20 @@ interface FetchResult {
  * The 52-week detail chart's own state for one symbol. `'unknown'` means
  * nobody has asked for this symbol yet. `'loading'` means a fetch is in
  * flight and no cached series exists yet. `'ok'` carries at least 2 daily
- * closes, oldest first. `'error'` means the last attempt failed and no
- * successful fetch has EVER landed for this symbol — a symbol with older
+ * closes, oldest first, plus `updatedAt` (epoch seconds of the fetch that
+ * produced them) — per finding I5, a page drawing this series needs to see
+ * its own age, since `requestYearly` only ever runs at the moment a symbol
+ * is selected and a detail view can stay open far longer than the 6-hour
+ * refresh interval with no other trigger to notice. `'error'` means the
+ * last attempt failed and no successful fetch has EVER landed for this
+ * symbol — a symbol with older
  * good data keeps reporting `'ok'` with that data while a background retry
  * is in cooldown, per docs/LESSONS.md lesson 10.
  */
 export type YearlyState =
   | { status: 'unknown' }
   | { status: 'loading' }
-  | { status: 'ok'; values: number[] }
+  | { status: 'ok'; values: number[]; updatedAt: number }
   | { status: 'error' }
 
 interface YearlyEntry {
@@ -435,7 +440,7 @@ export class StockSource extends EventEmitter {
    */
   getYearlyState(symbol: string): YearlyState {
     const entry = this.yearly.get(symbol)
-    if (entry?.status === 'ok') return { status: 'ok', values: entry.values }
+    if (entry?.status === 'ok') return { status: 'ok', values: entry.values, updatedAt: entry.updatedAt }
     if (this.yearlyInFlight.has(symbol)) return { status: 'loading' }
     if (entry?.status === 'error') return { status: 'error' }
     return { status: 'unknown' }
@@ -504,6 +509,24 @@ export class StockSource extends EventEmitter {
       return
     }
     if (this.stopped) return
+
+    // M4: `doFetchYearly` used to cache whatever came back purely under the
+    // REQUESTED symbol, with no check that the response was actually for
+    // it. `parseQuote` already resolves `meta.symbol` for the intraday body;
+    // this is the same cross-check for the yearly one, so an aliased or
+    // mismatched reply is treated as a failure rather than silently drawing
+    // one symbol's year under another symbol's caption.
+    const meta = extractMeta(body)
+    const metaSymbol = meta && typeof meta.symbol === 'string' ? meta.symbol : ''
+    if (metaSymbol && metaSymbol !== symbol) {
+      log.once(
+        `stocks-yearly-symbol-${symbol}`,
+        `Yearly fetch for ${symbol} returned data for ${metaSymbol}; discarding.`,
+      )
+      this.failYearly(symbol)
+      return
+    }
+    log.clearOnce(`stocks-yearly-symbol-${symbol}`)
 
     const values = extractCloses(body)
     if (values.length < 2) {
