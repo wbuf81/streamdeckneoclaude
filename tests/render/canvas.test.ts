@@ -8,6 +8,8 @@ import {
   KEY_SIZE,
   STRIP_WIDTH,
   STRIP_HEIGHT,
+  FLASH_RING_INSET,
+  FLASH_RING_THICKNESS,
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
 import type { KeySpec } from '../../src/render/specs.js'
@@ -1055,9 +1057,19 @@ describe('renderKey flashRing', () => {
     }
     const plain = renderKey(base)
     const flashed = renderKey({ ...base, flashRing: theme.flashWhite })
-    // The ring's measured band: columns/rows 0 to 4 and 91 to 95 (inset 1,
-    // thickness 4). Everything else must match exactly, pixel for pixel.
-    const inRingBand = (x: number, y: number) => x <= 4 || x >= 91 || y <= 4 || y >= 91
+    // The ring's band, derived from the same constants `canvas.ts` draws
+    // with, not hard-coded (M7) — so a change to either one tightens or
+    // loosens this check automatically instead of silently going stale.
+    // `FLASH_RING_INSET` is 1, so columns/rows 0 and (KEY_SIZE - 1) are NOT
+    // part of the ring at all and must be checked, not skipped — the old
+    // hard-coded band (`x <= 4 || x >= 91`) skipped them too, which is
+    // exactly the slack this rewrite removes.
+    const nearStart = FLASH_RING_INSET
+    const nearEnd = FLASH_RING_INSET + FLASH_RING_THICKNESS - 1
+    const farStart = KEY_SIZE - FLASH_RING_INSET - FLASH_RING_THICKNESS
+    const farEnd = KEY_SIZE - FLASH_RING_INSET - 1
+    const inBand = (v: number) => (v >= nearStart && v <= nearEnd) || (v >= farStart && v <= farEnd)
+    const inRingBand = (x: number, y: number) => inBand(x) || inBand(y)
     let checked = 0
     for (let y = 0; y < KEY_SIZE; y++) {
       for (let x = 0; x < KEY_SIZE; x++) {

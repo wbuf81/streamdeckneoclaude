@@ -23,15 +23,24 @@ const PULSE_PHASE_STEP = Math.PI / 2
 /** Bars drawn across one idle art key. */
 const PULSE_BARS = 6
 /**
- * Measured, not guessed. At 13 px Menlo one character advances 7.83 px, and the
- * strip has 236 px of usable width, so a line holds 30 characters. The clock
- * `2:17 / 2:33` needs 11 of them.
+ * Coarse, character-count pre-limits — NOT the thing that guarantees a fit.
+ * `renderStrip` (`src/render/canvas.ts`) is what actually measures both
+ * lines against the real font and shrinks whichever one needs it to make
+ * room for the right-aligned clock, so these two constants only bound how
+ * much text this page ever hands to the renderer in the first place.
  *
- * So the title gets the WHOLE first line, and the artist shares the second line
- * with the clock. An earlier version joined the artist and the title on one line
- * and truncated the pair at 34 characters. A track with three artists then filled
- * the budget and the TITLE became a single ellipsis, which loses the one thing
- * the user most wants to read.
+ * An earlier version of this comment reasoned from one example value (the
+ * clock `2:17 / 2:33` "needs 11" characters) to conclude the budget always
+ * fit — exactly the habit lesson 17 in docs/LESSONS.md exists to stop. A
+ * two-hour track's clock (`120:00 / 120:00`) needs 15, and an 18-character
+ * artist beside it measured 22.3 px of real overlap before the renderer
+ * started measuring for itself (I5).
+ *
+ * The title gets the WHOLE first line, and the artist shares the second
+ * line with the clock. An earlier version joined the artist and the title
+ * on one line and truncated the pair at 34 characters. A track with three
+ * artists then filled the budget and the TITLE became a single ellipsis,
+ * which loses the one thing the user most wants to read.
  */
 const TITLE_CHARS = 30
 const ARTIST_CHARS = 18

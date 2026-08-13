@@ -6,7 +6,7 @@ import { createCanvas } from '@napi-rs/canvas'
 import { ClaudePage, crabFrame, CRAB_STATE_PRIORITY, mostUrgentCrabState } from '../../src/pages/claude-page.js'
 import { theme } from '../../src/render/theme.js'
 import { loadCrabFrames } from '../../src/render/sprites.js'
-import { renderKey, probe } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import type { Session } from '../../src/sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../../src/sources/usage.js'
 
@@ -431,6 +431,25 @@ describe('ClaudePage strip', () => {
     const sessions = [1, 2, 3].map((n) => session({ sessionId: `s${n}`, ts: NOW - n }))
     const { page } = build({ sessions })
     expect(page.render(NOW).strip.lines.join(' ')).not.toContain('more')
+  })
+
+  it('never draws strip line 1 past the strip edge, even at this repo’s own project name (I6)', () => {
+    // The exact review reproduction: `streamdeckneoclaude · Bash · 2h11m`
+    // measured 266.1 px against the strip's 236 px usable width — 30.1 px
+    // past the edge — because line 1 was never truncated at all. Unlike the
+    // Spotify strip's I5/I7 overlap (which happens away from the true
+    // edge, so only comparing the two runs' own ink can catch it), line 1
+    // has no competing right-hand text: an overflow here paints all the
+    // way to the strip's true right edge, so probing that single column is
+    // a real, non-vacuous check for THIS defect.
+    const elapsed = 2 * 3600 + 11 * 60 // 2h11m
+    const { page } = build({ sessions: [session({ startedAt: NOW - elapsed })] })
+    const strip = page.render(NOW).strip
+    expect(strip.lines[0]).toContain('streamdeckneoclaude')
+    const buffer = renderStrip(strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
   })
 
   it('reports missing session data when the directory is absent', () => {

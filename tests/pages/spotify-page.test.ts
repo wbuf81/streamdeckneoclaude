@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
+import { createCanvas } from '@napi-rs/canvas'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
-import { renderKey, renderStrip, probe, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
 import type { Image } from '@napi-rs/canvas'
 
@@ -274,11 +275,58 @@ describe('SpotifyPage strip', () => {
     // `11:46 AM EDT` is 93.9 px, well clear of each other inside the
     // strip's 236 px usable width — verified by pixel probe, not
     // arithmetic, per docs/LESSONS.md #17.
+    //
+    // Probing only the last column (I7) is background for ANY overlap
+    // whatsoever, since the right-aligned text grows LEFTWARD from well
+    // short of the edge — it cannot fail. This still checks the edge itself
+    // stays clear, and the row-by-row ink-vs-ink check below is what
+    // actually proves the two runs of text do not overlap each other.
     const { page } = build(null, 'no-device')
     const buffer = renderStrip(page.render(NOW, 1786549560000).strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
       expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
     }
+  })
+
+  it('never overlaps line 2 with the right-hand clock, even at the widest realistic content (I5/I7)', () => {
+    // The exact combination the review measured: an 18-character artist
+    // (`ARTIST_CHARS`) beside a track over an hour long, so the clock reads
+    // `120:00 / 120:00` — 22.3 px of real overlap before this was fixed.
+    // `STRIP_WIDTH - 1` (I7's old probe column) is background for this case
+    // too, since the right text sits nowhere near the strip's true edge, so
+    // that single column cannot see this defect at all.
+    const { page } = build(player({
+      artist: 'X'.repeat(18),
+      positionMs: 120 * 60_000,
+      durationMs: 120 * 60_000,
+    }))
+    const strip = page.render(NOW).strip
+    expect(strip.right).toBe('120:00 / 120:00')
+
+    // Measure the clock's own rendered width with the SAME font the
+    // renderer draws it with, per lesson 17 — this is exactly how the
+    // review itself found the 22.3 px overlap, not a guess.
+    const ctx = createCanvas(1, 1).getContext('2d')
+    ctx.font = `13px ${FONT}`
+    const rightWidth = ctx.measureText(strip.right!).width
+    const rightStart = Math.floor(STRIP_WIDTH - 6 - rightWidth) // 6 = the strip's own PAD
+
+    const withLine2 = renderStrip(strip)
+    // A reference render of the SAME strip with line 2 blanked out. If line
+    // 2's real content painted anything inside the clock's own footprint —
+    // an overlap, whether it fully covers the clock's ink or only shows
+    // through the gaps between its glyphs — the two buffers diverge there.
+    // Identical pixels in that whole region is the only way this passes.
+    const withoutLine2 = renderStrip({ ...strip, lines: [strip.lines[0]!, ''] })
+
+    let comparedAnyColumn = false
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      for (let x = rightStart; x < STRIP_WIDTH; x++) {
+        comparedAnyColumn = true
+        expect(probe(withLine2, x, y, STRIP_WIDTH)).toEqual(probe(withoutLine2, x, y, STRIP_WIDTH))
+      }
+    }
+    expect(comparedAnyColumn).toBe(true)
   })
 
   it('tells the user how to authorize when unauthorized', () => {

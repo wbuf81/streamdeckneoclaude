@@ -42,6 +42,24 @@ const PULSE_H = 84
 const TEXT_MAX_WIDTH = KEY_SIZE - BORDER - PAD * 2
 /** Baseline of the strip's second text line. */
 const STRIP_LINE_2_Y = 21
+/**
+ * Usable text width of the whole strip: 248 − 6 padding each side. Matches
+ * docs/VERIFIED-FACTS.md's measured "236 px usable width." Both strip lines
+ * are shrunk to fit this by MEASURING with the real canvas (see
+ * `renderStrip`), never by trusting a page's own character-count truncation
+ * — a fixed character count cannot know how wide THIS string of digits and
+ * letters actually measures (lesson 17 in docs/LESSONS.md; I5 and I6 both
+ * reached shipped code exactly this way).
+ */
+const STRIP_TEXT_MAX_WIDTH = STRIP_WIDTH - PAD * 2
+/**
+ * Breathing room reserved between line 2's own text and the right-aligned
+ * clock/time beside it, on top of whatever width the clock itself measures.
+ * Without this, a line 2 shrunk to fit would still end flush against the
+ * clock's first character — technically non-overlapping, but visually
+ * crowded in exactly the way lesson 14 warns against.
+ */
+const STRIP_RIGHT_GAP = 6
 /** Dims a colour, or a colour emoji's `globalAlpha`, to this fraction. One
  * constant so text, border and emoji all dim by the same amount. */
 const DIM_FACTOR = 0.45
@@ -63,8 +81,8 @@ const DIM_FACTOR = 0.45
  * Claude page's pulsing amber permission border, without this file needing
  * to know that field exists or carve out a special case for it.
  */
-const FLASH_RING_INSET = 1
-const FLASH_RING_THICKNESS = 4
+export const FLASH_RING_INSET = 1
+export const FLASH_RING_THICKNESS = 4
 /**
  * Size and vertical centre of the emoji glyph.
  *
@@ -503,16 +521,36 @@ export function renderStrip(spec: StripSpec): Buffer {
   ctx.font = `13px ${FONT}`
   ctx.textAlign = 'left'
   ctx.textBaseline = 'top'
+
+  // `right` sits beside line 2 only (never line 1), and always gets the
+  // width it measures at plus its own gap — line 2 is what shrinks to fit
+  // whatever is left over. Measuring here, rather than trusting the page's
+  // own truncation, is what makes this correct for any actual string: I5
+  // measured 22.3 px of real overlap on an 18-character artist beside a
+  // two-hour clock, a combination no fixed character count anticipated.
+  let rightWidth = 0
+  if (spec.right) {
+    rightWidth = ctx.measureText(spec.right).width
+  }
+
   let y = 4
-  for (const line of spec.lines.slice(0, 2)) {
-    ctx.fillText(line, PAD, y)
+  const lines = spec.lines.slice(0, 2)
+  for (let i = 0; i < lines.length; i++) {
+    ctx.font = `13px ${FONT}`
+    const maxWidth =
+      i === 1 && spec.right
+        ? Math.max(0, STRIP_TEXT_MAX_WIDTH - rightWidth - STRIP_RIGHT_GAP)
+        : STRIP_TEXT_MAX_WIDTH
+    // Line 1 has no competing right-hand text, so this is the same fix as
+    // I6's clipped Claude strip: a line that was never truncated at all,
+    // now bounded to the strip's own measured budget regardless of source.
+    ctx.fillText(shrinkToFit(ctx, lines[i]!, maxWidth), PAD, y)
     y += 17
   }
 
   if (spec.right) {
     // Right-aligned on the SECOND line, beside line 2's text. Line 1 is reserved
-    // for the title, which needs the full width. Measured: a line holds 30
-    // characters at 13 px Menlo, and this clock takes 11 of them.
+    // for the title, which needs the full width.
     ctx.textAlign = 'right'
     ctx.fillStyle = css(theme.textDim, dim)
     ctx.fillText(spec.right, STRIP_WIDTH - PAD, STRIP_LINE_2_Y)
