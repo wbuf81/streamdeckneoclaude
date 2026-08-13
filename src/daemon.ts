@@ -42,6 +42,19 @@ const FLASH_MS = 90
 const FLASH_MAX_PENDING_MS = 5000
 
 /**
+ * Backoff step for `scheduleFlashPump`'s re-arm delay while `render()` keeps
+ * failing (C2). A page that throws never reaches `applyFlash`, so a flash
+ * already past its anchored expiry stays exactly that far past it on every
+ * subsequent attempt — with no floor, the pump re-armed at delay 0 every
+ * time, an unbounded loop measured at about 850 renders per second. Growing
+ * this with `renderFailureStreak`, capped at `FLASH_PUMP_MAX_BACKOFF_MS`,
+ * means a persistently broken page still gets retried (so it can recover),
+ * just not in a tight loop.
+ */
+const FLASH_PUMP_BACKOFF_STEP_MS = 50
+const FLASH_PUMP_MAX_BACKOFF_MS = 1000
+
+/**
  * A transient press-feedback flash on one key, index 0 to 7 — never the two
  * round buttons (8, 9): they carry RGB backlights, not screens, and a page
  * flip is already its own visible feedback, so there is nothing to flash.
@@ -128,6 +141,14 @@ export class Daemon {
   /** One pending press-feedback flash per screen key, indices 0 to 7. `null`
    * means no flash. See `Flash` and `applyFlash`. */
   private flashes: (Flash | null)[] = new Array(NEO_KEY_COUNT).fill(null)
+  /**
+   * Consecutive `page.render()` failures, reset to 0 on any success. Used
+   * only to back off `scheduleFlashPump`'s own re-arm delay (C2) — a page
+   * that throws never reaches `applyFlash`, so a flash already past its
+   * anchored expiry stays past it on every following attempt too, and this
+   * is what stops that from re-arming at delay 0 forever.
+   */
+  private renderFailureStreak = 0
 
   constructor(
     private readonly device: DeckDevice,
@@ -235,8 +256,19 @@ export class Daemon {
       }
       if (index < 0 || index >= NEO_KEY_COUNT) return
 
+      // Captured BEFORE the await, not after (C1). `onKeyPress` can hold this
+      // open for hundreds of milliseconds — Spotify's awaits an HTTP call,
+      // Claude's awaits `osascript` — and the page (or clock) at the moment
+      // the press LANDED is what the flash must be tagged with. Reading
+      // either one after the await let an ordinary "press play, then flip to
+      // Stocks" sequence tag the flash with the NEW page and draw the ring on
+      // a key of a page that was not even visible at press time — the exact
+      // bleed the per-page tagging (M3) was added to prevent, reachable
+      // through a different door.
+      const pressPage = this.pages.current().name
+      const pressAtMs = this.nowMs()
       const outcome = await this.callOnKeyPress(index, key)
-      this.setFlash(index, outcome === 'handled')
+      this.setFlash(index, outcome === 'handled', pressPage, pressAtMs)
       await this.renderOnce(this.now(), this.nowMs())
     } catch (e) {
       // `log.once`, not `log.error`: a press repeats, and this is the
@@ -282,16 +314,17 @@ export class Daemon {
     }
   }
 
-  /** Records a pending flash for `index`, tagged with the page current right
-   * now and the press-time clock. Its expiry is anchored later, by
-   * `applyFlash`, at the first render that actually draws it — see `Flash`'s
-   * doc comment for why. */
-  private setFlash(index: number, ok: boolean): void {
+  /** Records a pending flash for `index`, tagged with the page and clock
+   * reading the CALLER captured at press time (C1) — never read here, which
+   * would be after `onKeyPress`'s own await and could already belong to a
+   * different page. Its expiry is anchored later, by `applyFlash`, at the
+   * first render that actually draws it — see `Flash`'s doc comment for why. */
+  private setFlash(index: number, ok: boolean, page: string, createdAtMs: number): void {
     this.flashes[index] = {
       ok,
-      page: this.pages.current().name,
+      page,
       expiresAtMs: null,
-      createdAtMs: this.nowMs(),
+      createdAtMs,
     }
   }
 
@@ -322,7 +355,20 @@ export class Daemon {
    * than a silent truncation.
    */
   async renderOnce(now: number, nowMs: number): Promise<void> {
-    if (this.locked) return
+    // Checked first, and unconditionally (M1): `armTimer` already refuses to
+    // arm after `stop()`, but this method has an independent entry point — a
+    // press whose `onKeyPress` was still in flight when `stop()` ran resumes
+    // here once it resolves, with no other guard in its path. Without this,
+    // that resumed press could still write a ring to the device after
+    // shutdown, and nothing would ever clear it.
+    if (this.stopped) return
+    if (this.locked) {
+      // A stale request from before the lock must not survive it: the next
+      // call after unlock already forces a full repaint of its own (M6), so
+      // carrying this flag forward would only cost one duplicate frame.
+      this.renderRequested = false
+      return
+    }
     if (this.activeRender) {
       // A render is already in flight — the several awaited device writes
       // in `writeFrame`, or (on the Spotify page) a press's own outcome
@@ -337,7 +383,10 @@ export class Daemon {
       this.renderRequested = true
       return
     }
-    if (!this.device.isConnected()) return
+    if (!this.device.isConnected()) {
+      this.renderRequested = false // same reasoning as the locked branch above (M6)
+      return
+    }
     await this.runRender(now, nowMs)
     // Drains a request that arrived while the render above was busy. Guarded
     // by the same three conditions `renderOnce` itself checks, so this can
@@ -370,6 +419,7 @@ export class Daemon {
     this.activeRender = task
     try {
       await task
+      this.renderFailureStreak = 0
     } catch (e) {
       // A write failure means the cable moved. The Device retries the open.
       // `log.once`, not `log.warn`. This loop runs once per second, so a
@@ -377,10 +427,24 @@ export class Daemon {
       // line every second without a limit. `handleReconnect` clears the key.
       log.once('render', `render failed: ${String(e)}`)
       this.invalidateFrame()
+      this.renderFailureStreak += 1
     } finally {
       if (this.activeRender === task) this.activeRender = null
     }
-    this.scheduleFlashPump()
+    try {
+      // Never let a failure inside the pump's own bookkeeping escape as a
+      // rejection from `runRender` (M5): `renderOnce` awaits `runRender` with
+      // no `try`/`catch` of its own, and the flash pump's timer callback
+      // fires `renderOnce` fire-and-forget with `void` — a rejection from
+      // there would surface as an unhandled promise rejection, which Node
+      // terminates on by default. `scheduleFlashPump` reads `pages.current()`
+      // and could in principle throw before every page is added; kept as a
+      // backstop rather than a proof that it currently can, the same
+      // reasoning `handlePress`'s own outer catch already uses.
+      this.scheduleFlashPump()
+    } catch (e) {
+      log.once('flash-pump', `flash pump scheduling failed: ${String(e)}`)
+    }
   }
 
   /**
@@ -470,6 +534,17 @@ export class Daemon {
       this.flashPumpTimer = null
     }
     if (this.stopped) return
+    const nowMs = this.nowMs()
+    // Age out expired (or overlong-pending) flashes on the CLOCK, before
+    // computing the next delay — never only inside `applyFlash` (C2).
+    // `applyFlash` runs only when a render's page-building step succeeds far
+    // enough to reach `overlayFlashes`; a page that keeps throwing never gets
+    // there, so a flash that was already anchored (its `expiresAtMs` already
+    // in the past) would otherwise sit forever, with this method re-arming at
+    // delay 0 on every single call — an unbounded loop with no dependency on
+    // any render ever succeeding. Pruning here, independent of `applyFlash`,
+    // closes that regardless of whether the page recovers.
+    this.pruneFlashes(nowMs)
     const pageName = this.pages.current().name
     let earliest: number | null = null
     for (const flash of this.flashes) {
@@ -477,12 +552,46 @@ export class Daemon {
       if (earliest === null || flash.expiresAtMs < earliest) earliest = flash.expiresAtMs
     }
     if (earliest === null) return
-    const delay = Math.max(0, earliest - this.nowMs())
+    let delay = Math.max(0, earliest - nowMs)
+    if (this.renderFailureStreak > 0) {
+      // Belt and suspenders on top of the pruning above: even if some future
+      // change left a flash whose expiry keeps landing at or before "now",
+      // this refuses to let the pump re-arm in a tight loop while renders
+      // are actively failing. Grows with consecutive failures, capped, so a
+      // page that recovers is still retried promptly once it does.
+      delay = Math.max(
+        delay,
+        Math.min(FLASH_PUMP_MAX_BACKOFF_MS, FLASH_PUMP_BACKOFF_STEP_MS * this.renderFailureStreak),
+      )
+    }
     this.flashPumpTimer = setTimeout(() => {
       this.flashPumpTimer = null
       if (this.stopped) return
       void this.renderOnce(this.now(), this.nowMs())
     }, delay)
+  }
+
+  /**
+   * Clears any flash that is due, purely by the clock: an anchored flash
+   * (`expiresAtMs` set) whose expiry has passed, or a pending flash
+   * (`expiresAtMs` still `null`) that has sat unanchored for longer than
+   * `FLASH_MAX_PENDING_MS`. This is the SAME two rules `applyFlash` already
+   * enforces — duplicated here rather than shared, because `applyFlash` also
+   * needs `pageName` to decide whether to ANCHOR a still-live flash in the
+   * first place, which is not this method's job. Called from
+   * `scheduleFlashPump` so a flash's own clock-driven expiry never depends on
+   * a render actually reaching `applyFlash` to notice it (C2).
+   */
+  private pruneFlashes(nowMs: number): void {
+    for (let i = 0; i < this.flashes.length; i++) {
+      const flash = this.flashes[i]
+      if (!flash) continue
+      const due =
+        flash.expiresAtMs === null
+          ? nowMs - flash.createdAtMs > FLASH_MAX_PENDING_MS
+          : nowMs >= flash.expiresAtMs
+      if (due) this.flashes[i] = null
+    }
   }
 
   private async writeFrame(frame: DeckFrame): Promise<void> {

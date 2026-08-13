@@ -503,13 +503,21 @@ describe('Daemon.stop (M1)', () => {
     device.simulatePress(0)
     await Promise.resolve() // handlePress is now parked inside the held onKeyPress
 
+    // Reset BEFORE stop(), not after resolving the held press -- the
+    // original form of this test called `device.reset()` here, which
+    // silently discarded the very write M1 is about (the held press's own
+    // continuation, resolving AFTER `stop()`, used to still reach the
+    // device) before the assertion below ever counted it.
+    device.reset()
     await daemon.stop()
 
     // Let the held press finish. Its own continuation (a render) must not
-    // throw and must not do anything further on its own.
+    // throw, and per M1, must not write a ring to the device now that the
+    // daemon has stopped -- `renderOnce` checks `stopped` for exactly this.
     releasePress?.()
     await Promise.resolve()
     await Promise.resolve()
+    expect(device.keyWrites).toHaveLength(0) // M1: no post-stop write
 
     // The scenario itself: a round button press arrives while the rest of
     // shutdown is still running.
@@ -761,6 +769,87 @@ describe('Daemon press-feedback flash', () => {
     await flush()
     // Now the outcome has resolved, and the flash it earned is on the glass.
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    await daemon.stop()
+  })
+
+  /** Two pages, both async in `onKeyPress`, so a test can flip pages WHILE a
+   * press's own outcome is still pending -- the exact window r3's C1 finding
+   * closes. `ControlPage`'s `onKeyPress` is synchronous, so no test built on
+   * it can open this window at all. */
+  class AsyncFlipPage implements Page {
+    gate: Promise<void> = Promise.resolve()
+    outcome: PressOutcome = 'handled'
+    constructor(readonly name: string, private readonly line: string) {}
+
+    render(): DeckFrame {
+      const keys: KeySpec[] = Array.from({ length: 8 }, (_, i) =>
+        i === 0 ? { kind: 'gauge', lines: [this.line] } : { kind: 'blank' })
+      return { keys, strip: { lines: [this.name] }, buttons: [[0, 0, 0], [0, 0, 0]] }
+    }
+
+    async onKeyPress(): Promise<PressOutcome> {
+      await this.gate
+      return this.outcome
+    }
+  }
+
+  /**
+   * R3 review, C1: `setFlash` used to read `this.pages.current().name` (and
+   * the clock) AFTER awaiting `onKeyPress` -- so a press whose own work is
+   * still running when the user flips pages got tagged with the NEW page,
+   * and drawn there: a ring on a key the user never pressed, on a page that
+   * was not even visible when the press landed. Probe-confirmed by the
+   * review: pressing key 2 on Spotify, then flipping during its HTTP await,
+   * put a ring on the Stocks page's key 2. Capturing the page and clock
+   * BEFORE the await closes this.
+   */
+  it('tags the flash with the page CURRENT AT PRESS TIME, not whatever page is current once the press resolves (C1)', async () => {
+    const device = new FakeDevice()
+    const pageA = new AsyncFlipPage('pageA', 'A')
+    const pageB = new AsyncFlipPage('pageB', 'B')
+    let release: () => void = () => {}
+    pageA.gate = new Promise((resolve) => { release = resolve })
+    const manager = new PageManager()
+    manager.add(pageA)
+    manager.add(pageB)
+    let ms = 1000
+    const daemon = new Daemon(device, manager, () => Math.floor(ms / 1000), () => ms)
+    await daemon.start() // pageA is current; first render writes every key.
+
+    device.simulatePress(0) // pageA's onKeyPress parks inside the held gate, at ms 1000
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // The user flips pages WHILE the press is still in flight -- an ordinary
+    // "press play, then flip to Stocks" sequence, not an edge case.
+    ms = 1010
+    device.simulatePress(BUTTON_RIGHT) // pageA -> pageB
+    await flush()
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['B'] }))).toBe(true)
+
+    // Now the held press resolves. pageB is current at this instant, but the
+    // press landed on pageA, at ms 1000.
+    release()
+    await flush()
+
+    // The flash must never appear on pageB's key 0 -- pageB is current now,
+    // but the user never pressed it, and it was not even visible at press
+    // time. Under the C1 bug, `setFlash` would have tagged this flash with
+    // pageB (read after the await), and `applyFlash` would have drawn it
+    // right here, on a key the user never touched.
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['B'] }))).toBe(true)
+
+    // Flipping BACK to pageA proves the flash truly disappeared rather than
+    // lurking somewhere invisible: `applyFlash` discards a flash the FIRST
+    // render it ever sees mismatched (the pageB render above), so it cannot
+    // resurface here either -- pageA's key 0 must show its own plain
+    // content, still with no ring, exactly like the M3 flip-discard tests
+    // already prove for a flash that WAS drawn before the flip.
+    ms = 1020
+    device.simulatePress(BUTTON_LEFT) // pageB -> pageA
+    await flush()
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['A'] }))).toBe(true)
 
     await daemon.stop()
   })
@@ -1074,5 +1163,67 @@ describe('Daemon press-feedback flash', () => {
     expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['A'] }))).toBe(true)
 
     await daemon.stop()
+  })
+
+  /**
+   * R3 review, C2: a flash is cleared only inside `applyFlash`, which runs
+   * only when a render's page-building step succeeds far enough to reach
+   * `overlayFlashes`. A page that throws in `render()` -- a case
+   * `runRender`'s own comment anticipates -- never gets there, so a flash
+   * already past its anchored expiry stayed exactly that far past it on
+   * every following attempt, and `scheduleFlashPump` re-armed at delay 0
+   * every time: measured on the review's own probe at about 850
+   * `page.render()` calls per second, indefinitely, from one press and one
+   * broken page. This asserts a BOUNDED call count over a fixed span, not
+   * merely that the loop eventually stops -- a slow leak could satisfy the
+   * weaker claim too.
+   */
+  it('bounds the flash pump to a small, finite number of extra renders when page.render() throws, instead of spinning forever (C2)', async () => {
+    vi.useFakeTimers()
+    try {
+      class ThrowingPage implements Page {
+        readonly name = 'throwing'
+        readonly tickMs = 100_000 // so only the flash pump can drive a render here
+        renderCount = 0
+        throwing = false
+
+        render(): DeckFrame {
+          this.renderCount += 1
+          if (this.throwing) throw new Error('boom')
+          const keys: KeySpec[] = Array.from({ length: 8 }, () => ({ kind: 'blank' as const }))
+          return { keys, strip: { lines: ['x'] }, buttons: [[0, 0, 0], [0, 0, 0]] }
+        }
+
+        onKeyPress(): PressOutcome {
+          return 'handled'
+        }
+      }
+
+      const device = new FakeDevice()
+      const page = new ThrowingPage()
+      const manager = new PageManager()
+      manager.add(page)
+      const daemon = new Daemon(device, manager)
+      await daemon.start() // succeeds; anchors nothing yet.
+
+      device.simulatePress(0) // anchors a flash, expiring 90ms later; this render still succeeds.
+      await vi.advanceTimersByTimeAsync(0)
+
+      page.throwing = true // every render from here on throws.
+      page.renderCount = 0
+
+      // 5 seconds of fake time. The old code rendered about 850 times PER
+      // SECOND, indefinitely -- thousands of calls here. The fix bounds this
+      // to a handful: the flash's own already-armed expiry firing once (and
+      // being pruned on the clock, independent of the render ever
+      // succeeding), not a tight loop.
+      await vi.advanceTimersByTimeAsync(5000)
+
+      expect(page.renderCount).toBeLessThan(10)
+
+      await daemon.stop()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

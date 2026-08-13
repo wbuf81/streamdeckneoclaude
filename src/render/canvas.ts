@@ -371,14 +371,25 @@ function drawCroppedImage(ctx: SKRSContext2D, img: Image, crop?: ImageCrop): voi
  * ellipsis, until it measures at or under `maxWidth` at the context's
  * CURRENT font. Used only as the last resort, when even the smallest
  * `lineSizes` candidate does not fit — truncating is a smaller defect than
- * drawing past the key's edge. */
+ * drawing past the key's edge.
+ *
+ * The last-resort return used to be an unconditional `'…'` (M4 from the r3
+ * review), which can itself measure wider than `maxWidth` when `maxWidth` is
+ * very small — reachable on the strip only when `right` measures wider than
+ * about 228 px, well past any real value (the widest, `120:00 / 120:00`,
+ * measures 117.4 px), but the function itself should not depend on every
+ * caller staying inside that margin. `maxWidth <= 0` (the strip's own
+ * `Math.max(0, …)` clamp can produce exactly this) returns empty outright,
+ * and the loop's own fallback now measures the ellipsis before returning it,
+ * so nothing this function returns can ever measure past `maxWidth`. */
 function shrinkToFit(ctx: SKRSContext2D, text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return ''
   if (ctx.measureText(text).width <= maxWidth) return text
   for (let n = text.length - 1; n > 0; n--) {
     const candidate = text.slice(0, n) + '…'
     if (ctx.measureText(candidate).width <= maxWidth) return candidate
   }
-  return '…'
+  return ctx.measureText('…').width <= maxWidth ? '…' : ''
 }
 
 function sameSizeCandidates(a: number[], b: number[]): boolean {
@@ -569,7 +580,14 @@ export function renderKey(spec: KeySpec): Buffer {
     }
   }
 
-  if (spec.glyphCaption) {
+  if (spec.glyph && spec.glyphCaption) {
+    // Guarded on `spec.glyph` too, matching this field's own documented
+    // contract in `specs.ts` ("Ignored unless `glyph` is also set"). Drawing
+    // it unconditionally (M3 from the r3 review) let a caption with no glyph
+    // paint 103 ink pixels on a key no page today builds that way — harmless
+    // only because no page does it, not because the guard agreed with its
+    // own doc comment.
+    //
     // Plain short text (a percentage, at most 4 characters) — arithmetic
     // centring is fine here, unlike the single symbol above; there is no
     // per-glyph bearing asymmetry worth correcting for a run of digits.
@@ -674,9 +692,19 @@ export function renderStrip(spec: StripSpec): Buffer {
   // own truncation, is what makes this correct for any actual string: I5
   // measured 22.3 px of real overlap on an 18-character artist beside a
   // two-hour clock, a combination no fixed character count anticipated.
+  //
+  // `right` itself is shrunk to the strip's own full usable width first (M4
+  // from the r3 review): with no bound of its own, a `right` wider than the
+  // whole strip draws right-aligned starting at a NEGATIVE x, painting past
+  // column 0 into the left padding no other element is ever allowed to
+  // touch. No page produces a `right` anywhere near this wide today (the
+  // widest real value, `120:00 / 120:00`, measures 117.4 px against a 236 px
+  // budget), so this never shrinks a real one.
   let rightWidth = 0
+  let right: string | undefined
   if (spec.right) {
-    rightWidth = ctx.measureText(spec.right).width
+    right = shrinkToFit(ctx, spec.right, STRIP_TEXT_MAX_WIDTH)
+    rightWidth = ctx.measureText(right).width
   }
 
   let y = 4
@@ -694,12 +722,13 @@ export function renderStrip(spec: StripSpec): Buffer {
     y += 17
   }
 
-  if (spec.right) {
+  if (right) {
     // Right-aligned on the SECOND line, beside line 2's text. Line 1 is reserved
     // for the title, which needs the full width.
     ctx.textAlign = 'right'
     ctx.fillStyle = css(theme.textDim, dim)
-    ctx.fillText(spec.right, STRIP_WIDTH - PAD, STRIP_LINE_2_Y)
+    ctx.font = `13px ${FONT}`
+    ctx.fillText(right, STRIP_WIDTH - PAD, STRIP_LINE_2_Y)
     ctx.textAlign = 'left'
   }
 

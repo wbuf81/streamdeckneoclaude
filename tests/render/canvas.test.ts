@@ -196,6 +196,17 @@ describe('renderKey glyph optical centring (task 37)', () => {
     const dimmed = renderKey({ kind: 'control', glyph: '▲', glyphCaption: '55%', dim: true })
     expect(bright.equals(dimmed)).toBe(false)
   })
+
+  it('draws nothing for glyphCaption with no glyph, matching specs.ts\'s documented contract (r3 M3 review)', () => {
+    // `specs.ts` documents glyphCaption as "Ignored unless `glyph` is also
+    // set," but the guard used to check `spec.glyphCaption` alone, so this
+    // painted 103 ink pixels with no glyph present at all — harmless only
+    // because no page today builds a key this way, not because the code
+    // agreed with its own doc comment.
+    const blank = renderKey({ kind: 'control' })
+    const buf = renderKey({ kind: 'control', glyphCaption: '55%' })
+    expect(buf.equals(blank)).toBe(true)
+  })
 })
 
 /**
@@ -232,14 +243,21 @@ describe('renderKey glyph emoji mode and pulse (task 38)', () => {
     return n
   }
 
-  it('centres the ink of every emoji-mode transport glyph at the same y, within 1px', () => {
+  it('centres the ink of every emoji-mode transport glyph near the intended target y, not merely relative to each other (r3 C review)', () => {
+    // The r3 review's finding: the four media-control emoji (⏮️ ▶️ ⏸️ ⏭️) draw
+    // as full-bleed rounded squares with BYTE-IDENTICAL ink boxes by
+    // construction — same target draw point, same shape — so comparing them
+    // only to EACH OTHER (the old form of this test) can never fail, even for
+    // a bug that shifted every one of them off-target by the SAME amount.
+    // Pinning to the measured absolute value (ink centre y 29.5 for the four
+    // squares, 30 for 🔊 — both against the renderer's own target,
+    // `EMOJI_GLYPH_Y` = 30) gives this real teeth: a target shifted by even a
+    // few pixels now fails it.
     const glyphs = ['⏮️', '▶️', '⏸️', '⏭️', '🔊']
-    const centres = glyphs.map((glyph) =>
-      inkCentroid(renderKey({ kind: 'control', glyph, glyphFont: 'emoji' })),
-    )
-    const ys = centres.map((c) => c.cy)
-    for (const y of ys) {
-      expect(Math.abs(y - ys[0]!)).toBeLessThanOrEqual(1)
+    for (const glyph of glyphs) {
+      const { cy } = inkCentroid(renderKey({ kind: 'control', glyph, glyphFont: 'emoji' }))
+      expect(cy).toBeGreaterThanOrEqual(28)
+      expect(cy).toBeLessThanOrEqual(31)
     }
   })
 
@@ -305,23 +323,42 @@ describe('renderKey glyph emoji mode and pulse (task 38)', () => {
     }
   })
 
-  it('keeps the widest realistic caption inside the 81px usable width at the pulse\'s LARGEST frame, not just at rest', () => {
-    // The widest realistic caption ("100%") rendered alongside the pulse's
-    // biggest frame (phase π/2, sin = 1) — the combination that would
-    // reveal it if the growing glyph somehow pushed the caption's own draw
-    // position, rather than trusting that they are independent draw calls
-    // because of how the code is structured.
+  it('keeps the widest realistic caption\'s ink within a tight, measured margin at the pulse\'s LARGEST frame, not just at rest (r3 M2 review)', () => {
+    // The r3 review's finding: probing one fixed column (90) 30px past the
+    // caption's own measured ink edge meant this assertion only started to
+    // fail at FOURTEEN characters — the real caption ('100%', from
+    // `volumeLabel`) never comes remotely close, so the old form of this
+    // test proved nothing beyond "100% measures under 81px", which the
+    // "measured text width" describe block below already covers on its own.
+    // Tying the probe to the caption's OWN measured ink edge (lesson 17:
+    // measure, do not guess a pixel count), with a small fixed margin
+    // instead of a 30px one, gives this real teeth: a bug that grew the
+    // caption's font or shifted its centring by even a few pixels now fails
+    // it, and the pulse's largest frame (phase π/2) is still the frame under
+    // test, in case the growing glyph ever pushed the caption's own position.
+    const caption = '100%'
     const buf = renderKey({
       kind: 'control', glyph: '🔊', glyphFont: 'emoji',
-      glyphPulse: { phase: Math.PI / 2 }, glyphCaption: '100%',
+      glyphPulse: { phase: Math.PI / 2 }, glyphCaption: caption,
     })
-    // Usable width is 81px (KEY_SIZE 96 - 3 border - 6 padding each side),
-    // so column 90 (96 - 6 padding) is the right edge of that budget. No
-    // caption ink should reach it, matching the "no ink past the edge"
-    // pattern the lineSizes tests already use elsewhere in this file.
+    const measure = createCanvas(KEY_SIZE, KEY_SIZE).getContext('2d')
+    measure.font = '11px Menlo'
+    measure.textAlign = 'center'
+    const m = measure.measureText(caption)
+    const rightEdge = Math.ceil(KEY_SIZE / 2 + m.actualBoundingBoxRight)
+    // 6px of margin, not 30: comfortably clear of anti-aliasing, tight
+    // enough to catch a real regression.
     for (let y = 60; y < 74; y++) {
-      expect(near3(probe(buf, 90, y), theme.bg)).toBe(true)
+      expect(near3(probe(buf, rightEdge + 6, y), theme.bg)).toBe(true)
     }
+    // Proves the probe point is meaningful, not merely far from wherever the
+    // caption happened to paint: ink actually appears just inside the
+    // measured edge.
+    let inkNearEdge = false
+    for (let y = 60; y < 74 && !inkNearEdge; y++) {
+      if (!near3(probe(buf, rightEdge - 2, y), theme.bg)) inkNearEdge = true
+    }
+    expect(inkNearEdge).toBe(true)
   })
 
   it('renders a visibly different frame at two different pulse phases', () => {
@@ -519,6 +556,80 @@ describe('renderStrip', () => {
       bar: { value: 1.0, color: theme.green },
     })
     near(probe(buf, 200, 50, STRIP_WIDTH), theme.green)
+  })
+})
+
+/**
+ * I3 from the r3 review: `renderStrip`'s own measurement (52d3ddb) was
+ * covered only indirectly, from two page test files
+ * (`tests/pages/spotify-page.test.ts`, `tests/pages/claude-page.test.ts`),
+ * each pinning one page's own content. Direct coverage here, at the
+ * renderer's own level, with the widest realistic content the review asked
+ * for: a long artist beside `120:00 / 120:00`, and this repository's own
+ * name on the Claude strip.
+ */
+describe('renderStrip measurement (I3): direct coverage at the renderer level', () => {
+  const STRIP_RIGHT_PAD = 6 // matches canvas.ts's PAD
+
+  function hasInk(buf: Buffer, x: number, y: number): boolean {
+    return !near3(probe(buf, x, y, STRIP_WIDTH), theme.bg)
+  }
+
+  it('keeps a long artist beside the widest realistic clock (120:00 / 120:00) inside the strip, with no overlap', () => {
+    const buf = renderStrip({
+      lines: ['Everlong (Acoustic Version — Live at Wembley Arena)', 'Foo Fighters and the Colour and the Shape Band'],
+      right: '120:00 / 120:00',
+    })
+    // Nothing paints past the usable band's own right edge.
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(hasInk(buf, STRIP_WIDTH - STRIP_RIGHT_PAD + 2, y)).toBe(false)
+    }
+    // Line 2's own text and the right-aligned clock share one row band
+    // (around STRIP_LINE_2_Y, 21) — find each side's own ink and prove they
+    // do not overlap, the exact defect I5 found by measurement on an
+    // 18-character artist.
+    let line2RightmostInk = -1
+    let rightLeftmostInk = STRIP_WIDTH
+    for (let y = 18; y < 34; y++) {
+      for (let x = 0; x < STRIP_WIDTH; x++) {
+        if (!hasInk(buf, x, y)) continue
+        if (x < STRIP_WIDTH / 2 && x > line2RightmostInk) line2RightmostInk = x
+        if (x > STRIP_WIDTH / 2 && x < rightLeftmostInk) rightLeftmostInk = x
+      }
+    }
+    expect(line2RightmostInk).toBeGreaterThan(0)
+    expect(rightLeftmostInk).toBeLessThan(STRIP_WIDTH)
+    expect(rightLeftmostInk).toBeGreaterThan(line2RightmostInk)
+  })
+
+  it('fits this repository\'s own name on the Claude strip\'s line 1, with no right-hand clock', () => {
+    const buf = renderStrip({ lines: ['streamdeckneoclaude · Bash · 2h11m'] })
+    // Line 1 occupies roughly rows 4 to 17 (13px Menlo, baseline top y = 4).
+    for (let y = 0; y < 17; y++) {
+      expect(hasInk(buf, STRIP_WIDTH - STRIP_RIGHT_PAD + 2, y)).toBe(false)
+    }
+    let anyInk = false
+    for (let y = 0; y < 17 && !anyInk; y++) {
+      for (let x = 0; x < STRIP_WIDTH; x++) {
+        if (hasInk(buf, x, y)) { anyInk = true; break }
+      }
+    }
+    expect(anyInk).toBe(true)
+  })
+
+  it('never lets line 2 spill past the left padding, even when right is unrealistically wide (M4)', () => {
+    // M4 from the review: `shrinkToFit`'s old last-resort return (`'…'`,
+    // unconditional) could itself measure past `maxWidth` when `maxWidth`
+    // was driven to (near) zero by an oversized `right` — no real page
+    // produces this (the widest real value, `120:00 / 120:00`, measures
+    // 117.4px), but the fix makes the function itself safe regardless of
+    // what a future caller passes.
+    const buf = renderStrip({ lines: ['title', 'B'.repeat(60)], right: 'X'.repeat(40) })
+    for (let y = 18; y < 34; y++) {
+      for (let x = 0; x < STRIP_RIGHT_PAD; x++) {
+        expect(hasInk(buf, x, y)).toBe(false)
+      }
+    }
   })
 })
 
