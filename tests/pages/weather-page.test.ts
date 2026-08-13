@@ -1,10 +1,25 @@
 import { describe, it, expect } from 'vitest'
 import { WeatherPage, conditionTint, heatColor } from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
+import { renderKey, probe, KEY_SIZE } from '../../src/render/canvas.js'
 import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
 import type { Conditions, DayForecast, WeatherStatus } from '../../src/sources/weather.js'
 
 const NOW = 1786549560
+
+/** Allows a small difference, because canvas anti-aliases edges. */
+function near3(actual: readonly number[], expected: readonly number[], tol = 12): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(actual[i]! - expected[i]!) > tol) return false
+  }
+  return true
+}
+
+/** The eight condition emoji this page ever picks a tint for — the same
+ * keys `CONDITION_TINTS` covers in weather-page.ts. Kept here rather than
+ * exported from the page, since the page's own tests already exercise each
+ * one individually via `conditionTint`; this list just drives `it.each`. */
+const ALL_CONDITION_EMOJI = ['⛈', '🌨', '🌧', '🌫', '💨', '☁️', '⛅', '☀️']
 
 function day(label: string, over: Partial<DayForecast> = {}): DayForecast {
   return {
@@ -142,11 +157,21 @@ describe('WeatherPage layout', () => {
     expect(key.lineColors?.[1]).toEqual(theme.blue)
   })
 
-  it('shows a placeholder tile when a day slot has no data yet', () => {
+  it('gives a day slot with no data yet the SAME four-band layout as a populated tile', () => {
+    // A2/A4: a partial forecast (the source keeps whatever periods it
+    // parsed) used to leave this slot on the old, un-redesigned layout —
+    // left-aligned dashes with no lineSizes/lineY/bg at all — beside
+    // tiles either side of it that HAD the new centred, banded layout.
+    // Rendering the real dayKey output (not hand-written constants) is
+    // what would have caught that the first time.
     const days = sevenDays().slice(0, 3)
     const { page } = build({ days })
     const key = page.render(NOW).keys[5]!
     expect(key.dim).toBe(true)
+    expect(key.align).toBe('center')
+    expect(key.lineY).toHaveLength(3)
+    expect(key.bg).toBeDefined()
+    expect(key.lines).toEqual(['--', '--', '--'])
   })
 
   it('builds a conditions tile with wind speed, the ZIP, and the truncated place', () => {
@@ -283,6 +308,21 @@ describe('WeatherPage day tile layout details', () => {
     expect(precipY).toBeGreaterThan(tempY!)
   })
 
+  it('keeps a below-freezing high/low pair within the usable key width', () => {
+    // Per M2: TEMP_SIZE used to be a fixed 16 px with no fitting at all.
+    // `-10°/-25°` measures over budget at 16 px (86.7 px, see the review),
+    // so the renderer must drop to a smaller candidate. Measured with a
+    // real pixel probe: no ink at or past the right margin (x = 90).
+    const days = sevenDays()
+    days[0] = day('NOW', { high: -10, low: -25 })
+    const { page } = build({ days })
+    const key = page.render(NOW).keys[0]!
+    const buf = renderKey(key)
+    for (let y = 0; y < KEY_SIZE; y++) {
+      expect(near3(probe(buf, 90, y), key.bg!)).toBe(true)
+    }
+  })
+
   it('gives the conditions tile a bigger size for the fixed-width ZIP line only', () => {
     const { page } = build()
     const key = page.render(NOW).keys[7]!
@@ -291,6 +331,62 @@ describe('WeatherPage day tile layout details', () => {
     // is always exactly 5 digits, so it is safe to enlarge.
     expect(key.lineSizes?.[1]).toBe(11)
     expect(key.lineSizes?.[2]).toBeGreaterThan(11)
+  })
+})
+
+describe('WeatherPage day tile: rendered band geometry has no overlap, for every condition', () => {
+  // T3/T4 from the review: the old version of this proof hand-wrote
+  // lineSizes/lineY constants in tests/render/canvas.test.ts, decoupled from
+  // the page, and checked only one emoji (the tightest-fitting one, by
+  // luck rather than design). This renders the REAL `WeatherPage.dayKey`
+  // output for every one of the eight condition tints and rasterizes it
+  // through the real `renderKey`, so a future change to either the page's
+  // constants or the emoji band cannot drift out of sync with this proof
+  // the way it did for the empty-tile case (finding A4).
+  const inkOnRow = (buf: Buffer, bg: readonly number[], y: number) => {
+    for (let x = 9; x < 90; x++) {
+      if (!near3(probe(buf, x, y), bg)) return true
+    }
+    return false
+  }
+
+  it.each(ALL_CONDITION_EMOJI)('keeps every band clear of the others, for %s', (emoji) => {
+    const days = sevenDays()
+    days[0] = day('NOW', { emoji, high: 95, low: 77 })
+    const { page } = build({ days })
+    const key = page.render(NOW).keys[0]!
+    const buf = renderKey(key)
+    const bg = key.bg!
+
+    // Ink inside each of the three text bands (label ~4-12, temperature
+    // ~55-67, rain chance ~77-90 — measured for every emoji in this set by
+    // the review, see review-A-render-pages.md's "verified claims" #2).
+    expect(inkOnRow(buf, bg, 10)).toBe(true)
+    expect(inkOnRow(buf, bg, 60)).toBe(true)
+    expect(inkOnRow(buf, bg, 80)).toBe(true)
+    // Background in the gaps: between the label and the emoji band, between
+    // the emoji band and the temperature line, and between the temperature
+    // line and the rain chance.
+    expect(inkOnRow(buf, bg, 16)).toBe(false)
+    expect(inkOnRow(buf, bg, 52)).toBe(false)
+    expect(inkOnRow(buf, bg, 72)).toBe(false)
+  })
+
+  it('holds for the empty-tile placeholder layout too (finding A4), matching the populated tiles', () => {
+    const days = sevenDays().slice(0, 0) // every slot absent
+    const { page } = build({ days })
+    const key = page.render(NOW).keys[0]!
+    const buf = renderKey(key)
+    const bg = key.bg!
+    // A '--' dash is a much thinner glyph than real letters, so its ink
+    // sits at different (measured) rows than the populated tiles' — but it
+    // must still land inside each band and stay clear of the gaps.
+    expect(inkOnRow(buf, bg, 8)).toBe(true) // the '--' label
+    expect(inkOnRow(buf, bg, 62)).toBe(true) // the '--' temperature
+    expect(inkOnRow(buf, bg, 85)).toBe(true) // the '--' precip
+    expect(inkOnRow(buf, bg, 16)).toBe(false)
+    expect(inkOnRow(buf, bg, 52)).toBe(false)
+    expect(inkOnRow(buf, bg, 72)).toBe(false)
   })
 })
 

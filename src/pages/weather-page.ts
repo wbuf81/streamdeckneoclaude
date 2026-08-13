@@ -24,7 +24,13 @@ const DAY_TILE_COUNT = 7
  */
 const DAY_LABEL_SIZE = 12
 const DAY_LABEL_Y = 3
-const TEMP_SIZE = 16
+/**
+ * Candidate sizes for the temperature line, largest first. `95°/77°` fits at
+ * 16 px (measured, see docs/VERIFIED-FACTS.md), so that stays the common
+ * case, but a below-freezing pair like `-10°/-25°` does not — the renderer
+ * measures and drops to a smaller candidate rather than clipping.
+ */
+const TEMP_SIZES = [16, 13, 11]
 const TEMP_Y = 54
 const PRECIP_SIZE = 20
 const PRECIP_Y = 74
@@ -156,7 +162,21 @@ export class WeatherPage implements Page {
 
   private dayKey(day: DayForecast | undefined, dim: boolean): KeySpec {
     if (!day) {
-      return { kind: 'gauge', lines: ['--', '--', '--'], dim: true }
+      // Same four-band layout and centred alignment as a populated tile —
+      // just with placeholder text and no emoji. Without this, a partial
+      // forecast (the source keeps whatever periods it parsed) rendered
+      // this slot on the OLD legacy left-aligned layout, three tiny dashes
+      // hugging the top-left corner beside the redesigned tiles either side
+      // of it.
+      return {
+        kind: 'gauge',
+        lines: ['--', '--', '--'],
+        lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
+        lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
+        align: 'center',
+        bg: DEFAULT_TINT,
+        dim: true,
+      }
     }
 
     const key: KeySpec = {
@@ -164,7 +184,7 @@ export class WeatherPage implements Page {
       // Bands 1, 3 and 4. Band 2 (the emoji) sits between the label and the
       // temperature line, drawn separately by `canvas.ts` from `emoji`.
       lines: [day.label, formatTemps(day.high, day.low), formatPrecip(day.precipPercent)],
-      lineSizes: [DAY_LABEL_SIZE, TEMP_SIZE, PRECIP_SIZE],
+      lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
       lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
       // The temperature line is graded by heat; the precip line keeps the
       // user's existing rain-chance rule. Per the user's decision, this page
