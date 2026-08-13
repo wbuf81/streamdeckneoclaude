@@ -1,6 +1,6 @@
 import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
-import { truncate, fitSize } from '../render/text.js'
+import { truncate } from '../render/text.js'
 import type { Page } from './types.js'
 import type { MarketState, Quote, StockStatus } from '../sources/stocks.js'
 import { SYMBOLS, downsample } from '../sources/stocks.js'
@@ -12,15 +12,21 @@ const STRIP_CHARS = 30
 /** The exchange timezone for every symbol on this page. All eight tickers
  * trade on a US exchange, so one timezone covers them all. */
 const EXCHANGE_TZ = 'America/New_York'
-/** Measured usable width of one key: 96 - 3 border - 6 padding each side.
- * See docs/VERIFIED-FACTS.md. */
-const USABLE_WIDTH = 81
-/** `fitSize` candidates for the detail view's numeric lines, largest first.
- * 16 px is required to fit a 7-character price like `1234.56`. */
-const PRICE_SIZES = [24, 20, 16]
+/**
+ * Candidate sizes for the detail view's numeric lines, largest first. 16 px
+ * fits a 7-character price like `1234.56`; 13 and 11 extend the list
+ * downward for the widest realistic case, a three-digit change percent like
+ * `▲ 150.00%` (86.7 px at 16 px — the review's exact repro, past the 81 px
+ * usable width). This page passes the array itself: it declares intent, and
+ * `renderKey` measures with a real canvas and picks the size that actually
+ * fits — see `KeySpec.lineSizes`'s doc comment. That keeps this page pure
+ * (no canvas import, not even transitively) and lets the renderer shrink
+ * further than any single fixed candidate ever could.
+ */
+const PRICE_SIZES = [24, 20, 16, 13, 11]
 /** Fixed size for the detail view's symbol and label lines. Every symbol is
  * at most 4 characters and every label ("DAY", "52 WK") is short, so these
- * never need `fitSize` — they are measured once, here, not per render. */
+ * never need fitting — a plain number, drawn as given. */
 const SYMBOL_SIZE = 24
 const LABEL_SIZE = 16
 const BACK_SIZE = 16
@@ -213,13 +219,16 @@ export class StocksPage implements Page {
   }
 
   /** Key 0: the symbol, then the price sized to fit whatever width the
-   * actual digits need — measured, not assumed, per docs/LESSONS.md #17. */
+   * actual digits need. The size candidates are declared here; `renderKey`
+   * measures and resolves them — per docs/LESSONS.md #17, and per the A3
+   * ruling that pages declare intent while the renderer does the canvas
+   * work. */
   private priceKey(quote: Quote, border: Rgb, dim: boolean): KeySpec {
     const priceText = formatPrice(quote.price)
     const key: KeySpec = {
       kind: 'gauge',
       lines: [quote.symbol, priceText],
-      lineSizes: [SYMBOL_SIZE, fitSize(priceText, PRICE_SIZES, USABLE_WIDTH)],
+      lineSizes: [SYMBOL_SIZE, PRICE_SIZES],
       border,
     }
     if (dim) key.dim = true
@@ -235,7 +244,7 @@ export class StocksPage implements Page {
     const key: KeySpec = {
       kind: 'gauge',
       lines: [pctText, valText],
-      lineSizes: [fitSize(pctText, PRICE_SIZES, USABLE_WIDTH), fitSize(valText, PRICE_SIZES, USABLE_WIDTH)],
+      lineSizes: [PRICE_SIZES, PRICE_SIZES],
       lineColors: [color, color],
       border,
     }
@@ -243,45 +252,60 @@ export class StocksPage implements Page {
     return key
   }
 
-  /** Keys 2 and 3: a label, then the high, then the low. Used for both the
+  /**
+   * Keys 2 and 3: a label, then the high, then the low. Used for both the
    * day range and the 52-week range — the only difference is the label and
-   * which two fields feed it. */
+   * which two fields feed it.
+   *
+   * The high and low lines pass the SAME `PRICE_SIZES` array (by value), so
+   * `renderKey` sizes them as one group (M3) — otherwise fitting each line
+   * independently could render the low bigger than the high directly above
+   * it, which reads as two unrelated numbers instead of one range.
+   */
   private rangeKey(label: string, high: number | null, low: number | null, border: Rgb, dim: boolean): KeySpec {
     const highText = formatPrice(high)
     const lowText = formatPrice(low)
     const key: KeySpec = {
       kind: 'gauge',
       lines: [label, highText, lowText],
-      lineSizes: [
-        LABEL_SIZE,
-        fitSize(highText, PRICE_SIZES, USABLE_WIDTH),
-        fitSize(lowText, PRICE_SIZES, USABLE_WIDTH),
-      ],
+      lineSizes: [LABEL_SIZE, PRICE_SIZES, PRICE_SIZES],
       border,
     }
     if (dim) key.dim = true
     return key
   }
 
-  /** Keys 4, 5 and 6: one intraday chart, spanning all three. Each key draws
+  /**
+   * Keys 4, 5 and 6: one intraday chart, spanning all three. Each key draws
    * only its own slice of the SAME series, so the three stay in scale with
-   * each other — see `SparkSpec.slice` in `render/specs.ts`. */
+   * each other — see `SparkSpec.slice` in `render/specs.ts`. These three
+   * keys carry no text, so the chart uses `fullHeight` (M4) to own the
+   * whole tile instead of just the default lower band.
+   */
   private chartKey(quote: Quote, trend: Trend, border: Rgb, dim: boolean, index: number): KeySpec {
     const key: KeySpec = { kind: 'gauge', border }
     if (quote.spark.length >= 2) {
-      key.spark = { values: quote.spark, color: trendColor(trend), slice: { index, count: CHART_SPAN } }
+      key.spark = {
+        values: quote.spark,
+        color: trendColor(trend),
+        slice: { index, count: CHART_SPAN },
+        fullHeight: true,
+      }
     }
     if (dim) key.dim = true
     return key
   }
 
   /** Key 7: BACK. A gray border and no trend colour, on purpose, so it never
-   * reads as one more data tile. */
+   * reads as one more data tile. Centred vertically as well as
+   * horizontally (M4) — with no other line to share the tile, the label
+   * reads better in the middle than hugging the top edge. */
   private backKey(): KeySpec {
     return {
       kind: 'control',
       lines: ['◀ BACK'],
       lineSizes: [BACK_SIZE],
+      lineY: [40],
       align: 'center',
       border: theme.gray,
     }

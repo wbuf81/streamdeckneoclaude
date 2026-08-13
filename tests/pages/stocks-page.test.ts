@@ -1,8 +1,7 @@
 import { describe, it, expect } from 'vitest'
-import { createCanvas } from '@napi-rs/canvas'
 import { StocksPage } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
-import { FONT } from '../../src/render/canvas.js'
+import { renderKey, probe, KEY_SIZE } from '../../src/render/canvas.js'
 import { SYMBOLS } from '../../src/sources/stocks.js'
 import type { Quote, MarketState, StockStatus } from '../../src/sources/stocks.js'
 
@@ -327,6 +326,28 @@ describe('StocksPage detail view layout', () => {
     expect(key.lines).toEqual(['52 WK', '498.83', '297.38'])
   })
 
+  it('passes the SAME size-candidate array for the high and low lines, so the renderer sizes them as one unit (M3)', () => {
+    // The review's exact repro: a $1200 stock's 52-week tile used to render
+    // ['52 WK', '1499.99', '899.01'] at independently-fitted sizes
+    // [16, 16, 20] — the low bigger than the high directly above it.
+    // `renderKey` groups consecutive lines that pass the identical
+    // candidate array into one shared size (proven generally, with a pixel
+    // probe, in tests/render/canvas.test.ts's "sizes a group of consecutive
+    // lines... as one unit"); this test proves THIS page feeds it that
+    // shape for the range tiles.
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, {
+      price: 1200, previousClose: 1200, changePercent: 0,
+      week52High: 1499.99, week52Low: 899.01,
+    }))
+    const { page } = build({ quotes })
+    page.onKeyPress(0)
+    const key = page.render(NOW).keys[3]!
+    expect(key.lines).toEqual(['52 WK', '1499.99', '899.01'])
+    expect(Array.isArray(key.lineSizes![1])).toBe(true)
+    expect(key.lineSizes![1]).toEqual(key.lineSizes![2])
+  })
+
   it('keys 4, 5 and 6 share one spark series, sliced into 3 consecutive parts', () => {
     const keys = detailKeys()
     const [k4, k5, k6] = [keys[4]!, keys[5]!, keys[6]!]
@@ -337,10 +358,78 @@ describe('StocksPage detail view layout', () => {
     expect(k5.spark!.values).toEqual(k6.spark!.values)
   })
 
+  it('gives the chart keys fullHeight, since they carry no text (M4)', () => {
+    const keys = detailKeys()
+    for (const key of [keys[4]!, keys[5]!, keys[6]!]) {
+      expect(key.spark!.fullHeight).toBe(true)
+      expect(key.lines).toBeUndefined()
+    }
+  })
+
+  it('actually uses more of the key height for the chart than the default band (M4, measured)', () => {
+    // A custom oscillating series, not `tslaLikeQuote`'s monotonic one:
+    // slice 0 of a strictly increasing series only ever sees the SMALLEST
+    // values (see the normalisation test in tests/render/canvas.test.ts),
+    // so its bars are short regardless of fullHeight. An oscillating series
+    // gives slice 0 a tall bar too, so this test actually exercises the
+    // taller band.
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, {
+      spark: Array.from({ length: 24 }, (_, i) => Math.sin(i / 2) * 10 + 20),
+    }))
+    const { page } = build({ quotes })
+    page.onKeyPress(0)
+    const key = page.render(NOW).keys[4]!
+    const buf = renderKey(key)
+    let topInk = -1
+    // Scans from x = 4, past the chart key's own 3 px trend-coloured
+    // border strip, which spans the full key height — including it would
+    // find "ink" at row 0 on every chart key regardless of the spark band,
+    // making this proof vacuous.
+    for (let y = 0; y < KEY_SIZE && topInk < 0; y++) {
+      for (let x = 4; x < KEY_SIZE; x++) {
+        const [r, g, b] = probe(buf, x, y)
+        const bg = theme.bg
+        if (Math.abs(r - bg[0]) > 12 || Math.abs(g - bg[1]) > 12 || Math.abs(b - bg[2]) > 12) {
+          topInk = y
+          break
+        }
+      }
+    }
+    // The default spark band's tallest bar starts no earlier than row 48.
+    // A full-height chart must be able to paint above that.
+    expect(topInk).toBeGreaterThanOrEqual(0)
+    expect(topInk).toBeLessThan(48)
+  })
+
   it('key 7 shows BACK with a gray border, distinct from the trend-coloured data tiles', () => {
     const key = detailKeys()[7]!
     expect(key.lines!.join('')).toContain('BACK')
     expect(key.border).toEqual(theme.gray)
+  })
+
+  it('centres BACK vertically, not just horizontally (M4, measured)', () => {
+    const key = detailKeys()[7]!
+    const buf = renderKey(key)
+    // Scans from x = 4, past BACK's own 3 px gray border strip — the border
+    // spans the full key height, so including it would register as "ink"
+    // on every row and make this proof vacuous.
+    const inkAt = (y: number) => {
+      for (let x = 4; x < KEY_SIZE; x++) {
+        const [r, g, b] = probe(buf, x, y)
+        const bg = theme.bg
+        if (Math.abs(r - bg[0]) > 12 || Math.abs(g - bg[1]) > 12 || Math.abs(b - bg[2]) > 12) return true
+      }
+      return false
+    }
+    // The old top-hugging layout painted ink at rows 7-19. Centred in a
+    // 96 px key, ink should sit well below that, roughly the middle third.
+    expect(inkAt(10)).toBe(false)
+    let hasMiddleInk = false
+    for (let y = 35; y < 60; y++) {
+      if (inkAt(y)) hasMiddleInk = true
+    }
+    expect(hasMiddleInk).toBe(true)
   })
 
   it('every data tile (0-6) carries the trend colour as its border; key 7 does not', () => {
@@ -381,26 +470,48 @@ describe('StocksPage detail view layout', () => {
 })
 
 describe('StocksPage detail view text fits the usable key width', () => {
-  const USABLE_WIDTH = 81
+  // A3 from the review: `lineSizes` now declares a page's INTENT as an
+  // array of candidate sizes (see `KeySpec.lineSizes`'s doc comment); the
+  // renderer resolves it to a concrete size, measured at draw time. So the
+  // width proof has to render the real pixels through `renderKey` and probe
+  // them, rather than reading `key.lineSizes[i]` as if it were already a
+  // final number (it may now be the candidate array itself). This also
+  // means it measures the property that actually matters — no ink past the
+  // key's own right margin — instead of trusting the page's declared size.
+  const RIGHT_EDGE_X = 90 // BORDER(3) + PAD(6) + usable width(81)
 
-  function measure(text: string, size: number): number {
-    const ctx = createCanvas(1, 1).getContext('2d')
-    ctx.font = `${size}px ${FONT}`
-    return ctx.measureText(text).width
+  function noInkAtOrPastRightEdge(buf: Buffer): boolean {
+    for (let y = 0; y < KEY_SIZE; y++) {
+      const [r, g, b] = probe(buf, RIGHT_EDGE_X, y)
+      const bg = theme.bg
+      if (Math.abs(r - bg[0]) > 12 || Math.abs(g - bg[1]) > 12 || Math.abs(b - bg[2]) > 12) {
+        return false
+      }
+    }
+    return true
   }
 
   // Every real symbol, across prices spanning a single digit dollar up to a
-  // four-digit one (NOW trades near $1000), the exact stress case the brief
-  // calls out: a clipped price has already shipped twice in this project.
-  it.each(SYMBOLS)('fits every line on keys 0-3 for %s at $9.99, $327.51 and $1234.56', (symbol) => {
-    for (const price of [9.99, 327.51, 1234.56]) {
+  // four-digit one (NOW trades near $1000, the brief's stress case), AND a
+  // three-digit change percent with a negative sign — the review's exact
+  // repro for the clipped change line (`▲ 150.00%` measured at 86.7 px,
+  // past the 81 px budget, because the old fixed size list bottomed out at
+  // 16 and `fitSize` drew it anyway).
+  it.each(SYMBOLS)('keeps every line on keys 0-3 clear of the right margin for %s', (symbol) => {
+    for (const [price, changePercent] of [
+      [9.99, -1.59],
+      [327.51, -1.59],
+      [1234.56, -1.59],
+      [327.51, 150], // three-digit change percent, positive
+      [327.51, -150], // three-digit change percent, with a negative sign
+    ] as const) {
       const quotes = allQuotes()
       quotes.set(
         symbol,
         quote(symbol, {
           price,
-          previousClose: price + 5.3,
-          changePercent: -1.59,
+          previousClose: price - (price * changePercent) / 100,
+          changePercent,
           dayHigh: price + 8.12,
           dayLow: price - 8.12,
           week52High: price + 171.32,
@@ -413,10 +524,7 @@ describe('StocksPage detail view text fits the usable key width', () => {
       const keys = page.render(NOW).keys
 
       for (const key of keys.slice(0, 4)) {
-        key.lines?.forEach((line, i) => {
-          const size = key.lineSizes?.[i] ?? 11
-          expect(measure(line, size)).toBeLessThanOrEqual(USABLE_WIDTH)
-        })
+        expect(noInkAtOrPastRightEdge(renderKey(key))).toBe(true)
       }
     }
   })
