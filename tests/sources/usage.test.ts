@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -219,5 +219,59 @@ describe('UsageSource', () => {
     expect(changes).toBeGreaterThan(0)
     expect(s.getMeta('aaaa')!.model).toBe('Opus 5')
     await s.stop()
+  })
+
+  // I2 — `getUsage()` and `getMeta()` used to return the live cached objects
+  // directly. Break either fix (drop the `{ ...x }` spread) and the
+  // corresponding assertion below fails.
+  it('returns a copy from getUsage, so mutating the result cannot corrupt the source', async () => {
+    write({
+      rate_limits: { five_hour: { used_percentage: 62, resets_at: NOW + 100 } },
+      ts: NOW,
+    })
+    const s = new UsageSource(dir, () => NOW)
+    await s.start()
+    const usage = s.getUsage()!
+    usage.fiveHourPct = -1
+    expect(s.getUsage()!.fiveHourPct).toBe(62)
+    await s.stop()
+  })
+
+  it('returns a copy from getMeta, so mutating the result cannot corrupt the source', async () => {
+    writeFileSync(
+      join(dir, 'sessions', 'aaaa.json'),
+      JSON.stringify({ model: 'Opus 5', ctxPct: 41, costUsd: 1.23, ts: NOW }),
+    )
+    const s = new UsageSource(dir, () => NOW)
+    await s.start()
+    const meta = s.getMeta('aaaa')!
+    meta.model = 'HACKED'
+    expect(s.getMeta('aaaa')!.model).toBe('Opus 5')
+    await s.stop()
+  })
+
+  // M2 — `usage.ts` watched the same kind of directory as `ClaudeSource`,
+  // with the same rename-based writer, but had no debounce: a rename fires
+  // more than once, and the statusline wrapper rewrites `usage.json` on
+  // every Claude Code render. Exercises the debounce mechanism directly
+  // (not real fs.watch timing, which is OS-dependent and would make this
+  // test flaky): two events scheduled back to back collapse into one
+  // refresh. Break the fix (call `void this.refresh()` straight from the
+  // watcher again) and this fails with 2 calls instead of 1.
+  it('coalesces a burst of scheduled refreshes into one', async () => {
+    vi.useFakeTimers()
+    const s = new UsageSource(dir, () => NOW)
+    try {
+      await s.start()
+      const refreshSpy = vi.spyOn(s, 'refresh')
+      const scheduleRefresh = (s as unknown as { scheduleRefresh(): void }).scheduleRefresh.bind(s)
+      scheduleRefresh()
+      scheduleRefresh()
+      await vi.advanceTimersByTimeAsync(60)
+      expect(refreshSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      await s.stop()
+      vi.useRealTimers()
+    }
   })
 })

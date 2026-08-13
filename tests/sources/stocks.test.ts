@@ -465,37 +465,47 @@ describe('StockSource', () => {
     await src.stop()
   })
 
-  it('is stale when the market is open and the newest quote is older than 15 minutes', async () => {
+  it('is per-symbol stale when the market is open and the quote is older than 15 minutes', async () => {
     const body = chartBody({}, { symbol: 'AAA', regularMarketTime: NOW - 20 * 60 })
     const { fetchFn } = build({ AAA: body, BBB: body })
     const src = new StockSource(SYMS, fetchFn as never, () => NOW)
     await src.refresh()
-    expect(src.isStale()).toBe(true)
+    expect(src.isSymbolStale('AAA')).toBe(true)
   })
 
-  it('is not stale when the market is closed, even with an old quote', async () => {
-    const closedPeriod = {
-      pre: { start: NOW - 100000, end: NOW - 90000 },
-      regular: { start: NOW - 90000, end: NOW - 80000 },
-      post: { start: NOW - 80000, end: NOW - 70000 },
-    }
-    const body = chartBody(
-      {},
-      { symbol: 'AAA', regularMarketTime: NOW - 20 * 60, currentTradingPeriod: closedPeriod },
-    )
-    const { fetchFn } = build({ AAA: body, BBB: body })
-    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
-    await src.refresh()
-    expect(src.getMarketState()).toBe('closed')
-    expect(src.isStale()).toBe(false)
-  })
-
-  it('is not stale right after a fresh refresh while the market is open', async () => {
+  it('is not per-symbol stale right after a fresh refresh while the market is open', async () => {
     const body = chartBody({}, { symbol: 'AAA', regularMarketTime: NOW })
     const { fetchFn } = build({ AAA: body, BBB: body })
     const src = new StockSource(SYMS, fetchFn as never, () => NOW)
     await src.refresh()
-    expect(src.isStale()).toBe(false)
+    expect(src.isSymbolStale('AAA')).toBe(false)
+  })
+
+  // I4 — `'unknown'` used to read exactly like `'open'` being false: a
+  // one-sided `marketState !== 'open'` treated an absent or malformed
+  // `currentTradingPeriod` as a safe reason not to dim (lesson 18 inverted).
+  // Break the fix (drop the `marketState === 'unknown'` branch) and this
+  // fails, even though the quote itself is fresh by the clock.
+  it('is per-symbol stale when the market state is unknown, even for a fresh-by-the-clock quote', async () => {
+    const { fetchFn } = build({
+      AAA: chartBody({}, { symbol: 'AAA', regularMarketTime: NOW, currentTradingPeriod: undefined }),
+      BBB: chartBody({}, { symbol: 'BBB', regularMarketTime: NOW, currentTradingPeriod: undefined }),
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+    expect(src.getMarketState()).toBe('unknown')
+    expect(src.isSymbolStale('AAA')).toBe(true)
+  })
+
+  it('is not per-symbol stale for a symbol with no quote at all, even while the market state is unknown', async () => {
+    const { fetchFn } = build({
+      AAA: chartBody({}, { symbol: 'AAA', currentTradingPeriod: undefined }),
+      BBB: chartBody({}, { symbol: 'BBB', currentTradingPeriod: undefined }),
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+    expect(src.getMarketState()).toBe('unknown')
+    expect(src.isSymbolStale('ZZZ')).toBe(false)
   })
 
   it('returns a copy from getQuotes, so mutating the result cannot corrupt the source', async () => {
@@ -516,12 +526,32 @@ describe('StockSource', () => {
     expect(fresh.size).toBe(2)
   })
 
-  it('is stale for one symbol while a fresher symbol keeps the whole source non-stale', async () => {
-    // `isStale()` only ever looks at the NEWEST quote across every symbol,
-    // so a single lagging symbol hides behind a fresh one and the
-    // whole-source method reports false. Per-symbol staleness must catch
-    // it, and the existing whole-source method must keep behaving exactly
-    // as before -- a page not owned by this change still calls it.
+  // I2 — a shallow `new Map(this.quotes)` copies the container but shares
+  // every `Quote` OBJECT and its `spark` ARRAY with the source's own live
+  // cache. A test that only mutates the outer Map (deleting or adding keys,
+  // as above) passes against that broken code too — this mutates INSIDE a
+  // quote instead. Break the fix (go back to `new Map(this.quotes)`) and
+  // both assertions below fail.
+  it('deep-copies each quote, so mutating a field or the spark array cannot corrupt the source', async () => {
+    const { fetchFn } = build({
+      AAA: chartBody({}, { symbol: 'AAA' }),
+      BBB: chartBody({}, { symbol: 'BBB' }),
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+
+    const quote = src.getQuotes().get('AAA')!
+    quote.price = -1
+    quote.spark.push(999)
+
+    const fresh = src.getQuotes().get('AAA')!
+    expect(fresh.price).not.toBe(-1)
+    expect(fresh.spark).not.toContain(999)
+  })
+
+  it('is stale for one symbol without affecting a fresher one', async () => {
+    // A single lagging symbol must dim on its own, without a fresher
+    // symbol's own freshness masking it (and vice versa).
     const freshBody = chartBody({}, { symbol: 'AAA', regularMarketTime: NOW })
     const staleBody = chartBody({}, { symbol: 'BBB', regularMarketTime: NOW - 20 * 60 })
     const { fetchFn } = build({ AAA: freshBody, BBB: staleBody })
@@ -531,7 +561,6 @@ describe('StockSource', () => {
     expect(src.getMarketState()).toBe('open')
     expect(src.isSymbolStale('AAA')).toBe(false)
     expect(src.isSymbolStale('BBB')).toBe(true)
-    expect(src.isStale()).toBe(false)
   })
 
   it('is not per-symbol stale while the market is closed, even with an old quote', async () => {
@@ -632,6 +661,32 @@ describe('StockSource yearly series (the detail chart\'s 52-week data)', () => {
     const state = src.getYearlyState('AAA')
     expect(state.status).toBe('ok')
     if (state.status === 'ok') expect(state.values).toEqual([248.1, 249.3, 250.5])
+  })
+
+  // I2 — `getYearlyState` used to hand back the cached entry's `values`
+  // array BY REFERENCE. Verified: a caller truncating the returned array (the
+  // natural thing to do before drawing a sparkline) blanked the cache to
+  // `{ values: [] }`, and since `requestYearly` will not refetch for
+  // `YEARLY_REFRESH_SECONDS` (6 hours), that mutation blanked the 52-week
+  // chart for six hours. Break the fix (drop the `[...entry.values]` copy)
+  // and this fails.
+  it('deep-copies the yearly series, so truncating the result cannot blank the cache', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true, status: 200, json: async () => chartBody({}, { symbol: 'AAA' }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.requestYearly('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = src.getYearlyState('AAA')
+    if (state.status !== 'ok') throw new Error('expected ok')
+    state.values.length = 0 // truncate the array the caller got back.
+
+    const fresh = src.getYearlyState('AAA')
+    if (fresh.status !== 'ok') throw new Error('expected ok')
+    expect(fresh.values).toEqual([248.1, 249.3, 250.5])
   })
 
   it('sends the User-Agent header, same as the intraday fetch', async () => {

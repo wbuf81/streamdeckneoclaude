@@ -315,11 +315,28 @@ export class StockSource extends EventEmitter {
     this.fetchFn = f
   }
 
-  /** Returns a copy. The caller cannot mutate the source's own state through
-   * the result, and the map keeps being valid even after a later refresh
-   * replaces `this.quotes` with a new one. */
+  /**
+   * Returns a copy deep enough that the caller cannot mutate the source's
+   * own state through the result, and the map keeps being valid even after
+   * a later refresh replaces `this.quotes` with a new one.
+   *
+   * I2: a shallow `new Map(this.quotes)` — this method's own doc comment
+   * used to claim exactly the safety property this paragraph now describes,
+   * while the code below it copied only the MAP, leaving every `Quote`
+   * object and its `spark` array shared with the source's live cache.
+   * Verified: `getQuotes().get('TSLA').price = -1` and
+   * `.spark.push(999)` both corrupted the source's own state, and the
+   * corruption then suppressed the very whole-snapshot `change` key
+   * (`doRefresh`) that would have repaired it on the next poll. A new
+   * object per quote, with a new array for `spark`, is deep enough — every
+   * other field is a primitive.
+   */
   getQuotes(): Map<string, Quote> {
-    return new Map(this.quotes)
+    const out = new Map<string, Quote>()
+    for (const [symbol, quote] of this.quotes) {
+      out.set(symbol, { ...quote, spark: [...quote.spark] })
+    }
+    return out
   }
 
   getStatus(): StockStatus {
@@ -331,31 +348,32 @@ export class StockSource extends EventEmitter {
   }
 
   /**
-   * True when the newest known quote is older than 15 minutes and the market
-   * is open. A closed market is not stale, it is closed, so the page can
-   * tell the two apart instead of presenting old prices as current.
-   */
-  isStale(): boolean {
-    if (this.marketState !== 'open') return false
-    let newest = -Infinity
-    for (const q of this.quotes.values()) {
-      if (q.asOf > newest) newest = q.asOf
-    }
-    if (newest === -Infinity) return false
-    return this.now() - newest > STALE_SECONDS
-  }
-
-  /**
    * True when THIS symbol's own quote is older than 15 minutes while the
-   * market is open. `isStale()` looks only at the newest quote across every
-   * symbol, so one lagging symbol can hide behind the others and never dim
-   * on its own. This lets a caller check staleness per symbol instead.
-   * False for a symbol with no quote yet — there is nothing stale to show.
+   * market is open, OR the market state is unknown at all and a quote
+   * exists. False for a symbol with no quote yet — there is nothing stale to
+   * show — and false while the market is genuinely `'closed'`, `'pre'`, or
+   * `'post'`: a real measured state, not a signal that never arrived.
+   *
+   * I4: `'unknown'` used to read the SAME as `'open'` being false — a
+   * one-sided `if (this.marketState !== 'open') return false` treated an
+   * absent or malformed `currentTradingPeriod` as a positive reason NOT to
+   * dim, lesson 18 inverted (absence read as a safe state). An unmeasured
+   * market state is not evidence of freshness; it is evidence of nothing,
+   * and the honest answer is "cannot tell whether this is stale", which
+   * dims rather than brightens.
+   *
+   * (`isStale()`, the whole-source sibling of this method, was deleted: it
+   * had no caller anywhere in `src/` — not even `StockReader`, the
+   * interface `stocks-page.ts` actually depends on, ever declared it — the
+   * same dead-freshness-API trap `docs/LESSONS.md` records for Codex's
+   * `usage.ts`. `isSymbolStale` is the one the page uses, at both the grid
+   * tile and the detail view.)
    */
   isSymbolStale(symbol: string): boolean {
-    if (this.marketState !== 'open') return false
     const q = this.quotes.get(symbol)
     if (!q) return false
+    if (this.marketState === 'unknown') return true
+    if (this.marketState !== 'open') return false
     return this.now() - q.asOf > STALE_SECONDS
   }
 
@@ -501,10 +519,19 @@ export class StockSource extends EventEmitter {
    * The 52-week series for one symbol, or its current fetch/failure state.
    * Read-only: never triggers a fetch. The detail view calls this on every
    * render, so it must stay a plain lookup with no side effect.
+   *
+   * I2: `values` used to be handed back by reference to the cache entry
+   * itself. Verified: a caller truncating the returned array (the natural
+   * thing to do before drawing a sparkline) blanked the cached series down
+   * to `{ values: [] }`, and since `requestYearly` will not refetch for
+   * `YEARLY_REFRESH_SECONDS` (6 hours), one in-place mutation blanked the
+   * 52-week chart for six hours with no way to recover sooner.
    */
   getYearlyState(symbol: string): YearlyState {
     const entry = this.yearly.get(symbol)
-    if (entry?.status === 'ok') return { status: 'ok', values: entry.values, updatedAt: entry.updatedAt }
+    if (entry?.status === 'ok') {
+      return { status: 'ok', values: [...entry.values], updatedAt: entry.updatedAt }
+    }
     if (this.yearlyInFlight.has(symbol)) return { status: 'loading' }
     if (entry?.status === 'error') return { status: 'error' }
     return { status: 'unknown' }

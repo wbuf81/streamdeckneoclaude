@@ -236,10 +236,48 @@ describe('SpotifySource', () => {
     expect(src.interpolate(1010)!.positionMs).toBe(134000)
   })
 
-  it('never advances past the track duration', async () => {
+  it('never advances past the track duration, within the trusted poll-age window', async () => {
     const { src } = build([{ status: 200, body: PLAYER }])
     await src.poll()
-    expect(src.interpolate(99999)!.positionMs).toBe(272000)
+    // 250 seconds: past the remaining 138s of the track, but still inside
+    // the M7 freeze threshold (301s and beyond freezes instead — see the
+    // dedicated test below).
+    expect(src.interpolate(1000 + 250)!.positionMs).toBe(272000)
+  })
+
+  // M7 — `interpolate` used to advance from `polledAt` with no bound on how
+  // stale that poll had gotten, so a network outage let the bar creep all
+  // the way to `durationMs` and park there, still presenting as "playing,
+  // nearly done". 301 seconds is chosen so the OLD unbounded code would
+  // already have hit the duration clamp (134000 + 301000ms is far past
+  // 272000) — proving this freezes at the TRUE last position, not merely
+  // the pre-existing duration clamp. Break the fix (drop the poll-age
+  // check) and this fails, landing on 272000 instead.
+  it('freezes at the last known position rather than creeping to the end of the track after a long poll outage', async () => {
+    const { src } = build([{ status: 200, body: PLAYER }])
+    await src.poll() // polledAt = 1000 (this test's injected clock).
+    const frozen = src.interpolate(1000 + 301)
+    expect(frozen!.positionMs).toBe(134000)
+  })
+
+  // I2 — `getState()` used to return the live object, and `interpolate()`
+  // the same while paused (the playing branch already copied via its own
+  // `{ ...this.state, positionMs }` spread). Break either fix and the
+  // corresponding assertion below fails.
+  it('returns a copy from getState, so mutating the result cannot corrupt the source', async () => {
+    const { src } = build([{ status: 200, body: PLAYER }])
+    await src.poll()
+    const state = src.getState()!
+    state.title = 'HACKED'
+    expect(src.getState()!.title).toBe('Planet Caravan')
+  })
+
+  it('returns a copy from interpolate while paused, so mutating the result cannot corrupt the source', async () => {
+    const { src } = build([{ status: 200, body: { ...PLAYER, is_playing: false } }])
+    await src.poll()
+    const state = src.interpolate(1010)!
+    state.title = 'HACKED'
+    expect(src.getState()!.title).toBe('Planet Caravan')
   })
 
   it('sends a PUT to pause', async () => {

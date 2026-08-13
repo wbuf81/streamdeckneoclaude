@@ -17,6 +17,19 @@ const ART_CACHE_MAX = 200
 const ART_RETRY_COOLDOWN_SECONDS = 60
 /** The API needs a moment to settle after a command, so poll again shortly. */
 const SETTLE_MS = 300
+/**
+ * M7: `interpolate` advances the progress bar from `polledAt`, which only
+ * moves forward on a SUCCESSFUL poll. During a network outage `polledAt`
+ * stops advancing while wall-clock `now` keeps going, so the bar walked all
+ * the way to the end of the track and parked there — clamped to
+ * `durationMs`, so it never overran, but it kept presenting "playing,
+ * nearly done" when the truth was "no word from Spotify in ten minutes".
+ * Beyond this many seconds since the last successful poll, the position
+ * freezes at its last known value instead of continuing to creep, however
+ * old the poll gets. Set well above the idle poll interval
+ * (`POLL_IDLE_MS`) so a normal poll cadence never triggers it.
+ */
+const INTERPOLATE_MAX_POLL_AGE_SECONDS = 5 * 60
 
 export type RepeatMode = 'off' | 'context' | 'track'
 export type SpotifyStatus = 'ok' | 'unauthorized' | 'offline' | 'no-device'
@@ -159,8 +172,12 @@ export class SpotifySource extends EventEmitter {
     return mode === 'off' ? 'context' : mode === 'context' ? 'track' : 'off'
   }
 
+  /** I2: `PlayerState` is flat, so a shallow copy is deep enough — this used
+   * to return the live object itself. Verified: mutating a field on the
+   * returned state (for example `title`) corrupted the source's own cached
+   * player state for every subsequent caller. */
   getState(): PlayerState | null {
-    return this.state
+    return this.state ? { ...this.state } : null
   }
 
   getStatus(): SpotifyStatus {
@@ -342,8 +359,19 @@ export class SpotifySource extends EventEmitter {
    */
   interpolate(now: number): PlayerState | null {
     if (!this.state) return null
-    if (!this.state.isPlaying) return this.state
-    const elapsedMs = Math.max(0, now - this.polledAt) * 1000
+    // I2: a shallow copy — `PlayerState` is flat — so a paused state handed
+    // back here cannot be mutated into the source's own cached state, the
+    // same property the playing branch below already had via its `{
+    // ...this.state, positionMs }` spread.
+    if (!this.state.isPlaying) return { ...this.state }
+    const pollAgeSeconds = Math.max(0, now - this.polledAt)
+    if (pollAgeSeconds > INTERPOLATE_MAX_POLL_AGE_SECONDS) {
+      // M7: the last successful poll is too old to trust for interpolation.
+      // Freeze at the last known position rather than keep advancing toward
+      // "nearly done" on a track we have not actually heard about in a while.
+      return { ...this.state }
+    }
+    const elapsedMs = pollAgeSeconds * 1000
     const positionMs = Math.min(this.state.durationMs, this.state.positionMs + elapsedMs)
     return { ...this.state, positionMs }
   }

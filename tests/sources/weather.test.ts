@@ -534,6 +534,33 @@ describe('WeatherSource', () => {
     expect(src.getLastUpdatedAt()).toBe(NOW)
   })
 
+  // I2 — `getDays()` used to return `this.days` itself with no copy at all,
+  // and `getConditions()` the same for the live conditions object. A test
+  // that only replaces an array ELEMENT (or reassigns a whole day) can pass
+  // against that broken code; this mutates a FIELD, and inside the nested
+  // `day`/`night` detail specifically, to prove the copy goes deep enough.
+  // Break the fix (return `this.days/this.conditions` directly again) and
+  // every assertion below fails.
+  it('deep-copies days and conditions, so mutating a field or a nested day/night detail cannot corrupt the source', async () => {
+    const { fetchFn } = build()
+    const src = new WeatherSource(ZIP, fetchFn as never, () => NOW)
+    await src.refresh()
+
+    const days = src.getDays()
+    days[0]!.high = -999
+    if (days[0]!.day) days[0]!.day!.temperature = -999
+    if (days[0]!.night) days[0]!.night!.temperature = -999
+
+    const conditions = src.getConditions()!
+    conditions.temperature = -999
+
+    const freshDays = src.getDays()
+    expect(freshDays[0]!.high).not.toBe(-999)
+    expect(freshDays[0]!.day?.temperature).not.toBe(-999)
+    expect(freshDays[0]!.night?.temperature).not.toBe(-999)
+    expect(src.getConditions()!.temperature).not.toBe(-999)
+  })
+
   it('resolves the ZIP and the points lookup only once across several refreshes', async () => {
     const { fetchFn, calls } = build()
     const src = new WeatherSource(ZIP, fetchFn as never, () => NOW)
@@ -575,6 +602,57 @@ describe('WeatherSource', () => {
 
     expect(src.getStatus()).toBe('offline')
     expect(src.getDays()).toHaveLength(7)
+  })
+
+  // I3 — a cached gridpoint forecast URL that starts 404ing (NWS re-grids an
+  // office, or retires the URL) used to be retried forever, with no route
+  // back to `/points/`. Break the fix (drop the failure counter / URL
+  // retirement in `doRefresh`) and this fails: the mock would keep hitting
+  // the dead OLD url and `points` would never be called a second time.
+  it('re-resolves the forecast URL from /points/ after repeated forecast-fetch failures', async () => {
+    const OLD_URL = 'https://api.weather.gov/gridpoints/OKX/OLD/forecast'
+    const NEW_URL = 'https://api.weather.gov/gridpoints/OKX/NEW/forecast'
+    const calls = { zip: 0, points: 0, oldForecast: 0, newForecast: 0 }
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.includes('zippopotam')) {
+        calls.zip += 1
+        return { ok: true, status: 200, json: async () => zipBody() }
+      }
+      if (url.includes('api.weather.gov/points')) {
+        calls.points += 1
+        const forecast = calls.points === 1 ? OLD_URL : NEW_URL
+        return { ok: true, status: 200, json: async () => ({ properties: { forecast } }) }
+      }
+      if (url === OLD_URL) {
+        calls.oldForecast += 1
+        return { ok: false, status: 404, json: async () => ({}) } // the dead, re-gridded URL.
+      }
+      calls.newForecast += 1
+      return { ok: true, status: 200, json: async () => forecastBody(fullPeriods()) }
+    })
+    const src = new WeatherSource(ZIP, fetchFn as never, () => NOW)
+    try {
+      // Three consecutive failures against OLD_URL — the retirement
+      // threshold — without a fourth attempt against it.
+      await src.refresh()
+      await src.refresh()
+      await src.refresh()
+      expect(calls.oldForecast).toBe(3)
+      expect(calls.points).toBe(1) // not yet re-resolved.
+      expect(src.getStatus()).toBe('empty') // never succeeded even once yet.
+
+      // The next refresh must re-resolve /points/ rather than retry OLD_URL
+      // a fourth time, and then succeed against the NEW url it gets back.
+      await src.refresh()
+      expect(calls.points).toBe(2)
+      expect(calls.oldForecast).toBe(3) // no further attempt against the dead URL.
+      expect(calls.newForecast).toBe(1)
+      expect(src.getStatus()).toBe('ok')
+      expect(src.getDays()).toHaveLength(7)
+      expect(calls.zip).toBe(1) // the ZIP itself never needed re-resolving.
+    } finally {
+      await src.stop()
+    }
   })
 
   it('reports empty, not offline, when the very first refresh fails', async () => {

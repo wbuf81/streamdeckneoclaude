@@ -106,6 +106,7 @@ export class UsageSource extends EventEmitter {
   private watcher: FSWatcher | null = null
   private timer: NodeJS.Timeout | null = null
   private lastKey = ''
+  private debounce: NodeJS.Timeout | null = null
 
   constructor(
     private readonly stateDir: string = paths.stateDir,
@@ -126,12 +127,26 @@ export class UsageSource extends EventEmitter {
     await this.refresh()
     try {
       if (existsSync(this.stateDir)) {
-        this.watcher = watch(this.stateDir, () => void this.refresh())
+        this.watcher = watch(this.stateDir, () => this.scheduleRefresh())
       }
     } catch (e) {
       log.once('usage-watch-failed', `fs.watch failed, polling only: ${String(e)}`)
     }
     this.timer = setInterval(() => void this.refresh(), POLL_MS)
+  }
+
+  /** M2: coalesces a burst of watch events — same rationale as
+   * `ClaudeSource.scheduleRefresh`, watching the same kind of directory with
+   * the same rename-based writer: a rename fires more than once, and the
+   * statusline wrapper rewrites `usage.json` on every Claude Code render, so
+   * this fires often. Each event without this ran a full `readdirSync` of
+   * `sessions/` plus a `readFileSync` and `JSON.parse` per session file. */
+  private scheduleRefresh(): void {
+    if (this.debounce) return
+    this.debounce = setTimeout(() => {
+      this.debounce = null
+      void this.refresh()
+    }, 60)
   }
 
   async refresh(): Promise<void> {
@@ -193,8 +208,11 @@ export class UsageSource extends EventEmitter {
     return out
   }
 
+  /** I2: `UsageSnapshot` is flat, so a shallow copy is deep enough — this
+   * used to return the live object itself, letting a caller mutate the
+   * source's own cached usage snapshot. */
   getUsage(): UsageSnapshot | null {
-    return this.usage
+    return this.usage ? { ...this.usage } : null
   }
 
   /** True when the newest usage value is older than 15 minutes. */
@@ -203,14 +221,19 @@ export class UsageSource extends EventEmitter {
     return this.now() - this.usage.ts > STALE_USAGE_SECONDS
   }
 
+  /** I2: `SessionMeta` is flat, so a shallow copy is deep enough — this used
+   * to return the live map entry itself. */
   getMeta(sessionId: string): SessionMeta | null {
-    return this.meta.get(sessionId) ?? null
+    const m = this.meta.get(sessionId)
+    return m ? { ...m } : null
   }
 
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer)
+    if (this.debounce) clearTimeout(this.debounce)
     this.watcher?.close()
     this.timer = null
+    this.debounce = null
     this.watcher = null
   }
 }

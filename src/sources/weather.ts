@@ -15,6 +15,22 @@ const POLL_MS = 15 * 60 * 1000
 /** A forecast older than this counts as stale, so the page never presents an
  * old forecast as current. */
 const STALE_SECONDS = 2 * 60 * 60
+/**
+ * I3 — the resolved gridpoint forecast URL used to be cached for the whole
+ * process life with no route back to unresolved. NWS re-grids offices and
+ * retires gridpoint URLs — a real, recurring behaviour, not a hypothetical —
+ * so a URL that once worked can start 404ing at any time, and the source
+ * kept re-hitting the dead URL forever, only recoverable with a daemon
+ * restart. This many CONSECUTIVE forecast-fetch failures (network, HTTP, or
+ * JSON — see `fetchForecastBody`) retire the cached URL, so the next refresh
+ * re-resolves it from `/points/` using the already-cached coordinates,
+ * instead of the ZIP lookup running again too. The counter only ever resets
+ * on a genuine successful parse (lesson 10: a guard cleared in a `finally`
+ * regardless of outcome is not a guard, it is a request storm) — never
+ * cleared eagerly on every attempt, or a URL that fails every OTHER poll
+ * would never accumulate enough failures to retire.
+ */
+const FORECAST_URL_RETIRE_AFTER_FAILURES = 3
 
 export interface DayForecast {
   /** Short label for the key, for example `THU`. `NOW` for the current period. */
@@ -364,6 +380,11 @@ export class WeatherSource extends EventEmitter {
   private status: WeatherStatus = 'empty'
   private coords: Coordinates | null = null
   private forecastUrl: string | null = null
+  /** I3 — consecutive forecast-fetch failures against the CURRENT
+   * `forecastUrl`. Reset to 0 only on a genuine successful parse; a run of
+   * `FORECAST_URL_RETIRE_AFTER_FAILURES` retires the URL so the next refresh
+   * re-resolves it. */
+  private forecastFailures = 0
   private lastSuccessAt = 0
   private timer: NodeJS.Timeout | null = null
   private visible = false
@@ -386,12 +407,26 @@ export class WeatherSource extends EventEmitter {
     this.fetchFn = f
   }
 
+  /**
+   * I2: this used to return `this.days` itself — no copy at all, at either
+   * the array or the `DayForecast` level. A caller mutating a returned tile
+   * (or its nested `day`/`night` detail) corrupted the source's own live
+   * forecast. A new array, holding a new object per day, holding a new
+   * object for each non-null `day`/`night` half, is deep enough — every
+   * other field on `DayForecast` and `PeriodDetail` is a primitive.
+   */
   getDays(): DayForecast[] {
-    return this.days
+    return this.days.map((d) => ({
+      ...d,
+      day: d.day ? { ...d.day } : null,
+      night: d.night ? { ...d.night } : null,
+    }))
   }
 
+  /** I2: `Conditions` is flat, so a shallow copy is deep enough — this used
+   * to return the live object itself. */
   getConditions(): Conditions | null {
-    return this.conditions
+    return this.conditions ? { ...this.conditions } : null
   }
 
   getStatus(): WeatherStatus {
@@ -561,19 +596,38 @@ export class WeatherSource extends EventEmitter {
         const body = await this.fetchForecastBody(url)
         if (body !== undefined) {
           const parsed = parseForecast(body, this.now())
-            if (parsed.days.length > 0) {
+          if (parsed.days.length > 0) {
             this.days = parsed.days
             this.conditions = parsed.conditions
-              ok = true
-              log.clearOnce('weather-forecast-parse')
+            ok = true
+            this.forecastFailures = 0
+            log.clearOnce('weather-forecast-parse')
           } else {
             log.once('weather-forecast-parse', 'Forecast response has no usable periods.')
+          }
+        } else {
+          // I3: `fetchForecastBody` already logged the specific reason
+          // (network, HTTP, or JSON). This counts consecutive failures
+          // against the CURRENT url specifically, so a genuinely dead
+          // gridpoint URL (NWS re-grid, a retired endpoint) is eventually
+          // retired instead of retried forever.
+          this.forecastFailures++
+          if (this.forecastFailures >= FORECAST_URL_RETIRE_AFTER_FAILURES) {
+            this.forecastUrl = null
+            this.forecastFailures = 0
+            log.once(
+              'weather-forecast-url-retired',
+              `Forecast URL failed ${FORECAST_URL_RETIRE_AFTER_FAILURES} times in a row; re-resolving from /points/ on the next refresh.`,
+            )
           }
         }
       }
     }
 
-    if (ok) this.lastSuccessAt = this.now()
+    if (ok) {
+      this.lastSuccessAt = this.now()
+      log.clearOnce('weather-forecast-url-retired')
+    }
     this.status = ok ? 'ok' : this.days.length > 0 ? 'offline' : 'empty'
 
     const key = JSON.stringify({
