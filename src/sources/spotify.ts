@@ -117,6 +117,20 @@ export class SpotifySource extends EventEmitter {
   private retryAfter = 0
   private timer: NodeJS.Timeout | null = null
   private settleTimer: NodeJS.Timeout | null = null
+  /** Set while a token refresh is in flight, so a second caller that also
+   * needs a refresh awaits THIS one instead of starting its own. Without
+   * this, the poll and the one-time saved-library load — both started
+   * together by the first `setVisible(true)` — each read the same
+   * about-to-expire token and each call `refreshTokens` independently.
+   * Spotify rotates the refresh token on use, so the loser's copy is
+   * already stale by the time its own request lands: it fails, and its
+   * failure handler sets `status` to `'unauthorized'`, overwriting whatever
+   * the winner (or the poll itself) had just found — even though nothing is
+   * actually wrong with the user's authorization. A second `setVisible(true)`
+   * (leaving the page and coming back) never repeats this, because the
+   * saved-library load runs at most once per process, so this is exactly the
+   * "won't load, until I flip pages and back" defect. */
+  private refreshPromise: Promise<string | null> | null = null
   private visible = false
   /** Set by `stop()`, so a poll continuation that was already in flight
    * cannot arm a new timer after shutdown. Distinct from `visible`, which is
@@ -226,7 +240,24 @@ export class SpotifySource extends EventEmitter {
     return this.doRefresh(t)
   }
 
+  /** Refreshes the access token, sharing ONE in-flight attempt across every
+   * concurrent caller. The poll and the once-only saved-library load can
+   * both decide they need a refresh in the same tick — see `refreshPromise`
+   * — and issuing two real requests risks the second one failing against an
+   * already-rotated refresh token and wrongly marking the source
+   * unauthorized. */
   private async doRefresh(t: Tokens): Promise<string | null> {
+    if (this.refreshPromise) return this.refreshPromise
+    const attempt = this.performRefresh(t)
+    this.refreshPromise = attempt
+    try {
+      return await attempt
+    } finally {
+      this.refreshPromise = null
+    }
+  }
+
+  private async performRefresh(t: Tokens): Promise<string | null> {
     try {
       const fresh = await refreshTokens(this.clientId, t.refreshToken, this.now)
       this.store.save(fresh)

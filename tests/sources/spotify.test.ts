@@ -244,6 +244,15 @@ describe('SpotifySource', () => {
     expect(last.url).toContain('/me/player/next')
   })
 
+  it('sends a POST to skip back', async () => {
+    const { src, calls } = build([{ status: 200, body: PLAYER }, { status: 204 }])
+    await src.poll()
+    await src.previous()
+    const last = calls[calls.length - 1]!
+    expect(last.method).toBe('POST')
+    expect(last.url).toContain('/me/player/previous')
+  })
+
   it('clamps the volume to 0 and 100', async () => {
     const { src, calls } = build([{ status: 200, body: PLAYER }, { status: 204 }, { status: 204 }])
     await src.poll()
@@ -668,6 +677,86 @@ describe('SpotifySource saved-library', () => {
     await new Promise((r) => setTimeout(r, 20))
     const afterMore = fetchFn.mock.calls.filter(([url]) => String(url).includes('/me/tracks?')).length
     expect(afterMore).toBe(1) // Never re-fetched.
+    await src.stop()
+  })
+})
+
+describe('SpotifySource cold-load bug: the first setVisible(true) never dead-ends', () => {
+  it('emits change after the very first completed poll, even when nothing is playing', async () => {
+    // Guards the leading hypothesis for the reported cold-load bug: that a
+    // first poll finding "nothing playing" produces a snapshot identical to
+    // the constructor's initial one, so no `change` fires. It does not: the
+    // constructor's `status` starts as `'unauthorized'`, and the very first
+    // completed poll always moves it to `'ok'` or `'no-device'`, so the
+    // combined state+status key always differs on the first poll.
+    const { src } = build([{ status: 204 }])
+    const fired: string[] = []
+    src.on('change', () => fired.push('change'))
+    await src.poll()
+    expect(src.getStatus()).toBe('no-device')
+    expect(fired.length).toBeGreaterThan(0)
+  })
+
+  // Regression coverage for the REAL cause, found by testing the hypothesis
+  // above (it held) and then tracing what is actually different between a
+  // cold `setVisible(true)` and a later one: only the FIRST call also starts
+  // `loadSavedIds()`, concurrently with the poll. If the stored token is due
+  // for a refresh at that moment, both the poll and the saved-library load
+  // read the same about-to-expire token and each call `refreshTokens`
+  // independently. Spotify rotates the refresh token on use, so whichever
+  // request lands second is already using a stale one and fails. Before the
+  // fix, that failure's handler set `status` to `'unauthorized'` — even when
+  // the OTHER caller's poll had just found "nothing playing" correctly —
+  // because the two refreshes shared one `status` field with no
+  // coordination. A second `setVisible(true)` (leave the page, come back)
+  // never re-triggers `loadSavedIds`, so it never raced, which is exactly
+  // the workaround the user found. The fix shares one in-flight refresh
+  // across every concurrent caller instead of starting a second one.
+  it('does not let a concurrent saved-library refresh corrupt the poll status on the first setVisible(true)', async () => {
+    let tokenCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.includes('/api/token')) {
+        tokenCalls++
+        if (tokenCalls > 1) {
+          // The second concurrent refresh, using an already-rotated refresh
+          // token: Spotify rejects it. Before the fix, this branch was
+          // reached; after the fix, only one refresh ever happens.
+          return {
+            ok: false, status: 400, headers: { get: () => null },
+            json: async () => ({ error: 'invalid_grant' }), arrayBuffer: async () => new ArrayBuffer(0),
+          }
+        }
+        return {
+          ok: true, status: 200, headers: { get: () => null },
+          json: async () => ({ access_token: 'fresh-at', refresh_token: 'fresh-rt', expires_in: 3600 }),
+          arrayBuffer: async () => new ArrayBuffer(0),
+        }
+      }
+      if (url.includes('/me/player')) {
+        return {
+          ok: true, status: 204, headers: { get: () => null },
+          json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0),
+        }
+      }
+      // '/me/tracks?', the saved-library page.
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        json: async () => ({ items: [], total: 0 }), arrayBuffer: async () => new ArrayBuffer(0),
+      }
+    })
+    vi.stubGlobal('fetch', fetchFn) // refreshTokens() always uses the global fetch.
+    const store = {
+      load: () => ({ accessToken: 'stale', refreshToken: 'rt', expiresAt: 1000 }),
+      save: vi.fn(),
+      clear: vi.fn(),
+    }
+    const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
+
+    src.setVisible(true) // Starts the poll AND the one-time saved-library load together.
+    await new Promise((r) => setTimeout(r, 20))
+
+    expect(tokenCalls).toBe(1) // One refresh serves both callers.
+    expect(src.getStatus()).toBe('no-device') // Not corrupted to 'unauthorized'.
     await src.stop()
   })
 })
