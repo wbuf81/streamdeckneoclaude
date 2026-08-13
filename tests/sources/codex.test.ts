@@ -23,7 +23,11 @@ const { execFileMock } = vi.hoisted(() => ({
         stdout: string,
         stderr: string,
       ) => void,
-    ) => cb(null, '[]', ''),
+      // I4 — the real `sqlite3 -json` prints NOTHING (not `[]`) for a
+      // zero-row result (measured; see docs/VERIFIED-FACTS.md). This
+      // default stands in for that, so a test that never overrides it still
+      // exercises the shape the real tool actually produces.
+    ) => cb(null, '', ''),
   ),
 }))
 vi.mock('node:child_process', () => ({ execFile: execFileMock }))
@@ -129,6 +133,10 @@ describe('parseRolloutTail', () => {
     })
   })
 
+  // M4 — the primary slot fails closed to `null` rather than being dropped
+  // from the array. Fixed positions (index 0 primary, index 1 secondary)
+  // mean a failed primary can never be silently backfilled by a present
+  // secondary at the same index.
   it('still fails the whole limit closed when window_minutes itself is absent', () => {
     const event = JSON.stringify({
       timestamp: '2026-08-13T12:00:00.000Z',
@@ -139,7 +147,7 @@ describe('parseRolloutTail', () => {
         rate_limits: { primary: { used_percent: 50 }, secondary: null, plan_type: 'team' },
       },
     })
-    expect(parseRolloutTail(event).usage?.limits).toEqual([])
+    expect(parseRolloutTail(event).usage?.limits).toEqual([null, null])
   })
 
   // M2 — a resets_at that looks like epoch milliseconds (Codex's own sqlite
@@ -182,7 +190,33 @@ describe('parseRolloutTail', () => {
         },
       },
     })
-    expect(parseRolloutTail(event).usage?.limits).toEqual([])
+    // M4 — a failed primary is `null` AT INDEX 0, never dropped and
+    // backfilled by the (also-null-here) secondary.
+    expect(parseRolloutTail(event).usage?.limits).toEqual([null, null])
+  })
+
+  // M4 — a failed PRIMARY with a valid SECONDARY must not promote the
+  // secondary into index 0. Before the fix, `.filter(...)` compacted the
+  // array, so this exact shape put the secondary's own 96%/week-cap numbers
+  // in the slot `codex-page.ts` reads as the PRIMARY (key 4, and
+  // `RESETS IN`), under the primary's own label, with no unknown marker.
+  it('keeps a valid secondary at index 1, never promoted into the primary slot, when the primary fails to parse', () => {
+    const event = JSON.stringify({
+      timestamp: '2026-08-13T12:00:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {},
+        rate_limits: {
+          primary: { used_percent: 50 }, // window_minutes absent — fails closed.
+          secondary: { used_percent: 96, window_minutes: 10080, resets_at: 1787068486 },
+          plan_type: 'team',
+        },
+      },
+    })
+    const limits = parseRolloutTail(event).usage?.limits
+    expect(limits?.[0]).toBeNull()
+    expect(limits?.[1]).toEqual({ usedPct: 96, windowMinutes: 10080, resetsAt: 1787068486 })
   })
 
   // I1 — `usage.ts` must be `null`, never a fabricated `0` (which rendered
@@ -309,9 +343,10 @@ describe('runSqlite', () => {
   })
 
   it('reads via mode=ro on the first attempt, tagged non-degraded, and never mentions immutable', async () => {
-    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => cb(null, '[]', ''))
+    // I4 — empty stdout, matching the real tool's zero-row output, not '[]'.
+    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => cb(null, '', ''))
     const result = await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
-    expect(result).toEqual({ text: '[]', degraded: false })
+    expect(result).toEqual({ text: '', degraded: false })
     // A successful primary attempt needs no fallback: exactly one call.
     expect(execFileMock).toHaveBeenCalledTimes(1)
     const [cmd, args] = execFileMock.mock.calls[0]!
@@ -329,20 +364,63 @@ describe('runSqlite', () => {
   // on the strength of a now-corrected measurement (docs/VERIFIED-FACTS.md):
   // with the `-wal`/`-shm` sidecars absent, `mode=ro` fails with
   // `SQLITE_CANTOPEN (14)` because a read-only connection cannot create the
-  // `-shm` it needs. `immutable=1` succeeds in exactly that case. The
-  // fallback's result must come back tagged `degraded: true`, never
-  // indistinguishable from a primary success.
-  it('falls back to immutable=1 and succeeds, tagged degraded, when mode=ro fails', async () => {
+  // `-shm` it needs. `immutable=1` succeeds in exactly that case.
+  //
+  // I3 — whether the result is EXACT or genuinely degraded now depends on
+  // whether the `-wal` sidecar held anything at read time (measured on a
+  // scratch WAL database; see docs/VERIFIED-FACTS.md and
+  // `walSidecarBytes`'s own doc comment). Both cases are covered below,
+  // using a REAL temp path so the wal-size check — a real `statSync`, never
+  // mocked — has something real to measure.
+  it('falls back to immutable=1 and reports it EXACT when the wal sidecar is absent', async () => {
     execFileMock.mockImplementation((_cmd, args, _opts, cb) => {
-      if (args.some((arg) => arg.includes('immutable'))) { cb(null, '[]', ''); return }
+      if (args.some((arg) => arg.includes('immutable'))) { cb(null, '', ''); return }
       cb(new Error('exit 1'), '', 'Error: in prepare, unable to open database file (14)\n')
     })
-    const result = await runSqlite('/tmp/does-not-matter.sqlite', THREAD_QUERY)
-    expect(result).toEqual({ text: '[]', degraded: true })
-    expect(execFileMock).toHaveBeenCalledTimes(2)
-    const secondUri = execFileMock.mock.calls[1]![1].find((arg: string) => arg.startsWith('file:'))
-    expect(secondUri).toContain('mode=ro')
-    expect(secondUri).toContain('immutable=1')
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite') // no -wal sidecar ever created.
+    try {
+      const result = await runSqlite(database, THREAD_QUERY)
+      expect(result).toEqual({ text: '', degraded: false, walBytes: 0 })
+      expect(execFileMock).toHaveBeenCalledTimes(2)
+      const secondUri = execFileMock.mock.calls[1]![1].find((arg: string) => arg.startsWith('file:'))
+      expect(secondUri).toContain('mode=ro')
+      expect(secondUri).toContain('immutable=1')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to immutable=1 and reports it EXACT when the wal sidecar is present but empty', async () => {
+    execFileMock.mockImplementation((_cmd, args, _opts, cb) => {
+      if (args.some((arg) => arg.includes('immutable'))) { cb(null, '', ''); return }
+      cb(new Error('exit 1'), '', 'Error: in prepare, database is locked (5)\n')
+    })
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(`${database}-wal`, '') // present, zero-length.
+    try {
+      const result = await runSqlite(database, THREAD_QUERY)
+      expect(result).toEqual({ text: '', degraded: false, walBytes: 0 })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to immutable=1 and reports it genuinely DEGRADED when the wal sidecar holds real content', async () => {
+    execFileMock.mockImplementation((_cmd, args, _opts, cb) => {
+      if (args.some((arg) => arg.includes('immutable'))) { cb(null, '', ''); return }
+      cb(new Error('exit 1'), '', 'Error: in prepare, database is locked (5)\n')
+    })
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(`${database}-wal`, 'x'.repeat(4096)) // real, unread content.
+    try {
+      const result = await runSqlite(database, THREAD_QUERY)
+      expect(result).toEqual({ text: '', degraded: true, walBytes: 4096 })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   // C1's exact reachability scenario still matters, and is exactly why a
@@ -411,7 +489,7 @@ describe('runSqlite', () => {
   // `?mode=rwc` in through the path becomes a literal, harmless filename
   // character instead of a second URI parameter.
   it('percent-encodes a `?` in the database path so it cannot inject a second mode parameter', async () => {
-    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => cb(null, '[]', ''))
+    execFileMock.mockImplementation((_cmd, _args, _opts, cb) => cb(null, '', ''))
     await runSqlite('/tmp/evil.sqlite?mode=rwc', THREAD_QUERY)
     const args = execFileMock.mock.calls[0]![1]
     const uri = args.find((arg) => arg.startsWith('file:'))!
@@ -454,6 +532,96 @@ describe('CodexSource', () => {
         threadId: 'active', project: 'deckd', title: 'Build the Codex page',
       })])
       expect(source.getSnapshot().usage?.totalTokens).toBe(1_250_000)
+    } finally {
+      await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  /** Builds the two-rollout fixture C1's tests share: `first` and `second`
+   * are rollout ids, each carrying a `token_count` event with its own
+   * `timestamp` (`null` when it should be unparseable) and `used_percent`.
+   * Both thread rows carry the SAME `updated_at_ms`, so sqlite's own
+   * ordering never decides which rollout `doRefresh` visits first — only
+   * the array order below does, which is exactly what these tests vary. */
+  async function newestUsageWith(
+    rollouts: { id: string; ts: string | null; usedPct: number }[],
+  ): Promise<{ usedPct: number | null; ts: number | null } | null> {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const sqlite = vi.fn(async () => ok(JSON.stringify(rollouts.map((r) => ({
+      id: r.id, rollout_path: `/${r.id}.jsonl`, updated_at_ms: 0,
+      title: '', cwd: '', model: '', tokens_used: null,
+    })))))
+    const readTail = (file: string) => {
+      const r = rollouts.find((x) => file === `/${x.id}.jsonl`)!
+      const event = JSON.stringify({
+        timestamp: r.ts,
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {},
+          rate_limits: {
+            primary: { used_percent: r.usedPct, window_minutes: 10080, resets_at: 1787068486 },
+            secondary: null, plan_type: 'team',
+          },
+        },
+      })
+      return fixedRead(`${event}\n`)
+    }
+    const source = new CodexSource(database, sqlite, readTail, () => 500)
+    try {
+      await source.refresh()
+      const usage = source.getSnapshot().usage
+      return usage ? { usedPct: usage.limits[0]?.usedPct ?? null, ts: usage.ts } : null
+    } finally {
+      await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // C1 — the review's exact repro: a rollout whose `timestamp` will not
+  // parse must LOSE the "keep the newest usage sample" race, never win it.
+  // Before the fix, a `null` ts scored as `Number.POSITIVE_INFINITY`, so the
+  // broken-clock rollout's 96% always won, and the winner then rendered
+  // every accounting tile as unknown (`isUsageUnknown` treats a `null` ts as
+  // unknown) — hiding a correct, current 27% reading that was available on
+  // the very same poll. Checked in BOTH row orders, since the bug did not
+  // depend on which rollout `doRefresh` visited first.
+  it('never lets a rollout with an unparseable timestamp suppress a real sample that comes after it', async () => {
+    const usage = await newestUsageWith([
+      { id: 'broken', ts: 'not-a-date', usedPct: 96 },
+      { id: 'good', ts: '2026-08-13T12:00:00.000Z', usedPct: 27 },
+    ])
+    expect(usage?.usedPct).toBe(27)
+    expect(usage?.ts).not.toBeNull()
+  })
+
+  it('never lets a rollout with an unparseable timestamp suppress a real sample that came before it', async () => {
+    const usage = await newestUsageWith([
+      { id: 'good', ts: '2026-08-13T12:00:00.000Z', usedPct: 27 },
+      { id: 'broken', ts: 'not-a-date', usedPct: 96 },
+    ])
+    expect(usage?.usedPct).toBe(27)
+    expect(usage?.ts).not.toBeNull()
+  })
+
+  // I4 — the real `sqlite3 -json` prints NOTHING (not `[]`) for a zero-row
+  // result and exits 0 (measured; see docs/VERIFIED-FACTS.md). Before the
+  // fix, `JSON.parse('')` threw, so a fresh Codex install, or every thread
+  // archived, reported "task data unavailable" instead of the honest
+  // "no active tasks".
+  it('treats empty stdout as zero rows, not a parse failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const sqlite = vi.fn(async () => ok(''))
+    const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
+    try {
+      await source.refresh()
+      expect(source.isAvailable()).toBe(true)
+      expect(source.getSnapshot()).toEqual({ tasks: [], usage: null })
     } finally {
       await source.stop()
       rmSync(dir, { recursive: true, force: true })
@@ -508,7 +676,7 @@ describe('CodexSource', () => {
     const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
     const database = join(dir, 'state.sqlite')
     writeFileSync(database, '')
-    const sqlite = vi.fn(async () => ok('[]'))
+    const sqlite = vi.fn(async () => ok(''))
     const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
     try {
       source.setVisible(true)
@@ -574,7 +742,7 @@ describe('CodexSource', () => {
   })
 
   it('reports usage as unknown before any sample has ever arrived', () => {
-    const source = new CodexSource('/does/not/matter', async () => ok('[]'), () => fixedRead(''), () => 0)
+    const source = new CodexSource('/does/not/matter', async () => ok(''), () => fixedRead(''), () => 0)
     expect(source.isUsageUnknown()).toBe(true)
   })
 
@@ -599,7 +767,7 @@ describe('CodexSource', () => {
 
       const stopPromise = source.stop() // Races the in-flight refresh.
 
-      resolveSqlite(ok('[]'))
+      resolveSqlite(ok(''))
       await stopPromise
       await vi.advanceTimersByTimeAsync(0)
 
@@ -615,7 +783,7 @@ describe('CodexSource', () => {
     const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
     const database = join(dir, 'state.sqlite')
     writeFileSync(database, '')
-    const sqlite = vi.fn(async () => ok('[]'))
+    const sqlite = vi.fn(async () => ok(''))
     const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
     try {
       source.setVisible(true)
@@ -657,7 +825,7 @@ describe('CodexSource', () => {
     ) => void) => cb(new Error('exit 1'), '', 'Error: in prepare, unable to open database file (14)\n')
     const succeeding = (_cmd: string, _args: string[], _opts: unknown, cb: (
       error: Error | null, stdout: string, stderr: string,
-    ) => void) => cb(null, '[]', '')
+    ) => void) => cb(null, '', '')
     try {
       execFileMock.mockImplementation(failing)
       // `sqlite` left at its default (`runSqlite`) by passing `undefined`.
@@ -717,7 +885,7 @@ describe('CodexSource', () => {
     const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
     const degradedLines = () => lines.filter((line) => line.includes('DEGRADED'))
     try {
-      sqlite.mockResolvedValue(degraded('[]'))
+      sqlite.mockResolvedValue(degraded(''))
       await source.refresh()
       expect(source.isAvailable()).toBe(true) // real data, shown rather than an empty page...
       expect(source.isDegraded()).toBe(true)
@@ -729,12 +897,12 @@ describe('CodexSource', () => {
       expect(degradedLines()[0]).not.toContain('SELECT')
       expect(degradedLines()[0]).not.toContain(THREAD_QUERY)
 
-      sqlite.mockResolvedValue(ok('[]'))
+      sqlite.mockResolvedValue(ok(''))
       await source.refresh() // a primary read succeeds.
       expect(source.isDegraded()).toBe(false)
       expect(source.isStale()).toBe(false)
 
-      sqlite.mockResolvedValue(degraded('[]'))
+      sqlite.mockResolvedValue(degraded(''))
       await source.refresh() // degraded again, after a genuine recovery in between.
       expect(source.isDegraded()).toBe(true)
       expect(degradedLines()).toHaveLength(2) // the cleared once-key let this one log again.
@@ -743,6 +911,105 @@ describe('CodexSource', () => {
     } finally {
       setDefaultSink(() => {})
       log.clearOnce('codex-state-degraded')
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // M1 — probe-confirmed: clearing `this.degraded` without also clearing
+  // the `codex-state-degraded` log key left a LATER return to degraded
+  // silent, because `log.once` still treated the key as "already seen" from
+  // before an UNRELATED outright failure in between. Recovery through a
+  // PRIMARY success already cleared the key (covered above); this covers
+  // the other place the flag clears — an outright read failure.
+  it('clears the degraded log key on an outright read failure too, so a LATER degraded read logs again', async () => {
+    log.clearOnce('codex-state-degraded')
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    const sqlite = vi.fn<(database: string, query: string) => Promise<SqliteRead>>()
+    const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
+    const degradedLines = () => lines.filter((line) => line.includes('DEGRADED'))
+    try {
+      sqlite.mockResolvedValue(degraded(''))
+      await source.refresh()
+      expect(degradedLines()).toHaveLength(1)
+
+      sqlite.mockRejectedValue(new Error('in prepare, database is locked (5)'))
+      await source.refresh() // an outright failure — never a stale substitute.
+      expect(source.isAvailable()).toBe(false)
+      expect(source.isDegraded()).toBe(false)
+
+      sqlite.mockResolvedValue(degraded(''))
+      await source.refresh() // degraded again, after the outright failure in between.
+      expect(degradedLines()).toHaveLength(2) // the cleared once-key let this one log again.
+
+      await source.stop()
+    } finally {
+      setDefaultSink(() => {})
+      log.clearOnce('codex-state-degraded')
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // I3 — the `SqliteRunner` a `CodexSource` is given already carries the
+  // wal-based exact/degraded classification (`runSqlite` itself is covered
+  // separately above); this checks `CodexSource` CONSUMES that classification
+  // correctly rather than treating every fallback read as degraded.
+  it('treats a fallback read with walBytes: 0 as exact — fresh, never degraded', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const sqlite = vi.fn(async () => ({ text: '', degraded: false, walBytes: 0 }) as SqliteRead)
+    const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
+    try {
+      await source.refresh()
+      expect(source.isAvailable()).toBe(true)
+      expect(source.isDegraded()).toBe(false)
+      expect(source.isStale()).toBe(false)
+      expect(source.staleForSeconds()).toBe(0) // an exact read just happened.
+    } finally {
+      await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('treats a fallback read with a nonzero walBytes as genuinely degraded — dimmed, never fresh', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const sqlite = vi.fn(async () => ({ text: '', degraded: true, walBytes: 4096 }) as SqliteRead)
+    const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
+    try {
+      await source.refresh()
+      expect(source.isAvailable()).toBe(true) // real data, shown rather than an empty page...
+      expect(source.isDegraded()).toBe(true)
+      expect(source.isStale()).toBe(true) // ...but it never satisfies a freshness check.
+    } finally {
+      await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('reports staleForSeconds as null before any read has ever succeeded', () => {
+    const source = new CodexSource('/does/not/matter', async () => ok(''), () => fixedRead(''), () => 500)
+    expect(source.staleForSeconds()).toBeNull()
+  })
+
+  it('reports staleForSeconds as elapsed time since the last EXACT read', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    let now = 1_000
+    const sqlite = vi.fn(async () => ok(''))
+    const source = new CodexSource(database, sqlite, () => fixedRead(''), () => now)
+    try {
+      await source.refresh() // exact read at now=1,000.
+      now = 1_660 // 660 s later.
+      expect(source.staleForSeconds()).toBe(660)
+    } finally {
+      await source.stop()
       rmSync(dir, { recursive: true, force: true })
     }
   })
@@ -837,6 +1104,16 @@ describe('CodexSource.isUsageUnknown', () => {
     expect(await isUsageUnknownAt(ts + 4 * 24 * 3600, event)).toBe(true)
   })
 
+  // M3 — a sample timestamped in the FUTURE (a clock stepped backwards, or
+  // bad data) must read as unknown, not live. Before the fix,
+  // `this.now() - usage.ts` went negative, which is never greater than the
+  // positive backstop, so the check silently passed.
+  it('treats a sample timestamped in the future as unknown rather than live', async () => {
+    const ts = 10_000
+    const event = usageEvent({ ts, windowMinutes: WINDOW_MINUTES }) // resets_at absent — backstop branch.
+    expect(await isUsageUnknownAt(ts - 100, event)).toBe(true)
+  })
+
   // C2 — the review's exact repro: a 300-minute (5-hour) window with no
   // resets_at must not stay "known" for the old flat 24-hour backstop. It
   // must be bounded by its OWN window length (18,000 s = 5 h), so a sample
@@ -896,5 +1173,41 @@ describe('CodexSource.isUsageUnknown', () => {
     })
     expect(await isUsageUnknownAt(now, event, 0)).toBe(false)
     expect(await isUsageUnknownAt(now, event, 1)).toBe(true)
+  })
+
+  // I3/I5 — probe-confirmed: with NEITHER limit parsing at all (the
+  // fixtures already use `secondary: null` for "no second window"; this is
+  // that same shape for `primary` too), `isUsageUnknown(0)` must not answer
+  // `true` outright. `TASK TOKENS` and the strip clock both ask this with
+  // the DEFAULT index purely to gate "is this sample still current", a
+  // question that has nothing to do with any one window — so an absent
+  // PRIMARY limit alone must not blank a valid, current token count and
+  // sample time too. Falls back to the flat age backstop instead.
+  it('does not force usage unknown just because neither limit parsed, as long as the sample itself is recent', async () => {
+    const now = 10_000
+    const event = JSON.stringify({
+      timestamp: new Date(now * 1000).toISOString(),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { total_tokens: 1_250_000 } },
+        rate_limits: { primary: null, secondary: null, plan_type: 'team' },
+      },
+    })
+    expect(await isUsageUnknownAt(now, event, 0)).toBe(false)
+  })
+
+  it('still forces usage unknown, via the flat backstop, once a limitless sample grows too old', async () => {
+    const ts = 10_000
+    const event = JSON.stringify({
+      timestamp: new Date(ts * 1000).toISOString(),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { total_tokens: 1 } },
+        rate_limits: { primary: null, secondary: null, plan_type: 'team' },
+      },
+    })
+    expect(await isUsageUnknownAt(ts + 25 * 3600, event, 0)).toBe(true) // past the 24 h flat backstop.
   })
 })

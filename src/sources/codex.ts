@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { execFile } from 'node:child_process'
-import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs'
 import { basename } from 'node:path'
 import { paths } from '../paths.js'
 import { log } from '../log.js'
@@ -34,8 +34,17 @@ export const USAGE_UNKNOWN_BACKSTOP_SECONDS = 24 * 3600
  * read as live) and overruns the key's label line with a value like
  * `420000-DAY CAP` (I4/I6). Treated as unknown, same pattern as
  * `RESET_MAX_SECONDS` for `resets_at` — the whole limit fails closed via
- * `parseLimit`'s existing `windowMinutes === null` branch. */
-const WINDOW_MAX_MINUTES = 366 * 24 * 60
+ * `parseLimit`'s existing `windowMinutes === null` branch.
+ *
+ * M6 — a full YEAR was looser than any bound this fail-safe needs to be:
+ * the known figure is 10080 minutes, so 30 days (43,200 minutes) already
+ * leaves better than 4x headroom above it for a longer plan window Codex
+ * has not shipped yet, without leaving the door open to a value like a
+ * `window_minutes` given in SECONDS instead of minutes (300 becoming
+ * 18,000) sailing through under a year-wide bound and printing a
+ * confidently wrong `300-HR CAP`. No evidence Codex would ever emit
+ * seconds — this narrows a guessed boundary, not a reproduced defect. */
+const WINDOW_MAX_MINUTES = 30 * 24 * 60
 /** How long an `active` flag may outlive the thread row's own last-updated
  * time before this source stops trusting it.
  *
@@ -115,7 +124,17 @@ export interface CodexLimit {
 }
 
 export interface CodexUsage {
-  limits: CodexLimit[]
+  /** Always exactly two slots, index 0 the primary window and index 1 the
+   * secondary — `null` at either position when that window did not parse
+   * (see `parseLimit`), never dropped from the array. M4: an earlier
+   * version filtered out the `null` entries, which compacted the array and
+   * silently promoted the secondary window into the PRIMARY slot whenever
+   * the primary one alone failed to parse — key 4 and `RESETS IN` would
+   * then read the secondary's own numbers under the primary's label, with
+   * no unknown marker at all. Fixed positions mean a caller can always ask
+   * "what is the primary/secondary limit" by index, and a missing one is
+   * visibly missing rather than silently backfilled by its neighbour. */
+  limits: (CodexLimit | null)[]
   /** `null` when the field is absent, renamed, or not a number. */
   totalTokens: number | null
   plan: string
@@ -222,8 +241,12 @@ export function parseRolloutTail(
 
     const rate = payload.rate_limits as Record<string, unknown> | undefined
     const info = payload.info as Record<string, any> | undefined
-    const limits = [parseLimit(rate?.primary), parseLimit(rate?.secondary)]
-      .filter((limit): limit is CodexLimit => limit !== null)
+    // M4 — fixed positions, never compacted: index 0 is always the primary
+    // window's own parse result, index 1 always the secondary's, `null`
+    // when that one specifically failed. Filtering the `null`s out here
+    // used to let a failed primary be silently replaced, in key 4, by
+    // whatever the secondary parsed to.
+    const limits: (CodexLimit | null)[] = [parseLimit(rate?.primary), parseLimit(rate?.secondary)]
     const totalTokens = finite(info?.total_token_usage?.total_tokens)
     // I1 — a missing or non-string `timestamp`, or one `Date.parse` cannot
     // read, is UNKNOWN, never a fabricated `0` (which rendered as 7:00 PM
@@ -244,17 +267,30 @@ export function parseRolloutTail(
 /** Orders two usage samples for `doRefresh`'s "keep the newest" comparison
  * across rollouts. A `null` ts (I1's unparseable-timestamp case) carries no
  * ordering information of its own — it does not mean "very old", it means
- * "we do not know". Scoring it as the OLDEST possible sample (the previous
- * behaviour, via a fabricated `0`) meant it could never win this comparison,
- * so a genuinely fresher read would silently lose to an actually-older
- * sample from a different rollout just because the fresher one's logged
- * clock failed to parse. Scoring it as the NEWEST possible sample instead
- * means a broken clock inside the payload never costs the page a real,
- * current reading — the sample is still shown as `--` on the strip (see
- * `CodexPage.usageTimeLabel`), because `usage.ts` itself stays `null`; only
- * this internal ordering treats "unknown" differently from "old". */
+ * "we do not know". It must LOSE every comparison against a sample that DOES
+ * carry a real timestamp, never win one.
+ *
+ * C1 — a previous version of this function scored a `null` ts as
+ * `Number.POSITIVE_INFINITY`, on the reasoning that scoring it as the
+ * OLDEST possible sample (`Number.NEGATIVE_INFINITY`, this file's original
+ * behaviour) let a broken clock in one rollout silently outrank a real,
+ * current sample from another. That reasoning had it backwards: scoring a
+ * broken clock as the NEWEST possible sample instead let it WIN against a
+ * genuinely current one — probe-confirmed: a correct, current 27% sample
+ * lost to a broken-clock rollout's 96% one, and the winner then rendered as
+ * unknown on every accounting tile (`isUsageUnknown` also treats a `null` ts
+ * as unknown), blanking four tiles that a real reading was available for on
+ * the very same poll. A sample with no usable timestamp must never be able
+ * to suppress a good one — scoring it as the OLDEST possible value is what
+ * makes that hold, because `doRefresh`'s comparison below is a strict `>`:
+ * the first sample seen still becomes `newestUsage` (nothing to lose to
+ * yet), but a LATER comparison against any real timestamp always loses. The
+ * sample itself still renders as unknown wherever it lands, since
+ * `usage.ts` stays `null` regardless of this ordering (see
+ * `CodexPage.usageTimeLabel` and `isUsageUnknown`) — only the ordering
+ * changed, not what a `null` ts displays as. */
 function usageOrderKey(usage: CodexUsage): number {
-  return usage.ts ?? Number.POSITIVE_INFINITY
+  return usage.ts ?? Number.NEGATIVE_INFINITY
 }
 
 /**
@@ -323,10 +359,33 @@ function toReadOnlyUri(database: string): string {
 }
 
 /** The fallback read URI: `mode=ro&immutable=1`. See `runSqlite`'s doc
- * comment for when this is tried and why its result is always tagged
- * degraded rather than trusted outright. */
+ * comment for when this is tried and how its result is classified. */
 function toImmutableUri(database: string): string {
   return `file:${escapeForSqliteUri(database)}?mode=ro&immutable=1`
+}
+
+/**
+ * Size in bytes of `database`'s own `-wal` sidecar, or `0` when it is
+ * absent. I3 — this is what tells a fallback (`immutable=1`) read apart
+ * from a genuinely degraded one: `immutable=1` never reads the `-wal` at
+ * all, so an EMPTY or ABSENT one means there was nothing in it to miss —
+ * the read is byte-exact, not a second-class substitute. Measured directly
+ * on a scratch WAL database (docs/VERIFIED-FACTS.md): with the sidecar
+ * absent or truncated to zero, `immutable=1` returned every row a plain
+ * `mode=ro` read did; with the sidecar holding an uncommitted-to-main-file
+ * row, `immutable=1` silently omitted it while `mode=ro` (reading the same
+ * database at the same moment) returned it. `statSync` failing for any
+ * reason (most commonly `ENOENT` — no sidecar file at all) is treated the
+ * same as a zero-length file, never as a reason to guess degraded: the only
+ * way this function claims something is IN the WAL is by measuring actual
+ * bytes there.
+ */
+function walSidecarBytes(database: string): number {
+  try {
+    return statSync(`${database}-wal`).size
+  } catch {
+    return 0
+  }
 }
 
 /** A short, query-free description of an `execFile` failure, for the log.
@@ -372,12 +431,28 @@ function execSqlite(uri: string, query: string): Promise<string> {
 /** The result of one `runSqlite` call. */
 export interface SqliteRead {
   text: string
-  /** True when `text` came from the `immutable=1` fallback rather than the
-   * primary `mode=ro` open. `CodexSource` treats a degraded read as
-   * real data worth showing — dimmed — rather than an empty page, but never
-   * as good as a primary read: it must never satisfy a freshness check. See
+  /** I3 — true only when `text` came from the `immutable=1` fallback AND
+   * that fallback's own `-wal` sidecar held real, unread content at the
+   * time (see `walSidecarBytes`). A fallback read whose `-wal` was absent
+   * or empty is BYTE-EXACT — nothing was left for `immutable=1` to miss —
+   * and is reported here as `false`, the same as a primary read. This
+   * matters because Codex normally has the database open, so the fallback
+   * is the everyday path: if every fallback read counted as degraded
+   * regardless of the `-wal`, "degraded" would be the PERMANENT resting
+   * state and the dimming it drives would say nothing to the user. Reduced
+   * to the rarer, genuine case — the `-wal` actually holding something —
+   * this flag becomes a real signal again. `CodexSource` treats `true`
+   * here as real data worth showing — dimmed, and named as such on the
+   * task tiles — rather than an empty page, but never as good as an exact
+   * read: it must never satisfy a freshness check. See
    * `CodexSource.isStale` and `CodexSource.isDegraded`. */
   degraded: boolean
+  /** Size in bytes of the fallback's own `-wal` sidecar at read time.
+   * `undefined` for a primary `mode=ro` read, which reads the `-wal`
+   * directly and has no need of this. `0` means the sidecar was absent or
+   * empty — what makes `degraded` false above even though the fallback
+   * path was used. */
+  walBytes?: number
 }
 
 export type SqliteRunner = (database: string, query: string) => Promise<SqliteRead>
@@ -408,9 +483,7 @@ export type SqliteRunner = (database: string, query: string) => Promise<SqliteRe
  * checked. Retesting with the sidecars actually absent produced the failure
  * above. See docs/VERIFIED-FACTS.md for the full correction.)
  *
- * The fallback is not free of risk, and the risk is exactly why every
- * caller must treat a `degraded: true` result as second-class, never as
- * good as a primary read:
+ * The fallback is not free of risk:
  *
  * - `immutable=1` does not read the WAL at all. Against a database with one
  *   row checkpointed into the main file and a second left only in `-wal`,
@@ -423,11 +496,16 @@ export type SqliteRunner = (database: string, query: string) => Promise<SqliteRe
  *   as if they were current. The exact condition that makes the fallback
  *   unsafe is also the condition that triggers it.
  *
- * So a degraded result is always tagged as such, and `CodexSource` is
- * responsible for making sure it never satisfies a freshness check and
- * always renders dimmed (see its `doRefresh`, `isStale`, `isDegraded`) — the
- * fallback exists to avoid an empty page, not to quietly pass off
- * possibly-stale data as current.
+ * I3 — but that risk is conditional, not automatic: it exists ONLY when the
+ * `-wal` sidecar actually holds something at read time. `walSidecarBytes`
+ * checks exactly that, measured directly on a scratch WAL database (see
+ * `SqliteRead.degraded`'s own doc comment and docs/VERIFIED-FACTS.md): an
+ * absent or empty `-wal` means the fallback missed nothing, and is reported
+ * as an EXACT read, not a degraded one. `CodexSource` is responsible for
+ * making sure a genuinely degraded result never satisfies a freshness check
+ * and renders dimmed AND labelled as such (see its `doRefresh`, `isStale`,
+ * `isDegraded`) — the fallback exists to avoid an empty page, not to
+ * quietly pass off possibly-stale data as current.
  *
  * If BOTH attempts fail, the PRIMARY attempt's own error is what reaches the
  * caller: the fallback existing at all is an implementation detail, not
@@ -440,7 +518,8 @@ export async function runSqlite(database: string, query: string): Promise<Sqlite
   } catch (primaryError) {
     try {
       const text = await execSqlite(toImmutableUri(database), query)
-      return { text, degraded: true }
+      const walBytes = walSidecarBytes(database)
+      return { text, degraded: walBytes > 0, walBytes }
     } catch {
       throw primaryError
     }
@@ -532,14 +611,25 @@ export class CodexSource extends EventEmitter {
   private async doRefresh(): Promise<void> {
     if (!existsSync(this.database)) {
       this.updateAvailability(false)
+      // M1 — clearing the flag without clearing the log key it gates left a
+      // LATER return to degraded silent: `log.once` treats the key as
+      // already "seen" from before this failure, so the WARN that should
+      // mark the fallback in use again never re-fires.
       this.degraded = false
+      log.clearOnce('codex-state-degraded')
       log.once('codex-state-absent', `Codex state database absent: ${this.database}`)
       return
     }
 
     try {
       const read = await this.sqlite(this.database, THREAD_QUERY)
-      const rows = JSON.parse(read.text) as ThreadRow[]
+      // I4 — `sqlite3 -json` prints NOTHING, not `[]`, for a zero-row
+      // result (measured directly; see docs/VERIFIED-FACTS.md). `JSON.parse`
+      // on empty or whitespace-only text throws, which previously reported
+      // the honest "no active tasks" case as a full read failure. Treated
+      // as zero rows explicitly, before JSON.parse ever runs.
+      const trimmedText = read.text.trim()
+      const rows = trimmedText ? (JSON.parse(trimmedText) as ThreadRow[]) : []
       const tasks: CodexTask[] = []
       let newestUsage: CodexUsage | null = null
       const seenRollouts = new Set<string>()
@@ -616,11 +706,19 @@ export class CodexSource extends EventEmitter {
     } catch (error) {
       this.updateAvailability(false)
       this.degraded = false
+      log.clearOnce('codex-state-degraded') // M1 — see the same clear above.
       // Short and query-free: `runSqlite`'s own errors already carry only
       // sqlite3's stderr text or a code/signal, never the SQL body (see
-      // `describeExecFailure`), and a plain `Error.message` from anywhere
-      // else in this block (e.g. a `JSON.parse` failure) is already short.
-      const detail = error instanceof Error ? error.message : String(error)
+      // `describeExecFailure`). A `JSON.parse` failure is different: Node
+      // builds a `SyntaxError` message that can embed a fragment of the
+      // malformed input itself (measured: about ten characters, e.g.
+      // `..."T", "cwd":}]" is not valid JSON`) — for malformed sqlite3
+      // output that fragment could hold part of a thread title or working
+      // directory, private user data that must never reach a log (lesson
+      // 20). M5: named generically instead, never `error.message`.
+      const detail = error instanceof SyntaxError
+        ? 'malformed JSON from sqlite3'
+        : error instanceof Error ? error.message : String(error)
       log.once('codex-state-read', `cannot read Codex task data at ${this.database}: ${detail}`)
     }
   }
@@ -648,7 +746,13 @@ export class CodexSource extends EventEmitter {
     return {
       tasks: this.snapshot.tasks.map((task) => ({ ...task })),
       usage: this.snapshot.usage
-        ? { ...this.snapshot.usage, limits: this.snapshot.usage.limits.map((limit) => ({ ...limit })) }
+        ? {
+          ...this.snapshot.usage,
+          // M4 — a slot may legitimately be `null` (that window failed to
+          // parse); copy it through as `null` rather than spreading it into
+          // `{}`, which would fabricate a limit object out of nothing.
+          limits: this.snapshot.usage.limits.map((limit) => (limit ? { ...limit } : null)),
+        }
         : null,
     }
   }
@@ -672,13 +776,30 @@ export class CodexSource extends EventEmitter {
     return this.degraded || !this.lastSuccessAt || this.now() - this.lastSuccessAt > STALE_CODEX_SECONDS
   }
 
-  /** True when the MOST RECENT successful read came from the `immutable=1`
-   * fallback (see `runSqlite`) rather than the primary `mode=ro` open.
+  /** True when the MOST RECENT successful read came back genuinely
+   * degraded — a fallback (`immutable=1`) read whose own `-wal` sidecar
+   * held real content it could not see (I3; see `SqliteRead.degraded`'s
+   * doc comment). A fallback read whose `-wal` was absent or empty is
+   * EXACT and reports `false` here, the same as a primary read — this is
+   * what keeps "degraded" from being the permanent resting state Codex's
+   * normal open-most-of-the-time behaviour would otherwise make it.
    * Exposed for tests and logging; every caller that only needs to know
    * whether the current snapshot is trustworthy enough to render undimmed
    * can use `isStale()` alone, since it already folds this in. */
   isDegraded(): boolean {
     return this.degraded
+  }
+
+  /** Seconds since the last EXACT read (a primary `mode=ro` open, or a
+   * fallback whose `-wal` was absent or empty), or `null` when there has
+   * never been one. `isStale()` only answers a yes/no question; this gives
+   * a caller something to print ALONGSIDE a bare `STALE` label (I3) —
+   * task tiles carried no such text at all before this, so a task Codex
+   * finished minutes ago kept reading `RUNNING` with no cue beyond a
+   * permanent-looking dim. A word plus a number beats a shade that never
+   * changes. */
+  staleForSeconds(): number | null {
+    return this.lastSuccessAt ? this.now() - this.lastSuccessAt : null
   }
 
   /** True when `usage.limits[limitIndex]` (default the primary window, index
@@ -708,26 +829,40 @@ export class CodexSource extends EventEmitter {
   isUsageUnknown(limitIndex = 0): boolean {
     const usage = this.snapshot.usage
     if (!usage) return true
-    const limit = usage.limits[limitIndex]
-    if (!limit) return true
     // I1 — an unparseable sample timestamp is reason enough to distrust the
     // whole reading, not just its displayed clock. This also means a `null`
     // ts forces EVERY limit unknown, independent of that limit's own
     // `resetsAt`, since `ts` describes the sample as a whole.
     if (usage.ts === null) return true
+    const limit = usage.limits[limitIndex]
+    if (!limit) {
+      // I3/I5 — no limit parsed at this index (M4: now visible directly as
+      // `null` rather than a shifted-away slot), so there is no window
+      // boundary to check this figure against. An earlier version answered
+      // `true` outright here, which blanked more than just the missing
+      // limit: `TASK TOKENS` and the strip clock both ask this with the
+      // DEFAULT index purely to gate "is this usage sample still current at
+      // all", a question that has nothing to do with any one window — so an
+      // absent PRIMARY limit alone hid a valid, current token count and
+      // sample time too. Falls back to the flat age backstop instead, the
+      // same one a present limit with no `resetsAt` uses below, just without
+      // a window length to clamp it to.
+      return this.isSampleTooOld(usage.ts, USAGE_UNKNOWN_BACKSTOP_SECONDS)
+    }
     const resetsAt = limit.resetsAt
     if (resetsAt === null) {
-      // C2 — the backstop for a missing `resetsAt` must never outlive the
-      // window it stands in for: a 5-hour (300-minute) window's sample
-      // cannot possibly still describe "now" 20 hours later just because a
-      // flat 24-hour backstop said so. Clamping to the window's own length
-      // is what the window field is FOR. `USAGE_UNKNOWN_BACKSTOP_SECONDS`
-      // still bounds the other direction, for when `windowMinutes` itself is
-      // missing or absurd (see `WINDOW_MAX_MINUTES`, which already fails
-      // that whole limit closed before reaching here — so in practice this
-      // Math.min is almost always the window term).
+      // C2 (round 2) — the backstop for a missing `resetsAt` must never
+      // outlive the window it stands in for: a 5-hour (300-minute) window's
+      // sample cannot possibly still describe "now" 20 hours later just
+      // because a flat 24-hour backstop said so. Clamping to the window's
+      // own length is what the window field is FOR.
+      // `USAGE_UNKNOWN_BACKSTOP_SECONDS` still bounds the other direction,
+      // for when `windowMinutes` itself is missing or absurd (see
+      // `WINDOW_MAX_MINUTES`, which already fails that whole limit closed
+      // before reaching here — so in practice this Math.min is almost
+      // always the window term).
       const backstop = Math.min(USAGE_UNKNOWN_BACKSTOP_SECONDS, limit.windowMinutes * 60)
-      return this.now() - usage.ts > backstop
+      return this.isSampleTooOld(usage.ts, backstop)
     }
     const remaining = resetsAt - this.now()
     const windowSeconds = limit.windowMinutes * 60
@@ -738,12 +873,24 @@ export class CodexSource extends EventEmitter {
     // would still be sitting in the window BEFORE the one the figure is
     // actually about.
     //
-    // M5 — `remaining <= 0`, not `< 0`: at `resetsAt === now` the window has
-    // just ended. `formatResetIn` already reports `ELAPSED` at that exact
-    // instant (its own boundary is `remaining <= 0`), so this must agree,
-    // or the reset tile and the percentage tile disagree by one second on
-    // the same frame.
+    // `remaining <= 0`, not `< 0`: at `resetsAt === now` the window has just
+    // ended. `formatResetIn` already reports `ELAPSED` at that exact instant
+    // (its own boundary is `remaining <= 0`), so this must agree, or the
+    // reset tile and the percentage tile disagree by one second on the same
+    // frame.
     return remaining <= 0 || remaining > windowSeconds
+  }
+
+  /** True when `sampleTs` is more than `backstopSeconds` older than now, OR
+   * `sampleTs` sits in the FUTURE relative to now. M3 — a plain
+   * `this.now() - sampleTs > backstop` reads a future sample as live: the
+   * subtraction goes negative, which is never greater than a positive
+   * backstop. A future sample is exactly as untrustworthy as a very old
+   * one — a clock stepped backwards, or bad data — so it must fail this
+   * check too, not silently pass it. */
+  private isSampleTooOld(sampleTs: number, backstopSeconds: number): boolean {
+    const age = this.now() - sampleTs
+    return age < 0 || age > backstopSeconds
   }
 
   async stop(): Promise<void> {

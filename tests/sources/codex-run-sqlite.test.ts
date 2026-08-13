@@ -14,7 +14,11 @@ const { execFileMock } = vi.hoisted(() => ({
       _args: string[],
       _opts: Record<string, unknown>,
       cb: (error: Error | null, stdout: string, stderr: string) => void,
-    ) => cb(null, '[]', ''),
+      // I4 — the real `sqlite3 -json` prints NOTHING (not `[]`) for a
+      // zero-row result; see docs/VERIFIED-FACTS.md and codex.test.ts's own
+      // default. This test never examines the returned text, but the stub
+      // should not encode a shape the real tool does not produce.
+    ) => cb(null, '', ''),
   ),
 }))
 vi.mock('node:child_process', () => ({ execFile: execFileMock }))
