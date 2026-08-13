@@ -46,6 +46,23 @@ const PRECIP_Y = 74
  * This page never reasons about the width itself, per docs/LESSONS.md #17.
  */
 const DETAIL_TEXT_SIZES = [13, 11]
+/**
+ * Character budget for one wrapped forecast line (I3), sized to the smallest
+ * `DETAIL_TEXT_SIZES` candidate, 11 px: VERIFIED-FACTS.md measures 6.62 px
+ * advance per character at 11 px Menlo, so 81 px / 6.62 px = 12.24, and
+ * 12 * 6.62 = 79.44 px stays inside the budget with room to spare. Menlo is
+ * monospace, so — unlike reasoning about a proportional font, which
+ * docs/LESSONS.md #17 forbids — a character count IS an exact pixel bound
+ * here. `renderKey`'s own `shrinkToFit` still catches the rare single word
+ * (for example `Thunderstorms`, 13 characters) that alone runs over this
+ * budget, so a bad wrap can degrade to an ellipsis but never draw past the
+ * key's margin.
+ */
+const TEXT_WRAP_CHARS = 12
+/** The DAY/NIGHT text tiles give line 0 to the header (`DAY`/`NIGHT`) and the
+ * rest of `KeySpec`'s 4-line budget to the wrapped forecast text (I3): "the
+ * key supports four lines and uses two," per the finding. */
+const TEXT_WRAP_LINES = 3
 /** Fixed size for the detail view's BACK label, matching the stocks detail view. */
 const BACK_SIZE = 16
 
@@ -123,13 +140,65 @@ function precipColor(pct: number | null): readonly [number, number, number] {
   return typeof pct === 'number' && pct >= PRECIP_HOT_THRESHOLD ? theme.blue : theme.textDim
 }
 
-/** `"8 mph"` and `"NE"` become `"8 mph NE"`. A missing direction keeps just
- * the speed. A null period (that half of the day is unknown) becomes `--`,
- * never a fabricated reading. */
+/**
+ * `"8 mph"` and `"NE"` become `"8 NE"`; a range like `"5 to 9 mph"` becomes
+ * `"5-9"`. Per finding I2: a real range-plus-direction reading, `"5 to 9 mph
+ * WNW"`, ran the WIND tile's `D `/`N ` line to 106 px at the smallest 11 px
+ * candidate — 25 px past the 81 px budget — so the renderer truncated it
+ * mid-unit (`"D 5 to 9 mp…"`). The tile's own `WIND` header already says
+ * what these numbers mean, so dropping the redundant `mph` and shortening
+ * `to` to `-` carries every real reading at 11 px with room to spare
+ * (measured: the widest live combination, `"D 10-15 WNW"`, is 72.8 px)
+ * without ever cutting a unit in half. A missing direction keeps just the
+ * speed. A null period (that half of the day is unknown) becomes `--`,
+ * never a fabricated reading.
+ */
 function formatWind(period: PeriodDetail | null): string {
   if (!period) return '--'
-  const speed = period.windSpeed || '--'
+  const speed = (period.windSpeed || '--').replace(' to ', '-').replace(/\s*mph$/i, '')
   return period.windDirection ? `${speed} ${period.windDirection}` : speed
+}
+
+/**
+ * Greedily wraps `text` into up to `maxLines` lines of at most `maxChars`
+ * characters, breaking only between words (never inside one) — except that
+ * text still left over once every line is full is folded onto the LAST line
+ * and cut there with an ellipsis, via the shared `truncate` helper: the same
+ * fallback `renderKey`'s own `shrinkToFit` uses when even the smallest
+ * candidate size does not fit (see `render/canvas.ts`). Per finding I3: the
+ * old code gave the forecast text one line and let the renderer truncate it
+ * to 11 characters of up to 58 — two different forecasts sharing a long
+ * common prefix rendered identically. Spreading the same text across up to
+ * `maxLines` lines instead shows several times as much before any
+ * truncation is needed. A single word longer than `maxChars` (for example
+ * `Thunderstorms`) is not itself broken here; it becomes its own overlong
+ * line, and the renderer's own per-line `shrinkToFit` — not this function —
+ * is what keeps that one line from drawing past the key's margin.
+ */
+export function wrapText(text: string, maxChars: number, maxLines: number): string[] {
+  if (maxLines <= 0 || maxChars <= 0) return []
+  const words = text.split(/\s+/).filter(Boolean)
+  if (words.length === 0) return []
+
+  const lines: string[] = []
+  let current = ''
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word
+    if (candidate.length <= maxChars) {
+      current = candidate
+    } else {
+      if (current) lines.push(current)
+      current = word
+    }
+  }
+  if (current) lines.push(current)
+
+  if (lines.length <= maxLines) return lines
+
+  const kept = lines.slice(0, maxLines - 1)
+  const rest = lines.slice(maxLines - 1).join(' ')
+  kept.push(truncate(rest, maxChars))
+  return kept
 }
 
 /** `4:05 PM EDT`, in US Eastern time — the project's one timestamp
@@ -152,10 +221,22 @@ function formatUpdated(epochSeconds: number): string {
 export class WeatherPage implements Page {
   readonly name = 'weather'
 
-  /** The day index (0 to 6) shown in detail mode, or null on the grid.
-   * `onLeave` always clears this, so the page reopens on the grid every
-   * time it becomes visible again. */
-  private selected: number | null = null
+  /**
+   * The selected day's stable identity (`DayForecast.date`), or null on the
+   * grid. `onLeave` always clears this, so the page reopens on the grid
+   * every time it becomes visible again.
+   *
+   * Per finding I1 (docs/LESSONS.md lesson 19): this used to be the array
+   * INDEX the user pressed. `WeatherSource.getDays()` rebuilds its array from
+   * scratch on every poll, and a day's position in it shifts as periods
+   * expire — the day that was at index 1 can become index 0 on the very next
+   * poll. Keying on the array position meant the open detail view silently
+   * followed whatever day slid into that index next, not the day the user
+   * actually opened. `date` never changes for the same real day, so this
+   * keys on that instead — the same stable-identity fix the stocks page
+   * already gets for free by keying on the symbol.
+   */
+  private selected: string | null = null
 
   constructor(private readonly source: WeatherReader) {}
 
@@ -168,6 +249,21 @@ export class WeatherPage implements Page {
     this.source.setVisible(false)
   }
 
+  /**
+   * The day matching `this.selected`'s identity, or null when nothing is
+   * selected OR the selected day is no longer in `days` (per I1, this must
+   * never fall back to "whatever day is now at the old index" — it is
+   * either the SAME day, found by its stable identity, or nothing). Computed
+   * fresh from `days` every call rather than cached, so `render` never needs
+   * to mutate `this.selected` to fall back to the grid (M3: a page must not
+   * mutate its own state inside `render`) — `onKeyPress` calls this too, so
+   * the two stay consistent about whether a day is really selected.
+   */
+  private activeDay(days: DayForecast[]): DayForecast | null {
+    if (this.selected === null) return null
+    return days.find((d) => d.date === this.selected) ?? null
+  }
+
   render(_now: number): DeckFrame {
     const days = this.source.getDays()
     const status = this.source.getStatus()
@@ -175,15 +271,8 @@ export class WeatherPage implements Page {
     const absent = status !== 'ok' || days.length === 0
     const dim = stale || absent
 
-    if (this.selected !== null) {
-      const day = days[this.selected]
-      if (day) return this.detailFrame(day, dim)
-      // The selected day vanished from the forecast — this should not
-      // happen, since a refresh only ever replaces the whole array, but a
-      // page must never throw, so fall back to the grid rather than render
-      // a detail view with nothing behind it.
-      this.selected = null
-    }
+    const day = this.activeDay(days)
+    if (day) return this.detailFrame(day, dim)
 
     const keys: KeySpec[] = []
     for (let i = 0; i < DAY_TILE_COUNT; i++) {
@@ -345,15 +434,21 @@ export class WeatherPage implements Page {
   }
 
   /** Keys 4 and 5: one half's short forecast text, for example `Slight
-   * Chance Showers And Thunderstorms then Partly Cloudy`. Real strings run
-   * far past the usable width even at the smallest candidate size, so
-   * `renderKey` truncates with an ellipsis — measured, not guessed, per
-   * docs/LESSONS.md #17. A missing half shows `--`. */
+   * Chance Showers And Thunderstorms then Partly Cloudy`. Per I3, this wraps
+   * the text across the tile's remaining 3 lines instead of giving it one —
+   * still not always the WHOLE string (a 58-character forecast can run past
+   * even 3 wrapped lines), but several times as much of it, and two
+   * different forecasts sharing a long prefix now diverge sooner. Real
+   * strings, or a single overlong word, can still run past the usable width
+   * even at the smallest candidate size, so `renderKey` truncates THAT line
+   * with an ellipsis — measured, not guessed, per docs/LESSONS.md #17. A
+   * missing half shows `--`. */
   private textKey(label: string, period: PeriodDetail | null, dim: boolean): KeySpec {
+    const wrapped = wrapText(period?.shortForecast || '--', TEXT_WRAP_CHARS, TEXT_WRAP_LINES)
     const key: KeySpec = {
       kind: 'gauge',
-      lines: [label, period?.shortForecast || '--'],
-      lineSizes: [DAY_LABEL_SIZE, DETAIL_TEXT_SIZES],
+      lines: [label, ...wrapped],
+      lineSizes: [DAY_LABEL_SIZE, ...wrapped.map(() => DETAIL_TEXT_SIZES)],
     }
     if (dim) key.dim = true
     return key
@@ -391,14 +486,31 @@ export class WeatherPage implements Page {
     }
   }
 
-  /** The detail view's strip shows the day's actual forecast paragraph
+  /**
+   * The detail view's strip shows the day's actual forecast paragraph
    * instead of the grid's place-and-update-time summary: line 1 is the day
    * half's `detailedForecast`, line 2 the night half's, each truncated to
-   * the strip's usable width. A missing half shows `--`. */
+   * the strip's usable width. A missing half shows `--`.
+   *
+   * Per M2: the grid strip's `updated …`/`offline` honesty signal used to
+   * disappear entirely in detail mode — a stale or offline forecast still
+   * showed two forecast paragraphs with nothing to say they might be old.
+   * Both lines are already spoken for by the two forecast paragraphs, so
+   * this reuses `right` (the same field the stocks detail strip's own
+   * `renderStrip` mechanism is built for) rather than dropping either
+   * paragraph, matching the stocks page's own drill-down, which keeps its
+   * status text on the strip too.
+   */
   private detailStrip(day: DayForecast): StripSpec {
     const dayText = day.day?.detailedForecast || '--'
     const nightText = day.night?.detailedForecast || '--'
-    return { lines: [truncate(dayText, STRIP_CHARS), truncate(nightText, STRIP_CHARS)] }
+    const status = this.source.getStatus()
+    const updatedAt = this.source.getLastUpdatedAt()
+    const right = status === 'offline' ? 'offline' : updatedAt > 0 ? formatUpdated(updatedAt) : '--'
+    return {
+      lines: [truncate(dayText, STRIP_CHARS), truncate(nightText, STRIP_CHARS)],
+      right,
+    }
   }
 
   private strip(): StripSpec {
@@ -425,15 +537,17 @@ export class WeatherPage implements Page {
   }
 
   onKeyPress(index: number): PressOutcome {
-    if (this.selected === null) {
+    const days = this.source.getDays()
+    if (this.activeDay(days) === null) {
       // Key 7 is the conditions tile, never a day — it has no drill-down.
       if (index >= DAY_TILE_COUNT) return 'ignored'
       // No forecast at all for this slot yet: nothing to show a detail view
       // for. A partial forecast can leave a day tile empty before the first
       // full refresh, and an empty key must not open detail for a day that
       // does not exist.
-      if (!this.source.getDays()[index]) return 'ignored'
-      this.selected = index
+      const day = days[index]
+      if (!day) return 'ignored'
+      this.selected = day.date
       return 'handled'
     }
 

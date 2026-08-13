@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { WeatherPage, conditionTint, heatColor } from '../../src/pages/weather-page.js'
+import { WeatherPage, conditionTint, heatColor, wrapText } from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
@@ -37,6 +37,12 @@ function periodDetail(over: Partial<PeriodDetail> = {}): PeriodDetail {
 function day(label: string, over: Partial<DayForecast> = {}): DayForecast {
   return {
     label,
+    // Defaults to the label itself: every real LABELS entry is already
+    // distinct, so this keeps the existing fixtures usable as stable
+    // identities (I1) without every call site having to invent a fake ISO
+    // date. Tests that specifically exercise the identity-vs-position fix
+    // pass an explicit `date` override instead.
+    date: label,
     emoji: '☀️',
     high: 90,
     low: 70,
@@ -296,6 +302,42 @@ describe('conditionTint', () => {
 
   it('falls back to the cloudy tint for an emoji it does not recognise', () => {
     expect(conditionTint('🤷')).toEqual([22, 24, 28])
+  })
+})
+
+describe('wrapText (I3)', () => {
+  it('returns the text as one line when it already fits', () => {
+    expect(wrapText('Sunny', 12, 3)).toEqual(['Sunny'])
+  })
+
+  it('wraps on word boundaries, never splitting a word that fits', () => {
+    expect(wrapText('Showers And Thunderstorms', 12, 3)).toEqual(['Showers And', 'Thunderstorms'])
+  })
+
+  it('lets a single word longer than maxChars stand alone, unbroken, when it is not the final kept line', () => {
+    // `Thunderstorms` (13 characters) exceeds the 12-character budget by
+    // itself. This function does not hyphenate it — the renderer's own
+    // per-line `shrinkToFit` is what protects the key's margin for that
+    // one line, exactly as it already does for any other overlong string.
+    const out = wrapText('Thunderstorms then Sun', 12, 3)
+    expect(out).toContain('Thunderstorms')
+  })
+
+  it('folds remaining words onto the last line and truncates with an ellipsis once every line is full', () => {
+    const out = wrapText('Slight Chance Showers And Thunderstorms then Partly Cloudy', 12, 3)
+    expect(out).toHaveLength(3)
+    for (const line of out) expect(line.length).toBeLessThanOrEqual(12)
+    expect(out[2]!.endsWith('…')).toBe(true)
+  })
+
+  it('returns an empty array for empty or all-whitespace text', () => {
+    expect(wrapText('', 12, 3)).toEqual([])
+    expect(wrapText('   ', 12, 3)).toEqual([])
+  })
+
+  it('returns an empty array for a non-positive maxChars or maxLines, rather than throwing', () => {
+    expect(wrapText('Sunny', 0, 3)).toEqual([])
+    expect(wrapText('Sunny', 12, 0)).toEqual([])
   })
 })
 
@@ -588,6 +630,60 @@ describe('WeatherPage presses: entering and leaving detail mode', () => {
   })
 })
 
+describe('WeatherPage identity (I1 / lesson 19): selection follows the day, never the array position', () => {
+  it('keeps showing the SAME day after a poll shifts every later day one slot to the left', () => {
+    // Reproduces the review's exact measured scenario: at 23:55 the array is
+    // [NOW(Fri night), SAT, SUN...]. The user opens SAT (index 1). Once the
+    // Friday-night period expires, the next poll rebuilds the array as
+    // [NOW(Sat), SUN...] — SAT's own data now sits at index 0, not index 1.
+    // A page keyed on the array position would silently show SUN's data
+    // under whatever heading index 1 now carries. This page must keep
+    // showing SAT's numbers (90°/75°), found by date, wherever they moved.
+    const days = [
+      day('NOW', { date: '2026-08-14', high: 70, low: 60 }),
+      day('SAT', { date: '2026-08-15', high: 90, low: 75 }),
+      day('SUN', { date: '2026-08-16', high: 88, low: 74 }),
+    ]
+    const { page, f } = build({ days })
+    page.onKeyPress(1) // selects SAT, date 2026-08-15
+
+    // The next poll: the Friday-night period drops out of the source's own
+    // periods, SAT becomes NOW, and SUN slides from index 2 to index 1.
+    f.days = [
+      day('NOW', { date: '2026-08-15', high: 90, low: 75 }),
+      day('SUN', { date: '2026-08-16', high: 88, low: 74 }),
+    ]
+    const key0 = page.render(NOW).keys[0]!
+    expect(key0.lines![1]).toBe('90°/75°') // still the originally-selected day
+    expect(key0.lines![1]).not.toBe('88°/74°') // never SUN's data
+  })
+
+  it('falls back to the grid, honestly, once the selected day is truly gone — never shows another day under the old heading', () => {
+    const days = [
+      day('NOW', { date: '2026-08-14' }),
+      day('SAT', { date: '2026-08-15', high: 90, low: 75 }),
+    ]
+    const { page, f } = build({ days })
+    page.onKeyPress(1) // selects SAT, date 2026-08-15
+    f.days = [day('NOW', { date: '2026-08-16' })] // 2026-08-15 is gone entirely
+    const keys = page.render(NOW).keys
+    expect(keys).toHaveLength(8) // the grid, not a mislabelled detail view
+    expect(keys[0]!.lines![0]).toBe('NOW')
+    expect(keys[1]!.lines).toEqual(['--', '--', '--']) // no SAT day anymore — dashed, not fabricated
+  })
+
+  it('re-selecting the same identity after a fallback still works (onKeyPress and render agree on what is selected)', () => {
+    const days = [day('NOW', { date: '2026-08-14' }), day('SAT', { date: '2026-08-15' })]
+    const { page, f } = build({ days })
+    page.onKeyPress(1) // selects SAT
+    f.days = [day('NOW', { date: '2026-08-16' })] // SAT vanishes
+    page.render(NOW) // falls back to the grid (without mutating `selected`, per M3)
+    expect(page.onKeyPress(0)).toBe('handled') // the grid still responds normally
+    const key0 = page.render(NOW).keys[0]!
+    expect(key0.lines![0]).toBe('NOW')
+  })
+})
+
 describe('WeatherPage detail view layout', () => {
   function detailKeys() {
     const days = sevenDays()
@@ -615,19 +711,41 @@ describe('WeatherPage detail view layout', () => {
     expect(key.emoji).toBe('☀️')
   })
 
-  it('key 3 shows WIND, the day and night readings prefixed D/N', () => {
+  it('key 3 shows WIND, the day and night readings prefixed D/N, with the redundant "mph" dropped (I2)', () => {
+    // Per I2: "mph" and "to" together are what pushed a real range-plus-
+    // direction reading past the 81 px budget at every candidate size. The
+    // WIND tile's own header already says these are speeds.
     const key = detailKeys()[3]!
-    expect(key.lines).toEqual(['WIND', 'D 8 mph NE', 'N 5 to 8 mph SW'])
+    expect(key.lines).toEqual(['WIND', 'D 8 NE', 'N 5-8 SW'])
   })
 
-  it('key 4 shows the DAY half short forecast text', () => {
+  it('key 4 shows the DAY half short forecast text, wrapped across the tile\'s remaining lines (I3)', () => {
+    // Per I3: the old single line gave only 11 characters of a forecast
+    // that can run to 58. This text (25 characters) now spreads across two
+    // wrapped lines instead of one truncated one.
     const key = detailKeys()[4]!
-    expect(key.lines).toEqual(['DAY', 'Showers And Thunderstorms'])
+    expect(key.lines).toEqual(['DAY', 'Showers And', 'Thunderstorms'])
   })
 
   it('key 5 shows the NIGHT half short forecast text', () => {
     const key = detailKeys()[5]!
     expect(key.lines).toEqual(['NIGHT', 'Clear'])
+  })
+
+  it('shows different text for two forecasts sharing an 11-character prefix (I3): the old single truncated line could not tell them apart', () => {
+    const days = sevenDays()
+    days[0] = fullDay('NOW', {
+      day: periodDetail({ shortForecast: 'Chance Rain Showers then Sunny' }),
+      night: periodDetail({ shortForecast: 'Chance Rain Showers then Cloudy' }),
+    })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    expect(keys[4]!.lines).toEqual(['DAY', 'Chance Rain', 'Showers then', 'Sunny'])
+    expect(keys[5]!.lines).toEqual(['NIGHT', 'Chance Rain', 'Showers then', 'Cloudy'])
+    expect(keys[4]!.lines).not.toEqual(keys[5]!.lines)
+    // Both used to render identically as "Chance Rain…" (11 characters):
+    // the old single-line truncation never reached the word that differs.
   })
 
   it('key 6 shows RAIN, the day and night percentages prefixed D/N', () => {
@@ -743,6 +861,44 @@ describe('WeatherPage detail view strip', () => {
       expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
     }
   })
+
+  // M2: the grid strip's `updated …`/`offline` honesty signal used to
+  // disappear entirely in the detail view — both lines were already spent
+  // on the two forecast paragraphs, with nothing left to say the data might
+  // be old. This reuses `StripSpec.right`, the same mechanism other pages
+  // already use to share line 2 without dropping either half.
+  it('carries the updated time as `right` on the detail strip, same as the grid', () => {
+    const { page } = build({ updatedAt: NOW - 3600 }) // 10:46 AM EDT, per the grid strip test
+    page.onKeyPress(0)
+    expect(page.render(NOW).strip.right).toBe('10:46 AM EDT')
+  })
+
+  it('carries "offline" as `right` on the detail strip when the source is offline, instead of dropping the signal', () => {
+    const { page } = build({ status: 'offline' })
+    page.onKeyPress(0)
+    expect(page.render(NOW).strip.right).toBe('offline')
+  })
+
+  it('carries -- as `right` before the first successful fetch', () => {
+    // "empty" status normally has no day tiles, but a day can still be
+    // selected already (for example, this page reopened on a page switch
+    // while the source had a day from a stale prior success and then lost
+    // it) — the strip's honesty signal must still degrade to `--`, not throw
+    // or fabricate a time.
+    const days = [day('NOW')]
+    const { page } = build({ status: 'empty', days, updatedAt: 0 })
+    page.onKeyPress(0)
+    expect(page.render(NOW).strip.right).toBe('--')
+  })
+
+  it('never draws the `right` update indicator past the detail strip edge', () => {
+    const { page } = build({ updatedAt: NOW - 3600 })
+    page.onKeyPress(0)
+    const buffer = renderStrip(page.render(NOW).strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
+  })
 })
 
 describe('WeatherPage detail view text fits the usable key width', () => {
@@ -752,15 +908,24 @@ describe('WeatherPage detail view text fits the usable key width', () => {
   // the proof has to render real pixels and probe them, not read the
   // declared candidates as if they were already final.
   const RIGHT_EDGE_X = 90 // BORDER(3) + PAD(6) + usable width(81)
+  const RIGHT_EDGE_BAND_END = 95 // KEY_SIZE(96) - 1: probe the whole margin, not one column
 
   // The emoji tiles (keys 0 to 2) carry their own condition tint as `bg`,
   // not `theme.bg` — probing against the wrong background would flag every
   // pixel of the tint itself as "ink". Callers pass the key's own `bg` when
   // it has one; the plain info tiles (WIND, the text tiles, RAIN, BACK)
   // carry no `bg` at all, so the default covers them.
+  //
+  // Test quality: a single-column probe at x=90 alone cannot fail against
+  // ink one column further right — a prior review found exactly that shape
+  // of gap (ink at x=95 on a 96 px key survives a probe that only checks
+  // x=90). This probes the whole band from the usable-width edge to the
+  // key's last column instead.
   function noInkAtOrPastRightEdge(buf: Buffer, bg: readonly number[] = theme.bg): boolean {
     for (let y = 0; y < KEY_SIZE; y++) {
-      if (!near3(probe(buf, RIGHT_EDGE_X, y), bg)) return false
+      for (let x = RIGHT_EDGE_X; x <= RIGHT_EDGE_BAND_END; x++) {
+        if (!near3(probe(buf, x, y), bg)) return false
+      }
     }
     return true
   }
