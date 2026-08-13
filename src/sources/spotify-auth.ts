@@ -195,6 +195,19 @@ export async function runAuthFlow(
     // gets a chance to process I/O after this synchronous setup finishes.
     let timer: NodeJS.Timeout
 
+    // `closeServer` itself tolerates being called more than once (`close()`
+    // on an already-closed server is a no-op). But this flow can now trigger
+    // it from two independent events for the very same request -- the
+    // response's flush callback AND its `'close'` event, see below -- so
+    // `closed` keeps the teardown itself a single, well-defined action
+    // rather than something that happens to be safe to repeat.
+    let closed = false
+    const closeOnce = (): void => {
+      if (closed) return
+      closed = true
+      closeServer(server)
+    }
+
     const server = createServer((req, res) => {
       const requested = new URL(req.url ?? '/', `http://127.0.0.1:${port}`)
       if (requested.pathname !== '/callback') {
@@ -204,30 +217,45 @@ export async function runAuthFlow(
         res.writeHead(404, { Connection: 'close' }).end()
         return
       }
+
+      // `'finish'` (the callback `res.end` accepts below) fires only once
+      // the response has actually flushed, and Node does NOT guarantee it
+      // fires at all: if the response socket is already destroyed at the
+      // moment `res.end` runs, `'finish'` never comes, so a callback-only
+      // close would never run and nothing would ever stop the listener --
+      // the timeout that used to bound this is cleared on the very next
+      // line in every branch below, so the hang would be unbounded, not
+      // just five minutes. `'close'` fires either way: on a clean finish
+      // (once the socket subsequently closes, since every response here
+      // sends `Connection: close`) or on an aborted one, so it is the
+      // belt to the flush callback's braces, not a replacement for it --
+      // `'finish'` still closes fastest on the common, healthy path.
+      res.on('close', closeOnce)
+
       const err = requested.searchParams.get('error')
       const gotCode = requested.searchParams.get('code')
       const gotState = requested.searchParams.get('state')
 
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', Connection: 'close' })
       if (err || !gotCode) {
-        // `closeServer` runs from `res.end`'s own callback, which Node fires
-        // only once the response has actually flushed. Closing right after
-        // the synchronous `res.end()` call, before that flush, risked
-        // truncating the browser's confirmation page -- the same class of
-        // bug as the keep-alive socket in `closeServer`'s own doc comment,
-        // just on the write side instead of the connection side.
-        res.end('<h1>Authorization failed</h1><p>Return to the terminal.</p>', () => closeServer(server))
+        // Passing `closeOnce` as `res.end`'s own flush callback still closes
+        // as soon as the response is actually sent on the common, healthy
+        // path -- closing any earlier, before that flush, risked truncating
+        // the browser's confirmation page, the same class of bug as the
+        // keep-alive socket in `closeServer`'s own doc comment, just on the
+        // write side instead of the connection side.
+        res.end('<h1>Authorization failed</h1><p>Return to the terminal.</p>', closeOnce)
         clearTimeout(timer)
         reject(new Error(`authorization failed: ${err ?? 'no code'}`))
         return
       }
       if (gotState !== state) {
-        res.end('<h1>State mismatch</h1><p>Return to the terminal.</p>', () => closeServer(server))
+        res.end('<h1>State mismatch</h1><p>Return to the terminal.</p>', closeOnce)
         clearTimeout(timer)
         reject(new Error('state mismatch. The callback did not match the request.'))
         return
       }
-      res.end('<h1>deckd is connected</h1><p>You can close this tab.</p>', () => closeServer(server))
+      res.end('<h1>deckd is connected</h1><p>You can close this tab.</p>', closeOnce)
       clearTimeout(timer)
       resolve(gotCode)
     })
@@ -235,11 +263,11 @@ export async function runAuthFlow(
       // A bind failure (e.g. `EADDRINUSE`) settles the promise too, and a
       // pending timer would otherwise keep the process alive after it does.
       clearTimeout(timer)
-      closeServer(server)
+      closeOnce()
       reject(e)
     })
     timer = setTimeout(() => {
-      closeServer(server)
+      closeOnce()
       reject(new Error('authorization timed out after 5 minutes'))
     }, timeoutMs)
     server.listen(port, '127.0.0.1', () => {

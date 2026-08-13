@@ -342,4 +342,211 @@ describe('runAuthFlow', () => {
       closeSpy.mockRestore()
     }
   })
+
+  // Regression coverage for I2/B2: `closeServer` ran only from `res.end`'s
+  // flush callback. Node does not guarantee that callback fires -- if the
+  // response socket is already destroyed by the time `res.end` runs,
+  // `'finish'` never comes, so nothing would ever close the listener, and
+  // (since the timeout is cleared on the same line) nothing would ever bound
+  // the hang either. This does not need to reproduce a destroyed socket to
+  // prove the fix: it drops the flush callback entirely, exactly the
+  // condition under which the old code could never close, and shows the
+  // `'close'`-event path closes the server anyway.
+  it('closes the listener via the "close" event even when the flush callback never fires', async () => {
+    const originalEnd = ServerResponse.prototype.end
+    const endSpy = vi
+      .spyOn(ServerResponse.prototype, 'end')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(function (this: ServerResponse, ...args: any[]) {
+        // Simulates Node never invoking the flush callback at all -- the
+        // exact condition the review measured with a destroyed-socket probe.
+        const withoutCallback = args.filter((a) => typeof a !== 'function')
+        return (originalEnd as unknown as (...a: unknown[]) => unknown).apply(this, withoutCallback)
+      })
+
+    try {
+      const fetchFn = vi.fn(async () => ({
+        json: async () => ({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 }),
+      })) as unknown as typeof fetch
+
+      let port = 0
+      const tokens = await runAuthFlow('cid', {
+        port: 0,
+        fetchFn,
+        onListening: (p) => { port = p },
+        openUrl: (url) => {
+          const state = new URL(url).searchParams.get('state')
+          void fetch(`http://127.0.0.1:${port}/callback?code=testcode&state=${state}`)
+        },
+      })
+
+      expect(tokens).toEqual({ accessToken: 'at', refreshToken: 'rt', expiresAt: expect.any(Number) })
+
+      // The listener must still be gone -- proving the `'close'` event, not
+      // the flush callback, drove the teardown this time. Before the fix,
+      // this connection would have been accepted, because nothing ever
+      // called `closeServer`.
+      await new Promise<void>((resolve, reject) => {
+        const probe = netConnect(port, '127.0.0.1')
+        probe.on('connect', () => {
+          probe.destroy()
+          reject(new Error('the port still accepts connections; a flush-callback-only close would hang here'))
+        })
+        probe.on('error', () => resolve())
+      })
+    } finally {
+      endSpy.mockRestore()
+    }
+  })
+
+  // Regression coverage for the honest gap the review flagged: the earlier
+  // structural test proved the success path only. A CLI process hangs just
+  // as badly if the error, state-mismatch, or timeout path leaks the
+  // listener.
+  it('closes the listener after an authorization error from the provider', async () => {
+    let port = 0
+    await expect(
+      runAuthFlow('cid', {
+        port: 0,
+        onListening: (p) => { port = p },
+        openUrl: (url) => {
+          const state = new URL(url).searchParams.get('state')
+          void fetch(`http://127.0.0.1:${port}/callback?error=access_denied&state=${state}`)
+        },
+      }),
+    ).rejects.toThrow(/authorization failed/)
+
+    await new Promise<void>((resolve, reject) => {
+      const probe = netConnect(port, '127.0.0.1')
+      probe.on('connect', () => {
+        probe.destroy()
+        reject(new Error('the port still accepts connections after an authorization error'))
+      })
+      probe.on('error', () => resolve())
+    })
+  })
+
+  it('closes the listener after a state mismatch', async () => {
+    let port = 0
+    await expect(
+      runAuthFlow('cid', {
+        port: 0,
+        onListening: (p) => { port = p },
+        openUrl: (url) => {
+          void new URL(url) // the real state is deliberately ignored below
+          void fetch(`http://127.0.0.1:${port}/callback?code=testcode&state=wrong`)
+        },
+      }),
+    ).rejects.toThrow(/state mismatch/)
+
+    await new Promise<void>((resolve, reject) => {
+      const probe = netConnect(port, '127.0.0.1')
+      probe.on('connect', () => {
+        probe.destroy()
+        reject(new Error('the port still accepts connections after a state mismatch'))
+      })
+      probe.on('error', () => resolve())
+    })
+  })
+
+  it('closes the listener when the flow times out with no callback ever arriving', async () => {
+    let port = 0
+    await expect(
+      runAuthFlow('cid', {
+        port: 0,
+        timeoutMs: 50,
+        onListening: (p) => { port = p },
+        openUrl: () => {
+          // Deliberately does nothing -- the browser never comes back.
+        },
+      }),
+    ).rejects.toThrow(/timed out/)
+
+    await new Promise<void>((resolve, reject) => {
+      const probe = netConnect(port, '127.0.0.1')
+      probe.on('connect', () => {
+        probe.destroy()
+        reject(new Error('the port still accepts connections after the flow timed out'))
+      })
+      probe.on('error', () => resolve())
+    })
+  })
+
+  // The exact wording of the review's honest limit: "a client that never
+  // reads the response." A raw socket that writes the request and then never
+  // reads a byte back still must not hang the flow -- `Connection: close`
+  // plus `closeAllConnections()` are the backstop for a client like this,
+  // independent of whether it ever drains the response.
+  it('resolves even when the client socket never reads the response', async () => {
+    const fetchFn = vi.fn(async () => ({
+      json: async () => ({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 }),
+    })) as unknown as typeof fetch
+
+    let port = 0
+    let clientSocket: Socket | undefined
+    const tokens = await runAuthFlow('cid', {
+      port: 0,
+      fetchFn,
+      onListening: (p) => { port = p },
+      openUrl: (url) => {
+        const state = new URL(url).searchParams.get('state')
+        clientSocket = netConnect(port, '127.0.0.1', () => {
+          clientSocket!.write(
+            `GET /callback?code=testcode&state=${state} HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${port}\r\n` +
+            `Connection: keep-alive\r\n\r\n`,
+          )
+        })
+        // No `.resume()`, no `data` listener: this client never reads
+        // anything back.
+      },
+    })
+
+    expect(tokens).toEqual({ accessToken: 'at', refreshToken: 'rt', expiresAt: expect.any(Number) })
+    clientSocket?.destroy()
+  })
+
+  // Regression coverage for the idempotency this fix adds: the success path
+  // now has two independent triggers for the same teardown -- `res.end`'s
+  // flush callback and the response's `'close'` event -- and both routinely
+  // fire for one request, since every response here sends
+  // `Connection: close`. The teardown itself must still happen exactly once.
+  it('closes the server exactly once even though both the flush callback and the close event fire', async () => {
+    const originalClose = Server.prototype.close
+    const originalCloseAll = Server.prototype.closeAllConnections
+    const closeSpy = vi.spyOn(Server.prototype, 'close').mockImplementation(function (this: Server, ...a: unknown[]) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (originalClose as any).apply(this, a)
+    })
+    const closeAllSpy = vi.spyOn(Server.prototype, 'closeAllConnections').mockImplementation(function (this: Server) {
+      return originalCloseAll.apply(this)
+    })
+
+    try {
+      const fetchFn = vi.fn(async () => ({
+        json: async () => ({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 }),
+      })) as unknown as typeof fetch
+
+      let port = 0
+      await runAuthFlow('cid', {
+        port: 0,
+        fetchFn,
+        onListening: (p) => { port = p },
+        openUrl: (url) => {
+          const state = new URL(url).searchParams.get('state')
+          void fetch(`http://127.0.0.1:${port}/callback?code=testcode&state=${state}`)
+        },
+      })
+
+      // Give the socket's own `'close'` event, the second of the two
+      // triggers, a chance to fire after the flush callback already ran.
+      await new Promise((resolve) => setTimeout(resolve, 200))
+
+      expect(closeSpy).toHaveBeenCalledTimes(1)
+      expect(closeAllSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      closeSpy.mockRestore()
+      closeAllSpy.mockRestore()
+    }
+  })
 })
