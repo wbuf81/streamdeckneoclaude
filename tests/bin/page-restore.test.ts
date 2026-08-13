@@ -100,6 +100,23 @@ describe('restorePage', () => {
     restorePage(pages, readerFor(JSON.stringify({ page: 0, pageName: 'renamed-claude' })))
     expect(pages.current().name).toBe('claude') // NOT shifted to index 1 ('codex')
   })
+
+  it('demonstrates why every page must be added before this runs (M8): a page not registered yet cannot be found', () => {
+    // `bin/deckd.ts`'s own comment above its `restorePage(pages)` call
+    // states this order matters, but nothing enforced it. This calls
+    // `restorePage` against an EMPTY manager -- the exact ordering mistake
+    // the comment warns against -- then adds the real pages afterward, and
+    // shows the saved page is lost for good: `indexOf` cannot find a name
+    // that is not registered yet, and there is no second chance once the
+    // pages ARE added.
+    const pages = new PageManager()
+    restorePage(pages, readerFor(JSON.stringify({ page: 1, pageName: 'codex' })))
+    pages.add(fakePage('claude'))
+    pages.add(fakePage('codex'))
+    // Stranded on whichever page ends up first, silently -- no error, no
+    // log line, exactly the failure the comment describes.
+    expect(pages.current().name).toBe('claude')
+  })
 })
 
 describe('savePage', () => {

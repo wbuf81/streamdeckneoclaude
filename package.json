@@ -10,7 +10,7 @@
     "deckd": "./dist/bin/deckd.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/bin/deckd.js start",
     "test": "vitest run",
     "test:watch": "vitest",

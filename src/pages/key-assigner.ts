@@ -8,7 +8,7 @@ import type { Session } from '../sources/claude.js'
 export const SESSION_SLOTS = 3
 
 export interface Assignment {
-  /** Session id per key, index 0 to 3. `null` means the key is free. */
+  /** Session id per key, index 0 to 2. `null` means the key is free. */
   slots: (string | null)[]
   /** Live sessions that got no key. */
   overflow: number

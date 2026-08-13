@@ -5,6 +5,7 @@ import { WeatherPage } from '../../src/pages/weather-page.js'
 import type { PlayerReader } from '../../src/pages/spotify-page.js'
 import type { StockReader } from '../../src/pages/stocks-page.js'
 import type { WeatherReader } from '../../src/pages/weather-page.js'
+import type { Page } from '../../src/pages/types.js'
 
 /**
  * Task 22 gave `Page` an optional `tickMs`, defaulting to 1000 ms when a page
@@ -30,7 +31,12 @@ describe('pages that must keep the default 1000 ms render interval', () => {
       isSymbolStale: () => false,
       setVisible: () => {},
     } as unknown as StockReader
-    const page = new StocksPage(fake)
+    // Typed as `Page`, not the concrete class (I8): `StocksPage` correctly
+    // never declares `tickMs` at all, since it is optional on `Page` and
+    // this page has no reason to animate — but that means the CONCRETE
+    // class type has no such member for `tsc` to see, even though reading
+    // it through the interface (exactly how the daemon does) is fine.
+    const page: Page = new StocksPage(fake)
     expect(page.tickMs).toBeUndefined()
   })
 
@@ -43,7 +49,7 @@ describe('pages that must keep the default 1000 ms render interval', () => {
       isStale: () => false,
       setVisible: () => {},
     } as unknown as WeatherReader
-    const page = new WeatherPage(fake)
+    const page: Page = new WeatherPage(fake)
     expect(page.tickMs).toBeUndefined()
   })
 })

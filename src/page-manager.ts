@@ -1,4 +1,4 @@
-import type { Page } from './pages/types.js'
+import type { Page, PressOutcome } from './pages/types.js'
 
 export class PageManager {
   private pages: Page[] = []
@@ -50,7 +50,14 @@ export class PageManager {
     this.setIndex(this.indexOf(name))
   }
 
-  async onKeyPress(index: number): Promise<void> {
-    await this.current().onKeyPress(index)
+  /**
+   * Routes a press to the current page and reports what it did. The daemon
+   * itself calls `this.pages.current().onKeyPress(index)` directly rather
+   * than through here, so this is dead in production — but its signature
+   * used to discard the one value the whole press-feedback feature depends
+   * on (M4), which any future caller would inherit silently.
+   */
+  async onKeyPress(index: number): Promise<PressOutcome> {
+    return await this.current().onKeyPress(index)
   }
 }

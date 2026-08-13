@@ -66,13 +66,20 @@ describe('makeChangeHandler (B3)', () => {
 })
 
 /**
- * Mirrors the shape of a press-feedback flash (now owned by `src/daemon.ts`,
- * not any one page): a press arms a flash timed off the millisecond clock
- * the page's own last `render()` call saw, and a later render shows it
- * until `nowMs` reaches that recorded expiry. Modeled locally, rather than
- * driving the real daemon-level mechanism, so this regression test stays
- * about `makeChangeHandler`'s own clock plumbing — the thing this file
- * actually owns — independent of the daemon's internals.
+ * `FlashPage` models a press-feedback flash the way `src/daemon.ts` used to
+ * work BEFORE task 32 moved the real mechanism out of pages entirely (and
+ * before `697a42b`'s per-page-and-per-key redesign after that). It exists
+ * ONLY to exercise `makeChangeHandler`'s own clock plumbing — the thing
+ * this file actually owns — against something that reacts to a millisecond
+ * clock, independent of the daemon's real flash internals.
+ *
+ * IMPORTANT: this is NOT coverage of the daemon's actual flash (see
+ * `tests/daemon.test.ts`'s "Daemon press-feedback flash" describe block for
+ * that). `FlashPage` signals through `border`, a field the real mechanism
+ * has not used since task 32, and both tests below pass identically against
+ * a daemon whose flash logic is completely different from what ships today.
+ * Renamed from titles that claimed press-flash coverage (M9) to avoid that
+ * exact false impression.
  */
 const FLASH_MS = 200
 
@@ -99,8 +106,8 @@ class FlashPage implements Page {
   }
 }
 
-describe('press flash and a change-driven render (B3)', () => {
-  it('reproduces the review-measured bug directly: a truncated change-driven render makes the very next press flash invisible', async () => {
+describe('a page-local flash model exercises makeChangeHandler’s clock plumbing (B3)', () => {
+  it('reproduces the review-measured bug directly: a truncated change-driven render makes the modeled flash invisible', async () => {
     // This test pins the OLD, buggy behaviour on purpose, to prove the
     // scenario is real rather than theoretical -- it calls `renderOnce`
     // with the truncated `now * 1000` value the removed default used to
@@ -130,7 +137,7 @@ describe('press flash and a change-driven render (B3)', () => {
     await daemon.stop()
   })
 
-  it('the flash survives a change-driven render on the following tick, once every path carries a real millisecond clock', async () => {
+  it('the modeled flash survives a change-driven render on the following tick, once every path carries a real millisecond clock', async () => {
     const device = new FakeDevice()
     const page = new FlashPage()
     const manager = new PageManager()

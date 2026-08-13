@@ -1,34 +1,4 @@
-import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas'
-import { FONT } from './canvas.js'
-
 const ELLIPSIS = '…'
-
-/** A throwaway 1x1 canvas, kept alive for repeated measurement calls. It is
- * never drawn on, only measured against, so its size does not matter. */
-let measureCtx: SKRSContext2D | null = null
-
-function ctx(): SKRSContext2D {
-  measureCtx ??= createCanvas(1, 1).getContext('2d')
-  return measureCtx
-}
-
-/**
- * Picks the largest size in `candidates` whose rendered width for `text`
- * measures at or under `maxWidth`, using the SAME font `renderKey` draws
- * with — a size chosen with a different font could still clip. Candidates
- * are tried largest first. When none fits, this returns the smallest
- * candidate rather than throwing: an oversized line is a smaller defect than
- * a page that crashes.
- */
-export function fitSize(text: string, candidates: number[], maxWidth: number): number {
-  const c = ctx()
-  const sorted = [...candidates].sort((a, b) => b - a)
-  for (const size of sorted) {
-    c.font = `${size}px ${FONT}`
-    if (c.measureText(text).width <= maxWidth) return size
-  }
-  return sorted[sorted.length - 1] ?? 0
-}
 
 /**
  * Cuts a string to `max` characters. The result never exceeds `max`, because
@@ -79,8 +49,11 @@ const EASTERN_TZ = 'America/New_York'
  * Pass `zone: false` to drop the trailing abbreviation on a key where every
  * character counts. AM/PM stays either way, per the user's decision.
  *
- * Never throws: a formatting failure costs a blank string, not a lost
- * render.
+ * Never throws: a formatting failure costs a sentinel `--`, not a lost
+ * render. `--` rather than an empty string, per AGENTS.md's "treat absent
+ * platform signals as unknown" and docs/LESSONS.md #18 — a missing or
+ * unparseable timestamp is a fact worth showing, not silence that reads as
+ * an empty field.
  */
 export function formatEasternTime(epochMs: number, { zone = true }: { zone?: boolean } = {}): string {
   try {
@@ -93,7 +66,7 @@ export function formatEasternTime(epochMs: number, { zone = true }: { zone?: boo
     }).format(d)
     return zone ? `${time} ${easternZoneAbbr(d)}` : time
   } catch {
-    return ''
+    return '--'
   }
 }
 

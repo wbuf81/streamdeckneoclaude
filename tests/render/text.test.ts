@@ -1,15 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { createCanvas } from '@napi-rs/canvas'
-import { truncate, formatDuration, formatClock, fitSize, formatEasternTime } from '../../src/render/text.js'
-import { FONT } from '../../src/render/canvas.js'
-
-/** Measures independently of `fitSize`, so the test does not just check
- * that `fitSize` agrees with itself. */
-function measure(text: string, size: number): number {
-  const ctx = createCanvas(1, 1).getContext('2d')
-  ctx.font = `${size}px ${FONT}`
-  return ctx.measureText(text).width
-}
+import { truncate, formatDuration, formatClock, formatEasternTime } from '../../src/render/text.js'
 
 describe('truncate', () => {
   it('leaves a short string alone', () => {
@@ -106,47 +96,12 @@ describe('formatEasternTime', () => {
   it('never throws, even for a nonsense timestamp', () => {
     expect(() => formatEasternTime(Number.NaN)).not.toThrow()
   })
-})
 
-describe('fitSize', () => {
-  const USABLE_WIDTH = 81
-
-  it('picks the largest candidate that actually measures within the budget', () => {
-    // "9.99" is short: the largest candidate, 24, must measure within budget.
-    const size = fitSize('9.99', [24, 20, 16], USABLE_WIDTH)
-    expect(size).toBe(24)
-    expect(measure('9.99', size)).toBeLessThanOrEqual(USABLE_WIDTH)
-  })
-
-  it('drops to a smaller size when the largest candidate would clip a six-character price', () => {
-    // Per VERIFIED-FACTS.md, a 6-character price at 24 px measures over 81 px.
-    expect(measure('327.51', 24)).toBeGreaterThan(USABLE_WIDTH)
-    const size = fitSize('327.51', [24, 20, 16], USABLE_WIDTH)
-    expect(size).toBeLessThan(24)
-    expect(measure('327.51', size)).toBeLessThanOrEqual(USABLE_WIDTH)
-  })
-
-  it('drops to the smallest candidate for a seven-character price', () => {
-    const size = fitSize('1234.56', [24, 20, 16], USABLE_WIDTH)
-    expect(measure('1234.56', size)).toBeLessThanOrEqual(USABLE_WIDTH)
-  })
-
-  it('falls back to the smallest candidate when nothing measures inside the budget', () => {
-    // An absurdly small budget: even the smallest candidate overflows it, so
-    // the function must still return a defined size rather than throwing.
-    const size = fitSize('a very long line of text indeed', [24, 20, 16], 1)
-    expect(size).toBe(16)
-  })
-
-  it('measures each candidate rather than assuming the largest always fits', () => {
-    // T1 from the review: a single-candidate list is vacuous — it returns
-    // that candidate under ANY implementation, including one that never
-    // measures anything at all. A string that fits at 16 px but not at
-    // 24 px (both verified below, independently of fitSize) forces the
-    // function to actually measure and REJECT the larger candidate before
-    // it can return the smaller one.
-    expect(measure('1234.56', 24)).toBeGreaterThan(USABLE_WIDTH)
-    expect(measure('1234.56', 16)).toBeLessThanOrEqual(USABLE_WIDTH)
-    expect(fitSize('1234.56', [24, 16], USABLE_WIDTH)).toBe(16)
+  it('renders a nonsense timestamp as the unknown sentinel, not a blank string (M10)', () => {
+    // `Intl.DateTimeFormat.format(new Date(NaN))` throws `RangeError`. Per
+    // AGENTS.md's "treat absent platform signals as unknown," the catch
+    // must say so visibly rather than leave the strip's right-hand field
+    // looking simply empty.
+    expect(formatEasternTime(Number.NaN)).toBe('--')
   })
 })

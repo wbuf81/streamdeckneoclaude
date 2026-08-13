@@ -81,6 +81,12 @@ describe('PageManager', () => {
     expect(log).toContain('b:3')
   })
 
+  it('reports the page’s real outcome instead of discarding it (M4)', async () => {
+    const m = new PageManager()
+    m.add(fakePage('a'))
+    expect(await m.onKeyPress(3)).toBe('handled')
+  })
+
   it('throws when asked for a page before one is added', () => {
     expect(() => new PageManager().current()).toThrow(/no page/i)
   })

@@ -19,9 +19,9 @@ import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
 import { LockState } from '../src/lock-state.js'
-import { readFileSync, writeFileSync, chmodSync } from 'node:fs'
+import { readFileSync, writeFileSync, chmodSync, realpathSync } from 'node:fs'
 import { runAuthFlow, TokenStore } from '../src/sources/spotify-auth.js'
-import { install, uninstall } from '../src/install/install.js'
+import { install, uninstall, refreshWrapper } from '../src/install/install.js'
 
 /**
  * Builds the listener each source's `change` event uses to redraw at once,
@@ -182,7 +182,7 @@ export function savePage(
 }
 
 function usage(): never {
-  console.error('usage: deckd <start|install|uninstall|auth>')
+  console.error('usage: deckd <start|install|uninstall|refresh-wrapper|auth>')
   process.exit(2)
 }
 
@@ -236,9 +236,29 @@ async function authSpotify(): Promise<void> {
  * dispatch block against whatever `process.argv` the TEST runner happened to
  * have -- landing on `default` or `undefined` and calling `usage()`, which
  * calls `process.exit(2)` and would kill the entire test process.
+ *
+ * `fileURLToPath(import.meta.url)` is this file's RESOLVED real path.
+ * `process.argv[1]` is the literal string the caller passed, which is only
+ * the same string in the two cases above. `package.json` also declares
+ * `"bin": { "deckd": "./dist/bin/deckd.js" }`, so after `npm link` or a
+ * global install, `process.argv[1]` is a SYMLINK in some bin directory
+ * instead — a different string pointing at the same real file, which would
+ * make this return false and `deckd start` exit 0 having done nothing at
+ * all (M11). Resolving `process.argv[1]` through `realpathSync` first
+ * removes that whole class of mismatch; a path that does not exist at all
+ * (any other invocation shape) falls back to the direct string compare,
+ * which can only ever be false in that case anyway.
  */
 function isMain(): boolean {
-  return !!process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]
+  const argv1 = process.argv[1]
+  if (!argv1) return false
+  const here = fileURLToPath(import.meta.url)
+  if (here === argv1) return true
+  try {
+    return here === realpathSync(argv1)
+  } catch {
+    return false
+  }
 }
 
 if (isMain()) {
@@ -261,6 +281,21 @@ if (isMain()) {
         console.error(String(e))
         process.exit(1)
       })
+      break
+    case 'refresh-wrapper':
+      // I-5: re-copies the wrapper script from this repository into the
+      // state directory and re-verifies it, without touching settings.json
+      // or launchd. This is the ONLY way an already-installed user gets a
+      // wrapper fix without a full uninstall/install cycle -- and that
+      // cycle is exactly the path C-1 lived on. Safe to run repeatedly.
+      refreshWrapper()
+        .then((r) => {
+          console.log(`refreshed the wrapper at ${r.path}.`)
+        })
+        .catch((e: unknown) => {
+          console.error(String(e))
+          process.exit(1)
+        })
       break
     case 'auth':
       if (process.argv[3] === 'spotify') {
