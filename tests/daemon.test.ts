@@ -19,9 +19,11 @@ function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-/** A page whose content the test controls. */
+/** A page whose content the test controls. `name` defaults to `'test'`, but
+ * a test proving the flash is scoped per page (M3) needs two instances with
+ * DIFFERENT names. */
 class ControlPage implements Page {
-  readonly name = 'test'
+  readonly name: string
   lines = ['A']
   stripText = 'strip A'
   presses: number[] = []
@@ -32,6 +34,10 @@ class ControlPage implements Page {
    * unchanged, and the flash-focused tests below can override one key at a
    * time. */
   outcomes = new Map<number, PressOutcome>()
+
+  constructor(name = 'test') {
+    this.name = name
+  }
 
   render(): DeckFrame {
     const keys: KeySpec[] = Array.from({ length: 8 }, (_, i) =>
@@ -319,7 +325,7 @@ class TickPage implements Page {
     }
   }
 
-  onKeyPress(): PressOutcome {
+  onKeyPress(): PressOutcome | Promise<PressOutcome> {
     return 'ignored'
   }
 }
@@ -487,7 +493,13 @@ describe('Daemon.stop (M1)', () => {
     // in for something slow in a real page's `onKeyPress` (a shell call in
     // `focusWindow`, say). Held open on purpose; see the Lesson 8 note above.
     let releasePress: (() => void) | undefined
-    slow.onKeyPress = () => new Promise<void>((resolve) => { releasePress = resolve })
+    // Resolves to a real `PressOutcome`, not `undefined` (I8) — this used
+    // to be `Promise<void>`, which `tsc` never caught because `tests/` was
+    // outside `tsconfig.json`'s `include`. The mismatch was silent: an
+    // `undefined` outcome compares `!== 'handled'`, so it happened to still
+    // produce a (wrong-coloured) flash rather than a crash, which is why the
+    // suite stayed green regardless.
+    slow.onKeyPress = () => new Promise<PressOutcome>((resolve) => { releasePress = () => resolve('handled') })
     device.simulatePress(0)
     await Promise.resolve() // handlePress is now parked inside the held onKeyPress
 
@@ -848,6 +860,218 @@ describe('Daemon press-feedback flash', () => {
     setMs(1040) // still inside the 90 ms window
     await daemon.renderOnce(1, 1040)
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    await daemon.stop()
+  })
+
+  /**
+   * R2 review, I1: a press whose render lands while another render is
+   * already writing to the device used to draw NO ring at all -- the flash
+   * stayed pending (`expiresAtMs === null`) until whatever render happened
+   * to come next, up to a full second on a 1000 ms page. Proven here by
+   * holding a device write open across a press, exactly like the review's
+   * `flash.probe.test.ts`.
+   */
+  it('shows a press’s ring promptly even when the render it earned landed mid-write (I1)', async () => {
+    const { device, page, daemon } = buildFlash()
+    await daemon.start()
+    device.reset()
+    page.lines = ['sensitive'] // gives the in-flight render something to write
+
+    const realSetKeyImage = device.setKeyImage.bind(device)
+    let release: (() => void) | undefined
+    let held = true
+    device.setKeyImage = async (index, image) => {
+      if (held) {
+        held = false
+        await new Promise<void>((resolve) => { release = resolve })
+      }
+      await realSetKeyImage(index, image)
+    }
+
+    // An ordinary render, not press-triggered, holding key 0's write open.
+    const rendering = daemon.renderOnce(1, 1010)
+    await Promise.resolve()
+
+    // The press lands while that render is still in flight.
+    device.simulatePress(0)
+    await flush()
+
+    release?.()
+    await rendering // the held render finishes, then its own follow-up runs
+    await flush()
+
+    expect(
+      device.keyImages
+        .get(0)
+        ?.equals(renderKey({ kind: 'gauge', lines: ['sensitive'], flashRing: theme.flashWhite })),
+    ).toBe(true)
+
+    await daemon.stop()
+  })
+
+  /**
+   * R2 review, I2: the render that clears a flash on time can itself be
+   * dropped for finding the pipeline busy -- exactly the render this test
+   * simulates with an unrelated held write. Before this fix, nothing ever
+   * re-armed a replacement, so the ring survived far past `FLASH_MS`
+   * (measured on the probe: still up 200 ms and 450 ms after a 90 ms
+   * flash). Here, nothing but the daemon's own re-arming clears the ring --
+   * the page's tick is never advanced.
+   */
+  it('re-arms after a dropped clearing attempt, so the ring does not survive it (I2)', async () => {
+    const { device, page, daemon, setMs } = buildFlash()
+    await daemon.start()
+    device.reset()
+
+    device.simulatePress(0) // anchors key 0's expiry at ms 1000 + 90 = 1090
+    await flush()
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    // An unrelated render, held open past the flash's own expiry -- standing
+    // in for the pump's scheduled clearing render finding the daemon busy.
+    page.lines = ['B']
+    const realSetKeyImage = device.setKeyImage.bind(device)
+    let release: (() => void) | undefined
+    let held = true
+    device.setKeyImage = async (index, image) => {
+      if (held) {
+        held = false
+        await new Promise<void>((resolve) => { release = resolve })
+      }
+      await realSetKeyImage(index, image)
+    }
+    const busy = daemon.renderOnce(1, 1010)
+    await Promise.resolve()
+
+    // The flash's own clearing attempt lands while that write is still
+    // held, and is dropped -- the exact failure I2 describes.
+    setMs(1091)
+    await daemon.renderOnce(1, 1091)
+
+    // Release the held write. Nothing else in this test drives another
+    // render from here.
+    release?.()
+    await busy
+    await flush()
+
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['B'] }))).toBe(true)
+
+    await daemon.stop()
+  })
+
+  /**
+   * R2 review, I3: one shared timer, re-armed at `FLASH_MS + 1` from
+   * whichever press was most recent, let a later press extend an earlier
+   * key's ring past its own schedule (measured on the probe: about 211 ms
+   * for a flash specified as 90). Recomputing the earliest pending expiry
+   * after every render, instead of re-arming blindly from "now", fixes
+   * this: key 0's ring here is gone by its own deadline regardless of key
+   * 1's later press.
+   */
+  it('never lets a later press extend an earlier key’s ring past its own schedule (I3)', async () => {
+    // This has to let the daemon's OWN scheduled timer fire, not drive
+    // `renderOnce` by hand -- the I3 bug was entirely about WHEN that timer
+    // re-arms, which a manual render call cannot exercise. Real waits, per
+    // the existing "clears the ring on its own" test's own pattern: the
+    // logical clock (via `setMs`) determines whether a fired render sees a
+    // flash as expired, and the real wait is what lets the timer itself
+    // fire on its own schedule.
+    const { device, daemon, setMs } = buildFlash()
+    await daemon.start() // ms = 1000
+    device.reset()
+
+    device.simulatePress(0) // anchors key 0's expiry at 1000 + 90 = 1090
+    await flush()
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    setMs(1060)
+    device.simulatePress(1) // anchors key 1's expiry at 1060 + 90 = 1150
+    await flush()
+
+    // Move the logical clock just past key 0's OWN deadline, well before
+    // key 1's, then wait in REAL time for the daemon's own timer to fire.
+    // Old code re-armed its one shared timer to fire 91 REAL ms after
+    // whichever press was most recent (key 1's, here) -- about 91 ms from
+    // now. This wait is comfortably shorter than that, so a pass can only
+    // mean the NEW code's timer, re-targeted to key 0's earlier deadline,
+    // fired on its own.
+    setMs(1091)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['A'] }))).toBe(true)
+    // Key 1's own deadline (1150) has not arrived yet -- its ring must still
+    // be showing, not cleared early by key 0's timer.
+    expect(
+      device.keyImages.get(1)?.equals(renderKey({ kind: 'blank', flashRing: theme.flashWhite })),
+    ).toBe(true)
+
+    // Key 1 clears on ITS OWN deadline shortly after.
+    setMs(1151)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(device.keyImages.get(1)?.equals(renderKey({ kind: 'blank' }))).toBe(true)
+
+    await daemon.stop()
+  })
+
+  /**
+   * R2 review, M3: a flash was keyed by key index only, never by page.
+   * Proven by probe (`flash3.probe.test.ts`): press key 0 on one page, flip
+   * within the flash's window, and the OTHER page's key 0 -- a key the user
+   * never pressed, on a page that was not even visible at press time --
+   * shows the ring too. Tagging the flash with the page it was earned on,
+   * and discarding it the moment that page no longer matches, closes this.
+   */
+  it('does not bleed a pending ring onto a different page’s same key after a flip (M3)', async () => {
+    const device = new FakeDevice()
+    const pageA = new ControlPage('pageA')
+    const pageB = new ControlPage('pageB')
+    pageB.lines = ['B']
+    const manager = new PageManager()
+    manager.add(pageA)
+    manager.add(pageB)
+    let ms = 1000
+    const daemon = new Daemon(device, manager, () => Math.floor(ms / 1000), () => ms)
+    await daemon.start()
+
+    device.simulatePress(0) // handled, on pageA; anchors at ms 1000, expires 1090
+    await flush()
+    expect(
+      device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['A'], flashRing: theme.flashWhite })),
+    ).toBe(true)
+
+    ms = 1030 // still well inside the flash's 90 ms window
+    device.simulatePress(BUTTON_RIGHT) // flips to pageB
+    await flush()
+
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['B'] }))).toBe(true)
+
+    await daemon.stop()
+  })
+
+  /**
+   * R2 review, M3's longer-lived variant: a flash whose press-render never
+   * ran at all (here, the device disconnects right after the press) used to
+   * keep `expiresAtMs === null` indefinitely and could first be drawn
+   * minutes later, at reconnect or unlock. Bounding how long a flash may sit
+   * pending closes this: reconnecting long after the press discards it
+   * instead of drawing it late.
+   */
+  it('discards a flash that never got a chance to render before it aged out (M3 age bound)', async () => {
+    const { device, daemon, setMs } = buildFlash()
+    await daemon.start() // ms = 1000
+    device.reset()
+
+    await device.disconnect()
+    device.simulatePress(0) // records a pending flash; renderOnce bails: not connected
+    await flush()
+    expect(device.keyWrites).toHaveLength(0)
+
+    setMs(10_000) // long past the pending-flash age bound
+    await device.connect() // triggers the daemon's own reconnect handler
+    await flush()
+
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['A'] }))).toBe(true)
 
     await daemon.stop()
   })

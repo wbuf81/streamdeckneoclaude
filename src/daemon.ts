@@ -14,14 +14,32 @@ const SLEEP_GAP_MIN_MS = 5000
 /**
  * How long a press's flash stays visible before the key reverts to its own
  * content. Task 26 tuned 250 ms for a full-key fill on the Claude page.
- * Task 32 moved the mechanism into the daemon, unchanged. Task 36 shortens
- * it to 150 ms: real hardware feedback said the flash was "too bright" and
- * lingered too long, once it covered the whole key. Now that it is a thin
- * ring (see `KeySpec.flashRing`) rather than a fill, it needs less time on
- * screen to read as feedback — long enough to notice, short enough to feel
- * instant rather than like a state colour.
+ * Task 32 moved the mechanism into the daemon, unchanged. Task 36 replaced
+ * the full-key fill with a thin perimeter ring and shortened this to 90 ms:
+ * real hardware feedback said the fill was "too bright" and lingered too
+ * long. A ring needs less time on screen to read as feedback than a fill
+ * did — long enough to notice, short enough to feel instant rather than
+ * like a state colour.
+ *
+ * This value has drifted from its own docs twice in opposite directions —
+ * see `docs/PROJECT-STATE.md`'s note on the flash being wrong both ways —
+ * so a comment or a doc page claiming any OTHER number here is the stale
+ * one; trust this constant.
  */
 const FLASH_MS = 90
+
+/**
+ * How long a flash may sit PENDING (earned by a press, but never yet drawn)
+ * before it is discarded outright instead of being anchored late. Generous
+ * relative to `FLASH_MS` and to one ordinary render cycle, so it never
+ * fires under ordinary load — it exists only to bound the rare case where a
+ * press's own render never got a chance to run at all (the screen locks or
+ * the device disconnects moments after the press), so a ring cannot
+ * resurface minutes later at unlock or reconnect, looking like fresh
+ * feedback for a press the user has long forgotten (M3's longer-lived
+ * bleed variant).
+ */
+const FLASH_MAX_PENDING_MS = 5000
 
 /**
  * A transient press-feedback flash on one key, index 0 to 7 — never the two
@@ -32,6 +50,12 @@ const FLASH_MS = 90
  * `failed` (red) — see `PressOutcome`'s doc comment for why those two share
  * one colour instead of getting a third.
  *
+ * `page` is the name of the page that was current at press time. A flash
+ * whose `page` no longer matches the page being rendered is discarded
+ * rather than drawn: without this, flipping pages while a flash is still
+ * pending or still active bleeds the ring onto a DIFFERENT page's same key
+ * index — a key the user never pressed, proven by probe (M3).
+ *
  * `expiresAtMs` is `null` until the FIRST render that actually draws this
  * flash, which is the moment that anchors it. Anchoring at press time
  * instead (off whatever clock the daemon happened to see last) is what let a
@@ -40,10 +64,16 @@ const FLASH_MS = 90
  * time. Anchoring at first-draw time means a flash is impossible to be born
  * already expired, and it works even when a press lands before the current
  * page has ever been rendered at all.
+ *
+ * `createdAtMs` is `nowMs` at press time, used only to bound how long a
+ * flash may sit pending (see `FLASH_MAX_PENDING_MS`) before it is discarded
+ * rather than anchored late.
  */
 interface Flash {
   ok: boolean
+  page: string
   expiresAtMs: number | null
+  createdAtMs: number
 }
 
 /** The lock-state methods the daemon needs. Kept narrow for deterministic tests. */
@@ -68,9 +98,19 @@ export class Daemon {
   private timer: NodeJS.Timeout | null = null
   /** The interval the live timer was armed at, so a tick can notice a change. */
   private armedTickMs = 0
-  /** One-shot timer that renders a flash away on time. See `scheduleFlashClear`. */
-  private flashClearTimer: NodeJS.Timeout | null = null
+  /** Timer that renders a flash away on time, or anchors one that is still
+   * pending. See `scheduleFlashPump`. */
+  private flashPumpTimer: NodeJS.Timeout | null = null
   private activeRender: Promise<void> | null = null
+  /**
+   * Set when `renderOnce` is called while `activeRender` is already busy.
+   * The busy render's own completion (inside `renderOnce`'s own retry loop)
+   * drains this immediately, instead of the call being silently dropped
+   * until whatever render happens to come next — up to a full second on a
+   * 1000 ms page. This is what lets a press's flash reach the glass
+   * promptly even when its own render landed mid-write (I1).
+   */
+  private renderRequested = false
   private locked = false
   private lastTickAtMs: number | null = null
   private lockTransition: Promise<void> = Promise.resolve()
@@ -198,20 +238,20 @@ export class Daemon {
       const outcome = await this.callOnKeyPress(index, key)
       this.setFlash(index, outcome === 'handled')
       await this.renderOnce(this.now(), this.nowMs())
-      // A `failed` outcome already logged inside `callOnKeyPress` below; do
-      // not clear it here, or a repeating failure would log every time
-      // instead of once (M2). Any other outcome means the press itself did
-      // not throw, so a later genuine failure on this same key should log
-      // again.
-      if (outcome !== 'failed') log.clearOnce(key)
     } catch (e) {
-      // `log.once`, not `log.error` (M2): a press repeats, and this is the
-      // catch-all for every press failure. A broken page reader failing on
-      // every press would otherwise write one line per press, with no
-      // limit. Keyed per index, so a failure on key 3 does not suppress a
-      // later, genuine failure on key 5. `clearOnce` above logs a later
-      // failure again once a press on the same index succeeds.
-      log.once(key, `press handler failed for index ${index}: ${String(e)}`)
+      // `log.once`, not `log.error`: a press repeats, and this is the
+      // catch-all for a failure that reaches here WITHOUT going through
+      // `callOnKeyPress`'s own try/catch below — in practice only
+      // `pages.prev()`/`pages.next()`/`pages.current()` throwing "no page
+      // has been added" on the round-button branches above, since
+      // `callOnKeyPress` already catches every page-press throw itself and
+      // `renderOnce` catches its own failures. Kept as a backstop rather
+      // than removed, because this runs from a fire-and-forget device
+      // callback: an escaping throw here would surface as an unhandled
+      // rejection instead of a logged line. Distinct message text from
+      // `callOnKeyPress`'s, so the two logged shapes never look like the
+      // same defect drifting (M2).
+      log.once(key, `press handling crashed unexpectedly for index ${index}: ${String(e)}`)
     }
   }
 
@@ -223,21 +263,36 @@ export class Daemon {
    * outcome instead of escaping: the press still gets its red flash, exactly
    * like a press that ran and failed cleanly, rather than silently doing
    * nothing at all.
+   *
+   * `failed` is an ordinary, EXPECTED outcome (a focus call that returned
+   * false, a source method that returned false) and must not hold this
+   * key's log open — only a real throw should (M1). So the log key clears
+   * on every normal return, whatever the outcome, and is held open only
+   * inside the `catch`, until a LATER press on the same key returns
+   * normally again.
    */
   private async callOnKeyPress(index: number, logKey: string): Promise<PressOutcome> {
     try {
-      return await this.pages.current().onKeyPress(index)
+      const outcome = await this.pages.current().onKeyPress(index)
+      log.clearOnce(logKey)
+      return outcome
     } catch (e) {
       log.once(logKey, `press handler failed for index ${index}: ${String(e)}`)
       return 'failed'
     }
   }
 
-  /** Records a pending flash for `index`. Its expiry is anchored later, by
+  /** Records a pending flash for `index`, tagged with the page current right
+   * now and the press-time clock. Its expiry is anchored later, by
    * `applyFlash`, at the first render that actually draws it — see `Flash`'s
    * doc comment for why. */
   private setFlash(index: number, ok: boolean): void {
-    this.flashes[index] = { ok, expiresAtMs: null }
+    this.flashes[index] = {
+      ok,
+      page: this.pages.current().name,
+      expiresAtMs: null,
+      createdAtMs: this.nowMs(),
+    }
   }
 
   /** Forgets what is on the glass, so the next render writes everything. */
@@ -267,14 +322,50 @@ export class Daemon {
    * than a silent truncation.
    */
   async renderOnce(now: number, nowMs: number): Promise<void> {
-    if (this.locked || this.activeRender) return
+    if (this.locked) return
+    if (this.activeRender) {
+      // A render is already in flight — the several awaited device writes
+      // in `writeFrame`, or (on the Spotify page) a press's own outcome
+      // awaiting an HTTP call before it even gets here. A press's flash,
+      // already recorded in `this.flashes` by `setFlash`, used to have no
+      // way back onto the glass until whatever render happened to come
+      // next — up to a full second on a 1000 ms page (I1). Remembering that
+      // another render is owed, instead of silently dropping this call,
+      // means the in-flight render's own completion below runs it
+      // immediately, with a fresh clock reading, rather than losing it
+      // until the next tick.
+      this.renderRequested = true
+      return
+    }
     if (!this.device.isConnected()) return
+    await this.runRender(now, nowMs)
+    // Drains a request that arrived while the render above was busy. Guarded
+    // by the same three conditions `renderOnce` itself checks, so this can
+    // never keep working after `stop()`, while locked, or once disconnected.
+    while (this.renderRequested && !this.stopped && !this.locked && this.device.isConnected()) {
+      this.renderRequested = false
+      await this.runRender(this.now(), this.nowMs())
+    }
+  }
+
+  /**
+   * Builds one frame, writes what changed, and afterward always re-checks
+   * whether a press-feedback flash still needs a future render — to anchor
+   * one that just appeared, or to clear one whose time has come. Running
+   * this after EVERY render, not only the one that first anchors a flash,
+   * and always against the CURRENT earliest pending expiry rather than a
+   * timer armed once and never revisited, is what lets a dropped render
+   * always get a replacement (I2) and what stops a later press from
+   * extending an earlier key's ring past its own schedule (I3).
+   */
+  private async runRender(now: number, nowMs: number): Promise<void> {
     // Keep page rendering inside the promise too. A page that throws while it
     // builds its frame must take the same logged, non-fatal path as a failed
     // device write.
     const task = (async () => {
-      const frame = this.pages.current().render(now, nowMs)
-      await this.writeFrame(this.overlayFlashes(frame, nowMs))
+      const page = this.pages.current()
+      const frame = page.render(now, nowMs)
+      await this.writeFrame(this.overlayFlashes(frame, nowMs, page.name))
     })()
     this.activeRender = task
     try {
@@ -289,6 +380,7 @@ export class Daemon {
     } finally {
       if (this.activeRender === task) this.activeRender = null
     }
+    this.scheduleFlashPump()
   }
 
   /**
@@ -300,8 +392,8 @@ export class Daemon {
    * entirely (it calls `writeFrame` directly), so a flash never survives
    * into the privacy blank.
    */
-  private overlayFlashes(frame: DeckFrame, nowMs: number): DeckFrame {
-    return { ...frame, keys: frame.keys.map((key, i) => this.applyFlash(i, key, nowMs)) }
+  private overlayFlashes(frame: DeckFrame, nowMs: number, pageName: string): DeckFrame {
+    return { ...frame, keys: frame.keys.map((key, i) => this.applyFlash(i, key, nowMs, pageName)) }
   }
 
   /**
@@ -320,27 +412,38 @@ export class Daemon {
    * `canvas.ts`'s `drawFlashRing` draws it last, so it still wins visually
    * over anything the page drew, including a pulsing border.
    *
+   * `pageName` is the page this frame was actually built from. A flash
+   * whose own `page` disagrees belongs to a press on a DIFFERENT page —
+   * the user flipped away before it was ever drawn, or before it expired —
+   * so it is discarded outright rather than drawn on a key the press never
+   * touched (M3).
+   *
    * The flash's `expiresAtMs` is set HERE, on the first render that reaches
    * this key while the flash is pending (`expiresAtMs === null`), using
    * THIS render's own `nowMs` — see `Flash`'s doc comment for why anchoring
-   * at press time instead would let a flash arrive already expired.
+   * at press time instead would let a flash arrive already expired. A flash
+   * that has sat pending for longer than `FLASH_MAX_PENDING_MS` is instead
+   * discarded unanchored, so a press whose render never got a chance to run
+   * at all cannot resurface as a ring minutes later.
    *
    * Once `nowMs` reaches the (now-anchored) expiry, the flash is discarded
    * and this returns `key` untouched, so the key's hash goes back to exactly
    * what it would have been with no flash ever recorded — letting the
    * dirty-key check in `writeFrame` stop redrawing it.
    */
-  private applyFlash(index: number, key: KeySpec, nowMs: number): KeySpec {
+  private applyFlash(index: number, key: KeySpec, nowMs: number, pageName: string): KeySpec {
     const flash = this.flashes[index]
     if (!flash) return key
+    if (flash.page !== pageName) {
+      this.flashes[index] = null
+      return key
+    }
     if (flash.expiresAtMs === null) {
+      if (nowMs - flash.createdAtMs > FLASH_MAX_PENDING_MS) {
+        this.flashes[index] = null
+        return key
+      }
       flash.expiresAtMs = nowMs + FLASH_MS
-      // Clearing the ring needs a render, and nothing else guarantees a timely
-      // one: most pages tick at DEFAULT_TICK_MS, so waiting for the next tick
-      // showed the ring for up to a second no matter how short FLASH_MS was.
-      // Lowering FLASH_MS alone therefore did nothing on those pages. Schedule
-      // the clearing render explicitly instead.
-      this.scheduleFlashClear()
     } else if (nowMs >= flash.expiresAtMs) {
       this.flashes[index] = null
       return key
@@ -349,19 +452,37 @@ export class Daemon {
   }
 
   /**
-   * Renders once, just after the newest flash expires, so a ring disappears on
-   * time instead of at the page's next tick. One shared timer covers every key:
-   * a later press re-arms it, and the extra render costs nothing when nothing
-   * changed, because `writeFrame`'s dirty-key check writes only what moved.
+   * Arms (or re-arms) the ONE timer that renders a flash away on time,
+   * targeting the EARLIEST still-active expiry on the current page,
+   * recomputed from scratch after every render (`runRender`'s last step) —
+   * never only at the moment a flash is first anchored. A later press's own
+   * anchor can only ever LOWER this timer's target, never raise it, so an
+   * earlier key's ring is always cleared on its own schedule, even when a
+   * second press lands before the first one expires (I3). And because this
+   * runs after every render — including the retry `renderOnce` performs for
+   * a request that arrived while busy — a clearing attempt that itself gets
+   * dropped for being busy is still followed by a fresh render (via that
+   * same retry) that reschedules this timer correctly (I2).
    */
-  private scheduleFlashClear(): void {
+  private scheduleFlashPump(): void {
+    if (this.flashPumpTimer) {
+      clearTimeout(this.flashPumpTimer)
+      this.flashPumpTimer = null
+    }
     if (this.stopped) return
-    if (this.flashClearTimer) clearTimeout(this.flashClearTimer)
-    this.flashClearTimer = setTimeout(() => {
-      this.flashClearTimer = null
+    const pageName = this.pages.current().name
+    let earliest: number | null = null
+    for (const flash of this.flashes) {
+      if (!flash || flash.page !== pageName || flash.expiresAtMs === null) continue
+      if (earliest === null || flash.expiresAtMs < earliest) earliest = flash.expiresAtMs
+    }
+    if (earliest === null) return
+    const delay = Math.max(0, earliest - this.nowMs())
+    this.flashPumpTimer = setTimeout(() => {
+      this.flashPumpTimer = null
       if (this.stopped) return
       void this.renderOnce(this.now(), this.nowMs())
-    }, FLASH_MS + 1)
+    }, delay)
   }
 
   private async writeFrame(frame: DeckFrame): Promise<void> {
@@ -454,8 +575,8 @@ export class Daemon {
     this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
-    if (this.flashClearTimer) clearTimeout(this.flashClearTimer)
-    this.flashClearTimer = null
+    if (this.flashPumpTimer) clearTimeout(this.flashPumpTimer)
+    this.flashPumpTimer = null
     await this.lockState?.stop()
     await this.lockTransition
   }
