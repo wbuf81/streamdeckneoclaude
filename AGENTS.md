@@ -25,6 +25,33 @@ Read these files before changing code:
 - Put private external schemas behind one source boundary. A schema change must not stop the
   daemon or unrelated pages.
 
+## Product conventions
+
+These are the user's standing decisions. They apply to every page, now and in future work.
+
+### Timestamps
+
+- Render every wall-clock time in **US Eastern time**, on a **12-hour clock with AM or PM**,
+  through the **one shared helper**. Do not hand-roll a second formatter — four different ones
+  had already grown before this rule existed.
+- Use the `America/New_York` zone, never a fixed offset, so the switch between standard and
+  daylight time is automatic.
+- Annotate the zone with the **real** abbreviation for that date. In summer that is `EDT`, not
+  `EST`. The user asked for "EST", meaning Eastern; printing `EST` in July would be wrong.
+- A **duration** is not a timestamp. `formatClock` renders elapsed and remaining time, and it
+  stays a 24-hour-style `m:ss`.
+
+### Press feedback
+
+- **Every key press gives feedback on the device.** A press that does nothing must still be
+  visibly rejected, because silence is indistinguishable from a press the deck never received.
+- This belongs in the **daemon**, once, not in each page. A page reports whether it handled the
+  press; the daemon draws the feedback.
+- The current signal is a full-key red flash for a press with no action. If red is ever needed
+  for something else on that key, pick a different signal for the rejection — but never remove
+  it.
+- This applies to gauge keys, empty slots, decorative tiles, and any page added later.
+
 ## Live-system safety
 
 - The launchd daemon normally owns the Stream Deck. Do not open the device concurrently.
