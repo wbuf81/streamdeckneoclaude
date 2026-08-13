@@ -269,6 +269,81 @@ describe('statusline-wrapper.sh', () => {
     expect(code).toBe(143)
   })
 
+  // M-8: before this fix, ONE trap handled TERM, INT, and HUP together, so
+  // it always reported exit 143 (the TERM code) no matter which signal
+  // actually arrived. A separate trap per signal reports the conventional
+  // 128+signal code for each.
+  it.each([
+    ['SIGINT', 130],
+    ['SIGHUP', 129],
+  ] as const)('M-8: %s reports its own exit code, not always 143', async (signal, expectedCode) => {
+    const child = spawn('/bin/sh', [WRAPPER], {
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: 'sleep 20' },
+    })
+    child.stdin.end(PAYLOAD)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    child.kill(signal)
+
+    const code: number | null = await new Promise((resolve) => {
+      child.on('close', (c) => resolve(c))
+    })
+    expect(code).toBe(expectedCode)
+  })
+
+  // M-7: `${DECKD_STATE_DIR:-$HOME/...}` still evaluates `$HOME` under
+  // `set -u` whenever `DECKD_STATE_DIR` is UNSET -- exactly the hand-run or
+  // future-unwrapped-invocation case this guards. With both unset,
+  // `HOME: unbound variable` used to abort the whole script before the
+  // inner command ever ran, in direct violation of the file's own header
+  // rule that it must never fail in a way that hides the statusline.
+  it('M-7: does not abort when both HOME and DECKD_STATE_DIR are unset', () => {
+    const env = { ...process.env }
+    delete env.HOME
+    delete env.DECKD_STATE_DIR
+    env.DECKD_INNER = `${inner} ${join(dir, 'seen-home-unset.json')}`
+
+    const out = execFileSync('/bin/sh', [WRAPPER], {
+      input: PAYLOAD,
+      env,
+      encoding: 'utf8',
+    })
+
+    expect(out).toContain('INNER OUTPUT')
+  })
+
+  // M-6: instrumented copy that forces `$TMPIN` to be a DIRECTORY instead
+  // of the file `mktemp` actually created, so `cat > "$TMPIN"` fails
+  // deterministically and portably (no full filesystem needed) with
+  // "Is a directory". Before the fix, this write was unchecked: the script
+  // carried on as if caching had succeeded, `$TMPIN` still pointed at the
+  // directory, and the cached-path read (`cat "$TMPIN" | sh -c "$INNER"`)
+  // then silently failed too -- handing the inner command an EMPTY payload
+  // instead of the real one. The fix falls back to the uncached path
+  // (`TMPIN=""`), so the inner command reads the wrapper's own stdin
+  // directly and gets the real bytes regardless.
+  it('M-6: falls back to the uncached path when writing $TMPIN fails, instead of feeding a corrupted payload through', () => {
+    const forcedDir = join(dir, 'forced-tmpin-is-a-directory')
+    mkdirSync(forcedDir)
+    const instrumented = join(dir, 'instrumented-m6-wrapper.sh')
+    const src = readFileSync(WRAPPER, 'utf8')
+    const marker = 'TMPIN=$(mktemp 2>/dev/null) || TMPIN=""'
+    expect(src).toContain(marker)
+    const patched = src.replace(marker, `${marker}\nTMPIN="${forcedDir}"`)
+    expect(patched).not.toBe(src)
+    writeFileSync(instrumented, patched)
+    chmodSync(instrumented, 0o755)
+
+    const seen = join(dir, 'seen-m6.json')
+    const out = execFileSync('/bin/sh', [instrumented], {
+      input: PAYLOAD,
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: `${inner} ${seen}` },
+      encoding: 'utf8',
+    })
+
+    expect(out).toContain('INNER OUTPUT')
+    expect(readFileSync(seen, 'utf8')).toBe(PAYLOAD)
+  })
+
   // I-2: the M-3 test above uses `DECKD_INNER: 'sleep 20'` -- a single
   // simple command. `bash` (which `/bin/sh` is here) exec-optimises
   // `sh -c '<one simple command>'` down to that ONE process with no fork at
@@ -333,6 +408,46 @@ describe('statusline-wrapper.sh', () => {
       // expected, passing outcome.
     }
     expect(leftover.trim()).toBe('')
+  })
+
+  // I-2: instrumented copy of the wrapper, the same technique the review
+  // used to measure this -- a killing signal makes `cleanup` run TWICE
+  // (once from `trap '...' TERM`, once more from the EXIT trap that
+  // `exit 143` fires right after), and before the fix the second call
+  // still saw the FIRST call's now-stale `INNER_PID` and re-issued
+  // `kill -TERM -"$INNER_PID"` -- a process-GROUP signal -- against a pid
+  // the OS was already free to have handed to an unrelated process. The
+  // fix clears `INNER_PID` at the end of `cleanup` itself, so the second
+  // call's own guard sees it empty and skips the kill entirely.
+  it('I-2: cleanup does not re-signal a reaped pid on the second, EXIT-trap call after a killing signal', async () => {
+    const traceFile = join(dir, 'cleanup-trace.log')
+    writeFileSync(traceFile, '')
+    const instrumented = join(dir, 'instrumented-wrapper.sh')
+    const src = readFileSync(WRAPPER, 'utf8')
+    const patched = src.replace(
+      'cleanup() {',
+      `cleanup() { printf 'CLEANUP-CALL INNER_PID=%s\\n' "$INNER_PID" >> ${JSON.stringify(traceFile)}`,
+    )
+    expect(patched).not.toBe(src)
+    writeFileSync(instrumented, patched)
+    chmodSync(instrumented, 0o755)
+
+    const child = spawn('/bin/sh', [instrumented], {
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: 'sleep 20' },
+    })
+    child.stdin.end(PAYLOAD)
+    // A short, fixed wait to let the inner `sleep 20` actually start before
+    // the signal arrives, matching the M-3 test above (a single simple
+    // inner command gives nothing else observable to poll for).
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    child.kill('SIGTERM')
+    await new Promise((resolve) => { child.on('close', resolve) })
+
+    const lines = readFileSync(traceFile, 'utf8').trim().split('\n').filter(Boolean)
+    expect(lines).toHaveLength(2)
+    const pids = lines.map((l) => l.replace('CLEANUP-CALL INNER_PID=', ''))
+    expect(pids[0]).not.toBe('')
+    expect(pids[1]).toBe('')
   })
 
   it('M-1: a normal, non-killed run clears INNER_PID before the EXIT trap runs', () => {
