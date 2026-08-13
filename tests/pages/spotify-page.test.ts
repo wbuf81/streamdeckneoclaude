@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
-import { theme } from '../../src/render/theme.js'
+import { renderKey } from '../../src/render/canvas.js'
 import type { Image } from '@napi-rs/canvas'
 
 const NOW = 1786549560
@@ -21,21 +21,16 @@ function player(over: Partial<PlayerState> = {}): PlayerState {
  */
 const FAKE_ART = { width: 300, height: 300 } as unknown as Image
 
-function build(
-  state: PlayerState | null,
-  status: SpotifyStatus = 'ok',
-  art: Image | null = null,
-  saved: boolean | null = false,
-) {
+function build(state: PlayerState | null, status: SpotifyStatus = 'ok', art: Image | null = null) {
   const calls: string[] = []
   const source = {
     interpolate: () => state,
     getStatus: () => status,
     getArt: () => art,
-    isSaved: () => saved,
     play: async () => { calls.push('play'); return true },
     pause: async () => { calls.push('pause'); return true },
     next: async () => { calls.push('next'); return true },
+    previous: async () => { calls.push('previous'); return true },
     setVolume: async (p: number) => { calls.push(`volume:${p}`); return true },
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
   }
@@ -82,12 +77,14 @@ describe('SpotifyPage layout', () => {
     }
   })
 
-  it('shows SIGN IN on key 0 when unauthorized, and leaves 1, 4, 5 blank', () => {
+  it('shows SIGN IN on key 0 when unauthorized, and leaves 1, 4, 5 blank with no animation', () => {
     const { page } = build(null, 'unauthorized')
     const keys = page.render(NOW).keys
     expect(keys[0]!.lines!.join(' ')).toContain('SIGN IN')
+    expect(keys[0]!.pulse).toBeUndefined()
     for (const i of [1, 4, 5]) {
       expect(keys[i]!.kind).toBe('blank')
+      expect(keys[i]!.pulse).toBeUndefined()
     }
   })
 
@@ -101,50 +98,23 @@ describe('SpotifyPage layout', () => {
     expect(page.render(NOW).keys[2]!.glyph).toBe('▶')
   })
 
-  it('shows the next-track glyph on key 3', () => {
+  it('shows the previous-track glyph on key 6 and the next-track glyph on key 7', () => {
     const { page } = build(player())
-    expect(page.render(NOW).keys[3]!.glyph).toBe('▶▶')
+    const keys = page.render(NOW).keys
+    expect(keys[6]!.glyph).toBe('◀◀')
+    expect(keys[7]!.glyph).toBe('▶▶')
   })
 
-  it('shows a filled red heart on key 6 when the track is saved', () => {
-    const { page } = build(player(), 'ok', FAKE_ART, true)
-    const key = page.render(NOW).keys[6]!
-    expect(key.glyph).toBe('♥')
-    expect(key.glyphColor).toEqual(theme.red)
-    expect(key.dim).not.toBe(true)
-  })
-
-  it('shows an outline heart on key 6 when the track is not saved', () => {
-    const { page } = build(player(), 'ok', FAKE_ART, false)
-    const key = page.render(NOW).keys[6]!
-    expect(key.glyph).toBe('♡')
-    expect(key.glyphColor).toBeUndefined()
-  })
-
-  it('shows a dim outline heart on key 6 when saved state is unknown', () => {
-    const { page } = build(player(), 'ok', FAKE_ART, null)
-    const key = page.render(NOW).keys[6]!
-    expect(key.glyph).toBe('♡')
-    expect(key.dim).toBe(true)
-  })
-
-  it('never shows a play count anywhere near the heart', () => {
-    const { page } = build(player(), 'ok', FAKE_ART, true)
-    const key = page.render(NOW).keys[6]!
-    // The heart key carries no lines with digits — no locally derived count.
-    expect(key.lines ?? []).not.toEqual(expect.arrayContaining([expect.stringMatching(/\d/)]))
-  })
-
-  it('shows VOL + and the current percent on key 7', () => {
+  it('shows VOL + and the current percent on key 3', () => {
     const { page } = build(player({ volumePercent: 55 }))
-    const key = page.render(NOW).keys[7]!
+    const key = page.render(NOW).keys[3]!
     expect(key.lines!.join(' ')).toContain('VOL +')
     expect(key.lines!.join(' ')).toContain('55')
   })
 
-  it('shows a placeholder on key 7 when the volume is unknown', () => {
+  it('shows a placeholder on key 3 when the volume is unknown', () => {
     const { page } = build(player({ volumePercent: null }))
-    const key = page.render(NOW).keys[7]!
+    const key = page.render(NOW).keys[3]!
     expect(key.lines!.join(' ')).not.toMatch(/\d/)
   })
 
@@ -153,17 +123,99 @@ describe('SpotifyPage layout', () => {
     const keys = page.render(NOW).keys
     expect(keys[2]!.dim).toBe(true)
     expect(keys[3]!.dim).toBe(true)
+    expect(keys[6]!.dim).toBe(true)
     expect(keys[7]!.dim).toBe(true)
   })
 
-  it('does not render previous, shuffle, or repeat anywhere on the deck', () => {
+  it('does not render shuffle or repeat anywhere on the deck', () => {
     const { page } = build(player())
     const keys = page.render(NOW).keys
-    const allGlyphs = keys.map((k) => k.glyph ?? '').join(' ')
     const allLines = keys.flatMap((k) => k.lines ?? []).join(' ').toUpperCase()
-    expect(allGlyphs).not.toContain('◀◀')
     expect(allLines).not.toContain('SHUFFLE')
     expect(allLines).not.toContain('REPEAT')
+  })
+})
+
+describe('SpotifyPage idle equaliser (nothing playing)', () => {
+  it('gives keys 0, 1, 4 and 5 a pulse spec, and no lines, glyph or image', () => {
+    const { page } = build(null, 'no-device')
+    const keys = page.render(NOW).keys
+    for (const i of [0, 1, 4, 5]) {
+      expect(keys[i]!.pulse).toBeDefined()
+      expect(keys[i]!.lines).toBeUndefined()
+      expect(keys[i]!.glyph).toBeUndefined()
+      expect(keys[i]!.image).toBeUndefined()
+    }
+  })
+
+  it('gives the four idle keys four different phases at the same instant', () => {
+    const { page } = build(null, 'no-device')
+    const keys = page.render(NOW, 5000).keys
+    const phases = [0, 1, 4, 5].map((i) => keys[i]!.pulse!.phase)
+    expect(new Set(phases).size).toBe(4)
+  })
+
+  it('advances the phase as nowMs advances', () => {
+    const { page } = build(null, 'no-device')
+    const phaseAt = (nowMs: number) => page.render(NOW, nowMs).keys[0]!.pulse!.phase
+    expect(phaseAt(0)).not.toBe(phaseAt(2000))
+  })
+
+  it('never calls Date.now(): the same nowMs always produces the same phase', () => {
+    const { page } = build(null, 'no-device')
+    const a = page.render(NOW, 12345).keys[0]!.pulse!.phase
+    const b = page.render(NOW, 12345).keys[0]!.pulse!.phase
+    expect(a).toBe(b)
+  })
+
+  // Lesson 17: measure the actual rendered pixels, not just the spec fields.
+  // A render at two different clocks must produce two different key buffers,
+  // proving the bars themselves move, not just some inert number in the spec.
+  it('renders visibly different pixels for the same key at two different clocks', () => {
+    const { page } = build(null, 'no-device')
+    const bufA = renderKey(page.render(NOW, 0).keys[0]!)
+    const bufB = renderKey(page.render(NOW, 1000).keys[0]!)
+    expect(bufA.equals(bufB)).toBe(false)
+  })
+
+  // And the four keys, rendered at the SAME clock, must differ from each
+  // other too — proving the per-key phase offset actually reaches the pixels,
+  // not just the spec.
+  it('renders visibly different pixels for all four idle keys at the same clock', () => {
+    const { page } = build(null, 'no-device')
+    const frame = page.render(NOW, 1500)
+    const bufs = [0, 1, 4, 5].map((i) => renderKey(frame.keys[i]!))
+    for (let i = 0; i < bufs.length; i++) {
+      for (let j = i + 1; j < bufs.length; j++) {
+        expect(bufs[i]!.equals(bufs[j]!)).toBe(false)
+      }
+    }
+  })
+
+  it('does not show the idle animation while a track is loaded, even paused', () => {
+    const { page } = build(player({ isPlaying: false }), 'ok', null)
+    const keys = page.render(NOW).keys
+    for (const i of [0, 1, 4, 5]) {
+      expect(keys[i]!.pulse).toBeUndefined()
+    }
+  })
+})
+
+describe('SpotifyPage tickMs', () => {
+  it('is undefined (the 1000 ms default) while a track is loaded', () => {
+    const { page } = build(player())
+    expect(page.tickMs).toBeUndefined()
+  })
+
+  it('is defined and faster than 1000 ms while nothing is playing', () => {
+    const { page } = build(null, 'no-device')
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
+  })
+
+  it('is undefined while unauthorized, since key 0 shows the sign-in text, not the animation', () => {
+    const { page } = build(null, 'unauthorized')
+    expect(page.tickMs).toBeUndefined()
   })
 })
 
@@ -206,6 +258,12 @@ describe('SpotifyPage strip', () => {
     expect(page.render(NOW).strip.lines.join(' ')).toContain('nothing playing')
   })
 
+  it('shows a wall clock beside the idle message', () => {
+    const { page } = build(null, 'no-device')
+    const strip = page.render(NOW, 1786549560000).strip
+    expect(strip.right).toMatch(/^\d{1,2}:\d{2}$/)
+  })
+
   it('tells the user how to authorize when unauthorized', () => {
     const { page } = build(null, 'unauthorized')
     expect(page.render(NOW).strip.lines.join(' ')).toContain('deckd auth spotify')
@@ -230,31 +288,28 @@ describe('SpotifyPage presses', () => {
     expect(calls).toContain('play')
   })
 
-  it('advances to the next track on key 3', async () => {
-    const { page, calls } = build(player())
-    await page.onKeyPress(3)
-    expect(calls).toContain('next')
-  })
-
-  it('raises the volume by 10 points on key 7', async () => {
+  it('raises the volume by 10 points on key 3', async () => {
     const { page, calls } = build(player({ volumePercent: 55 }))
-    await page.onKeyPress(7)
+    await page.onKeyPress(3)
     expect(calls).toContain('volume:65')
   })
 
   it('assumes 50 percent when the volume is unknown, before raising it', async () => {
     const { page, calls } = build(player({ volumePercent: null }))
-    await page.onKeyPress(7)
+    await page.onKeyPress(3)
     expect(calls).toContain('volume:60')
   })
 
-  it('does nothing on key 6 — the heart is display-only', async () => {
-    // Spotify 403s the save/unsave endpoint at the app level, even with the
-    // right scopes, so there is no toggle to call: `PlayerReader` no longer
-    // has one, and a press here must not throw or call anything.
+  it('goes to the previous track on key 6', async () => {
     const { page, calls } = build(player())
     await page.onKeyPress(6)
-    expect(calls).toEqual([])
+    expect(calls).toContain('previous')
+  })
+
+  it('advances to the next track on key 7', async () => {
+    const { page, calls } = build(player())
+    await page.onKeyPress(7)
+    expect(calls).toContain('next')
   })
 
   it('does nothing on any of the four album-art keys', async () => {

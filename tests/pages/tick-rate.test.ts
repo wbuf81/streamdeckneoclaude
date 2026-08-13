@@ -8,29 +8,20 @@ import type { WeatherReader } from '../../src/pages/weather-page.js'
 
 /**
  * Task 22 gave `Page` an optional `tickMs`, defaulting to 1000 ms when a page
- * never sets it. These three pages have no reason to animate — Spotify's own
- * player-position interpolation already reads `now` in whole seconds, stocks
- * update every five minutes, and weather every fifteen — so none of them
- * should declare `tickMs` at all. A future edit that accidentally added it
- * here would raise their render rate for no benefit and would slip past a
- * type check, since `tickMs` is optional; this test is the guard.
+ * never sets it. Stocks (updates every five minutes) and weather (every
+ * fifteen) still have no reason to animate, so neither should declare
+ * `tickMs` at all. A future edit that accidentally added it here would raise
+ * their render rate for no benefit and would slip past a type check, since
+ * `tickMs` is optional; this test is the guard.
+ *
+ * Spotify is the exception, covered separately below: task 27 gave it an
+ * idle equaliser animation across its four album-art keys, shown only while
+ * nothing is playing, so it now DOES raise its tick rate — but only then.
  *
  * Minimal fakes stand in for each page's reader: only construction and the
  * `tickMs` property matter here, not the rendered content.
  */
 describe('pages that must keep the default 1000 ms render interval', () => {
-  it('SpotifyPage declares no tickMs', () => {
-    const fake = {
-      interpolate: () => null,
-      getStatus: () => 'no-token',
-      getArt: () => null,
-      isSaved: () => null,
-      setVisible: () => {},
-    } as unknown as PlayerReader
-    const page = new SpotifyPage(fake)
-    expect(page.tickMs).toBeUndefined()
-  })
-
   it('StocksPage declares no tickMs', () => {
     const fake = {
       getQuotes: () => new Map(),
@@ -53,6 +44,49 @@ describe('pages that must keep the default 1000 ms render interval', () => {
       setVisible: () => {},
     } as unknown as WeatherReader
     const page = new WeatherPage(fake)
+    expect(page.tickMs).toBeUndefined()
+  })
+})
+
+/**
+ * SpotifyPage's idle equaliser (task 27) needs a faster tick only while it
+ * is actually showing — a still album-art image gains nothing from a faster
+ * clock, and the device's render interval is the only throughput constraint
+ * (docs/VERIFIED-FACTS.md). So `tickMs` here is a getter, re-read every time
+ * the page becomes current, rather than a fixed value like the other pages'.
+ */
+describe('SpotifyPage tickMs: fast only while the idle animation shows', () => {
+  function fakeReader(over: Partial<PlayerReader>): PlayerReader {
+    return {
+      interpolate: () => null,
+      getStatus: () => 'ok',
+      getArt: () => null,
+      play: async () => true,
+      pause: async () => true,
+      next: async () => true,
+      previous: async () => true,
+      setVolume: async () => true,
+      setVisible: () => {},
+      ...over,
+    } as unknown as PlayerReader
+  }
+
+  it('keeps the default 1000 ms tick while a track is loaded, playing or paused', () => {
+    const fake = fakeReader({ interpolate: () => ({} as never), getStatus: () => 'ok' })
+    const page = new SpotifyPage(fake)
+    expect(page.tickMs).toBeUndefined()
+  })
+
+  it('raises the tick rate while nothing is playing', () => {
+    const fake = fakeReader({ interpolate: () => null, getStatus: () => 'no-device' })
+    const page = new SpotifyPage(fake)
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
+  })
+
+  it('keeps the default 1000 ms tick while unauthorized, since key 0 shows text, not the animation', () => {
+    const fake = fakeReader({ interpolate: () => null, getStatus: () => 'unauthorized' })
+    const page = new SpotifyPage(fake)
     expect(page.tickMs).toBeUndefined()
   })
 })
