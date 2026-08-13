@@ -150,6 +150,40 @@ export function unwrapStatusLine(current: unknown): unknown {
   return tryUnwrapStatusLine(current).value
 }
 
+/**
+ * The unwrap attempt `recoverStatusLine` actually uses -- unlike
+ * `tryUnwrapStatusLine` above, this takes `wrapperPath` and treats an
+ * absent marker as a FAILURE whenever the command still invokes the
+ * wrapper, rather than as proof there was never a wrap.
+ *
+ * That distinction is C-1's fix. `tryUnwrapStatusLine`'s "no marker found"
+ * branch was written for a caller that had already gated on the SAME
+ * marker to decide "is this wrapped" in the first place -- so by the time
+ * it ran, "no marker" and "not wrapped" were the same fact. Once
+ * `isInstalled` stopped depending on the marker (see above), that
+ * assumption broke: a command can now be known-wrapped (it invokes
+ * `wrapperPath`) while ALSO lacking a marker (someone trimmed it). Handing
+ * back `current` unchanged in that case would tell the caller "this is
+ * already the original" -- while `current` still runs the wrapper. That is
+ * the exact stranding C-1 found, just one level down. Losing the marker
+ * must fail closed here, so the caller (`recoverStatusLine`) falls back to
+ * the pre-install backup instead of trusting a command that still points
+ * at the wrapper.
+ */
+function tryUnwrapWrapped(current: unknown, wrapperPath: string): UnwrapAttempt {
+  const command = extractCommand(current)
+  if (!command.includes(wrapperPath)) return { ok: true, value: current }
+  const at = command.indexOf(WRAPPER_MARKER)
+  if (at === -1) return { ok: false, value: undefined }
+  try {
+    const blob = command.slice(at + WRAPPER_MARKER.length).trim()
+    const parsed = JSON.parse(blob) as { original: unknown }
+    return { ok: true, value: parsed.original ?? undefined }
+  } catch {
+    return { ok: false, value: undefined }
+  }
+}
+
 export interface RecoverResult {
   /** The value to assign to `statusLine`, or `undefined` to leave it absent. */
   statusLine: unknown
@@ -173,9 +207,16 @@ export interface RecoverResult {
  * quietly -- it returns `source: 'none'` with a warning, so the caller can
  * tell the user plainly that their original statusline could not be found,
  * rather than silently discarding it.
+ *
+ * `wrapperPath` is required so the embedded attempt below (`tryUnwrapWrapped`)
+ * can tell "never wrapped" from "wrapped, but the marker was trimmed" (C-1)
+ * -- the two cases `tryUnwrapStatusLine` alone cannot distinguish, and
+ * conflating them is exactly how the marker-trimmed case used to strand a
+ * live reference to a wrapper this function had already decided to hand
+ * back as "the original".
  */
-export function recoverStatusLine(current: unknown, backupPath: string): RecoverResult {
-  const attempt = tryUnwrapStatusLine(current)
+export function recoverStatusLine(current: unknown, backupPath: string, wrapperPath: string): RecoverResult {
+  const attempt = tryUnwrapWrapped(current, wrapperPath)
   if (attempt.ok) return { statusLine: attempt.value, source: 'embedded' }
 
   try {
@@ -198,11 +239,52 @@ export function recoverStatusLine(current: unknown, backupPath: string): Recover
   }
 }
 
-export function isInstalled(settings: unknown): boolean {
+/** The fixed basename every copy of the wrapper script shares, regardless of
+ * which state directory it was installed into. Used only by `looksWrapped`
+ * below to spot an AMBIGUOUS wrap -- one that does not match `wrapperPath`
+ * exactly, e.g. because `DECKD_STATE_DIR` changed between installs -- never
+ * as the install/uninstall decision itself. */
+const WRAPPER_BASENAME = 'statusline-wrapper.sh'
+
+/**
+ * Decides whether `settings` is already wrapped, by checking whether its
+ * statusLine command actually INVOKES `wrapperPath` -- not by looking for
+ * `WRAPPER_MARKER`.
+ *
+ * C-1: the marker is a `#`-prefixed shell comment, so it is cosmetic text a
+ * person can trim (e.g. "cleaning up" the noisy trailing JSON) with ZERO
+ * effect on how the statusline behaves -- the wrapper keeps working, so
+ * nothing tells anyone the marker is gone. Gating `isInstalled` on that
+ * comment meant a trimmed marker made `uninstall` think nothing was
+ * installed, skip the unwrap entirely, and fall through to deleting the
+ * wrapper and the backup anyway -- stranding a live reference. It also made
+ * `install` fail to recognise an existing wrap and wrap it a second time.
+ *
+ * The wrapper path is not cosmetic: it is the literal file the shell is
+ * about to execute. A command cannot both invoke it and "not really" be
+ * wrapped, so this is load-bearing in the way a comment can never be.
+ */
+export function isInstalled(settings: unknown, wrapperPath: string): boolean {
   if (!settings || typeof settings !== 'object') return false
   const sl = (settings as Record<string, unknown>).statusLine
   if (sl === undefined) return false
-  return extractCommand(sl).includes(WRAPPER_MARKER)
+  return extractCommand(sl).includes(wrapperPath)
+}
+
+/**
+ * True when a command looks like it invokes SOME deckd wrapper -- by the
+ * fixed basename every copy shares, or by the marker -- even if it does not
+ * match `wrapperPath` exactly. This is deliberately broader and less exact
+ * than `isInstalled`, and it exists for exactly one job: giving `install` a
+ * way to notice an AMBIGUOUS state (e.g. `DECKD_STATE_DIR` changed since a
+ * prior install, so the old wrap points at a different path) and refuse
+ * rather than guess. Guessing here means nesting a wrap inside another
+ * wrap, which is the failure mode C-1 also produces from the other
+ * direction. Never used for the unwrap/verify/delete decision itself --
+ * only `isInstalled`, keyed on the exact path, decides that.
+ */
+function looksWrapped(commandStr: string): boolean {
+  return commandStr.includes(WRAPPER_BASENAME) || commandStr.includes(WRAPPER_MARKER)
 }
 
 function extractCommand(v: unknown): string {
@@ -405,13 +487,33 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
   }
 
   const changed: string[] = []
+  const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
 
   // Refuse to run twice. Checked first, before any file is touched, so a
   // repeat run leaves the wrapper copy, the backup, and settings.json alone.
+  // Keyed on the wrapper PATH (C-1), not the marker comment, so a hand-edit
+  // that trims the marker cannot make this miss an existing wrap.
   const settings = readSettingsForInstall(p)
-  if (isInstalled(settings)) {
+  if (isInstalled(settings, wrapperDst)) {
     console.log('deckd is already installed. Run `deckd uninstall` first to redo it.')
     return
+  }
+
+  // C-1, the other direction: the statusLine command looks like it invokes
+  // SOME deckd wrapper (by basename or marker) but not the one at
+  // `wrapperDst` -- e.g. `DECKD_STATE_DIR` changed since a prior install, or
+  // the file was moved. Wrapping this would nest a wrap inside another
+  // wrap: `verifyWrap` would still pass, because a double wrap reproduces
+  // the original output byte for byte, so it would go live unverified, and
+  // a later `uninstall` would restore the OLD wrap as "the original" and
+  // strand it. Refuse outright rather than guess.
+  const currentCmd = extractCommand(settings.statusLine)
+  if (looksWrapped(currentCmd)) {
+    throw new Error(
+      'statusLine already looks like a deckd wrap, but not the one this install would use ' +
+        `(${wrapperDst}). Refusing to wrap it again, to avoid nesting one wrap inside another. ` +
+        'Run `deckd uninstall` first, or fix statusLine in settings.json by hand, then retry.',
+    )
   }
 
   // 1. Copy the wrapper into the state directory, so an uninstalled repo
@@ -422,7 +524,6 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
   if (!existsSync(wrapperSrc)) {
     throw new Error(`wrapper script missing: ${wrapperSrc}`)
   }
-  const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
   const backup = `${p.claudeSettings}.deckd-backup`
   const script = opts.script ?? join(root, 'dist', 'bin', 'deckd.js')
   await preflightBuild(script)
@@ -522,12 +623,40 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
         rollbackErrors.push(`stop the partially-installed agent: ${String(stopError)}`)
       })
     }
+    // I-1: a failed restore is FATAL to rollback, full stop. The old code
+    // pushed a failed `restoreFile` onto `rollbackErrors` and kept going --
+    // so a failed settings.json restore (disk full, permissions) did not
+    // stop the loop from reaching the wrapper's own snapshot next and
+    // unlinking it, because that snapshot's content was `null` (the
+    // wrapper did not exist before this attempt). Result: settings.json
+    // left pointing at a wrapper that rollback had just deleted -- the
+    // same "live reference to a deleted file" harm C-1 exists to prevent,
+    // reached through rollback instead of uninstall. The instant one
+    // restore fails, stop: leave every remaining snapshot's file exactly
+    // as this failed attempt left it (nothing further deleted, nothing
+    // further overwritten), skip the launchd reload below too, and throw
+    // with the exact manual recovery steps -- there is no safe automatic
+    // next move once a restore has already failed once.
+    let fatalRestore: string | null = null
     for (const snapshot of [...snapshots].reverse()) {
+      if (fatalRestore) break
       try {
         restoreFile(snapshot)
       } catch (restoreError) {
         rollbackErrors.push(`${snapshot.path}: ${String(restoreError)}`)
+        fatalRestore =
+          `rollback could not restore ${snapshot.path} (${String(restoreError)}), so it stopped ` +
+          'immediately -- nothing else was touched, deleted, or restored after this point. To ' +
+          'recover by hand: 1) fix whatever is blocking that path (free disk space, fix ' +
+          'permissions, or restore ownership); 2) compare it against the backup file next to ' +
+          'it if one exists, and copy the correct content back yourself if needed; 3) only once ' +
+          `${p.claudeSettings} is confirmed correct and no longer mentions the deckd wrapper, ` +
+          'remove any leftover wrapper script or backup file by hand. Do not delete anything ' +
+          'under the state directory before that is confirmed.'
       }
+    }
+    if (fatalRestore) {
+      throw new Error(`${String(e)} ${fatalRestore}`)
     }
     // Restore exactly the load state recorded before this attempt touched
     // anything (finding 4): only if launchd was actually touched, and only
@@ -574,13 +703,37 @@ export async function refreshWrapper(opts: InstallOptions = {}): Promise<Refresh
   const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
 
   const settings = readSettingsForInstall(p)
-  if (!isInstalled(settings)) {
+  if (!isInstalled(settings, wrapperDst)) {
     throw new Error('deckd is not installed. Run `deckd install` first.')
+  }
+
+  // I-2: `settings.statusLine` here is the ALREADY-INSTALLED, already-wrapped
+  // command -- unlike `install()`, where it is still the pristine original.
+  // The old code passed it straight to `wrapStatusLine` as if it were the
+  // original, so `inner` became the entire installed command, DECKD_STATE_DIR
+  // and all: running that command directly as the probe's "before", and
+  // again nested inside the probe's "after", both executed the wrapper a
+  // SECOND time with no override -- reading `DECKD_STATE_DIR='<the live
+  // dir>'` baked into that inner command -- and wrote fabricated usage and a
+  // probe session file straight into the live state directory, twice, with
+  // no cleanup. Recovering the true pre-wrap original first means the probe
+  // below never invokes `wrapperDst` or the live state directory at all: it
+  // only ever runs the ORIGINAL command and a freshly-built wrap of it, both
+  // confined to `probeStateDir`.
+  const backupPath = `${p.claudeSettings}.deckd-backup`
+  const recovered = tryUnwrapWrapped(settings.statusLine, wrapperDst)
+  if (!recovered.ok) {
+    throw new Error(
+      'could not recover the original statusLine command from the installed wrap (the ' +
+        'embedded marker is missing or unreadable), so the wrapper cannot be safely ' +
+        `re-verified. Nothing was changed. A pre-install backup may exist at ${backupPath} -- ` +
+        "check it by hand, or run 'deckd uninstall' then 'deckd install' again.",
+    )
   }
 
   const probeStateDir = mkdtempSync(join(tmpdir(), 'deckd-refresh-probe-'))
   try {
-    const probeWrap = wrapStatusLine(settings.statusLine, wrapperSrc, probeStateDir)
+    const probeWrap = wrapStatusLine(recovered.value, wrapperSrc, probeStateDir)
     const probe = await verifyWrap(extractCommand(probeWrap.statusLine), probeWrap.inner)
     if (!probe.ok) {
       throw new Error(
@@ -592,8 +745,15 @@ export async function refreshWrapper(opts: InstallOptions = {}): Promise<Refresh
     rmSync(probeStateDir, { recursive: true, force: true })
   }
 
-  copyFileSync(wrapperSrc, wrapperDst)
-  chmodSync(wrapperDst, 0o755)
+  // I-3: replace the LIVE, possibly-executing script atomically. The old
+  // `copyFileSync` truncates the destination and streams into it in place;
+  // a render that `exec`s the file mid-copy would run a truncated script.
+  // `writeAtomic` writes a temp file in the same directory and renames it,
+  // so any reader sees either the whole old file or the whole new one,
+  // never a partial one. `preserveExistingMode: false` forces 0755
+  // regardless of whatever mode the file currently has, matching the old
+  // unconditional `chmodSync`.
+  writeAtomic(wrapperDst, readFileSync(wrapperSrc), 0o755, { preserveExistingMode: false })
   return { path: wrapperDst }
 }
 
@@ -876,6 +1036,8 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
   const p = opts.paths ?? paths
   const controller = opts.controller ?? systemLaunchAgentController
   const removed: string[] = []
+  const wrapper = join(p.stateDir, 'statusline-wrapper.sh')
+  const backupPath = `${p.claudeSettings}.deckd-backup`
 
   // C1: refuse outright when settings.json will not parse, BEFORE touching
   // launchd, the plist, or anything else. The old lenient reader returned
@@ -893,9 +1055,16 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
     removed.push(`removed ${p.launchAgent}`)
   }
 
-  if (isInstalled(settings)) {
-    const backupPath = `${p.claudeSettings}.deckd-backup`
-    const recovered = recoverStatusLine(settings.statusLine, backupPath)
+  // C-1: keyed on the wrapper PATH, not the marker comment. A hand-edit that
+  // trims the trailing `# deckd-wrapped {...}` comment leaves the statusline
+  // working (it is only a shell comment) and used to make this `false` --
+  // skipping the unwrap entirely and falling through to unlinking the
+  // wrapper and the backup below, unconditionally. Checking the path
+  // instead means this is still `true` for exactly that case, so the unwrap
+  // below still runs.
+  let recovered: RecoverResult | undefined
+  if (isInstalled(settings, wrapper)) {
+    recovered = recoverStatusLine(settings.statusLine, backupPath, wrapper)
     if (recovered.warning) console.warn(recovered.warning)
     if (recovered.statusLine === undefined) delete settings.statusLine
     else settings.statusLine = recovered.statusLine
@@ -906,8 +1075,13 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
     // the old command pointed at. This is the exact ordering C1 found
     // missing: unwrap, verify the unwrap, and only THEN delete -- never
     // delete first, and never delete on the strength of an assumption that
-    // the write above worked.
-    if (isInstalled(readSettingsForUninstall(p))) {
+    // the write above worked. The check itself is now path-based too, so it
+    // catches the ambiguous case where the "recovered" original ITSELF still
+    // invokes the wrapper (e.g. a prior marker-absent double-wrap already
+    // nested one wrap inside another): if so, this still references the
+    // wrapper after the write, and the throw below refuses to delete
+    // anything rather than stranding it again.
+    if (isInstalled(readSettingsForUninstall(p), wrapper)) {
       throw new Error(
         `${p.claudeSettings} still references the deckd wrapper after writing the unwrap. ` +
           'Refusing to delete the wrapper script, so nothing is stranded. Check the file by ' +
@@ -916,7 +1090,6 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
     }
   }
 
-  const wrapper = join(p.stateDir, 'statusline-wrapper.sh')
   if (existsSync(wrapper)) {
     unlinkSync(wrapper)
     removed.push(`removed ${wrapper}`)
@@ -925,10 +1098,23 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
   // Finding 6: deckd made this backup; deckd removes it. Leaving it behind
   // forever meant a secrets-bearing duplicate of settings.json persisted
   // indefinitely with no cleanup path at all.
-  const backupPath = `${p.claudeSettings}.deckd-backup`
-  if (existsSync(backupPath)) {
-    unlinkSync(backupPath)
-    removed.push(`removed ${backupPath}`)
+  //
+  // I-4: but only once recovery actually used it, or recovered something
+  // from the embedded blob -- never on the `source: 'none'` path. There,
+  // the embedded copy was unreadable AND the backup itself would not parse,
+  // so the backup is not a safe duplicate to discard: it is very likely the
+  // last legible copy of the original statusLine left anywhere, and
+  // deleting it destroys exactly the thing a person would otherwise have
+  // recovered by eye. `recovered` is `undefined` when settings.json was
+  // never wrapped at all (nothing to gate on); the backup, if any exists in
+  // that case, is still deckd's own and still safe to remove.
+  if (recovered === undefined || recovered.source !== 'none') {
+    if (existsSync(backupPath)) {
+      unlinkSync(backupPath)
+      removed.push(`removed ${backupPath}`)
+    }
+  } else {
+    console.warn(`kept ${backupPath}; the embedded original was unreadable and it did not parse either.`)
   }
 
   console.log('deckd uninstalled.\n')
@@ -937,10 +1123,27 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
   console.log('It holds your Spotify token. Delete it by hand if you want it gone.')
 }
 
-/** Install must not replace an unreadable settings file with an empty object. */
+/**
+ * Install must not replace an unreadable settings file with an empty object.
+ *
+ * M-6: `install()` always runs `enforceDirModes` and the I2 stray-file
+ * repair BEFORE this read, because those are wanted regardless of whether
+ * settings.json turns out to be readable. So the generic
+ * "no install changes were made" wording from `parseSettingsObject` is not
+ * quite true here -- the state directory setup already happened, and it is
+ * safe to keep. This appends a clarification rather than claiming zero
+ * side effects; the original phrase stays a substring, so callers matching
+ * on it still match.
+ */
 function readSettingsForInstall(p: Paths): Record<string, unknown> {
   if (!existsSync(p.claudeSettings)) return {}
-  return parseSettingsObject(readFileSync(p.claudeSettings, 'utf8'), p.claudeSettings, 'install')
+  try {
+    return parseSettingsObject(readFileSync(p.claudeSettings, 'utf8'), p.claudeSettings, 'install')
+  } catch (e) {
+    throw new Error(
+      `${String(e)} (deckd's own state directory setup, if any was needed, already ran and is safe to keep.)`,
+    )
+  }
 }
 
 /**
@@ -978,7 +1181,17 @@ export function parseSettingsObject(
   try {
     parsed = JSON.parse(text)
   } catch (e) {
-    throw new Error(`cannot parse ${file}; no ${action} changes were made: ${String(e)}`)
+    // M-5: `String(e)` from `JSON.parse` can embed the first bytes of the
+    // file itself -- Node 22 prints `Unexpected token 's', ""sk-ant-api"...
+    // is not valid JSON` for input that is not JSON at all. settings.json
+    // can hold anything by the time this runs (a hand edit, a botched
+    // restore), so this never echoes any of it. A "position N" detail is
+    // safe -- it names an offset, not content -- and is kept when present;
+    // otherwise a fixed, contentless phrase is used.
+    const message = e instanceof Error ? e.message : String(e)
+    const positionMatch = /at position \d+(?: \(line \d+ column \d+\))?/.exec(message)
+    const safeDetail = positionMatch ? positionMatch[0] : 'it does not start with valid JSON'
+    throw new Error(`cannot parse ${file}; no ${action} changes were made (${safeDetail}).`)
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`${file} must contain a JSON object; no ${action} changes were made.`)

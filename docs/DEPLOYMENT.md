@@ -17,8 +17,27 @@ Use this checklist for the installed daemon on this Mac. The launchd label is
    git diff --check
    ```
 
-4. If the wrapper changed, compare the tested source with the installed wrapper. Replace it
-   atomically. Do not modify unrelated Claude settings.
+4. If the wrapper changed, compare the tested source with the installed wrapper. Run
+   `deckd refresh-wrapper` to replace it. Do not modify unrelated Claude settings.
+
+## Updating an already-installed wrapper
+
+`deckd refresh-wrapper` re-copies `src/install/statusline-wrapper.sh` into the state
+directory and re-verifies it, without touching `settings.json` or launchd. Use it whenever
+the wrapper script changes on an already-installed machine.
+
+- It replaces the wrapper atomically (write a temp file, then rename), so a render cannot
+  ever see a truncated script mid-copy.
+- It re-verifies the wrap against the recovered original command, using a disposable
+  temporary directory. It never writes to the live state directory during that check.
+- It refuses, and changes nothing, if it cannot recover the original command from the
+  installed wrap (for example, a hand edit removed the embedded blob and there is no usable
+  backup).
+- It is safe to run more than once. Each run re-copies and re-verifies from the same source.
+
+Before `refresh-wrapper` existed, the only way to update an installed wrapper was
+`deckd uninstall` followed by `deckd install` — the same path the C-1 defect lived on. Prefer
+`refresh-wrapper` for a wrapper-only change.
 
 ## Restart the daemon
 

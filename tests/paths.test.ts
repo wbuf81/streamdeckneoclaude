@@ -62,6 +62,22 @@ describe('paths', () => {
       consoleError.mockRestore()
     }
   })
+
+  // M-4: DECKD_STATE_DIR=$HOME is a footgun worth rejecting outright, even
+  // though it cannot weaken a mode. It would chmod the home directory
+  // itself to 0700, create `sessions` and `art` directly inside it, make
+  // `deckd uninstall` unlink `~/statusline-wrapper.sh`, and make the
+  // render-time wrapper `chmod 700 $HOME` on every render.
+  it('M-4: rejects DECKD_STATE_DIR set to the home directory itself', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const isolated = buildPaths('/Users/tester', '/Users/tester')
+      expect(isolated.stateDir).toBe('/Users/tester/.local/state/deckd')
+      expect(consoleError).toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
 })
 
 describe('enforceDirModes', () => {

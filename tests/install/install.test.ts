@@ -26,6 +26,7 @@ vi.mock('node:fs', async (importOriginal) => {
     writeFileSync: vi.fn(actual.writeFileSync),
     chmodSync: vi.fn(actual.chmodSync),
     renameSync: vi.fn(actual.renameSync),
+    copyFileSync: vi.fn(actual.copyFileSync),
   }
 })
 import {
@@ -147,16 +148,33 @@ describe('wrapStatusLine', () => {
 
 describe('isInstalled', () => {
   it('is false for a clean settings file', () => {
-    expect(isInstalled({ statusLine: '~/.claude/statusline.sh' })).toBe(false)
+    expect(isInstalled({ statusLine: '~/.claude/statusline.sh' }, WRAPPER)).toBe(false)
   })
 
   it('is false when there is no statusline', () => {
-    expect(isInstalled({})).toBe(false)
+    expect(isInstalled({}, WRAPPER)).toBe(false)
   })
 
   it('is true after a wrap', () => {
     const r = wrapStatusLine('x.sh', WRAPPER, STATE_DIR)
-    expect(isInstalled({ statusLine: r.statusLine })).toBe(true)
+    expect(isInstalled({ statusLine: r.statusLine }, WRAPPER)).toBe(true)
+  })
+
+  // C-1: the decision is keyed on the wrapper PATH, not the `# deckd-wrapped`
+  // marker comment. A marker is cosmetic shell-comment text a person can
+  // trim with zero effect on behaviour -- the wrapper keeps working -- so it
+  // must never be what gates a destructive decision.
+  it('is still true after the trailing marker comment is trimmed off', () => {
+    const r = wrapStatusLine('x.sh', WRAPPER, STATE_DIR)
+    const command = (r.statusLine as string)
+    const trimmed = command.slice(0, command.indexOf(WRAPPER_MARKER)).trimEnd()
+    expect(trimmed).not.toContain(WRAPPER_MARKER)
+    expect(isInstalled({ statusLine: trimmed }, WRAPPER)).toBe(true)
+  })
+
+  it('is false for a command that invokes a DIFFERENT path, even one containing the marker', () => {
+    const r = wrapStatusLine('x.sh', '/some/other/statusline-wrapper.sh', STATE_DIR)
+    expect(isInstalled({ statusLine: r.statusLine }, WRAPPER)).toBe(false)
   })
 })
 
@@ -216,9 +234,16 @@ describe('verifyWrap', () => {
   // command failed, without ever running the WRAPPED command -- so a
   // wrapper that was non-executable, or carried a syntax error, went live
   // completely unverified whenever the user's own statusline happened to
-  // exit non-zero. These three tests exercise the fixed behaviour: the
+  // exit non-zero. These two tests exercise the fixed behaviour: the
   // wrapped side always runs now, and its outcome is compared against the
-  // original's, not just assumed equivalent.
+  // original's, not just assumed equivalent. (I-7: a third test used to sit
+  // here, "still accepts a wrapper that runs to completion despite a
+  // failing original" -- it ran `verifyWrap("printf 'ok\n'", 'exit 4')`,
+  // which is the identical case the "allows the install when the ORIGINAL
+  // command already fails" test above already covers with different
+  // literal strings. It passed against the UNFIXED code too, since that
+  // code special-cased "original fails, wrapped succeeds" from the start.
+  // It was removed rather than kept as a second copy of the same case.)
   it('accepts a wrapper that reproduces the SAME failure as a failing original', async () => {
     // Both "wrapped" and "inner" fail with the identical exit code here --
     // standing in for a wrapper that faithfully re-executes a broken inner
@@ -236,15 +261,6 @@ describe('verifyWrap', () => {
     const r = await verifyWrap('exit 9', 'exit 5')
     expect(r.ok).toBe(false)
     expect(r.reason).toContain('differently')
-  })
-
-  it('still accepts a wrapper that runs to completion despite a failing original', async () => {
-    // Original fails; wrapper (standing in for the real mechanism) succeeds
-    // anyway. The wrapper itself is proven to work; the original's failure
-    // is the user's business.
-    const r = await verifyWrap("printf 'ok\\n'", 'exit 4')
-    expect(r.ok).toBe(true)
-    expect(r.reason).toContain('original command failed')
   })
 })
 
@@ -287,7 +303,7 @@ describe('recoverStatusLine', () => {
 
   it('uses the embedded original when it parses, and reports no warning', () => {
     const r = wrapStatusLine('~/.claude/statusline.sh', WRAPPER, STATE_DIR)
-    const result = recoverStatusLine(r.statusLine, '/does/not/exist/settings.json.deckd-backup')
+    const result = recoverStatusLine(r.statusLine, '/does/not/exist/settings.json.deckd-backup', WRAPPER)
     expect(result.source).toBe('embedded')
     expect(result.statusLine).toBe('~/.claude/statusline.sh')
     expect(result.warning).toBeUndefined()
@@ -299,7 +315,7 @@ describe('recoverStatusLine', () => {
       const backupPath = join(dir, 'settings.json.deckd-backup')
       writeFileSync(backupPath, JSON.stringify({ statusLine: 'original-from-backup.sh' }))
 
-      const result = recoverStatusLine(BROKEN, backupPath)
+      const result = recoverStatusLine(BROKEN, backupPath, WRAPPER)
       expect(result.source).toBe('backup')
       expect(result.statusLine).toBe('original-from-backup.sh')
       expect(result.warning).toContain('backup')
@@ -314,7 +330,7 @@ describe('recoverStatusLine', () => {
       const backupPath = join(dir, 'settings.json.deckd-backup')
       writeFileSync(backupPath, JSON.stringify({ someOtherSetting: true }))
 
-      const result = recoverStatusLine(BROKEN, backupPath)
+      const result = recoverStatusLine(BROKEN, backupPath, WRAPPER)
       expect(result.source).toBe('backup')
       expect(result.statusLine).toBeUndefined()
     } finally {
@@ -328,7 +344,7 @@ describe('recoverStatusLine', () => {
       const missingBackupPath = join(dir, 'settings.json.deckd-backup')
       // Deliberately do not create the file.
 
-      const result = recoverStatusLine(BROKEN, missingBackupPath)
+      const result = recoverStatusLine(BROKEN, missingBackupPath, WRAPPER)
       expect(result.source).toBe('none')
       expect(result.statusLine).toBeUndefined()
       expect(result.warning).toContain('no usable backup')
@@ -343,10 +359,55 @@ describe('recoverStatusLine', () => {
       const backupPath = join(dir, 'settings.json.deckd-backup')
       writeFileSync(backupPath, 'not valid json either')
 
-      const result = recoverStatusLine(BROKEN, backupPath)
+      const result = recoverStatusLine(BROKEN, backupPath, WRAPPER)
       expect(result.source).toBe('none')
       expect(result.statusLine).toBeUndefined()
       expect(result.warning).toContain('no usable backup')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // C-1: a wrapped command whose trailing marker comment has been trimmed
+  // off must NOT be treated as "already the original" -- it still invokes
+  // the wrapper at WRAPPER, so handing it back unchanged would leave a live
+  // reference to the wrapper mislabelled as recovered. This must fall back
+  // to the backup, exactly like a malformed blob does.
+  it('C-1: falls back to the backup when the marker comment itself was trimmed off', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-recover-'))
+    try {
+      const wrapped = wrapStatusLine('~/.claude/statusline.sh', WRAPPER, STATE_DIR)
+      const command = wrapped.statusLine as string
+      const markerTrimmed = command.slice(0, command.indexOf(WRAPPER_MARKER)).trimEnd()
+      expect(markerTrimmed).toContain(WRAPPER)
+      expect(markerTrimmed).not.toContain(WRAPPER_MARKER)
+
+      const backupPath = join(dir, 'settings.json.deckd-backup')
+      writeFileSync(backupPath, JSON.stringify({ statusLine: '~/.claude/statusline.sh' }))
+
+      const result = recoverStatusLine(markerTrimmed, backupPath, WRAPPER)
+      expect(result.source).toBe('backup')
+      expect(result.statusLine).toBe('~/.claude/statusline.sh')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('C-1: reports source "none" (never "embedded") when the marker is trimmed and no backup exists', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-recover-'))
+    try {
+      const wrapped = wrapStatusLine('~/.claude/statusline.sh', WRAPPER, STATE_DIR)
+      const command = wrapped.statusLine as string
+      const markerTrimmed = command.slice(0, command.indexOf(WRAPPER_MARKER)).trimEnd()
+      const missingBackupPath = join(dir, 'settings.json.deckd-backup')
+
+      const result = recoverStatusLine(markerTrimmed, missingBackupPath, WRAPPER)
+      // The old bug: this used to report `source: 'embedded'` with
+      // `statusLine` set to the STILL-WRAPPED command itself, which the
+      // caller would then treat as "already the original" and delete the
+      // wrapper out from under it.
+      expect(result.source).toBe('none')
+      expect(result.statusLine).toBeUndefined()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -611,6 +672,23 @@ describe('install settings preflight', () => {
     expect(() => parseSettingsObject('[]', '/tmp/settings.json'))
       .toThrow(/must contain a JSON object/i)
   })
+
+  // M-5: Node's own `JSON.parse` error text can embed the first bytes of
+  // the input for input that is not JSON at all (measured: `Unexpected
+  // token 's', ""sk-ant-api"... is not valid JSON`). settings.json can hold
+  // anything by the time this runs, so the thrown message must never repeat
+  // any of it back -- only a safe, contentless detail (or none at all).
+  it('M-5: never echoes file content in the error, even for input that is not JSON at all', () => {
+    let message = ''
+    try {
+      parseSettingsObject('sk-ant-api-fake-secret-value-should-never-appear', '/tmp/settings.json')
+    } catch (e) {
+      message = String(e)
+    }
+    expect(message).toContain('no install changes were made')
+    expect(message).not.toContain('sk-ant-api')
+    expect(message).not.toContain('fake-secret')
+  })
 })
 
 describe('describeStatusLineOutcome', () => {
@@ -783,7 +861,7 @@ describe('install() and uninstall()', () => {
 
     expect(statSync(p.stateDir + '/statusline-wrapper.sh').mode & 0o777).toBe(0o755)
     const settings = JSON.parse(readFileSync(p.claudeSettings, 'utf8'))
-    expect(isInstalled(settings)).toBe(true)
+    expect(isInstalled(settings, p.stateDir + '/statusline-wrapper.sh')).toBe(true)
     expect(existsSync(p.launchAgent)).toBe(true)
     expect(controller.calls).toContain('bootstrap')
   })
@@ -800,6 +878,78 @@ describe('install() and uninstall()', () => {
 
     expect(readFileSync(p.claudeSettings, 'utf8')).toBe(before)
     expect(controller.calls).toEqual([])
+  })
+
+  // C-1, the other direction of the critical finding: with the marker gone,
+  // the OLD `isInstalled` did not recognise the existing wrap, so install
+  // wrapped the already-wrapped invocation a SECOND time. `verifyWrap`
+  // still passed, because a double wrap reproduces the original output
+  // byte for byte, so the double wrap would have gone live silently. Keying
+  // detection on the wrapper PATH instead means this still refuses, exactly
+  // like the ordinary double-install case above, even with the marker gone.
+  it('C-1: still refuses to double-wrap when the marker comment has been trimmed off', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    const controller = fakeController()
+    await install({ paths: p, controller, script: writeGoodScript(dir) })
+    const wrapped = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as { statusLine: string }
+    const markerAt = wrapped.statusLine.indexOf(WRAPPER_MARKER)
+    expect(markerAt).toBeGreaterThan(-1)
+    const trimmed = wrapped.statusLine.slice(0, markerAt).trimEnd()
+    expect(trimmed).not.toContain(WRAPPER_MARKER)
+    expect(trimmed).toContain(p.stateDir + '/statusline-wrapper.sh')
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: trimmed }))
+    const before = readFileSync(p.claudeSettings, 'utf8')
+    controller.calls.length = 0
+
+    await install({ paths: p, controller, script: writeGoodScript(dir) })
+
+    // Refused, not nested: settings.json is untouched, and launchd was
+    // never called a second time.
+    expect(readFileSync(p.claudeSettings, 'utf8')).toBe(before)
+    expect(controller.calls).toEqual([])
+  })
+
+  // C-1: an AMBIGUOUS wrap -- one that looks like some deckd wrapper but not
+  // the exact path this install would use, e.g. because DECKD_STATE_DIR
+  // changed since a prior install -- must refuse rather than nest one wrap
+  // inside another.
+  it('C-1: refuses to wrap a statusLine that already looks like a DIFFERENT deckd wrap', async () => {
+    const p = makeTestPaths(dir)
+    const otherWrap = wrapStatusLine(
+      "printf 'STATUS OK\\n'",
+      join(dir, 'some-other-state-dir', 'statusline-wrapper.sh'),
+      join(dir, 'some-other-state-dir'),
+    )
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: otherWrap.statusLine }))
+    const before = readFileSync(p.claudeSettings, 'utf8')
+
+    await expect(
+      install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) }),
+    ).rejects.toThrow(/already looks like a deckd wrap/)
+
+    // Refused, changing nothing: no wrapper copied, no plist written.
+    expect(readFileSync(p.claudeSettings, 'utf8')).toBe(before)
+    expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
+    expect(existsSync(p.launchAgent)).toBe(false)
+  })
+
+  // M-6: `install()` always runs `enforceDirModes` and the I-2 stray-file
+  // repair BEFORE reading settings.json, because the state directory is
+  // wanted regardless of whether settings.json turns out to be readable.
+  // So when settings.json cannot be parsed, the thrown message must not
+  // claim it changed nothing at all -- that would be false, since the
+  // state directory was just created and chmod'd. It must say so plainly.
+  it("M-6: the state directory is still created even when settings.json cannot be parsed, and the error says so", async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, '{ not valid json')
+
+    await expect(
+      install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) }),
+    ).rejects.toThrow(/already ran and is safe to keep/)
+
+    expect(existsSync(p.stateDir)).toBe(true)
+    expect(statSync(p.stateDir).mode & 0o777).toBe(0o700)
   })
 
   // C1, the critical finding. The old `readSettings()` swallowed every parse
@@ -877,6 +1027,73 @@ describe('install() and uninstall()', () => {
     expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(false)
   })
 
+  // C-1, THE critical finding's exact repro: the user (or an agent
+  // "cleaning up" the noisy trailing JSON) trims the `# deckd-wrapped {...}`
+  // comment. The statusline keeps working -- it is only a shell comment --
+  // so nothing signals anything changed. The OLD `isInstalled` was false
+  // afterward, so `uninstall` skipped the unwrap entirely and fell through
+  // to unlinking the wrapper AND the backup unconditionally, stranding
+  // settings.json pointing at a file it had just deleted, with the backup
+  // gone too. The fix must still recognise this as installed (by path,
+  // C-1), fall back to the backup to recover the original (since the
+  // embedded blob is unreadable with the marker gone), and only then
+  // delete the wrapper and the backup -- ending in the SAME safe state as
+  // an ordinary uninstall, not a stranded one.
+  it('C-1: uninstall still recovers and cleans up when the marker comment was trimmed off', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    const controller = fakeController()
+    await install({ paths: p, controller, script: writeGoodScript(dir) })
+    expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
+
+    const wrapped = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as { statusLine: string }
+    const markerAt = wrapped.statusLine.indexOf(WRAPPER_MARKER)
+    const trimmed = wrapped.statusLine.slice(0, markerAt).trimEnd()
+    expect(trimmed).not.toContain(WRAPPER_MARKER)
+    expect(trimmed).toContain(p.stateDir + '/statusline-wrapper.sh')
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: trimmed }))
+
+    await uninstall({ paths: p, controller })
+
+    const settings = JSON.parse(readFileSync(p.claudeSettings, 'utf8'))
+    // Recovered from the backup, since the embedded blob is gone with the
+    // marker -- NOT left as the still-wrapped `trimmed` command, which is
+    // what the old bug would have done (by never touching settings.json
+    // at all after concluding, wrongly, that nothing was installed).
+    expect(settings.statusLine).toBe("printf 'STATUS OK\\n'")
+    expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
+    expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(false)
+  })
+
+  // I-4: when recovery source is 'none' -- the embedded blob is unreadable
+  // AND the backup itself will not parse -- the backup file is very likely
+  // the last legible copy of the original left anywhere. Deleting it
+  // destroys exactly what a person could otherwise have recovered by eye.
+  it("I-4: uninstall keeps the backup when it could not recover anything (source: 'none')", async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    const controller = fakeController()
+    await install({ paths: p, controller, script: writeGoodScript(dir) })
+
+    const wrapped = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as { statusLine: string }
+    const markerAt = wrapped.statusLine.indexOf(WRAPPER_MARKER)
+    const trimmed = wrapped.statusLine.slice(0, markerAt).trimEnd()
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: trimmed }))
+    // Corrupt the backup too, so recovery has nowhere left to fall back to.
+    writeFileSync(`${p.claudeSettings}.deckd-backup`, 'not valid json at all')
+
+    await uninstall({ paths: p, controller })
+
+    const settings = JSON.parse(readFileSync(p.claudeSettings, 'utf8'))
+    expect(settings.statusLine).toBeUndefined()
+    expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
+    // The old bug: this file was deleted unconditionally, even here --
+    // destroying the last legible copy of the original statusLine, which a
+    // person could still have read by eye even though `JSON.parse` failed.
+    expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
+    expect(readFileSync(`${p.claudeSettings}.deckd-backup`, 'utf8')).toBe('not valid json at all')
+  })
+
   // Finding I2. The old probe ran with no DECKD_STATE_DIR override, so it
   // cached fabricated usage straight into the live sessions directory.
   it("I2: install never writes probe data into the real sessions directory", async () => {
@@ -919,6 +1136,48 @@ describe('install() and uninstall()', () => {
     await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
 
     expect(statSync(`${p.claudeSettings}.deckd-backup`).mode & 0o777).toBe(0o600)
+  })
+
+  // I-6: the test above passes even with install's own `chmodSync(backup,
+  // ...)` line deleted, because on this platform `copyFileSync` already
+  // copies the SOURCE's mode onto an existing destination -- the premise
+  // "copyFileSync keeps an EXISTING destination's mode" the old comment
+  // stated is false here, so the explicit chmodSync was a no-op the whole
+  // time and nothing would notice if it regressed. This test forces the
+  // discriminating case directly: it makes `copyFileSync` behave as if it
+  // preserved the destination's stale mode (by re-loosening it right after
+  // the real copy runs, simulating the platform the original comment
+  // assumed), so the assertion can only pass if install's own explicit
+  // `chmodSync` call actually runs afterward and corrects it.
+  it('I6: an explicit chmodSync call forces the backup mode, independent of what copyFileSync itself leaves behind', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }), { mode: 0o600 })
+    chmodSync(p.claudeSettings, 0o600)
+    const backupPath = `${p.claudeSettings}.deckd-backup`
+    writeFileSync(backupPath, '{"stale":true}', { mode: 0o644 })
+    chmodSync(backupPath, 0o644)
+
+    const actual = actualRef.current!
+    const copyMock = vi.mocked(fsModule.copyFileSync)
+    copyMock.mockImplementation((...args: Parameters<typeof fsModule.copyFileSync>) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = (actual.copyFileSync as any)(...args)
+      if (String(args[1]) === backupPath) {
+        // Simulate a platform where copyFileSync does NOT touch an
+        // existing destination's mode: force it back to the stale 0644
+        // right after the real copy, so only install's own explicit
+        // chmodSync call (not copyFileSync itself) can correct it.
+        actual.chmodSync(backupPath, 0o644)
+      }
+      return result
+    })
+    try {
+      await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+    } finally {
+      copyMock.mockImplementation(actual.copyFileSync)
+    }
+
+    expect(statSync(backupPath).mode & 0o777).toBe(0o600)
   })
 
   // Finding I4. Presence of a plist file is not the same as the agent
@@ -985,6 +1244,53 @@ describe('install() and uninstall()', () => {
       expect(readFileSync(p.claudeSettings, 'utf8')).toBe(original)
       expect(existsSync(p.launchAgent)).toBe(false)
     })
+
+    // I-1: a failed restore must stop rollback immediately, not get logged
+    // and skipped over. The old code pushed the failure onto
+    // `rollbackErrors` and kept going -- so a failed settings.json restore
+    // did not stop the loop from reaching the wrapper's own snapshot next
+    // (content `null`, since the wrapper did not exist before this
+    // install) and unlinking it. Result: settings.json left exactly as the
+    // sabotage below leaves it -- still referencing a wrapper the old
+    // rollback had just deleted. This sabotages the settings.json restore
+    // itself (by replacing it with a directory right when `bootstrap`
+    // fails, so `renameSync` inside `restoreFile` cannot succeed) and
+    // proves the fixed rollback stops there rather than reaching the
+    // wrapper or the backup snapshots that come after it in the reversed
+    // order.
+    it('I-1: stops rollback immediately on a failed restore, so no later snapshot is deleted', async () => {
+      const p = makeTestPaths(dir)
+      writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+      let bootstrapCalls = 0
+      const controller: LaunchAgentController = {
+        async isLoaded() { return false },
+        async bootout() {},
+        async bootstrap() {
+          bootstrapCalls += 1
+          if (bootstrapCalls === 1) {
+            // Sabotage the settings.json restore: replace it with a
+            // directory, so `restoreFile`'s `renameSync(tmp, file)` fails.
+            // This models a real failure (permissions, a full disk, a
+            // concurrent process) without needing one to actually occur.
+            unlinkSync(p.claudeSettings)
+            mkdirSync(p.claudeSettings)
+            throw new Error('simulated bootstrap failure')
+          }
+        },
+      }
+
+      await expect(
+        install({ paths: p, controller, script: writeGoodScript(dir) }),
+      ).rejects.toThrow(/could not restore/)
+
+      // Snapshot order is [wrapperDst, backup, claudeSettings, launchAgent],
+      // restored REVERSED: launchAgent, then claudeSettings (which fails
+      // here), then backup, then wrapperDst. Stopping the instant
+      // claudeSettings fails to restore must leave backup and wrapperDst
+      // exactly as the forward pass left them -- neither was reached.
+      expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(true)
+      expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
+    })
   })
 })
 
@@ -1025,5 +1331,74 @@ describe('refreshWrapper', () => {
       readFileSync(join(process.cwd(), 'src/install/statusline-wrapper.sh'), 'utf8'),
     )
     expect(readFileSync(p.claudeSettings, 'utf8')).toBe(settingsBefore)
+  })
+
+  // I-2: `settings.statusLine` here is already the WRAPPED command, unlike
+  // in `install()`. The old code passed it to `wrapStatusLine` as if it
+  // were the pristine original, so the probe's "before" ran the entire
+  // installed command directly -- reading the LIVE `DECKD_STATE_DIR` baked
+  // into it by a prior install -- and cached fabricated usage and a probe
+  // session file straight into the live sessions directory, twice, with no
+  // cleanup. The fix recovers the true pre-wrap original first, so neither
+  // probe run ever touches the live directory at all.
+  it('I-2: never writes probe data into the live state directory', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+    expect(existsSync(join(p.sessionsDir, 'deckd-install-probe.json'))).toBe(false)
+    expect(existsSync(join(p.stateDir, 'usage.json'))).toBe(false)
+
+    await refreshWrapper({ paths: p })
+
+    expect(existsSync(join(p.sessionsDir, 'deckd-install-probe.json'))).toBe(false)
+    expect(existsSync(join(p.stateDir, 'usage.json'))).toBe(false)
+  })
+
+  // I-3: the live wrapper script must be replaced atomically -- a temp file
+  // written in the same directory, then renamed -- never truncated and
+  // streamed into in place. `copyFileSync` does the latter, so a render
+  // that `exec`s the file mid-copy would run a truncated script.
+  it('I-3: replaces the wrapper via a temp file and a rename, never by truncating it in place', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+    const wrapperPath = p.stateDir + '/statusline-wrapper.sh'
+
+    const renameMock = vi.mocked(fsModule.renameSync)
+    renameMock.mockClear()
+
+    await refreshWrapper({ paths: p })
+
+    const wrapperRenames = renameMock.mock.calls.filter(([, dest]) => String(dest) === wrapperPath)
+    expect(wrapperRenames.length).toBeGreaterThanOrEqual(1)
+    for (const [src] of wrapperRenames) {
+      // The source of the rename is a DISTINCT temp file, never the
+      // destination path itself -- proof this went through a temp-file
+      // swap, not an in-place write.
+      expect(String(src)).not.toBe(wrapperPath)
+      expect(String(src)).toContain('.tmp')
+    }
+  })
+
+  // C-1's "if ambiguous, refuse" rule, applied to refreshWrapper: if the
+  // original command cannot be recovered from the installed wrap (the
+  // marker is gone and there is no way to prove what the wrapper should
+  // reproduce), refuse outright rather than guess at what to re-verify
+  // against.
+  it('refuses to refresh when the installed wrap cannot be unwrapped, and changes nothing', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+    const wrapperPath = p.stateDir + '/statusline-wrapper.sh'
+    const wrapperBefore = readFileSync(wrapperPath, 'utf8')
+
+    const wrapped = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as { statusLine: string }
+    const markerAt = wrapped.statusLine.indexOf(WRAPPER_MARKER)
+    const trimmed = wrapped.statusLine.slice(0, markerAt).trimEnd()
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: trimmed }))
+
+    await expect(refreshWrapper({ paths: p })).rejects.toThrow(/could not recover the original/)
+
+    expect(readFileSync(wrapperPath, 'utf8')).toBe(wrapperBefore)
   })
 })

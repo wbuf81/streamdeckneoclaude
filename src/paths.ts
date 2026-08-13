@@ -11,12 +11,28 @@ import { mkdirSync, chmodSync } from 'node:fs'
  * unrelated to what the person setting it intended. Reject it outright and
  * fall back to the default, rather than caching into the wrong directory.
  */
+/**
+ * M-4: `DECKD_STATE_DIR=$HOME` is a footgun worth rejecting outright, even
+ * though it cannot weaken a mode (`enforceDirModes` always forces 0700, and
+ * a mode cannot go looser than what it already was set to). It is
+ * dangerous anyway: it would `chmod 700` the home directory itself, create
+ * `~/sessions` and `~/art` directly inside it, make `deckd uninstall`
+ * unlink `~/statusline-wrapper.sh`, and make the render-time wrapper
+ * `chmod 700 $HOME` on every single render.
+ */
 function resolveStateDir(home: string, stateOverride?: string): string {
   const fallback = join(home, '.local', 'state', 'deckd')
   if (!stateOverride) return fallback
   if (!isAbsolute(stateOverride)) {
     console.error(
       `DECKD_STATE_DIR must be an absolute path; ignoring relative value ` +
+        `${JSON.stringify(stateOverride)} and using ${fallback} instead.`,
+    )
+    return fallback
+  }
+  if (stateOverride === home) {
+    console.error(
+      `DECKD_STATE_DIR must not be the home directory itself; ignoring ` +
         `${JSON.stringify(stateOverride)} and using ${fallback} instead.`,
     )
     return fallback

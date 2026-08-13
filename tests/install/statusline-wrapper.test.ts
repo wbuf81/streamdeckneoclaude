@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync, readdirSync } from 'node:fs'
+import {
+  mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync, readdirSync,
+  mkdirSync, statSync, utimesSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -194,5 +197,75 @@ describe('statusline-wrapper.sh', () => {
     // concurrent run.
     expect(readdirSync(dir).filter((name) => name.startsWith('.'))).toEqual([])
     expect(readdirSync(join(dir, 'sessions')).filter((name) => name.startsWith('.'))).toEqual([])
+  })
+
+  // I-8 / claim 6: this was previously verified only by hand (the review's
+  // "Verified by experiment" section), never by an automated test. An
+  // already-loose state directory (from a manual delete-and-recreate, or a
+  // fresh machine where a render happens before the daemon ever runs) must
+  // be forced to 0700 on the very next render, not merely created at 0700
+  // the first time.
+  it('claim 6: forces an already-loose state directory back to 0700', () => {
+    chmodSync(dir, 0o755)
+    mkdirSync(join(dir, 'sessions'), { recursive: true })
+    chmodSync(join(dir, 'sessions'), 0o755)
+
+    run()
+
+    expect(statSync(dir).mode & 0o777).toBe(0o700)
+    expect(statSync(join(dir, 'sessions')).mode & 0o777).toBe(0o700)
+  })
+
+  // M-1 / I-8: the prune used to match only `-name '*.json'`, which cannot
+  // match this script's own `mktemp` leftovers -- `.<sid>.json.XXXXXX` --
+  // because they do not END in `.json`. A leftover from a `SIGKILL`'d
+  // render (the one signal that cannot be trapped) survived every prune
+  // forever before this fix. This proves the fixed pattern actually
+  // catches that exact shape, not just an ordinary `sid.json` file.
+  it('M-1: prunes its own week-old mktemp leftovers, not just real session files', () => {
+    mkdirSync(join(dir, 'sessions'), { recursive: true })
+    const leftover = join(dir, 'sessions', '.old-leftover.json.AbCdEf')
+    writeFileSync(leftover, '{}')
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000)
+    utimesSync(leftover, eightDaysAgo, eightDaysAgo)
+    // A real, RECENT session file must survive -- this is a targeted
+    // prune, not a directory wipe.
+    const recentSession = join(dir, 'sessions', 'kept-session.json')
+    writeFileSync(recentSession, '{}')
+
+    run()
+
+    expect(existsSync(leftover)).toBe(false)
+    expect(existsSync(recentSession)).toBe(true)
+  })
+
+  // M-3 / I-8: a signal that kills the wrapper must reach the inner command
+  // too, instead of leaving it orphaned and running for its full duration.
+  // Measured before this fix: a `SIGTERM` sent while a slow inner command
+  // was still running left the wrapper's cleanup deferred until the inner
+  // process exited on its own, minutes later for a real hung render.
+  it('M-3: forwards a killing signal to the inner command instead of leaving it orphaned', async () => {
+    const child = spawn('/bin/sh', [WRAPPER], {
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: 'sleep 20' },
+    })
+    child.stdin.end(PAYLOAD)
+
+    // Give the wrapper a moment to actually be running the inner command,
+    // standing in for Claude Code timing out and killing a slow render.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const start = Date.now()
+    child.kill('SIGTERM')
+
+    const code: number | null = await new Promise((resolve) => {
+      child.on('close', (c) => resolve(c))
+    })
+    const elapsedMs = Date.now() - start
+
+    // Before the fix, the wrapper's own trap did not run until the inner
+    // `sleep 20` finished on its own -- so this would take ~20 seconds
+    // regardless of when the signal arrived. Exiting promptly is only
+    // possible if the signal was actually forwarded to the inner process.
+    expect(elapsedMs).toBeLessThan(5000)
+    expect(code).toBe(143)
   })
 })
