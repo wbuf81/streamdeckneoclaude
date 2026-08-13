@@ -334,7 +334,7 @@ describe('runAuthFlow', () => {
           // all, so there is nothing to defer the close on.
           order.push('ended-without-callback')
         }
-        return (originalEnd as unknown as (...a: unknown[]) => unknown).apply(this, args)
+        return (originalEnd as unknown as (...a: unknown[]) => ServerResponse).apply(this, args)
       })
     const closeSpy = vi
       .spyOn(Server.prototype, 'closeAllConnections')
@@ -388,7 +388,7 @@ describe('runAuthFlow', () => {
         // Simulates Node never invoking the flush callback at all -- the
         // exact condition the review measured with a destroyed-socket probe.
         const withoutCallback = args.filter((a) => typeof a !== 'function')
-        return (originalEnd as unknown as (...a: unknown[]) => unknown).apply(this, withoutCallback)
+        return (originalEnd as unknown as (...a: unknown[]) => ServerResponse).apply(this, withoutCallback)
       })
 
     try {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   mkdtempSync, writeFileSync, readFileSync, chmodSync, statSync, rmSync,
-  existsSync, unlinkSync, mkdirSync,
+  existsSync, unlinkSync, mkdirSync, renameSync,
 } from 'node:fs'
 import * as fsModule from 'node:fs'
 import { tmpdir } from 'node:os'
