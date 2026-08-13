@@ -584,10 +584,26 @@ export class CodexSource extends EventEmitter {
     this.visible = visible
     if (this.stopped) return
     if (visible) {
-      void this.refresh().then(() => this.schedule())
+      void this.refreshAndSchedule()
     } else if (this.timer) {
       clearInterval(this.timer)
       this.timer = null
+    }
+  }
+
+  /** M4: `refresh()` should not reject in practice — `doRefresh` already
+   * catches its own failures — but if it ever did, the un-awaited
+   * `.then(() => this.schedule())` this replaces would silently drop the
+   * rejection AND skip `schedule()`, so the recurring `setInterval` this
+   * source relies on would never even get armed. A stray failure is logged
+   * rather than swallowed, and `schedule()` still runs via `finally`. */
+  private async refreshAndSchedule(): Promise<void> {
+    try {
+      await this.refresh()
+    } catch (e) {
+      log.once('codex-refresh-unexpected', `Codex refresh failed unexpectedly: ${String(e)}`)
+    } finally {
+      this.schedule()
     }
   }
 

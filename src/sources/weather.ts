@@ -336,8 +336,14 @@ function checkIdentitiesUnique(days: readonly DayForecast[]): void {
   for (const d of days) {
     if (d.id === '') continue
     if (seen.has(d.id)) {
+      // M8: one fixed key for every collision, not one embedding the
+      // colliding id. The id is a date, so a key built from it grows without
+      // bound over the process life (`createLogger`'s `seen` set is
+      // unbounded) — every other `log.once` key in the family is either
+      // fixed or bounded by the eight symbols. The id itself still appears
+      // in the MESSAGE, just not in the key that gates repetition.
       log.once(
-        `weather-day-identity-collision-${d.id}`,
+        'weather-day-identity-collision',
         `Two day tiles resolved to the same identity (${d.id}); the day tile is unreliable this poll.`,
       )
       continue
@@ -452,15 +458,37 @@ export class WeatherSource extends EventEmitter {
   }
 
   /** Called when the weather page becomes visible. It refreshes at once and
-   * starts the poll loop. */
+   * starts the poll loop. I5: a source that has already been `stop()`ped
+   * stays stopped — this never clears `stopped`, so a stray
+   * `setVisible(true)` after shutdown cannot restart polling. Matches
+   * `CodexSource`, the one sibling that already made `stopped` a one-way
+   * latch. */
   setVisible(visible: boolean): void {
     this.visible = visible
+    if (this.stopped) return
     if (visible) {
-      this.stopped = false
-      void this.refresh().then(() => this.schedule())
+      void this.refreshAndSchedule()
     } else if (this.timer) {
       clearTimeout(this.timer)
       this.timer = null
+    }
+  }
+
+  /** M4: `refresh()` should not reject in practice — every network step
+   * inside `doRefresh` already catches its own failure — but this loop runs
+   * on a `setTimeout` chain, not `setInterval`: an uncaught rejection here
+   * would silently stop `schedule()` from ever running again, unlike
+   * `CodexSource`'s `setInterval` (which keeps ticking on its own) or
+   * `SpotifySource.pollAndSchedule` (which already has this shape). A stray
+   * failure is logged rather than swallowed, and polling continues either
+   * way via the `finally`. */
+  private async refreshAndSchedule(): Promise<void> {
+    try {
+      await this.refresh()
+    } catch (e) {
+      log.once('weather-refresh-unexpected', `weather refresh failed unexpectedly: ${String(e)}`)
+    } finally {
+      this.schedule()
     }
   }
 
@@ -473,7 +501,7 @@ export class WeatherSource extends EventEmitter {
     if (this.timer) clearTimeout(this.timer)
     if (!this.visible) return
     this.timer = setTimeout(() => {
-      void this.refresh().then(() => this.schedule())
+      void this.refreshAndSchedule()
     }, POLL_MS)
   }
 

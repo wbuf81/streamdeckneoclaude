@@ -19,7 +19,13 @@ export interface Session {
   cwd: string
   termProgram: string
   pid: number
-  startedAt: number
+  /** Epoch seconds the session started, or null when absent or not a
+   * number. M1: this used to fabricate `0` (1970) for an absent field,
+   * defended only by `claude-page.ts`'s own truthy check (`newest.startedAt
+   * ? ... : ''`), which already tolerates null the same way it tolerated
+   * `0`. Moving the "is this real?" decision here, to the one place that
+   * reads the raw field, removes the fabrication at its source. */
+  startedAt: number | null
   ts: number
 }
 
@@ -53,7 +59,7 @@ export function parseSessionFile(json: string, now: number): Session | null {
     cwd: str(raw.cwd),
     termProgram: str(raw.term_program),
     pid: num(raw.pid),
-    startedAt: num(raw.startedAt),
+    startedAt: numOrNull(raw.startedAt),
     ts,
   }
 }
@@ -64,6 +70,10 @@ function str(v: unknown): string {
 
 function num(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0
+}
+
+function numOrNull(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
 }
 
 /**

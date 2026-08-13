@@ -265,6 +265,19 @@ Measured locally on 2026-08-13:
   percentage) and forces that whole usage sample unknown, regardless of what its
   `resets_at` claims — an unparseable clock on the sample is reason enough to distrust
   the reading as a whole, not only its displayed time.
+- **M9 — the 256 KB cold-start tail cap (`COLD_START_TAIL_BYTES`) can under-report an
+  active task.** The cap itself is correct and necessary (see above: an unbounded first
+  read of a multi-megabyte rollout would block the event loop). The consequence is not
+  hypothetical and is recorded here rather than left implicit: a task whose
+  `task_started` line sits more than 256 KB back from the end of its rollout reads as
+  INACTIVE after a daemon restart, or the first time the Codex page opens for a rollout
+  it has not seen before, because the cold-start tail contains that task's later
+  `token_count` events but not its `task_started` line. `active` stays false, the task
+  never enters `tasks`, and the grid can show empty while Codex is genuinely working.
+  This fails closed, which is the right default, but the failure is silent from the
+  page's perspective — there is no "possibly more active tasks than shown" signal.
+  Widening the cap for this one case, or detecting "no lifecycle event found in a cold
+  tail" and reading further back, would close it; neither is implemented.
 
 ---
 
@@ -367,6 +380,30 @@ A second request, on the SAME keyless endpoint and the SAME `User-Agent`:
   shape, not a malformed response — the chart must render correctly with far
   fewer than 252 points too.
 
+### The four `meta` fields the source reads but this file never recorded
+
+`parseQuote` reads `meta.symbol`, `meta.shortName`, `meta.currency`, and
+`meta.regularMarketTime` — the last of these is the SOLE input to `Quote.asOf`,
+which both staleness checks depend on. Live probe, TSLA intraday, 2026-08-13,
+`User-Agent: Mozilla/5.0`:
+
+| Field | Type | Value |
+| --- | --- | --- |
+| `symbol` | string | `"TSLA"` |
+| `shortName` | string | `"Tesla, Inc."` |
+| `currency` | string | `"USD"` |
+| `regularMarketTime` | number | `1786651200` |
+| `marketState` | undefined | still absent, as already recorded above |
+
+All four assumptions hold. If `regularMarketTime` ever disappeared, `asOf`
+would silently pin to `0` on every symbol — and with `marketState` unknown,
+`isSymbolStale` now dims for that reason (see the "unknown" market-state
+handling), rather than treating it as a safe, non-stale reading.
+
+Also confirmed from the same body: `currentTradingPeriod.regular.end ===
+currentTradingPeriod.post.start === 1786651200`, so `within`'s `[start, end)`
+boundaries produce no gap at the pre/regular/post handover.
+
 ---
 
 ## Weather
@@ -399,6 +436,51 @@ US National Weather Service, **no API key**. **Rejects requests without a `User-
   row. The margin is thin enough that this line is passed to `renderKey` as a one-candidate
   array (`[11]`), not a bare `11`, so it is measured and `shrinkToFit`-protected rather than
   drawn unchecked — a bare `number` in `lineSizes` skips measuring entirely.
+
+### Four more `periods[]` fields, and the one assumption this file did not support
+
+`parseForecast` also reads `periods[].name`, `isDaytime`, `startTime` (the tile
+identity), and `temperature` — none previously recorded here. Live probe,
+`gridpoints/OKX/33,37/forecast`, 2026-08-13:
+
+```
+periods: 14
+distinct dates: 8
+keys: number,name,startTime,endTime,isDaytime,temperature,temperatureUnit,
+      temperatureTrend,probabilityOfPrecipitation,windSpeed,windDirection,
+      icon,shortForecast,detailedForecast
+temperatureUnit values: ["F"]
+isDaytime seq: NDNDNDNDNDNDND
+names[0..3]: ["Tonight","Friday","Friday Night","Saturday"]
+probabilityOfPrecipitation nulls: 0
+```
+
+8 distinct dates across 14 periods is the correct shape (a past fixture with 7
+days and 1 distinct date hid a Critical — see the day-identity tests). Tracing
+this body through `parseForecast`: `p0` is `Tonight` (night), so tile 0 is
+`2026-08-13:night`; the loop then pairs `Friday`/`Friday Night` into
+`2026-08-14:day`, and so on. No identity collides on real data.
+
+**The unsupported assumption, now flagged: `temperatureUnit` is never read.**
+`PeriodDetail.temperature` is documented as "Degrees Fahrenheit" and `tempOf`
+takes the number as-is with no unit check. The field exists on every period
+and is `"F"` today, but nothing in the source ties the two together — if NWS
+ever served Celsius for this office (the `/forecast?units=si` parameter
+already produces exactly that), the deck would draw the number as Fahrenheit
+with no error anywhere. This file records the assumption explicitly here
+rather than leaving it silent: `temperatureUnit` is assumed `"F"` and is not
+currently enforced in code.
+
+### Zippopotam's `latitude`/`longitude` are JSON strings, not numbers
+
+`parseZipBody` requires `typeof p.latitude === 'string'` (and the same for
+`longitude`) before calling `Number.parseFloat` — a numeric `40.7484` in the
+body would fail that check and return `null`. This file already recorded the
+resolved values (`40.7484, -73.9967`) but not their JSON type. If the service
+ever returned numbers instead of strings, `resolveZip` would return `null`
+forever, `coords` would never cache, and the weather page would stay
+permanently `empty` — recorded here so that failure mode is traceable to this
+exact assumption rather than treated as a mystery.
 
 ---
 

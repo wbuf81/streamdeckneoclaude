@@ -67,6 +67,17 @@ export function pickArtUrl(images: ImageLike[], minWidth: number): string | null
   return (sized.find((i) => i.width >= minWidth) ?? sized[sized.length - 1]!).url
 }
 
+/**
+ * M3: `trackId` is used to build a filename (`loadArt`'s `${trackId}.img`).
+ * `item.id` comes straight from a network response with no shape guarantee,
+ * so a value containing `/` or `..` could place that write outside
+ * `artDir`. Only `api.spotify.com` over TLS supplies it today, so this is
+ * not reachable in practice — but validating at THIS parse boundary makes
+ * it unreachable by construction rather than by trust in the caller.
+ * Spotify's real track ids are base62, well under this bound.
+ */
+const SAFE_TRACK_ID = /^[A-Za-z0-9]{1,64}$/
+
 /** Parses the `/me/player` body. Returns null for an empty body or no track. */
 export function parsePlayer(body: unknown): PlayerState | null {
   if (!body || typeof body !== 'object') return null
@@ -86,7 +97,7 @@ export function parsePlayer(body: unknown): PlayerState | null {
     album: typeof item.album?.name === 'string' ? item.album.name : '',
     positionMs: typeof b.progress_ms === 'number' ? b.progress_ms : 0,
     durationMs: typeof item.duration_ms === 'number' ? item.duration_ms : 0,
-    trackId: typeof item.id === 'string' ? item.id : '',
+    trackId: typeof item.id === 'string' && SAFE_TRACK_ID.test(item.id) ? item.id : '',
     artUrl: pickArtUrl(images, ART_MIN_WIDTH),
     shuffle: b.shuffle_state === true,
     repeat,
@@ -188,11 +199,15 @@ export class SpotifySource extends EventEmitter {
     return this.retryAfter
   }
 
-  /** Called when the Spotify page becomes visible. It starts the poll loop. */
+  /** Called when the Spotify page becomes visible. It starts the poll loop.
+   * I5: a source that has already been `stop()`ped stays stopped — this
+   * never clears `stopped`, so a stray `setVisible(true)` after shutdown
+   * cannot restart polling. Matches `CodexSource`, the one sibling that
+   * already made `stopped` a one-way latch. */
   setVisible(visible: boolean): void {
     this.visible = visible
+    if (this.stopped) return
     if (visible) {
-      this.stopped = false
       void this.pollAndSchedule()
     } else if (this.timer) {
       clearTimeout(this.timer)

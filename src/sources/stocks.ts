@@ -378,15 +378,37 @@ export class StockSource extends EventEmitter {
   }
 
   /** Called when the stocks page becomes visible. It refreshes at once and
-   * starts the poll loop. */
+   * starts the poll loop. I5: a source that has already been `stop()`ped
+   * stays stopped — this never clears `stopped`, so a stray
+   * `setVisible(true)` after shutdown cannot restart polling. Matches
+   * `CodexSource`, the one sibling that already made `stopped` a one-way
+   * latch. */
   setVisible(visible: boolean): void {
     this.visible = visible
+    if (this.stopped) return
     if (visible) {
-      this.stopped = false
-      void this.refresh().then(() => this.schedule())
+      void this.refreshAndSchedule()
     } else if (this.timer) {
       clearTimeout(this.timer)
       this.timer = null
+    }
+  }
+
+  /** M4: `refresh()` should not reject in practice — every network step
+   * inside `doRefresh` already catches its own failure — but this loop runs
+   * on a `setTimeout` chain, not `setInterval`: an uncaught rejection here
+   * would silently stop `schedule()` from ever running again, unlike
+   * `CodexSource`'s `setInterval` (which keeps ticking on its own) or
+   * `SpotifySource.pollAndSchedule` (which already has this shape). A stray
+   * failure is logged rather than swallowed, and polling continues either
+   * way via the `finally`. */
+  private async refreshAndSchedule(): Promise<void> {
+    try {
+      await this.refresh()
+    } catch (e) {
+      log.once('stocks-refresh-unexpected', `stock refresh failed unexpectedly: ${String(e)}`)
+    } finally {
+      this.schedule()
     }
   }
 
@@ -415,7 +437,7 @@ export class StockSource extends EventEmitter {
     if (!this.visible) return
     const delay = this.marketState === 'open' ? POLL_OPEN_MS : POLL_CLOSED_MS
     this.timer = setTimeout(() => {
-      void this.refresh().then(() => this.schedule())
+      void this.refreshAndSchedule()
     }, delay)
   }
 
@@ -578,6 +600,14 @@ export class StockSource extends EventEmitter {
       this.failYearly(symbol)
       return
     }
+    // M5: each key clears immediately after the step it belongs to passes —
+    // matching `fetchOne`'s own pattern — rather than being bundled after a
+    // LATER check. The bundled form left `stocks-yearly-network` cleared
+    // only once `!res.ok` also passed, so a persistent HTTP error (which
+    // never reaches that line) left the NETWORK key permanently marked
+    // "seen" from any earlier network failure, and a later genuine network
+    // failure would then log nothing at all.
+    log.clearOnce(`stocks-yearly-network-${symbol}`)
     if (this.stopped) return
 
     if (!res.ok) {
@@ -588,7 +618,6 @@ export class StockSource extends EventEmitter {
       this.failYearly(symbol)
       return
     }
-    log.clearOnce(`stocks-yearly-network-${symbol}`)
     log.clearOnce(`stocks-yearly-http-${symbol}`)
 
     let body: unknown
@@ -599,6 +628,11 @@ export class StockSource extends EventEmitter {
       this.failYearly(symbol)
       return
     }
+    // Same fix as the network key above: this used to clear only after the
+    // `values.length < 2` check further down also passed, so a body that
+    // PARSED fine but carried too short a series left the JSON key
+    // permanently "seen" from any earlier JSON failure.
+    log.clearOnce(`stocks-yearly-json-${symbol}`)
     if (this.stopped) return
 
     // M4: `doFetchYearly` used to cache whatever came back purely under the
@@ -625,7 +659,6 @@ export class StockSource extends EventEmitter {
       this.failYearly(symbol)
       return
     }
-    log.clearOnce(`stocks-yearly-json-${symbol}`)
     log.clearOnce(`stocks-yearly-parse-${symbol}`)
 
     this.yearly.set(symbol, { status: 'ok', values, updatedAt: this.now() })

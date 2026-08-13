@@ -6,6 +6,7 @@ import {
   shortDayLabel,
   parseForecast,
 } from '../../src/sources/weather.js'
+import { log, setDefaultSink } from '../../src/log.js'
 
 const NOW = 1_755_000_000
 const FORECAST_URL = 'https://api.weather.gov/gridpoints/OKX/33,37/forecast'
@@ -438,6 +439,40 @@ describe('parseForecast', () => {
     ]
     expect(() => parseForecast(forecastBody(periods), NOW)).not.toThrow()
   })
+
+  // M8 — the collision log key used to embed the colliding id (a date), so
+  // it grew without bound over the process life: a DIFFERENT colliding date
+  // on a later poll got its OWN key and logged again, forever, one entry
+  // per distinct date. Break the fix (put the id back into the key) and
+  // this fails: two DIFFERENT colliding dates, on two separate calls,
+  // would produce two log lines instead of one.
+  it('uses one fixed log key for every collision, not one per colliding date', () => {
+    log.clearOnce('weather-day-identity-collision')
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    try {
+      const firstCollision = [
+        period({ name: 'Thursday', isDaytime: true, startTime: dayStart('2026-08-14') }),
+        period({ name: 'Thursday Night', isDaytime: false, startTime: nightStart('2026-08-14') }),
+        period({ name: 'Friday', isDaytime: true, startTime: dayStart('2026-08-14') }),
+      ]
+      parseForecast(forecastBody(firstCollision), NOW)
+
+      // A different colliding date, on what would be a later poll.
+      const secondCollision = [
+        period({ name: 'Monday', isDaytime: true, startTime: dayStart('2026-09-01') }),
+        period({ name: 'Monday Night', isDaytime: false, startTime: nightStart('2026-09-01') }),
+        period({ name: 'Tuesday', isDaytime: true, startTime: dayStart('2026-09-01') }),
+      ]
+      parseForecast(forecastBody(secondCollision), NOW)
+
+      const collisionLines = lines.filter((l) => l.includes('resolved to the same identity'))
+      expect(collisionLines).toHaveLength(1)
+    } finally {
+      setDefaultSink(() => {})
+      log.clearOnce('weather-day-identity-collision')
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -744,6 +779,48 @@ describe('WeatherSource', () => {
     expect(calls.forecast).toBe(2)
 
     await src.stop()
+  })
+
+  // I5 — `stopped` is a one-way latch, matching `CodexSource`: once `stop()`
+  // has run, a later `setVisible(true)` must not resurrect polling. Break
+  // the fix (restore `this.stopped = false` inside the `visible` branch) and
+  // this fails.
+  it('does not restart polling when setVisible(true) is called after stop()', async () => {
+    vi.useFakeTimers()
+    const { fetchFn, calls } = build()
+    const src = new WeatherSource(ZIP, fetchFn as never, () => NOW)
+    src.setVisible(true)
+    await vi.advanceTimersByTimeAsync(0)
+    const callsBeforeStop = calls.forecast
+    await src.stop()
+    src.setVisible(true) // must be a no-op: the source is permanently stopped.
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000)
+    expect(calls.forecast).toBe(callsBeforeStop)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  // M4 — the poll chain used `void this.refresh().then(() => this.schedule())`
+  // with no `.catch`. `refresh()` should not reject in practice, but this
+  // loop runs on a `setTimeout` chain: a single rejection would silently
+  // stop `schedule()` from ever running again. Break the fix (revert to the
+  // bare `.then` chain) and this fails — polling stops permanently after
+  // the injected rejection.
+  it('keeps polling after a refresh rejects unexpectedly', async () => {
+    vi.useFakeTimers()
+    const { fetchFn, calls } = build()
+    const src = new WeatherSource(ZIP, fetchFn as never, () => NOW)
+    try {
+      src.setVisible(true)
+      await vi.advanceTimersByTimeAsync(0)
+      const refreshSpy = vi.spyOn(src, 'refresh').mockRejectedValueOnce(new Error('boom'))
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000) // POLL_MS, not exported.
+      refreshSpy.mockRestore()
+      const callsAfterRejection = calls.forecast
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(calls.forecast).toBeGreaterThan(callsAfterRejection)
+    } finally {
+      await src.stop()
+    }
   })
 })
 

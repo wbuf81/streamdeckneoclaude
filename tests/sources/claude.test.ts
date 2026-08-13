@@ -72,6 +72,17 @@ describe('parseSessionFile', () => {
   it('defaults a missing project to a dash', () => {
     expect(parseSessionFile(fileFor({ project: undefined }), NOW)!.project).toBe('—')
   })
+
+  // M1 — `startedAt` used to fabricate `0` (1970) for an absent field.
+  // Break the fix (revert to `num()`) and this fails, receiving `0` instead
+  // of `null`.
+  it('reports startedAt as null, never a fabricated 0, when the field is absent', () => {
+    expect(parseSessionFile(fileFor({ startedAt: undefined }), NOW)!.startedAt).toBeNull()
+  })
+
+  it('reports startedAt as null for a non-numeric value', () => {
+    expect(parseSessionFile(fileFor({ startedAt: 'nope' }), NOW)!.startedAt).toBeNull()
+  })
 })
 
 describe('ClaudeSource', () => {

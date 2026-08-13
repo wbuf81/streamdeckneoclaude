@@ -693,6 +693,33 @@ describe('CodexSource', () => {
     }
   })
 
+  // M4 — `setVisible(true)` used `void this.refresh().then(() => this.schedule())`
+  // with no `.catch`. If `refresh()` ever rejected, `schedule()` would never
+  // run and the recurring `setInterval` this source relies on would never
+  // even get armed. Break the fix (revert to the bare `.then` chain) and
+  // this fails — no further poll ever happens after the injected rejection.
+  it('keeps polling after a refresh rejects unexpectedly', async () => {
+    vi.useFakeTimers()
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const sqlite = vi.fn(async () => ok(''))
+    const source = new CodexSource(database, sqlite, () => fixedRead(''), () => 500)
+    try {
+      const refreshSpy = vi.spyOn(source, 'refresh').mockRejectedValueOnce(new Error('boom'))
+      source.setVisible(true)
+      await vi.advanceTimersByTimeAsync(0)
+      refreshSpy.mockRestore()
+      const callsAfterRejection = sqlite.mock.calls.length
+      await vi.advanceTimersByTimeAsync(5000) // POLL_MS, not exported.
+      expect(sqlite.mock.calls.length).toBeGreaterThan(callsAfterRejection)
+    } finally {
+      await source.stop()
+      vi.useRealTimers()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   // I4 — Codex dies mid-task: no task_complete line is ever appended, so the
   // rollout alone would say `active` forever. The thread's own updated_at_ms
   // stops moving at the same moment, and that is what this guard reads.

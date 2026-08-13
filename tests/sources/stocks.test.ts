@@ -7,6 +7,7 @@ import {
   downsample,
   YEARLY_REFRESH_SECONDS,
 } from '../../src/sources/stocks.js'
+import { log, setDefaultSink } from '../../src/log.js'
 
 const NOW = 1_755_000_000
 
@@ -465,6 +466,25 @@ describe('StockSource', () => {
     await src.stop()
   })
 
+  // I5 — `stopped` is a one-way latch, matching `CodexSource`: once `stop()`
+  // has run, a later `setVisible(true)` must not resurrect polling. Break
+  // the fix (restore `this.stopped = false` inside the `visible` branch) and
+  // this fails.
+  it('does not restart polling when setVisible(true) is called after stop()', async () => {
+    vi.useFakeTimers()
+    const body = chartBody({}, { symbol: 'AAA' })
+    const { fetchFn } = build({ AAA: body, BBB: body })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.setVisible(true)
+    await vi.advanceTimersByTimeAsync(0)
+    const callsBeforeStop = fetchFn.mock.calls.length
+    await src.stop()
+    src.setVisible(true) // must be a no-op: the source is permanently stopped.
+    await vi.advanceTimersByTimeAsync(20 * 60 * 1000)
+    expect(fetchFn.mock.calls.length).toBe(callsBeforeStop)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('is per-symbol stale when the market is open and the quote is older than 15 minutes', async () => {
     const body = chartBody({}, { symbol: 'AAA', regularMarketTime: NOW - 20 * 60 })
     const { fetchFn } = build({ AAA: body, BBB: body })
@@ -588,6 +608,33 @@ describe('StockSource', () => {
     await src.refresh()
     expect(src.getMarketState()).toBe('open')
     expect(src.isSymbolStale('ZZZ')).toBe(false)
+  })
+
+  // M4 — the poll chain used `void this.refresh().then(() => this.schedule())`
+  // with no `.catch`. `refresh()` should not reject in practice, but this
+  // loop runs on a `setTimeout` chain: a single rejection would silently
+  // stop `schedule()` from ever running again, unlike codex's
+  // `setInterval`. Break the fix (revert to the bare `.then` chain) and
+  // this fails — polling stops permanently after the injected rejection.
+  it('keeps polling after a refresh rejects unexpectedly', async () => {
+    vi.useFakeTimers()
+    const body = chartBody({}, { symbol: 'AAA' })
+    const { fetchFn } = build({ AAA: body, BBB: body })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    try {
+      src.setVisible(true)
+      await vi.advanceTimersByTimeAsync(0)
+      const refreshSpy = vi.spyOn(src, 'refresh').mockRejectedValueOnce(new Error('boom'))
+      // Force the next scheduled tick to hit the rejecting refresh.
+      await vi.advanceTimersByTimeAsync(60_000) // POLL_OPEN_MS, not exported.
+      refreshSpy.mockRestore()
+      const callsAfterRejection = fetchFn.mock.calls.length
+      // If polling died, no further scheduled call ever happens.
+      await vi.advanceTimersByTimeAsync(60_000) // POLL_OPEN_MS, not exported.
+      expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterRejection)
+    } finally {
+      await src.stop()
+    }
   })
 })
 
@@ -795,6 +842,104 @@ describe('StockSource yearly series (the detail chart\'s 52-week data)', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(fetchFn).toHaveBeenCalledTimes(2)
+  })
+
+  // M5 — `stocks-yearly-network` used to clear only after the LATER
+  // `!res.ok` check also passed, so a persistent HTTP error (which never
+  // reaches that line) left the network key permanently "seen" from an
+  // earlier network failure — a later genuine network failure then logged
+  // nothing. Break the fix (bundle the clear back after the http check) and
+  // this fails: the third attempt's log line never appears.
+  it('logs a network failure again after an intervening HTTP failure, not just the first time (M5)', async () => {
+    // Guards against a dedup key left "seen" by another test earlier in
+    // this file's shared `log` instance.
+    log.clearOnce('stocks-yearly-network-AAA')
+    log.clearOnce('stocks-yearly-http-AAA')
+    let now = NOW
+    let mode: 'network' | 'http' | 'network2' = 'network'
+    const fetchFn = vi.fn(async () => {
+      if (mode === 'http') return { ok: false, status: 500, json: async () => ({}) }
+      throw new Error('ENOTFOUND')
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => now)
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    try {
+      src.requestYearly('AAA') // 1: network failure — logs.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+
+      now += 6 * 60
+      mode = 'http'
+      src.requestYearly('AAA') // 2: HTTP failure — must not clear the network key incorrectly.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+
+      now += 6 * 60
+      mode = 'network2'
+      src.requestYearly('AAA') // 3: network failure again — must log again.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+
+      const networkLines = lines.filter((l) => l.includes('Yearly fetch for AAA failed:'))
+      expect(networkLines).toHaveLength(2) // attempts 1 and 3, not swallowed by attempt 2.
+    } finally {
+      setDefaultSink(() => {})
+      log.clearOnce('stocks-yearly-network-AAA')
+      log.clearOnce('stocks-yearly-http-AAA')
+    }
+  })
+
+  // M5's other half — `stocks-yearly-json` used to clear only after the
+  // LATER `values.length < 2` check also passed, so a body that parsed but
+  // carried too short a series left the JSON key permanently "seen" from an
+  // earlier JSON failure. Break the fix and the third attempt's log line
+  // never appears.
+  it('logs a JSON failure again after an intervening too-short series, not just the first time (M5)', async () => {
+    // Guards against a dedup key left "seen" by another test earlier in
+    // this file's shared `log` instance.
+    log.clearOnce('stocks-yearly-json-AAA')
+    log.clearOnce('stocks-yearly-parse-AAA')
+    let now = NOW
+    let mode: 'json' | 'short' | 'json2' = 'json'
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        if (mode === 'short') {
+          // A body that parses fine but carries too short a series (fewer
+          // than 2 closes) to be a usable yearly series.
+          return {
+            chart: {
+              result: [{ meta: { symbol: 'AAA' }, indicators: { quote: [{ close: [123] }] } }],
+              error: null,
+            },
+          }
+        }
+        throw new Error('bad json')
+      },
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => now)
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    try {
+      src.requestYearly('AAA') // 1: JSON failure — logs.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+
+      now += 6 * 60
+      mode = 'short'
+      src.requestYearly('AAA') // 2: parses, but too short a series.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+
+      now += 6 * 60
+      mode = 'json2'
+      src.requestYearly('AAA') // 3: JSON failure again — must log again.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+
+      const jsonLines = lines.filter((l) => l.includes('is not valid JSON'))
+      expect(jsonLines).toHaveLength(2) // attempts 1 and 3, not swallowed by attempt 2.
+    } finally {
+      setDefaultSink(() => {})
+      log.clearOnce('stocks-yearly-json-AAA')
+      log.clearOnce('stocks-yearly-parse-AAA')
+    }
   })
 
   it('keeps the last known good series when a later refresh fails, rather than discarding it', async () => {

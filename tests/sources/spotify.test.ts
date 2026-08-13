@@ -14,7 +14,11 @@ const PLAYER = {
   repeat_state: 'context',
   device: { volume_percent: 55 },
   item: {
-    id: 'track-1',
+    // A realistic (alphanumeric-only) shape, matching what Spotify's real
+    // base62 track ids look like — see M3's `SAFE_TRACK_ID` in
+    // src/sources/spotify.ts, which `parsePlayer` enforces at the parse
+    // boundary before this ever reaches a filename.
+    id: 'track1abc',
     name: 'Planet Caravan',
     duration_ms: 272000,
     artists: [{ name: 'Black Sabbath' }],
@@ -35,7 +39,7 @@ describe('parsePlayer', () => {
     expect(s.title).toBe('Planet Caravan')
     expect(s.artist).toBe('Black Sabbath')
     expect(s.album).toBe('Paranoid')
-    expect(s.trackId).toBe('track-1')
+    expect(s.trackId).toBe('track1abc')
   })
 
   it('reads the position and the duration in milliseconds', () => {
@@ -76,6 +80,27 @@ describe('parsePlayer', () => {
   it('handles a track with no album art', () => {
     const s = parsePlayer({ ...PLAYER, item: { ...PLAYER.item, album: { name: 'X', images: [] } } })!
     expect(s.artUrl).toBeNull()
+  })
+
+  // M3 — `trackId` is used to build a filename (`loadArt`'s
+  // `${trackId}.img`), and `item.id` comes straight from a network response
+  // with no shape guarantee. A value containing a path separator or `..`
+  // could place that write outside `artDir`. Break the fix (drop the
+  // `SAFE_TRACK_ID` check) and these fail — the unsafe id would pass
+  // through as `trackId` instead of becoming `''`.
+  it('rejects a track id containing a path separator, so it can never reach a filename', () => {
+    const s = parsePlayer({ ...PLAYER, item: { ...PLAYER.item, id: '../../etc/passwd' } })!
+    expect(s.trackId).toBe('')
+  })
+
+  it('rejects a track id containing "..", so it can never escape artDir', () => {
+    const s = parsePlayer({ ...PLAYER, item: { ...PLAYER.item, id: '..' } })!
+    expect(s.trackId).toBe('')
+  })
+
+  it('accepts a realistic alphanumeric track id unchanged', () => {
+    const s = parsePlayer({ ...PLAYER, item: { ...PLAYER.item, id: '4uLU6hMCjMI75M1A2tKUQC' } })!
+    expect(s.trackId).toBe('4uLU6hMCjMI75M1A2tKUQC')
   })
 })
 
@@ -419,7 +444,7 @@ describe('SpotifySource token refresh never leaks a secret to the log (C1/I6)', 
       call++
       if (call === 1) {
         // The player poll's own 401.
-        return { ok: false, status: 401, headers: { get: () => null }, json: async () => ({}) }
+        return { ok: false, status: 401, headers: { get: (_name: string): string | null => null }, json: async () => ({}) }
       }
       // A captive portal or proxy error page: not JSON at all, and the
       // truncated text below starts with the secret, so a leaked SyntaxError
@@ -427,7 +452,7 @@ describe('SpotifySource token refresh never leaks a secret to the log (C1/I6)', 
       return {
         ok: true,
         status: 200,
-        headers: { get: () => null },
+        headers: { get: (_name: string): string | null => null },
         json: async () => JSON.parse(`<html>${SECRET}`),
         arrayBuffer: async () => new ArrayBuffer(0),
       }
@@ -463,6 +488,23 @@ describe('SpotifySource visibility-gated polling', () => {
     src.setVisible(false)
     await vi.advanceTimersByTimeAsync(60000)
     expect(fetchFn.mock.calls.length).toBe(callsAfterFirst)
+  })
+
+  // I5 — `stopped` is a one-way latch, matching `CodexSource`: once `stop()`
+  // has run, a later `setVisible(true)` must not resurrect polling. Break
+  // the fix (restore `this.stopped = false` inside the `visible` branch) and
+  // this fails.
+  it('does not restart polling when setVisible(true) is called after stop()', async () => {
+    vi.useFakeTimers()
+    const { src, fetchFn } = build([{ status: 200, body: PLAYER }])
+    src.setVisible(true)
+    await vi.advanceTimersByTimeAsync(0)
+    const callsBeforeStop = fetchFn.mock.calls.length
+    await src.stop()
+    src.setVisible(true) // must be a no-op: the source is permanently stopped.
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(fetchFn.mock.calls.length).toBe(callsBeforeStop)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('schedules the next poll at the playing interval, not the idle one', async () => {
