@@ -326,7 +326,13 @@ US National Weather Service, **no API key**. **Rejects requests without a `User-
 
 - `probabilityOfPrecipitation` is an **object** whose `.value` can be `null`. Null means
   unknown and must never render as `0%`.
-- `windSpeed` is a **string** like `"8 mph"`.
+- `windSpeed` is a **string** like `"8 mph"`. Measured live on 2026-08-13 (OKX office): 14
+  periods, 4 distinct `windSpeed` values, 3 of the 4 a range like `"5 to 8 mph"` — a range is
+  the COMMON shape here, not an edge case.
+- `windDirection` is a **string** like `"NE"`, already abbreviated (1 to 3 letters: `N`,
+  `SW`, `WNW`). Empty when unknown, never fabricated.
+- `detailedForecast` is a full paragraph. Measured live on 2026-08-13: longest 290
+  characters. `shortForecast`'s longest measured the same day was 58 characters.
 - **User decision: percent chance only, NO rainfall amounts.** So `forecastGridData` is
   never fetched and there is no millimetre conversion. (Amounts *are* available there as
   `quantitativePrecipitation` in mm, if that ever changes.)
