@@ -51,7 +51,14 @@ const RESET_SIZES = [24, 20, 16, 11]
 export interface CodexReader {
   getSnapshot(): CodexSnapshot
   isAvailable(): boolean
-  /** True when the last successful sqlite read is too old. */
+  /** True when the last successful, primary sqlite read is too old, OR the
+   * most recent read used the `immutable=1` fallback rather than the
+   * primary `mode=ro` open. That second case (see `CodexSource.isDegraded`)
+   * is why this page's own dimming logic never needs a separate "degraded"
+   * branch of its own — a fallback read is real data, shown rather than an
+   * empty page, but it must never look as current as a primary read, and
+   * folding it into this one check is what makes that hold everywhere this
+   * page already dims for staleness. */
   isStale(): boolean
   /** True when `limits[limitIndex]` (default the primary window, index 0)
    * no longer describes the CURRENT rate-limit window, or there is no
@@ -136,8 +143,11 @@ export class CodexPage implements Page {
     const readStale = this.source.isStale()
     // Accounting tiles (the limits, the token count, the reset countdown) can
     // be wrong for two DIFFERENT reasons, and each renders differently:
-    //  - `readStale`: the sqlite READ itself is lagging. The numbers are
-    //    probably still true, so they show dimmed with a STALE label.
+    //  - `readStale`: the sqlite READ itself is lagging, OR the most recent
+    //    read came from the `immutable=1` fallback rather than a primary
+    //    open (`CodexSource.isDegraded`, folded into `isStale()` itself).
+    //    Either way the numbers are probably still true, so they show
+    //    dimmed with a STALE label rather than an empty tile.
     //  - `usageUnknown`: the usage SAMPLE no longer describes the current
     //    rate-limit window (C2). The true figure is unknowable, so these
     //    render an explicit `--` instead — a dimmed but wrong number still

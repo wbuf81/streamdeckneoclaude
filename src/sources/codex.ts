@@ -76,8 +76,10 @@ export const COLD_START_TAIL_BYTES = 256 * 1024
 const RESET_MAX_SECONDS = 4_000_000_000
 /** Bounds a hung `sqlite3` child well under the 5 s poll interval, so a
  * stuck read cannot block `stop()`'s await on `refreshing` forever and
- * delay shutdown past SIGTERM's grace window. Applies to `runSqlite`'s
- * single `mode=ro` attempt — there is no fallback attempt any more (C1). */
+ * delay shutdown past SIGTERM's grace window. Applies to EACH of
+ * `runSqlite`'s sqlite3 child attempts — the primary `mode=ro` open and, on
+ * its failure, the `immutable=1` fallback — so a hang on either one is
+ * bounded the same way. */
 const SQLITE_TIMEOUT_MS = 4000
 
 export const THREAD_QUERY = `
@@ -158,7 +160,8 @@ export interface RolloutRead {
   consumedTo: number
 }
 
-export type SqliteRunner = (database: string, query: string) => Promise<string>
+// `SqliteRunner` (and the `SqliteRead` shape it resolves to) are declared
+// next to `runSqlite`, its default implementation, further down this file.
 export type RolloutTailReader = (file: string, start?: number) => RolloutRead
 
 function str(value: unknown): string {
@@ -299,17 +302,31 @@ export function readRolloutTail(file: string, requestedStart?: number): RolloutR
   }
 }
 
-/** Turns a filesystem path into the `file:` URI form sqlite3 needs to accept
- * `mode=ro`. Only `%`, `#`, and `?` are percent-encoded — sqlite gives those
- * three special meaning inside a URI filename — so an ordinary absolute path
- * passes through unchanged and a leading `/` still reads as an absolute path
+/** Percent-encodes only `%`, `#`, and `?` — sqlite gives those three special
+ * meaning inside a URI filename — so an ordinary absolute path passes
+ * through unchanged and a leading `/` still reads as an absolute path
  * rather than a relative one. Escaping `?` specifically means a malformed
  * `database` value (M2: one that itself contains `?mode=rwc` or similar)
- * cannot inject a second query parameter and override `mode=ro` — it becomes
- * a literal, harmless character in the filename instead. */
+ * cannot inject a second query parameter and override the mode either URI
+ * form below chose — it becomes a literal, harmless character in the
+ * filename instead. Shared by both forms so they can never drift apart on
+ * escaping. */
+function escapeForSqliteUri(database: string): string {
+  return database.replace(/[%#?]/g, (char) => encodeURIComponent(char))
+}
+
+/** The primary read URI: `mode=ro`. The only mode that reads the `-wal`
+ * file, so a row Codex has written but not yet checkpointed into the main
+ * database file is still visible. */
 function toReadOnlyUri(database: string): string {
-  const escaped = database.replace(/[%#?]/g, (char) => encodeURIComponent(char))
-  return `file:${escaped}?mode=ro`
+  return `file:${escapeForSqliteUri(database)}?mode=ro`
+}
+
+/** The fallback read URI: `mode=ro&immutable=1`. See `runSqlite`'s doc
+ * comment for when this is tried and why its result is always tagged
+ * degraded rather than trusted outright. */
+function toImmutableUri(database: string): string {
+  return `file:${escapeForSqliteUri(database)}?mode=ro&immutable=1`
 }
 
 /** A short, query-free description of an `execFile` failure, for the log.
@@ -336,11 +353,13 @@ function execSqlite(uri: string, query: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       '/usr/bin/sqlite3',
-      // M2 — `-readonly` and the `mode=ro` URI compose; keeping both costs
-      // nothing and means a future sqlite3 build that, for whatever reason,
-      // stopped honouring URI filenames would still refuse to open
-      // read-write, rather than silently falling through to a literal path.
-      ['-readonly', '-json', uri, query],
+      // The `-readonly` CLI flag was measured (docs/VERIFIED-FACTS.md) to
+      // compose IDENTICALLY with the URI's own `mode=ro` in every case
+      // tried, including the sidecar-absent failure this file exists to
+      // handle — it never once changed the result. Dropped as redundant
+      // rather than kept "for extra safety" at the cost of a second thing
+      // that could drift out of sync with the URI logic below.
+      ['-json', uri, query],
       { maxBuffer: 1024 * 1024, timeout: SQLITE_TIMEOUT_MS },
       (error, stdout, stderr) => {
         if (!error) { resolve(stdout); return }
@@ -350,42 +369,82 @@ function execSqlite(uri: string, query: string): Promise<string> {
   })
 }
 
+/** The result of one `runSqlite` call. */
+export interface SqliteRead {
+  text: string
+  /** True when `text` came from the `immutable=1` fallback rather than the
+   * primary `mode=ro` open. `CodexSource` treats a degraded read as
+   * real data worth showing — dimmed — rather than an empty page, but never
+   * as good as a primary read: it must never satisfy a freshness check. See
+   * `CodexSource.isStale` and `CodexSource.isDegraded`. */
+  degraded: boolean
+}
+
+export type SqliteRunner = (database: string, query: string) => Promise<SqliteRead>
+
 /**
- * Reads the Codex sqlite database without ever opening it read-write, using
- * the URI form with `mode=ro` — the ONLY read mode this function has. There
- * is no fallback.
+ * Reads the Codex sqlite database without ever opening it read-write.
  *
- * An earlier version fell back to `mode=ro&immutable=1` when the primary
- * attempt failed, on the theory that reaching the fallback meant no writer
- * could be live at that instant. Both halves of that theory were measured
- * and refuted (C1):
+ * Primary attempt: the URI form with `mode=ro`. This is the only mode that
+ * reads the `-wal` file, so a row Codex has written but not yet checkpointed
+ * into the main database file is still visible.
+ *
+ * On failure, ONE fallback attempt: `mode=ro&immutable=1`. This restores a
+ * fallback an earlier version of this file removed entirely — that removal
+ * was itself a mistake, and this comment records why, so it is not repeated.
+ *
+ * The fallback exists because of a measured fact (docs/VERIFIED-FACTS.md):
+ * with the `-wal`/`-shm` sidecars ABSENT — which is Codex's database's
+ * normal resting state whenever Codex itself is not actively holding it
+ * open, i.e. most of the time — `mode=ro` fails outright with
+ * `SQLITE_CANTOPEN (14)`, because a read-only connection to a WAL database
+ * needs the `-shm` and cannot create one. `immutable=1` succeeds in that
+ * exact case and creates no sidecar file at all. Without this fallback the
+ * Codex page shows nothing whenever Codex is not this instant writing to its
+ * database — honest, but useless, since that is most of the time. (An
+ * earlier version of this file claimed `mode=ro` creates the missing `-shm`
+ * itself and so never needs a fallback; that claim was false — it only
+ * looked true because the sidecars already existed at the moment it was
+ * checked. Retesting with the sidecars actually absent produced the failure
+ * above. See docs/VERIFIED-FACTS.md for the full correction.)
+ *
+ * The fallback is not free of risk, and the risk is exactly why every
+ * caller must treat a `degraded: true` result as second-class, never as
+ * good as a primary read:
  *
  * - `immutable=1` does not read the WAL at all. Against a database with one
- *   row checkpointed and a second left in the `-wal` file, `mode=ro` returns
- *   both rows; `mode=ro&immutable=1` returns only the checkpointed one, exit
- *   code 0, no warning. It is not "read-only", it is "read a stale snapshot
- *   and call it done".
+ *   row checkpointed into the main file and a second left only in `-wal`,
+ *   `mode=ro` returns both rows; `mode=ro&immutable=1` returns only the
+ *   checkpointed one, exit code 0, no warning on stderr. It can silently
+ *   hand back a stale snapshot and call it done.
  * - A live writer holding the database under `PRAGMA locking_mode=exclusive`
  *   makes the primary `mode=ro` attempt fail with `database is locked (5)` —
- *   and makes the `immutable=1` fallback SUCCEED, handing back pre-checkpoint
- *   rows as if they were current. The exact condition that made the fallback
- *   unsafe was also the condition that triggered it.
+ *   and makes this SAME fallback succeed, handing back pre-checkpoint rows
+ *   as if they were current. The exact condition that makes the fallback
+ *   unsafe is also the condition that triggers it.
  *
- * The `-shm` hypothesis that originally justified even trying a fallback
- * does not hold either: opening `mode=ro` against a `-wal` file with no
- * `-shm` present succeeded and created the missing `-shm` itself, because
- * the containing directory is writable by the daemon's own user. So a
- * missing `-shm` was never the reason `mode=ro` could fail, and no fallback
- * was justified by it in the first place.
+ * So a degraded result is always tagged as such, and `CodexSource` is
+ * responsible for making sure it never satisfies a freshness check and
+ * always renders dimmed (see its `doRefresh`, `isStale`, `isDegraded`) — the
+ * fallback exists to avoid an empty page, not to quietly pass off
+ * possibly-stale data as current.
  *
- * With the fallback gone, a failed `mode=ro` open now reports unavailable
- * (see `doRefresh`'s catch block) instead of silently substituting old data.
- * If a future finding shows some real, reachable case still needs a
- * fallback, it must mark its data degraded (dimmed, logged) — never read
- * silently, the way this one did.
+ * If BOTH attempts fail, the PRIMARY attempt's own error is what reaches the
+ * caller: the fallback existing at all is an implementation detail, not
+ * something a "why is Codex unavailable" message should dwell on.
  */
-export async function runSqlite(database: string, query: string): Promise<string> {
-  return execSqlite(toReadOnlyUri(database), query)
+export async function runSqlite(database: string, query: string): Promise<SqliteRead> {
+  try {
+    const text = await execSqlite(toReadOnlyUri(database), query)
+    return { text, degraded: false }
+  } catch (primaryError) {
+    try {
+      const text = await execSqlite(toImmutableUri(database), query)
+      return { text, degraded: true }
+    } catch {
+      throw primaryError
+    }
+  }
 }
 
 /** Best-effort, read-only view of Codex desktop's local task index and the
@@ -396,6 +455,12 @@ export class CodexSource extends EventEmitter {
   private snapshot: CodexSnapshot = { tasks: [], usage: null }
   private available = false
   private lastSuccessAt = 0
+  /** True when the MOST RECENT successful read used the `immutable=1`
+   * fallback (see `runSqlite`) rather than the primary `mode=ro` open. Set
+   * back to `false` the instant a primary read next succeeds, or a read
+   * fails outright — there is no data left to call degraded once the source
+   * is unavailable. See `isDegraded()` and `isStale()`. */
+  private degraded = false
   private lastKey = ''
   private timer: NodeJS.Timeout | null = null
   private refreshing: Promise<void> | null = null
@@ -467,12 +532,14 @@ export class CodexSource extends EventEmitter {
   private async doRefresh(): Promise<void> {
     if (!existsSync(this.database)) {
       this.updateAvailability(false)
+      this.degraded = false
       log.once('codex-state-absent', `Codex state database absent: ${this.database}`)
       return
     }
 
     try {
-      const rows = JSON.parse(await this.sqlite(this.database, THREAD_QUERY)) as ThreadRow[]
+      const read = await this.sqlite(this.database, THREAD_QUERY)
+      const rows = JSON.parse(read.text) as ThreadRow[]
       const tasks: CodexTask[] = []
       let newestUsage: CodexUsage | null = null
       const seenRollouts = new Set<string>()
@@ -525,12 +592,30 @@ export class CodexSource extends EventEmitter {
       }
 
       this.available = true
-      this.lastSuccessAt = this.now()
+      if (read.degraded) {
+        // A fallback read: real data, worth showing dimmed rather than an
+        // empty page, but never provably as current as a primary read (see
+        // `runSqlite`'s doc comment for the exact trap this guards against).
+        // `lastSuccessAt` is deliberately left untouched — a degraded read
+        // must never be able to satisfy `isStale()`, and `isStale()` also
+        // checks `degraded` directly so this holds even if an earlier
+        // primary success is still within the staleness window.
+        this.degraded = true
+        log.once(
+          'codex-state-degraded',
+          `Codex task data is DEGRADED (immutable fallback) at ${this.database}`,
+        )
+      } else {
+        this.degraded = false
+        this.lastSuccessAt = this.now()
+        log.clearOnce('codex-state-degraded')
+      }
       log.clearOnce('codex-state-absent')
       log.clearOnce('codex-state-read')
       this.setSnapshot({ tasks, usage: newestUsage })
     } catch (error) {
       this.updateAvailability(false)
+      this.degraded = false
       // Short and query-free: `runSqlite`'s own errors already carry only
       // sqlite3's stderr text or a code/signal, never the SQL body (see
       // `describeExecFailure`), and a plain `Error.message` from anywhere
@@ -541,7 +626,11 @@ export class CodexSource extends EventEmitter {
   }
 
   private setSnapshot(next: CodexSnapshot): void {
-    const key = JSON.stringify({ available: this.available, ...next })
+    // `degraded` is included even though it is not part of `next`: a poll
+    // that reads byte-for-identical task/usage data but flips degraded (a
+    // recovery, or a fresh fallback) must still emit `change`, or the page
+    // never redraws to add or remove the dimming that flip requires.
+    const key = JSON.stringify({ available: this.available, degraded: this.degraded, ...next })
     if (key === this.lastKey) return
     this.lastKey = key
     this.snapshot = next
@@ -568,11 +657,28 @@ export class CodexSource extends EventEmitter {
     return this.available
   }
 
-  /** True when the last successful sqlite READ is too old (or there has
-   * never been one). Says nothing about whether the accounting numbers
-   * themselves are still true — see `isUsageUnknown()`. */
+  /** True when the last successful, PRIMARY sqlite READ is too old, there
+   * has never been one, or the MOST RECENT read used the `immutable=1`
+   * fallback instead of a primary `mode=ro` open (`this.degraded` — see
+   * `isDegraded()`). That last clause is what keeps a fallback read from
+   * ever masquerading as current: without it, a degraded read arriving
+   * shortly after an earlier, unrelated primary success would read as
+   * fresh purely because `lastSuccessAt` from that EARLIER success was
+   * still within `STALE_CODEX_SECONDS` — even though the CURRENT data on
+   * screen is the fallback's, not that earlier success's. Says nothing
+   * about whether the accounting numbers themselves are still true — see
+   * `isUsageUnknown()`. */
   isStale(): boolean {
-    return !this.lastSuccessAt || this.now() - this.lastSuccessAt > STALE_CODEX_SECONDS
+    return this.degraded || !this.lastSuccessAt || this.now() - this.lastSuccessAt > STALE_CODEX_SECONDS
+  }
+
+  /** True when the MOST RECENT successful read came from the `immutable=1`
+   * fallback (see `runSqlite`) rather than the primary `mode=ro` open.
+   * Exposed for tests and logging; every caller that only needs to know
+   * whether the current snapshot is trustworthy enough to render undimmed
+   * can use `isStale()` alone, since it already folds this in. */
+  isDegraded(): boolean {
+    return this.degraded
   }
 
   /** True when `usage.limits[limitIndex]` (default the primary window, index

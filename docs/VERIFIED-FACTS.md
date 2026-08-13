@@ -180,29 +180,58 @@ Measured locally on 2026-08-13:
   stop the daemon or the other pages. A field that is absent or renamed must render as
   unknown (`--`), never as a measured `0` — that failure mode reached shipped code once
   already and is why this line is here.
-- **`mode=ro` is the ONLY read mode; there is no `immutable=1` fallback, and this
-  supersedes the earlier `-shm`-absence hypothesis below.** A prior version of this
-  source fell back to `mode=ro&immutable=1` on the theory that reaching the fallback
-  proved no writer could be live. Both halves were measured and refuted:
-  - `immutable=1` does not read the WAL at all. Against a WAL database with one row
-    checkpointed into the main file and a second left only in `-wal`, `mode=ro` returns
-    both rows; `mode=ro&immutable=1` returns only the checkpointed row, exit code 0, no
-    warning on stderr. It reads a stale snapshot and reports success.
-  - A live writer holding the database under `PRAGMA locking_mode=exclusive` makes the
-    primary `mode=ro` attempt fail with `Error: in prepare, database is locked (5)` — and
-    makes the `immutable=1` fallback SUCCEED, handing back the pre-checkpoint rows as
-    current. The exact condition that made the fallback unsafe was also the condition
-    that triggered it.
-  - **The earlier `-shm`-absence hypothesis for the original intermittent
-    `SQLITE_CANTOPEN` (error 14) failures does not hold.** Opening `mode=ro` against a
-    `-wal` file with its `-shm` deliberately absent still succeeded and created the
-    missing `-shm` itself, because the containing directory is writable by the daemon's
-    own user. A missing `-shm` was never a reason `mode=ro` could fail, so it was never a
-    valid justification for a fallback in the first place.
-  - Consequence: with the fallback removed, a `mode=ro` failure for ANY reason —
-    including a live writer's exclusive lock — makes the source report unavailable. The
-    page shows the honest unknown state; it never substitutes an old snapshot while
-    claiming success, and never opens the database read-write.
+- **The database is WAL mode, and its `-wal`/`-shm` sidecars exist only while Codex is
+  actively holding the database open.** Measured on this machine on 2026-08-13: while
+  Codex has `state_5.sqlite` open, `state_5.sqlite-wal` and `state_5.sqlite-shm` exist
+  beside it; once Codex closes or checkpoints, they disappear, and only the bare
+  `state_5.sqlite` file remains. This is the database's NORMAL resting state, not a rare
+  edge case — Codex is not continuously writing to it.
+- **With the sidecars absent, every read-only form of `mode=ro` fails; `immutable=1` is
+  the only one that still works, and it creates no sidecar file.** Measured directly
+  against a scratch WAL database with its sidecars removed by hand (the reproduction
+  technique that caught the correction below, and the one this fix's own tests use):
+
+  | Command | Result |
+  | --- | --- |
+  | `sqlite3 -readonly "file:<path>?mode=ro"` | error 14 |
+  | `sqlite3 "file:<path>?mode=ro"` | error 14 |
+  | `sqlite3 -readonly <path>` | error 14 |
+  | `sqlite3 "file:<path>?mode=ro&immutable=1"` | **works**, creates no sidecar |
+  | plain read-write open | works, but **creates the `-shm`** |
+
+  The cause: a read-only connection to a WAL database needs the `-shm` file to track the
+  WAL's state, and a read-only connection cannot create one. This is also the root cause
+  of the daemon's own intermittent `unable to open database file (14)` warning on the
+  live deck: not a locked writer, simply Codex not holding the database open at that
+  instant, which is most of the time.
+- **CORRECTION.** An earlier version of this file claimed the opposite: that `mode=ro`
+  creates the missing `-shm` itself and so never needs an `immutable=1` fallback. **That
+  claim was false**, and the fallback that absence justified removing was wrongly
+  removed along with it — for a time, the live Codex page showed no task data whenever
+  Codex was not that instant writing to its database. The false claim looked true only
+  because the one time it was checked, the sidecars already existed (Codex happened to
+  be holding the database open at that moment), so the open trivially succeeded and the
+  absence of any create-`-shm` step went unnoticed. Retested with the sidecars actually
+  absent, per the table above, `mode=ro` fails outright. **Do not re-derive this from
+  memory of an earlier version of this file; the table above is the measurement.**
+- **The exclusive-lock trap measured previously still stands, and is exactly why the
+  restored fallback is tagged rather than trusted outright.** A live writer holding the
+  database under `PRAGMA locking_mode=exclusive` makes the primary `mode=ro` attempt
+  fail with `Error: in prepare, database is locked (5)` — and makes the SAME
+  `immutable=1` fallback SUCCEED, handing back pre-checkpoint rows as current, exit code
+  0, no warning on stderr, because `immutable=1` does not read the WAL at all. The exact
+  condition that makes the fallback unsafe is also the condition that triggers it. This
+  is why a fallback read is never treated as equivalent to a primary one: it is tagged
+  degraded, rendered dimmed on the page, and never allowed to satisfy a freshness
+  check — the user would rather see a slightly old task list, clearly marked, than an
+  empty page, but only for as long as it cannot masquerade as current.
+- **Current design.** Primary read: `file:<path>?mode=ro` (no `-readonly` flag — the
+  table above shows it composes identically with the URI's own `mode=ro` in every case
+  tried, so it added nothing). On failure, ONE fallback attempt: `mode=ro&immutable=1`,
+  its result always tagged degraded. If BOTH attempts fail, the page shows the honest
+  unavailable state, exactly as before. The database is never opened read-write, which
+  would create the `-shm` and mutate Codex's own on-disk state — that is the one thing
+  this source must never do, whichever read mode it is trying.
 - `window_minutes` needs the same sanity bound `resets_at` already had: a value at or
   beyond roughly a year of minutes is far more likely to be the same figure in
   milliseconds (Codex's own sqlite already writes `updated_at_ms`/`created_at_ms` that
