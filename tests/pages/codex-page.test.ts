@@ -11,6 +11,18 @@ import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '
  * same documented value rather than reasoning about it fresh. */
 const STRIP_PAD = 6
 
+/** I6 — the furthest column a LEFT-ALIGNED key line can ever legitimately
+ * reach: `render/canvas.ts`'s private `BORDER` (3) + `PAD` (6) +
+ * `TEXT_MAX_WIDTH` (81, itself `KEY_SIZE - BORDER - PAD * 2`). A probe past
+ * this column (the old test used 95, five pixels beyond it) can never fail,
+ * however badly a line overflows — `shrinkToFit` guarantees every measured
+ * line stops at or before this column BY CONSTRUCTION, so nothing short of
+ * a change to those constants themselves could ever paint past it. Probing
+ * AT the boundary instead means a real overflow bug — a candidate array
+ * that stops measuring, or a bare size given text too wide for it — has
+ * somewhere to show up. */
+const KEY_TEXT_RIGHT_EDGE = 90
+
 /** Measures with the SAME font and size `renderStrip` draws line 1 and 2
  * with, independently of the page. */
 function measureStrip(text: string): number {
@@ -50,6 +62,10 @@ function build(
   // answer, so a fake that ignores the argument entirely could not tell
   // those two call sites apart.
   usageUnknown: boolean | ((limitIndex?: number) => boolean) = false,
+  // I3 — `null` (the default) matches every existing test's assumption:
+  // "stale" without a further age to report. Tests that care about the
+  // printed age pass a number explicitly.
+  staleForSeconds: number | null = null,
 ) {
   const isUsageUnknown = typeof usageUnknown === 'function' ? usageUnknown : () => usageUnknown
   return new CodexPage({
@@ -57,6 +73,7 @@ function build(
     isAvailable: () => available,
     isStale: () => stale,
     isUsageUnknown,
+    staleForSeconds: () => staleForSeconds,
     setVisible: () => {},
   })
 }
@@ -126,6 +143,58 @@ describe('CodexPage', () => {
     expect(frame.strip).toEqual({ lines: ['codex', 'task data unavailable'], dim: true })
   })
 
+  // C2 — the review's exact repro: `isAvailable() -> false`, `isStale() ->
+  // false`, `isUsageUnknown() -> false`, with a RETAINED snapshot that still
+  // carries a valid percentage, token count and reset time. Before the fix,
+  // none of the four accounting tiles ever read `available` at all, so key
+  // 4 rendered `WEEK CAP` / `27%` undimmed with a full green bar while the
+  // strip said "task data unavailable" on the very same frame — one page
+  // contradicting itself. Every accounting tile must instead render the
+  // SAME unknown state a caller already gets from `usageUnknown` — never a
+  // number, never a bar — because "no current data at all" is the STRONGER
+  // of the reasons a tile cannot trust its own retained numbers.
+  it('never renders a confident percentage or a bar when the source is unavailable, even with fresh-looking retained data', () => {
+    const frame = build(snapshot(), false, false, false).render(NOW)
+    expect(frame.strip).toEqual({ lines: ['codex', 'task data unavailable'], dim: true })
+
+    const primaryLimit = frame.keys[4]!
+    expect(primaryLimit.lines).toEqual(['WEEK CAP', '--'])
+    expect(primaryLimit.bar).toBeUndefined()
+    expect(primaryLimit.dim).toBe(true)
+
+    const tokens = frame.keys[6]!
+    expect(tokens.lines).toEqual(['TASK TOKENS', '--'])
+    expect(tokens.dim).toBe(true)
+
+    const reset = frame.keys[7]!
+    expect(reset.lines?.[1]).toBe('--')
+    expect(reset.dim).toBe(true)
+
+    // Task tiles and the identity tile dim too — the same audit the review
+    // asked for, across every tile on the page, not just the limit gauges.
+    expect(frame.keys[0]!.dim).toBe(true)
+    expect(frame.keys[3]!.dim).toBe(true)
+  })
+
+  // The secondary limit tile must get the SAME treatment through its own
+  // `isUsageUnknown(1)` call site, not just the primary's default index.
+  it('never renders a confident secondary percentage when the source is unavailable', () => {
+    const data = snapshot({
+      usage: {
+        limits: [
+          { usedPct: 10, windowMinutes: 300, resetsAt: NOW + 3600 },
+          { usedPct: 96, windowMinutes: 10080, resetsAt: NOW + 86400 },
+        ],
+        totalTokens: 1, plan: 'team', ts: NOW,
+      },
+    })
+    const isUsageUnknown = () => false // both windows are otherwise fresh.
+    const secondary = build(data, false, false, isUsageUnknown).render(NOW).keys[5]!
+    expect(secondary.lines).toEqual(['WEEK CAP', '--'])
+    expect(secondary.bar).toBeUndefined()
+    expect(secondary.dim).toBe(true)
+  })
+
   it('renders an explicit unknown, not the last known percentage dimmed, once the usage sample no longer describes the current window', () => {
     // Available and read-fresh (not `readStale`), but `isUsageUnknown()`
     // reports the C2 scenario: the sample's own window has ended, so the
@@ -180,6 +249,44 @@ describe('CodexPage', () => {
     const key = build(snapshot(), true, true, true).render(NOW).keys[0]!
     expect(key.lines?.[0]).toBe('RUNNING') // still shows the retained data...
     expect(key.dim).toBe(true) // ...but visibly marked historic.
+  })
+
+  // I3 — probe-confirmed by the review: task tiles carried NO textual
+  // staleness cue at all before this, only dimming — and dimming alone
+  // means nothing once "degraded" is Codex's everyday resting state (see
+  // `CodexSource.isDegraded`'s doc comment). A task that finished minutes
+  // ago must now say so, not just look a shade darker.
+  it('adds a bare STALE line to a task tile when stale with no known age', () => {
+    const key = build(snapshot(), true, true, false, null).render(NOW).keys[0]!
+    expect(key.lines).toEqual([
+      'RUNNING', 'deckd', 'Improve the Stream Deck integration', 'gpt-5.6-sol', 'STALE',
+    ])
+  })
+
+  it('adds a STALE line with the elapsed age to a task tile when the age is known', () => {
+    const key = build(snapshot(), true, true, false, 660).render(NOW).keys[0]!
+    expect(key.lines?.[4]).toBe('STALE 11m')
+  })
+
+  it('adds no fifth line to a task tile at all when the read is fresh', () => {
+    const key = build(snapshot(), true, false, false, 5).render(NOW).keys[0]!
+    expect(key.lines).toHaveLength(4)
+  })
+
+  it('never draws a wide STALE age line past the task-tile edge', () => {
+    // `formatDuration`'s widest realistic form: several days old.
+    const wide = task({
+      project: 'a-fairly-long-project-directory-name-for-a-real-repo',
+      title: 'W'.repeat(64),
+      model: 'a-fairly-long-model-identifier-string-example',
+    })
+    const threeDaysOld = 3 * 24 * 3600 + 3600 * 2 // "3d2h".
+    const key = build(snapshot({ tasks: [wide] }), true, true, false, threeDaysOld).render(NOW).keys[0]!
+    expect(key.lines?.[4]).toBe('STALE 3d2h')
+    const buffer = renderKey(key)
+    for (let y = 0; y < 96; y++) {
+      expect(probe(buffer, KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
+    }
   })
 
   it('dims task tiles when the source is unavailable', () => {
@@ -362,10 +469,12 @@ describe('CodexPage', () => {
     expect(key.dim).toBe(true)
   })
 
-  // I7 — the widest realistic values must never draw ink past the key's
-  // usable width. Column x=95 (one pixel from the 96 px right edge) must
-  // stay pure background for every row, for a task whose project, title and
-  // model are all far longer than the OLD fixed-width truncation assumed.
+  // I6 (round 3) — the OLD probe sat at x=95, five pixels beyond the
+  // furthest column a left-aligned line can ever legitimately reach
+  // (`KEY_TEXT_RIGHT_EDGE` = 90; see its own doc comment). Nothing could
+  // ever draw that far out, so the probe could not fail however badly the
+  // layout broke. Moved to the real boundary, where an actual overflow —
+  // a candidate array that stops measuring — has somewhere to show up.
   it('never draws task-tile text past the key edge for the widest realistic values', () => {
     const wide = task({
       project: 'a-fairly-long-project-directory-name-for-a-real-repo',
@@ -375,10 +484,15 @@ describe('CodexPage', () => {
     const key = build(snapshot({ tasks: [wide] })).render(NOW).keys[0]!
     const buffer = renderKey(key)
     for (let y = 0; y < 96; y++) {
-      expect(probe(buffer, 95, y)).toEqual(theme.bg)
+      expect(probe(buffer, KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
     }
   })
 
+  // I6 (round 3) — the OLD probe sat at `STRIP_WIDTH - 1` = 247.
+  // `renderStrip` right-aligns at `STRIP_WIDTH - PAD` = 242 and shrink-fits
+  // both lines to the same budget, so nothing ever draws past 242 either —
+  // the probe was five pixels into territory that could never fail. Moved
+  // to the real right-aligned boundary.
   it('never draws strip text past the strip edge for the widest realistic values', () => {
     const wide = task({
       project: 'a-fairly-long-project-directory-name-for-a-real-repo',
@@ -387,7 +501,37 @@ describe('CodexPage', () => {
     const strip = build(snapshot({ tasks: [wide] })).render(NOW).strip
     const buffer = renderStrip(strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+      expect(probe(buffer, STRIP_WIDTH - STRIP_PAD, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
+  })
+
+  // I6 (round 3) — every BARE (unmeasured, `resolveLineSpecs` skips
+  // measuring a plain `number`) label or value line on this page had no
+  // probe at all: `TASK TOKENS` / `USAGE CAP` / `RESETS IN` / `PLAN` at 11,
+  // `STALE` at 11, `CODEX` at 22, `OPENAI` / `N ACTIVE` at 11. They are
+  // fixed, short strings by design, not user-controlled — measured by hand
+  // to fit today — but "measured by hand once" is exactly what lesson 17
+  // warns against relying on going forward. This locks the claim in with
+  // the real canvas. All of them draw centered (`align: 'center'`), so an
+  // overflow shows up symmetrically around the key's own horizontal centre
+  // (x=48) — checking the SAME column `KEY_TEXT_RIGHT_EDGE` uses for
+  // left-aligned lines, and its mirror on the left, catches either
+  // direction.
+  it('keeps every bare-size centered label and value line within the key edge, for every key that draws one', () => {
+    // `usage: null` routes key 4 through `limitKey`'s `!limit` branch
+    // (`USAGE CAP` / `--`, bare), key 5 through `planKey` (`PLAN` / `--`,
+    // bare), key 6 through `tokensKey`'s unknown branch (`TASK TOKENS`,
+    // bare), and key 7 through `resetKey` (`RESETS IN`, bare) — and
+    // `readStale: true` puts the bare `STALE` line on keys 5 and 7 too.
+    // Key 3's identity tile (`OPENAI` / `CODEX` / `N ACTIVE`, all bare)
+    // renders unconditionally.
+    const frame = build(snapshot({ usage: null }), true, true, false).render(NOW)
+    for (const index of [3, 4, 5, 6, 7]) {
+      const buffer = renderKey(frame.keys[index]!)
+      for (let y = 0; y < 96; y++) {
+        expect(probe(buffer, KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
+        expect(probe(buffer, 96 - KEY_TEXT_RIGHT_EDGE, y)).toEqual(theme.bg)
+      }
     }
   })
 })

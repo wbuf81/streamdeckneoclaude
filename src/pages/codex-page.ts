@@ -47,6 +47,13 @@ const LABEL_SIZES = [11, 10, 9, 8]
  * measures 101.1 px at 24 px and 67.4 px at 16 px, against the 81 px usable
  * width — so 24 alone, the old fixed size, would have clipped it. */
 const RESET_SIZES = [24, 20, 16, 11]
+/** Candidate sizes for a task tile's I3 stale-age line (`STALE`, or
+ * `STALE 11m` / `STALE 3d2h` once `formatDuration` adds an age). Measured
+ * rather than assumed (lesson 17) — a candidate array, not a bare number,
+ * so a future genuinely-degraded spell lasting DAYS (`formatDuration`'s
+ * widest form, `999d23h`) still shrinks to fit instead of overrunning the
+ * key. */
+const STALE_AGE_SIZES = [11, 10, 9, 8]
 
 export interface CodexReader {
   getSnapshot(): CodexSnapshot
@@ -69,6 +76,18 @@ export interface CodexReader {
    * so the secondary tile must pass its OWN index rather than reusing the
    * primary's answer. See `CodexSource.isUsageUnknown`. */
   isUsageUnknown(limitIndex?: number): boolean
+  /** Seconds since the last EXACT read — a primary open, or a fallback
+   * (`immutable=1`) read whose own `-wal` sidecar was absent or empty at
+   * read time — or `null` when there has never been one. I3: task tiles
+   * used to carry no textual staleness cue at all, only dimming, so a task
+   * Codex finished minutes ago kept reading `RUNNING` with nothing but a
+   * shade — and that shade is Codex's PERMANENT resting state, since it
+   * normally has the database open, making a genuinely degraded fallback
+   * (see `CodexSource.isDegraded`) the everyday path rather than a rare
+   * one. This lets the page print a real number alongside the word
+   * `STALE`, which stays meaningful now that "degraded" itself is the
+   * rarer case. */
+  staleForSeconds(): number | null
   setVisible(visible: boolean): void
 }
 
@@ -92,6 +111,20 @@ export function limitLabel(minutes: number): string {
  * asked: whether two instants fall on the same Eastern calendar day. */
 const EASTERN_ZONE = 'America/New_York'
 
+/** M2 — module-scope, not built fresh inside `easternDatePrefix` on every
+ * call: `render(now)` calls that function on every frame (the render loop
+ * runs at 1 Hz or faster), and an `Intl.DateTimeFormat` carries real
+ * construction cost that a plain string comparison does not need to pay
+ * repeatedly. Both formatters are pure functions of their `Date` argument,
+ * so sharing one instance across calls changes nothing about what they
+ * print. */
+const EASTERN_DAY_KEY_FORMAT = new Intl.DateTimeFormat('en-US', {
+  timeZone: EASTERN_ZONE, year: 'numeric', month: 'numeric', day: 'numeric',
+})
+const EASTERN_SHORT_DATE_FORMAT = new Intl.DateTimeFormat('en-US', {
+  timeZone: EASTERN_ZONE, month: 'numeric', day: 'numeric',
+})
+
 /** A short `M/D ` prefix (with a trailing space), or `''` when `sampleMs`
  * falls on the SAME Eastern calendar day as `nowMs` (I2). This answers only
  * "does a date need to go in front of the time", never how to format the
@@ -102,14 +135,8 @@ const EASTERN_ZONE = 'America/New_York'
  * text, and the yesterday one can even read as being in the FUTURE relative
  * to `now`. */
 function easternDatePrefix(sampleMs: number, nowMs: number): string {
-  const dayKey = new Intl.DateTimeFormat('en-US', {
-    timeZone: EASTERN_ZONE, year: 'numeric', month: 'numeric', day: 'numeric',
-  })
-  if (dayKey.format(new Date(sampleMs)) === dayKey.format(new Date(nowMs))) return ''
-  const shortDate = new Intl.DateTimeFormat('en-US', {
-    timeZone: EASTERN_ZONE, month: 'numeric', day: 'numeric',
-  })
-  return `${shortDate.format(new Date(sampleMs))} `
+  if (EASTERN_DAY_KEY_FORMAT.format(new Date(sampleMs)) === EASTERN_DAY_KEY_FORMAT.format(new Date(nowMs))) return ''
+  return `${EASTERN_SHORT_DATE_FORMAT.format(new Date(sampleMs))} `
 }
 
 /** The reset countdown's value line. `null` means the reset time itself is
@@ -141,31 +168,58 @@ export class CodexPage implements Page {
     const snapshot = this.source.getSnapshot()
     const available = this.source.isAvailable()
     const readStale = this.source.isStale()
+    // C2 (round 3) — the accounting tiles never consulted `available` at
+    // all, which is reachable: after a read FAILURE, `CodexSource` sets
+    // `available = false` but leaves `lastSuccessAt` untouched, so
+    // `isStale()` stays `false` for up to `STALE_CODEX_SECONDS` — measured,
+    // a live 60-second window where the strip says "task data unavailable"
+    // while key 4 rendered a confident `27%` under a full green bar, one
+    // frame contradicting itself. Folded into `usageUnknown` itself (rather
+    // than threaded through as a fifth parameter everywhere) so every tile
+    // downstream that already treats an unknown usage sample as "show `--`,
+    // never a number, never a bar" gets the same treatment for real for
+    // "there is no current data at all" — the STRONGER of the two reasons a
+    // tile cannot trust its own retained numbers.
+    const dataUnavailable = !available
     // Accounting tiles (the limits, the token count, the reset countdown) can
-    // be wrong for two DIFFERENT reasons, and each renders differently:
+    // be wrong for three DIFFERENT reasons, and each renders differently:
+    //  - `dataUnavailable`: the source has no current data at all (a read
+    //    failed outright). Folded into `usageUnknown` below — see above.
     //  - `readStale`: the sqlite READ itself is lagging, OR the most recent
     //    read came from the `immutable=1` fallback rather than a primary
     //    open (`CodexSource.isDegraded`, folded into `isStale()` itself).
     //    Either way the numbers are probably still true, so they show
     //    dimmed with a STALE label rather than an empty tile.
     //  - `usageUnknown`: the usage SAMPLE no longer describes the current
-    //    rate-limit window (C2). The true figure is unknowable, so these
-    //    render an explicit `--` instead — a dimmed but wrong number still
-    //    reads as data, the same rule commit 185bcb4 set for schema drift.
-    const usageUnknown = this.source.isUsageUnknown()
+    //    rate-limit window (C2, round 2). The true figure is unknowable, so
+    //    these render an explicit `--` instead — a dimmed but wrong number
+    //    still reads as data, the same rule commit 185bcb4 set for schema
+    //    drift.
+    const usageUnknown = this.source.isUsageUnknown() || dataUnavailable
     // Task tiles carry the retained snapshot from before a failure (lesson
     // 20's "preserve the last safe state"), so they need the SAME dim
     // treatment the accounting tiles already had, or a schema-drift or quit
-    // failure leaves `RUNNING` on the glass indefinitely — I3.
-    const taskDim = !available || readStale
+    // failure leaves `RUNNING` on the glass indefinitely.
+    const taskDim = dataUnavailable || readStale
+    // I3 — dimming alone used to be the ONLY staleness cue a task tile
+    // carried, and dimming cannot say anything when it is the PERMANENT
+    // resting state: Codex normally has the database open, so a genuinely
+    // degraded fallback read (`CodexSource.isDegraded`, folded into
+    // `readStale`) is the everyday path, not a rare one, and a task that
+    // finished minutes ago kept reading `RUNNING` with no textual tell at
+    // all. `null` when the read is not stale, so a fresh tile draws its
+    // normal four lines with no fifth line reserved.
+    const staleLine = readStale ? this.staleAgeLine() : null
     const keys: KeySpec[] = []
 
     for (let i = 0; i < TASK_SLOTS; i++) {
       const task = snapshot.tasks[i]
       keys.push(task ? {
         kind: 'session',
-        lines: ['RUNNING', task.project, task.title, task.model],
-        lineSizes: [11, PROJECT_SIZES, TITLE_SIZES, MODEL_SIZES],
+        lines: staleLine
+          ? ['RUNNING', task.project, task.title, task.model, staleLine]
+          : ['RUNNING', task.project, task.title, task.model],
+        lineSizes: [11, PROJECT_SIZES, TITLE_SIZES, MODEL_SIZES, STALE_AGE_SIZES],
         border: theme.green,
         dim: taskDim,
       } : { kind: 'blank' })
@@ -186,8 +240,10 @@ export class CodexPage implements Page {
     // I3/I5 — the secondary tile asks about ITS OWN window (index 1), never
     // the primary's `usageUnknown`. A secondary window can end while the
     // primary is still live; the two `resetsAt` values are independent.
+    // `dataUnavailable` still applies to both alike — an unavailable source
+    // has no current data for either window.
     keys.push(limits[1]
-      ? this.limitKey(limits[1], this.source.isUsageUnknown(1), readStale)
+      ? this.limitKey(limits[1], this.source.isUsageUnknown(1) || dataUnavailable, readStale)
       : this.planKey(snapshot.usage?.plan ?? '', usageUnknown || readStale))
     keys.push(this.tokensKey(snapshot.usage?.totalTokens ?? null, usageUnknown, readStale))
     keys.push(this.resetKey(limits[0], now, usageUnknown, readStale))
@@ -199,7 +255,18 @@ export class CodexPage implements Page {
     }
   }
 
-  private limitKey(limit: CodexLimit | undefined, unknown: boolean, readStale: boolean): KeySpec {
+  /** I3 — the textual staleness cue a task tile shows ALONGSIDE dimming,
+   * within the tile's own tiny width budget. `STALE` alone when
+   * `staleForSeconds()` cannot say how old (no successful read yet, so
+   * there is no "since" to measure from); `STALE 11m` once it can.
+   * `formatDuration` is the one shared duration formatter (AGENTS.md's
+   * "Product conventions" — never a second, hand-rolled one). */
+  private staleAgeLine(): string {
+    const age = this.source.staleForSeconds()
+    return age === null ? 'STALE' : `STALE ${formatDuration(age)}`
+  }
+
+  private limitKey(limit: CodexLimit | null | undefined, unknown: boolean, readStale: boolean): KeySpec {
     if (!limit) {
       return {
         kind: 'gauge', lines: ['USAGE CAP', '--'], lineSizes: [11, 28],
@@ -267,7 +334,7 @@ export class CodexPage implements Page {
     }
   }
 
-  private resetKey(limit: CodexLimit | undefined, now: number, unknown: boolean, readStale: boolean): KeySpec {
+  private resetKey(limit: CodexLimit | null | undefined, now: number, unknown: boolean, readStale: boolean): KeySpec {
     let value = formatResetIn(limit?.resetsAt ?? null, now)
     // `unknown` covers two shapes: the countdown already reads `ELAPSED` (an
     // honest signal on its own, so it stays), or `resetsAt` describes a
