@@ -3,7 +3,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createCanvas } from '@napi-rs/canvas'
-import { ClaudePage, crabFrame, CRAB_STATE_PRIORITY, mostUrgentCrabState } from '../../src/pages/claude-page.js'
+import {
+  ClaudePage, crabFrame, CRAB_STATE_PRIORITY, mostUrgentCrabState,
+  formatResetIn, isWindowEnded, RESET_SIZES, EVIDENCE_SIZES,
+} from '../../src/pages/claude-page.js'
 import { theme } from '../../src/render/theme.js'
 import { loadCrabFrames } from '../../src/render/sprites.js'
 import { renderKey, renderStrip, probe, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
@@ -12,6 +15,27 @@ import type { UsageSnapshot, SessionMeta } from '../../src/sources/usage.js'
 
 const NOW = 1786549560
 const FIVE_HOURS = 5 * 3600
+
+/** The strip's own left/right inset, matching `render/canvas.ts`'s private
+ * `PAD` — same documented value codex-page.test.ts hardcodes for the same
+ * reason. */
+const STRIP_PAD = 6
+
+/** I5/I6-lesson (see codex-page.test.ts's own, fuller doc comment): the
+ * furthest column a LEFT-ALIGNED key line can ever legitimately reach, and
+ * the key's own last column. A probe must sweep this whole band, not one
+ * column — a single column can sit inside an overflowing line's own
+ * inter-glyph gap and miss real ink either side of it. */
+const KEY_TEXT_RIGHT_EDGE = 90
+const KEY_TEXT_RIGHT_BAND_END = 95
+
+function rightBandIsBackground(buf: Buffer, y: number): boolean {
+  for (let x = KEY_TEXT_RIGHT_EDGE; x <= KEY_TEXT_RIGHT_BAND_END; x++) {
+    const [r, g, b] = probe(buf, x, y)
+    if (r !== theme.bg[0] || g !== theme.bg[1] || b !== theme.bg[2]) return false
+  }
+  return true
+}
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -316,12 +340,15 @@ describe('ClaudePage gauges: burn rate (key 6)', () => {
     expect(page.render(NOW).keys[6]!.lines![1]).toBe('OVER')
   })
 
-  it('shows the rounded used and elapsed percent as evidence on the third line', () => {
+  it('shows the rounded used and elapsed percent as evidence, sized from EVIDENCE_SIZES (M1)', () => {
+    // M1: the size is now a candidate array, not a bare 11 — a schema-drift
+    // `usedPct` can produce `100% of 1000%`, which measures past the key's
+    // usable width at a bare 11 px (see `EVIDENCE_SIZES`'s own doc comment).
     const resetsAt = NOW + Math.round(FIVE_HOURS * 0.56)
     const { page } = build({ usage: freshUsage({ fiveHourPct: 20, fiveHourResetsAt: resetsAt }) })
     const key = page.render(NOW).keys[6]!
     expect(key.lines![2]).toBe('20% of 44%')
-    expect(key.lineSizes![2]).toBe(11)
+    expect(key.lineSizes![2]).toEqual(EVIDENCE_SIZES)
   })
 
   it('rounds a fractional evidence percent to the nearest whole number', () => {
@@ -355,11 +382,15 @@ describe('ClaudePage gauges: resets in (key 7)', () => {
     expect(page.render(NOW).keys[7]!.lines![0]).toBe('RESETS IN')
   })
 
-  it('shows the duration at 24 px', () => {
+  it('shows the duration, sized from RESET_SIZES so ELAPSED (C1) also fits', () => {
+    // C1: the value line's size is now a candidate array, not a bare 24 —
+    // `ELAPSED` (7 characters) measures past the key's usable width at 24 px
+    // alone (see `RESET_SIZES`'s own doc comment), so a bare fixed size
+    // would have clipped it the way the old `2h11m`-only test never noticed.
     const { page } = build({ usage: freshUsage({ fiveHourResetsAt: NOW + 7860 }) })
     const key = page.render(NOW).keys[7]!
     expect(key.lines![1]).toBe('2h11m')
-    expect(key.lineSizes![1]).toBe(24)
+    expect(key.lineSizes![1]).toEqual(RESET_SIZES)
   })
 
   it('names the window on the third line, at 11 px', () => {
@@ -384,6 +415,128 @@ describe('ClaudePage gauges: resets in (key 7)', () => {
     const key = page.render(NOW).keys[7]!
     expect(key.lines).toEqual(['RESETS IN', '2h11m', 'STALE'])
     expect(key.dim).toBe(true)
+  })
+})
+
+describe('isWindowEnded and formatResetIn (C1)', () => {
+  it('is false while a window has not yet ended, or is unknown', () => {
+    expect(isWindowEnded(0, NOW)).toBe(false)
+    expect(isWindowEnded(NOW + 10, NOW)).toBe(false)
+  })
+
+  it('is true once resetsAt is at or before now', () => {
+    expect(isWindowEnded(NOW, NOW)).toBe(true)
+    expect(isWindowEnded(NOW - 60, NOW)).toBe(true)
+  })
+
+  it('formats an elapsed reset as ELAPSED rather than a fabricated 0m', () => {
+    expect(formatResetIn(NOW - 60, NOW)).toBe('ELAPSED')
+    expect(formatResetIn(NOW, NOW)).toBe('ELAPSED')
+  })
+
+  it('formats an unknown reset time (resetsAt 0) as --', () => {
+    expect(formatResetIn(0, NOW)).toBe('--')
+  })
+
+  it('formats a real remaining duration normally', () => {
+    expect(formatResetIn(NOW + 7860, NOW)).toBe('2h11m')
+  })
+})
+
+/**
+ * C1 — the review's exact repro, reproduced with the review's own measured
+ * values: the five-hour window ended 60 seconds ago, but `usage.json` is
+ * only 61 seconds old, so `isStale()` (threshold 900 seconds) reports
+ * `false`. Before the fix this rendered `5-HR CAP 87%` under a full red bar,
+ * `BURN RATE UNDER`, and `RESETS IN 0m` at full brightness — a cap that had
+ * already reset, presented as nearly exhausted and live. `break the fix and
+ * watch it fail` (lesson 22): reverting `capKey`/`burnRateKey`/`resetKey` to
+ * ignore `windowEnded` reproduces every one of these failures exactly.
+ */
+describe('ClaudePage gauges: an ended window must not present as live (C1)', () => {
+  it('shows -- with no bar for the five-hour cap once its window has ended, even though the usage read itself is fresh', () => {
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 87, fiveHourResetsAt: NOW - 60 }),
+      stale: false,
+    })
+    const key = page.render(NOW).keys[4]!
+    expect(key.lines).toEqual(['5-HR CAP', '--'])
+    expect(key.bar).toBeUndefined()
+    expect(key.dim).toBe(true)
+  })
+
+  it('shows -- for the week cap too, once ITS OWN window has ended — the seven-day tile has the same hole', () => {
+    const { page } = build({
+      usage: freshUsage({ sevenDayPct: 41, sevenDayResetsAt: NOW - 60 }),
+      stale: false,
+    })
+    const key = page.render(NOW).keys[5]!
+    expect(key.lines).toEqual(['WEEK CAP', '--'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('shows -- for burn rate once the five-hour window has ended, never a pace verdict computed against a closed window', () => {
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 87, fiveHourResetsAt: NOW - 60 }),
+      stale: false,
+    })
+    const key = page.render(NOW).keys[6]!
+    expect(key.lines).toEqual(['BURN RATE', '--'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('shows ELAPSED, not a fabricated 0m, for the reset countdown once the window has ended', () => {
+    const { page } = build({
+      usage: freshUsage({ fiveHourPct: 87, fiveHourResetsAt: NOW - 60 }),
+      stale: false,
+    })
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines).toEqual(['RESETS IN', 'ELAPSED', '5-hr'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('still reads ELAPSED, never a frozen 0m, once staleness catches up after the window ends', () => {
+    // The review's other failure mode: `RESETS IN 0m` used to persist
+    // FOREVER once `isStale()` finally flipped true, a countdown frozen at
+    // "resets right now."
+    const { page } = build({
+      usage: freshUsage({ fiveHourResetsAt: NOW - 1000 }),
+      stale: true,
+    })
+    const key = page.render(NOW).keys[7]!
+    expect(key.lines).toEqual(['RESETS IN', 'ELAPSED', 'STALE'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('keeps the bar and a live percentage while the window is still open', () => {
+    const { page } = build({ usage: freshUsage({ fiveHourPct: 62, fiveHourResetsAt: NOW + 60 }) })
+    const key = page.render(NOW).keys[4]!
+    expect(key.lines).toEqual(['5-HR CAP', '62%'])
+    expect(key.bar).toBeDefined()
+    expect(key.dim).not.toBe(true)
+  })
+})
+
+describe('ClaudePage session tile: the model line does not overflow the key (I1)', () => {
+  it('never draws a real, unbounded Claude Code display_name past the key edge', () => {
+    // The review's own measured repro strings: `Claude Sonnet 4.5` (17
+    // characters, measured column 94 at the old bare, unmeasured 11 px) and
+    // `Opus 5 (1M context)` (19 characters, same overflow).
+    for (const model of ['Claude Sonnet 4.5', 'Opus 5 (1M context)']) {
+      const meta = new Map([['aaaa', { model, ctxPct: null, costUsd: null, ts: NOW }]])
+      const { page } = build({ sessions: [session()], meta })
+      const key = page.render(NOW).keys[0]!
+      const buffer = renderKey(key)
+      for (let y = 0; y < 96; y++) {
+        expect(rightBandIsBackground(buffer, y)).toBe(true)
+      }
+    }
+  })
+
+  it('still renders a short model name in full, unshrunk', () => {
+    const meta = new Map([['aaaa', { model: 'Sonnet 4.5', ctxPct: null, costUsd: null, ts: NOW }]])
+    const { page } = build({ sessions: [session()], meta })
+    expect(page.render(NOW).keys[0]!.lines).toContain('Sonnet 4.5')
   })
 })
 
@@ -433,22 +586,48 @@ describe('ClaudePage strip', () => {
     expect(page.render(NOW).strip.lines.join(' ')).not.toContain('more')
   })
 
-  it('never draws strip line 1 past the strip edge, even at this repo’s own project name (I6)', () => {
-    // The exact review reproduction: `streamdeckneoclaude · Bash · 2h11m`
-    // measured 266.1 px against the strip's 236 px usable width — 30.1 px
-    // past the edge — because line 1 was never truncated at all. Unlike the
-    // Spotify strip's I5/I7 overlap (which happens away from the true
-    // edge, so only comparing the two runs' own ink can catch it), line 1
-    // has no competing right-hand text: an overflow here paints all the
-    // way to the strip's true right edge, so probing that single column is
-    // a real, non-vacuous check for THIS defect.
-    const elapsed = 2 * 3600 + 11 * 60 // 2h11m
-    const { page } = build({ sessions: [session({ startedAt: NOW - elapsed })] })
+  // M3 — the strip used to describe `live[0]` (the newest session by `ts`
+  // in the RAW list from the source), while key 0 shows whatever the
+  // assigner is actually holding there. Those two can differ: the assigner
+  // holds a session in its slot until it ends, so a session that claimed
+  // slot 0 first keeps key 0 even after a NEWER session arrives and claims
+  // a different, later slot.
+  it('describes the session key 0 itself shows, not simply the newest session in the raw source list', () => {
+    const { page, f } = build({
+      sessions: [session({ sessionId: 'a', project: 'held-project', ts: NOW - 100 })],
+    })
+    page.render(NOW) // 'a' claims slot 0 and, per the assigner's contract, stays there.
+
+    // A newer session arrives. The raw source list puts it FIRST — so
+    // `live[0]` and key 0 now name two different sessions.
+    f.sessions = [
+      session({ sessionId: 'b', project: 'newer-project', ts: NOW }),
+      session({ sessionId: 'a', project: 'held-project', ts: NOW - 100 }),
+    ]
+    const frame = page.render(NOW)
+    expect(frame.strip.lines[0]).toContain('held-project')
+    expect(frame.strip.lines[0]).not.toContain('newer-project')
+  })
+
+  it('never draws strip text past the strip edge for the widest realistic values (I6)', () => {
+    // The OLD probe sat at the single column `STRIP_WIDTH - 1` = 247 and
+    // carried a comment defending it as "a real, non-vacuous check". It was
+    // not: `renderStrip` (`render/canvas.ts`) shrink-fits every line to
+    // `STRIP_TEXT_MAX_WIDTH` = 236 px starting at `PAD` = 6, so nothing this
+    // page can hand it ever paints past column ~242 — measured, a
+    // 500-character line's rightmost ink lands at column 240, and ink at
+    // column 247 is zero regardless of what this page does. Moved to a band
+    // sweep across the real margin, the same correction
+    // codex-page.test.ts's own I6 fix made.
+    const longProject = 'p'.repeat(500)
+    const longTool = 'x'.repeat(500)
+    const { page } = build({ sessions: [session({ project: longProject, tool: longTool })] })
     const strip = page.render(NOW).strip
-    expect(strip.lines[0]).toContain('streamdeckneoclaude')
     const buffer = renderStrip(strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+      for (let x = STRIP_WIDTH - STRIP_PAD; x < STRIP_WIDTH; x++) {
+        expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
+      }
     }
   })
 
@@ -503,6 +682,22 @@ describe('ClaudePage presses', () => {
     })
     page.render(NOW)
     await page.onKeyPress(1)
+    expect(f.focused[0]!.pid).toBe(2)
+  })
+
+  // M9 — pressing used to read a page-level `this.slots` cache that only
+  // `render()` ever populated, making a press target a side effect of
+  // rendering. Verified by the review: a page with live sessions that had
+  // never rendered a single frame reported `ignored` on every session key.
+  // `onKeyPress` now asks the assigner itself, the same call `render`
+  // makes, so this must resolve correctly with NO prior `render()` call.
+  it('resolves a press correctly even when the page has never rendered a frame', async () => {
+    const { page, f } = build({
+      sessions: [session({ sessionId: 'a', pid: 1, ts: NOW }),
+                 session({ sessionId: 'b', pid: 2, ts: NOW - 5 })],
+    })
+    // No `page.render(...)` call here on purpose.
+    expect(await page.onKeyPress(1)).toBe('handled')
     expect(f.focused[0]!.pid).toBe(2)
   })
 })
