@@ -3,7 +3,7 @@ import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
 import type { MarketState, Quote, StockStatus, YearlyState } from '../sources/stocks.js'
-import { SYMBOLS, downsample } from '../sources/stocks.js'
+import { SYMBOLS, downsample, YEARLY_REFRESH_SECONDS } from '../sources/stocks.js'
 
 /** How many buckets the intraday series downsamples to for the tile. */
 const SPARK_BUCKETS = 12
@@ -29,6 +29,18 @@ const LABEL_SIZE = 16
 const BACK_SIZE = 16
 /** How many of the detail view's tiles the intraday chart spans. */
 const CHART_SPAN = 3
+/**
+ * Fewer than this many points cannot be sliced sensibly across `CHART_SPAN`
+ * keys (I4): `render/canvas.ts`'s `drawSpark` divides the series into
+ * `CHART_SPAN` virtual-width slices, and with 2 or 3 points that geometry
+ * puts the whole chart's bars on the wrong key, or draws none at all on the
+ * first one — measured: a 2-point rising series draws zero bars on key 4 and
+ * the caption ends up sitting alone over an empty tile. Below this count,
+ * `chartKey` draws the WHOLE (tiny) series, un-sliced, on the first key only
+ * — the same "no slice" mode the grid ticker's own sparkline already uses —
+ * rather than asking the renderer to spread 2 or 3 points across 3 keys.
+ */
+const MIN_SLICE_POINTS = 4
 
 const STATE_LABELS: Record<MarketState, string> = {
   open: 'MARKET OPEN',
@@ -141,18 +153,24 @@ export class StocksPage implements Page {
     this.source.setVisible(false)
   }
 
+  /** The quote `this.selected` names, or null when nothing is selected OR
+   * the selected symbol has no quote (this should not happen — quotes are
+   * only ever added, never removed — but a page must never throw). Computed
+   * fresh from `quotes` every call rather than cached, so `render` never
+   * needs to mutate `this.selected` to fall back to the grid (M3: a page
+   * must not mutate its own state inside `render`) — `onKeyPress` calls
+   * this too, so the two stay consistent about whether a symbol is really
+   * selected. */
+  private activeQuote(quotes: Map<string, Quote>): Quote | null {
+    if (this.selected === null) return null
+    return quotes.get(this.selected) ?? null
+  }
+
   render(now: number): DeckFrame {
     const quotes = this.source.getQuotes()
 
-    if (this.selected !== null) {
-      const quote = quotes.get(this.selected)
-      if (quote) return this.detailFrame(this.selected, quote, now)
-      // The selected symbol's quote vanished. This should not happen — quotes
-      // are only ever added, never removed — but a page must never throw, so
-      // fall back to the grid rather than render a detail view with nothing
-      // behind it.
-      this.selected = null
-    }
+    const quote = this.activeQuote(quotes)
+    if (quote) return this.detailFrame(this.selected!, quote, now)
 
     const keys = SYMBOLS.map((symbol) => this.tickerKey(quotes.get(symbol), symbol))
     return {
@@ -195,16 +213,21 @@ export class StocksPage implements Page {
     const trend = trendOf(quote.changePercent)
     const border = trendColor(trend)
     const dim = this.source.isSymbolStale(symbol) || quote.price === null
-    const chart = this.chartSeries(symbol, quote)
+    const chart = this.chartSeries(symbol, quote, now)
+    // I5: the chart itself dims when its OWN yearly series has gone stale,
+    // even while the intraday quote (keys 0-3) is perfectly fresh — a
+    // detail view left open for days must not keep drawing old closes as
+    // if they were just fetched.
+    const chartDim = dim || chart.stale
 
     const keys: KeySpec[] = [
       this.priceKey(quote, border, dim),
       this.changeKey(quote, trend, border, dim),
       this.rangeKey('DAY', quote.dayHigh, quote.dayLow, border, dim),
       this.rangeKey('52 WK', quote.week52High, quote.week52Low, border, dim),
-      this.chartKey(chart, trend, border, dim, 0),
-      this.chartKey(chart, trend, border, dim, 1),
-      this.chartKey(chart, trend, border, dim, 2),
+      this.chartKey(chart, trend, border, chartDim, 0),
+      this.chartKey(chart, trend, border, chartDim, 1),
+      this.chartKey(chart, trend, border, chartDim, 2),
       this.backKey(),
     ]
 
@@ -224,13 +247,24 @@ export class StocksPage implements Page {
    * label always matches the values it goes with, so a still-loading or
    * failed yearly fetch shows the grid's own honest range instead of
    * silently mislabelling a day as a year.
+   *
+   * Per I5: `requestYearly` used to fire only at the instant of selection,
+   * so a detail view left open past the 6-hour refresh interval kept
+   * drawing the SAME closes forever with nothing to say they had gone
+   * stale. This gives the caller `stale` — the age the page can see — and
+   * asks the source for a fresh copy right here. That is safe to call on
+   * every render: `requestYearly` is itself cooldown- and in-flight-guarded
+   * (docs/LESSONS.md lesson 10), so this can only ever start the ONE fetch
+   * the staleness actually justifies, never a request per render tick.
    */
-  private chartSeries(symbol: string, quote: Quote): { values: number[]; label: string } {
+  private chartSeries(symbol: string, quote: Quote, now: number): { values: number[]; label: string; stale: boolean } {
     const yearly = this.source.getYearlyState(symbol)
     if (yearly.status === 'ok' && yearly.values.length >= 2) {
-      return { values: yearly.values, label: '52 WK' }
+      const stale = now - yearly.updatedAt > YEARLY_REFRESH_SECONDS
+      if (stale) this.source.requestYearly(symbol)
+      return { values: yearly.values, label: '52 WK', stale }
     }
-    return { values: quote.spark, label: '1D' }
+    return { values: quote.spark, label: '1D', stale: false }
   }
 
   /** Key 0: the symbol, then the price sized to fit whatever width the
@@ -301,6 +335,21 @@ export class StocksPage implements Page {
    * identically on all three keys so the bars still line up at the seams,
    * and `label` itself is set only on index 0 so the caption is not
    * repeated three times.
+   *
+   * Per I4, this now handles every point count sensibly instead of just
+   * "4 or more":
+   * - 0 or 1 points: nothing to draw at all, but a chart slot must never go
+   *   blank with no explanation — key 4 alone still carries `chart.label` as
+   *   a plain text line, in the SAME spot `drawSpark`'s own caption would
+   *   occupy, so there is always a caption when a chart slot is shown.
+   * - 2 or 3 points: too few to slice across `CHART_SPAN` keys — measured,
+   *   `drawSpark`'s per-key virtual-width geometry puts the whole series on
+   *   the wrong key, or draws none at all on this one. Key 4 alone draws
+   *   the whole (tiny) series un-sliced instead, the same "no slice" mode
+   *   the grid ticker's own sparkline already uses; keys 5 and 6 stay
+   *   blank, since there is no meaningful "next third" of a 2- or 3-point
+   *   series to show them.
+   * - 4 or more points: the existing 3-key slice, unchanged.
    */
   private chartKey(
     chart: { values: number[]; label: string },
@@ -310,7 +359,9 @@ export class StocksPage implements Page {
     index: number,
   ): KeySpec {
     const key: KeySpec = { kind: 'gauge', border }
-    if (chart.values.length >= 2) {
+    const n = chart.values.length
+
+    if (n >= MIN_SLICE_POINTS) {
       key.spark = {
         values: chart.values,
         color: trendColor(trend),
@@ -319,6 +370,25 @@ export class StocksPage implements Page {
         labelBand: true,
         label: index === 0 ? chart.label : undefined,
       }
+    } else if (n >= 2) {
+      if (index === 0) {
+        key.spark = {
+          values: chart.values,
+          color: trendColor(trend),
+          fullHeight: true,
+          labelBand: true,
+          label: chart.label,
+        }
+      }
+    } else if (index === 0) {
+      // 0 or 1 points: no bars to draw, but the caption must still appear.
+      // Positioned to match exactly where `drawSpark`'s own `label` would
+      // land for a `fullHeight`/`labelBand` chart (`x0 = BORDER + PAD`,
+      // `y = SPARK_FULL_Y`), so a chart slot with a caption and one with
+      // real bars read as the same family of tile.
+      key.lines = [chart.label]
+      key.lineSizes = [11]
+      key.lineY = [6]
     }
     if (dim) key.dim = true
     return key
@@ -371,14 +441,18 @@ export class StocksPage implements Page {
   }
 
   onKeyPress(index: number): PressOutcome {
-    if (this.selected === null) {
+    const quotes = this.source.getQuotes()
+    if (this.activeQuote(quotes) === null) {
       const symbol = SYMBOLS[index]
       if (!symbol) return 'ignored'
-      // No quote at all for this key yet: nothing to show a detail view for.
-      // The grid can hold fewer than eight known symbols before the first
-      // successful refresh, and an empty key must not open detail for a
-      // symbol that does not exist.
-      if (!this.source.getQuotes().has(symbol)) return 'ignored'
+      // No quote at all for this key yet, or a quote with no price at all
+      // (M1: a halted or non-trading instrument's `meta` can come back with
+      // every price field null) — either way there is nothing to show a
+      // detail view for, and a press that opens nothing must report
+      // `ignored`, not `handled`, so the on-device flash tells the truth
+      // (per AGENTS.md's "Press feedback" convention).
+      const quote = quotes.get(symbol)
+      if (!quote || quote.price === null) return 'ignored'
       this.selected = symbol
       // Lazily kicks off the 52-week fetch for THIS symbol only, right at
       // the moment its detail view opens — never for all eight symbols on

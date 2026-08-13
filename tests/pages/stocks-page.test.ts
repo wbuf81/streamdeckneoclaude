@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { StocksPage } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
-import { SYMBOLS } from '../../src/sources/stocks.js'
+import { SYMBOLS, YEARLY_REFRESH_SECONDS } from '../../src/sources/stocks.js'
 import type { Quote, MarketState, StockStatus, YearlyState } from '../../src/sources/stocks.js'
 
 const NOW = 1786549560
@@ -313,6 +313,18 @@ describe('StocksPage presses report the real outcome, keys 0 to 7', () => {
     expect(page.onKeyPress(0)).toBe('ignored')
   })
 
+  it('reports ignored, never handled, for a quote with no price (M1): a press that opens nothing must not flash white', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { price: null, changePercent: null }))
+    const { page, yearlyRequests } = build({ quotes })
+    expect(page.onKeyPress(0)).toBe('ignored')
+    // Confirms the press really did nothing, not just the return value:
+    // no detail view opened and no yearly fetch was kicked off.
+    expect(page.render(NOW).keys).toHaveLength(8)
+    expect(page.render(NOW).keys[0]!.lines![0]).toBe(SYMBOLS[0])
+    expect(yearlyRequests).toEqual([])
+  })
+
   it('reports handled for BACK (key 7), and ignored for every other key, once a symbol is selected', () => {
     const { page } = build({ quotes: allQuotes() })
     expect(page.onKeyPress(2)).toBe('handled') // enters detail mode
@@ -471,7 +483,7 @@ describe('StocksPage detail view layout', () => {
       quotes.set(SYMBOLS[0]!, tslaLikeQuote())
       const { page } = build({
         quotes,
-        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: yearlyValues }]]),
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: yearlyValues, updatedAt: NOW }]]),
       })
       page.onKeyPress(0)
       const keys = page.render(NOW).keys
@@ -491,7 +503,7 @@ describe('StocksPage detail view layout', () => {
       quotes.set(SYMBOLS[0]!, tslaLikeQuote())
       const { page } = build({
         quotes,
-        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: yearlyValues }]]),
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: yearlyValues, updatedAt: NOW }]]),
       })
       page.onKeyPress(0)
       const keys = page.render(NOW).keys
@@ -507,12 +519,205 @@ describe('StocksPage detail view layout', () => {
       quotes.set(SYMBOLS[0]!, tslaLikeQuote())
       const { page } = build({
         quotes,
-        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: [42] }]]),
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: [42], updatedAt: NOW }]]),
       })
       page.onKeyPress(0)
       const key = page.render(NOW).keys[4]!
       expect(key.spark!.label).toBe('1D')
       expect(key.spark!.values).toEqual(tslaLikeQuote().spark)
+    })
+  })
+
+  describe('chart geometry at every point count (I4): 0, 1, 2, 3, 43 and 251', () => {
+    // The review found two distinct failures at the low end: 0/1 points left
+    // keys 4-6 blank with NO caption at all, and 2/3 points made `drawSpark`
+    // put the whole series on the wrong key or draw nothing on key 4. Both
+    // are reproduced here directly against the intraday spark, and again
+    // separately against a short (43-point) and full (251-point) yearly
+    // series to prove those two real shapes still render exactly as before.
+
+    it('shows a caption but no bars for 0 points, never a blank key with no explanation', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { spark: [] }))
+      const { page } = build({ quotes })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      expect(keys[4]!.spark).toBeUndefined()
+      expect(keys[4]!.lines).toEqual(['1D'])
+      expect(keys[5]!.spark).toBeUndefined()
+      expect(keys[5]!.lines).toBeUndefined()
+      expect(keys[6]!.spark).toBeUndefined()
+      expect(keys[6]!.lines).toBeUndefined()
+    })
+
+    it('shows a caption but no bars for 1 point', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { spark: [42] }))
+      const { page } = build({ quotes })
+      page.onKeyPress(0)
+      const key = page.render(NOW).keys[4]!
+      expect(key.spark).toBeUndefined()
+      expect(key.lines).toEqual(['1D'])
+    })
+
+    it('draws the whole (un-sliced) series on key 4 alone for 2 points, rather than slicing it across 3 keys', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { spark: [10, 20] }))
+      const { page } = build({ quotes })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      expect(keys[4]!.spark!.values).toEqual([10, 20])
+      expect(keys[4]!.spark!.slice).toBeUndefined()
+      expect(keys[4]!.spark!.label).toBe('1D')
+      expect(keys[5]!.spark).toBeUndefined()
+      expect(keys[6]!.spark).toBeUndefined()
+    })
+
+    it('draws the whole (un-sliced) series on key 4 alone for 3 points', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { spark: [10, 20, 15] }))
+      const { page } = build({ quotes })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      expect(keys[4]!.spark!.values).toEqual([10, 20, 15])
+      expect(keys[4]!.spark!.slice).toBeUndefined()
+      expect(keys[5]!.spark).toBeUndefined()
+      expect(keys[6]!.spark).toBeUndefined()
+    })
+
+    it('renders an actual bar on key 4 for a 2-point rising series (the review\'s exact failure: 0 bars, chart appears to start on key 5)', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { spark: [10, 20] }))
+      const { page } = build({ quotes })
+      page.onKeyPress(0)
+      const buf = renderKey(page.render(NOW).keys[4]!)
+      let sawInk = false
+      for (let y = 0; y < KEY_SIZE && !sawInk; y++) {
+        for (let x = 4; x < KEY_SIZE; x++) {
+          const [r, g, b] = probe(buf, x, y)
+          const bg = theme.bg
+          if (Math.abs(r - bg[0]) > 12 || Math.abs(g - bg[1]) > 12 || Math.abs(b - bg[2]) > 12) {
+            sawInk = true
+            break
+          }
+        }
+      }
+      expect(sawInk).toBe(true)
+    })
+
+    it('uses the normal 3-key slice at 4 points — the threshold right above the low-end fix', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { spark: [10, 20, 15, 25] }))
+      const { page } = build({ quotes })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      expect(keys[4]!.spark!.slice).toEqual({ index: 0, count: 3 })
+      expect(keys[5]!.spark!.slice).toEqual({ index: 1, count: 3 })
+      expect(keys[6]!.spark!.slice).toEqual({ index: 2, count: 3 })
+    })
+
+    it('slices normally for a short (43-point) yearly series — no coverage existed at this length before', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const shortYearly = Array.from({ length: 43 }, (_, i) => 100 + i)
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: shortYearly, updatedAt: NOW }]]),
+      })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      expect(keys[4]!.spark!.values).toEqual(shortYearly)
+      expect(keys[4]!.spark!.slice).toEqual({ index: 0, count: 3 })
+      expect(keys[4]!.spark!.label).toBe('52 WK')
+    })
+
+    it('slices normally for a full (251-point) yearly series — no coverage existed at this length before', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const fullYearly = Array.from({ length: 251 }, (_, i) => 100 + Math.sin(i / 10) * 20)
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: fullYearly, updatedAt: NOW }]]),
+      })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      expect(keys[4]!.spark!.values).toEqual(fullYearly)
+      expect(keys[6]!.spark!.slice).toEqual({ index: 2, count: 3 })
+      // Renders without throwing at the full length — the geometry above 81
+      // points was the subject of an earlier review; this just confirms the
+      // low-end fix (I4) did not disturb it.
+      expect(() => renderKey(keys[4]!)).not.toThrow()
+    })
+  })
+
+  describe('yearly chart staleness (I5): the chart must show its own age and refresh when opened stale', () => {
+    const staleYearly = [10, 20, 30, 40, 50]
+
+    it('dims only the chart keys (4-6), not the rest of the detail view, when the cached yearly series has gone stale', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const staleUpdatedAt = NOW - (YEARLY_REFRESH_SECONDS + 1)
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: staleYearly, updatedAt: staleUpdatedAt }]]),
+      })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      for (const key of keys.slice(4, 7)) expect(key.dim).toBe(true)
+      // The intraday quote itself is fresh — only the chart's OWN data aged out.
+      for (const key of keys.slice(0, 4)) expect(key.dim).not.toBe(true)
+    })
+
+    it('does not dim the chart for a yearly series that is still within the refresh interval', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: staleYearly, updatedAt: NOW - 60 }]]),
+      })
+      page.onKeyPress(0)
+      const keys = page.render(NOW).keys
+      for (const key of keys.slice(4, 7)) expect(key.dim).not.toBe(true)
+    })
+
+    it('asks the source for a fresh copy while the view stays open on a stale cached series (never re-requests once fresh)', () => {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const staleUpdatedAt = NOW - (YEARLY_REFRESH_SECONDS + 1)
+      const { page, yearlyRequests } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: staleYearly, updatedAt: staleUpdatedAt }]]),
+      })
+      page.onKeyPress(0) // clears yearlyRequests below, since selection itself always requests once
+      yearlyRequests.length = 0
+      page.render(NOW)
+      page.render(NOW)
+      expect(yearlyRequests).toEqual([SYMBOLS[0], SYMBOLS[0]])
+      // (The real source's own cooldown/in-flight guards, proven in
+      // tests/sources/stocks.test.ts, are what keep this from becoming an
+      // actual network request per render tick — this page is only asking,
+      // never fetching directly.)
+    })
+
+    it('never draws stale closes under the 52 WK label while a fresh copy is still loading — the label always matches the cached values', () => {
+      // Even though the cache is stale, `chartSeries` must keep showing the
+      // OLD values honestly labelled 52 WK (dimmed) rather than silently
+      // switching to 1D mid-view — that would be a MORE confusing change
+      // than staying on stale-but-labelled data, per the original task's
+      // honesty rule: never show one range's data under another range's
+      // label.
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+      const staleUpdatedAt = NOW - (YEARLY_REFRESH_SECONDS + 1)
+      const { page } = build({
+        quotes,
+        yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: staleYearly, updatedAt: staleUpdatedAt }]]),
+      })
+      page.onKeyPress(0)
+      const key = page.render(NOW).keys[4]!
+      expect(key.spark!.values).toEqual(staleYearly)
+      expect(key.spark!.label).toBe('52 WK')
+      expect(key.dim).toBe(true)
     })
   })
 
@@ -671,13 +876,19 @@ describe('StocksPage detail view text fits the usable key width', () => {
   // means it measures the property that actually matters — no ink past the
   // key's own right margin — instead of trusting the page's declared size.
   const RIGHT_EDGE_X = 90 // BORDER(3) + PAD(6) + usable width(81)
+  const RIGHT_EDGE_BAND_END = 95 // KEY_SIZE(96) - 1: probe the whole margin, not one column
 
+  // Test quality: a single-column probe at x=90 alone cannot fail against
+  // ink one column further right. This probes the whole band from the
+  // usable-width edge to the key's last column instead.
   function noInkAtOrPastRightEdge(buf: Buffer): boolean {
+    const bg = theme.bg
     for (let y = 0; y < KEY_SIZE; y++) {
-      const [r, g, b] = probe(buf, RIGHT_EDGE_X, y)
-      const bg = theme.bg
-      if (Math.abs(r - bg[0]) > 12 || Math.abs(g - bg[1]) > 12 || Math.abs(b - bg[2]) > 12) {
-        return false
+      for (let x = RIGHT_EDGE_X; x <= RIGHT_EDGE_BAND_END; x++) {
+        const [r, g, b] = probe(buf, x, y)
+        if (Math.abs(r - bg[0]) > 12 || Math.abs(g - bg[1]) > 12 || Math.abs(b - bg[2]) > 12) {
+          return false
+        }
       }
     }
     return true
