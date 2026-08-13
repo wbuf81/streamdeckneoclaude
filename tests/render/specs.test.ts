@@ -180,6 +180,32 @@ describe('keyHash', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
+  // Task 38: without glyphFont in the hash, switching a key between the
+  // text and emoji Spotify variants would leave the OLD glyph's pixels on
+  // the glass.
+  it('differs when glyphFont changes, even with the same glyph string', () => {
+    const a: KeySpec = { kind: 'control', glyph: '🔊', glyphFont: 'text' }
+    const b: KeySpec = { kind: 'control', glyph: '🔊', glyphFont: 'emoji' }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  // Task 38: the volume key's "thump" advances `glyphPulse.phase` every
+  // render tick. Without it in the hash, the daemon's dirty-key check would
+  // see no difference between two ticks and the animation would freeze
+  // after its first frame — the exact defect lesson 11 describes, and the
+  // same one task 27's `pulse.phase` guards against for the idle equaliser.
+  it('differs when glyphPulse.phase changes, so the daemon keeps redrawing the thump', () => {
+    const a: KeySpec = { kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: 0 } }
+    const b: KeySpec = { kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: 1 } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('matches when glyphFont and glyphPulse are both equal', () => {
+    const a: KeySpec = { kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: 0.5 } }
+    const b: KeySpec = { kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: 0.5 } }
+    expect(keyHash(a)).toBe(keyHash(b))
+  })
+
   it('matches when glyph and glyphCaption are both equal', () => {
     const a: KeySpec = { kind: 'control', glyph: '▲', glyphCaption: '55%' }
     const b: KeySpec = { kind: 'control', glyph: '▲', glyphCaption: '55%' }

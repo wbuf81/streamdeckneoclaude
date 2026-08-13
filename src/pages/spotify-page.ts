@@ -8,18 +8,58 @@ import type { PlayerState, SpotifyStatus } from '../sources/spotify.js'
 
 const VOLUME_STEP = 10
 /**
- * The four transport-control glyphs, all from the Geometric Shapes Unicode
- * block (task 37 — see `render/canvas.ts`'s `GLYPH_SIZE` comment for the
- * measurement that picked this family and rejected the media-control block
- * and the speaker emoji as tofu on this machine's font stack). One named
- * constant per glyph, so trying a different variant is a one-line edit here
- * rather than a hunt through `render(...)` below.
+ * The four transport-control glyphs, drawn with the colour-emoji font
+ * (task 38 — the user's pick over task 37's plain-text Geometric Shapes
+ * set, `▶` `▮▮` `◀◀` `▶▶` `▲`, which shipped first and is still available as
+ * the non-emoji option via `glyphFont: 'text'`, see `render/canvas.ts`).
+ *
+ * Task 37 measured the media-control Unicode block and the speaker emoji as
+ * an IDENTICAL tofu box and rejected them. That measurement used the
+ * plain-TEXT font, which has no emoji coverage at all — every codepoint
+ * falls back to the SAME `.notdef` box there, so the "identical" result was
+ * a font-choice bug in the measurement, not a fact about the glyphs.
+ * Re-measured against the real colour-emoji font
+ * (`render/canvas.ts`'s `EMOJI_GLYPH_SIZE`), they render correctly.
+ *
+ * `glyphFont: 'emoji'` on every control key below is set PER KEY, not a
+ * global switch — `render/canvas.ts` reads this field per key, so a future
+ * key on this same page could still use the text path if that ever made
+ * sense for it.
  */
-const PLAY_GLYPH = '▶'
-const PAUSE_GLYPH = '▮▮'
-const PREVIOUS_GLYPH = '◀◀'
-const NEXT_GLYPH = '▶▶'
-const VOLUME_UP_GLYPH = '▲'
+const PLAY_GLYPH = '▶️'
+const PAUSE_GLYPH = '⏸️'
+const PREVIOUS_GLYPH = '⏮️'
+const NEXT_GLYPH = '⏭️'
+/**
+ * DO NOT replace this with a `🔈 → 🔉 → 🔊` cycle for the "thump" below —
+ * it was tried, measured, and rejected; re-attempting it as an "obvious"
+ * improvement will reproduce the same defect. Measured chromatic pixel
+ * weight at `EMOJI_GLYPH_SIZE`: `🔈` 49, `🔉` 92, `🔊` 279 — an UNEVEN step
+ * (small jump, then a 3x jump), not a smooth progression. Worse, the three
+ * glyphs' own ink CENTRES differ from each other by up to 2px (a real,
+ * measured jitter, not anti-aliasing noise), so cycling between them reads
+ * as the icon twitching sideways as much as it pulses outward — confirmed
+ * visually, not just numerically (see the task's rejected-cycle preview:
+ * `🔈` shows no wave lines at all, `🔉` adds a faint one, `🔊` pops in two
+ * bright cyan waves — a visible identity change between frames, not a
+ * radiating wave).
+ *
+ * A single glyph scaled by `glyphPulse` has none of that: its ink centre is
+ * re-measured and re-corrected at every frame's actual size
+ * (`render/canvas.ts`'s `drawCenteredGlyph`), so `🔊` alone is what
+ * animates, and only its size changes from frame to frame — never its
+ * colour or identity.
+ */
+const VOLUME_UP_GLYPH = '🔊'
+/**
+ * One full "thump" cycle, in milliseconds. Nothing in the data this page
+ * reads carries the track's actual tempo — Spotify's audio-features
+ * endpoint has it, but this app has no access to that endpoint, and this
+ * page must not attempt it (it would need the user's real OAuth token,
+ * which pages never touch directly). This is a fixed, decorative rhythm,
+ * not synced to the music.
+ */
+const VOLUME_THUMP_PERIOD_MS = 800
 /** How often the render loop should tick while the idle equaliser is
  * showing instead of album art — see the `tickMs` getter below. Matches the
  * rate already proven smooth for the Claude page's crab animation, well
@@ -90,19 +130,33 @@ export class SpotifyPage implements Page {
   constructor(private readonly source: PlayerReader) {}
 
   /**
-   * Raises the render rate only while the idle equaliser is showing. A
-   * loaded track (playing or paused) leaves this `undefined` — the daemon's
-   * default 1000 ms — because the art tile is then a still image, and a
-   * faster tick would burn CPU for nothing. `interpolate(0)` is called only
-   * for its nullness: a null result means no track is loaded, regardless of
-   * what clock value is passed in, and any non-null result (even with a
-   * meaningless position, since `now = 0` is not the real clock) proves a
-   * track IS loaded. `unauthorized` also stays at the default, because key 0
-   * shows the sign-in message there, not the animation.
+   * Raises the render rate while the idle equaliser is showing, OR while a
+   * track is playing (task 38's volume-key "thump" — see `glyphPulse` on
+   * key 3 below). A loaded but PAUSED track is the one case left at the
+   * daemon's default 1000 ms, because nothing on the page animates then; a
+   * faster tick there would still burn CPU for a still image, exactly the
+   * reasoning task 27 wrote here originally.
+   *
+   * UPDATE THIS COMMENT, do not just revert the rate, if a future page
+   * change removes the last thing that animates while playing — task 27's
+   * original version said "a loaded track ... leaves this undefined ...
+   * because the art tile is a still image," which was true THEN and stopped
+   * being true the moment anything on this page started moving during
+   * playback. Leaving stale reasoning here is exactly what invites the next
+   * person to "fix" this back to task 27's version.
+   *
+   * `interpolate(0)` is called only to read `isPlaying`/nullness: a null
+   * result means no track is loaded, regardless of what clock value is
+   * passed in, and any non-null result (even with a meaningless position,
+   * since `now = 0` is not the real clock) proves a track IS loaded.
+   * `unauthorized` stays at the default, because key 0 shows the sign-in
+   * message there, not the animation.
    */
   get tickMs(): number | undefined {
     if (this.source.getStatus() === 'unauthorized') return undefined
-    return this.source.interpolate(0) ? undefined : PULSE_TICK_MS
+    const state = this.source.interpolate(0)
+    if (!state) return PULSE_TICK_MS
+    return state.isPlaying ? PULSE_TICK_MS : undefined
   }
 
   onEnter(): void {
@@ -123,12 +177,23 @@ export class SpotifyPage implements Page {
       keys: [
         this.primaryArtKey(state, status, art, CROP_TOP_LEFT, nowMs),
         this.spanArtKey(state, status, art, CROP_TOP_RIGHT, nowMs, 1),
-        { kind: 'control', glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH, dim: dead },
-        { kind: 'control', glyph: VOLUME_UP_GLYPH, glyphCaption: volumeLabel(state), dim: dead },
+        { kind: 'control', glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH, glyphFont: 'emoji', dim: dead },
+        {
+          kind: 'control',
+          glyph: VOLUME_UP_GLYPH,
+          glyphFont: 'emoji',
+          glyphCaption: volumeLabel(state),
+          // The "thump" — only while a track is actually PLAYING. A
+          // thumping speaker beside a paused track would be decoration with
+          // no meaning; static here matches static everywhere else on a
+          // paused or idle page.
+          glyphPulse: state?.isPlaying ? { phase: volumePulsePhase(nowMs) } : undefined,
+          dim: dead,
+        },
         this.spanArtKey(state, status, art, CROP_BOTTOM_LEFT, nowMs, 2),
         this.spanArtKey(state, status, art, CROP_BOTTOM_RIGHT, nowMs, 3),
-        { kind: 'control', glyph: PREVIOUS_GLYPH, dim: dead },
-        { kind: 'control', glyph: NEXT_GLYPH, dim: dead },
+        { kind: 'control', glyph: PREVIOUS_GLYPH, glyphFont: 'emoji', dim: dead },
+        { kind: 'control', glyph: NEXT_GLYPH, glyphFont: 'emoji', dim: dead },
       ],
       strip: this.strip(state, status, nowMs),
       buttons: [theme.gray, theme.gray],
@@ -244,6 +309,18 @@ export class SpotifyPage implements Page {
 function volumeLabel(state: PlayerState | null): string {
   if (!state || state.volumePercent === null) return '—'
   return `${state.volumePercent}%`
+}
+
+/**
+ * Phase for the volume key's "thump", the same `nowMs`-driven pattern
+ * `pulseSpec` below uses for the idle equaliser: never `Date.now()`, so two
+ * calls with the same `nowMs` always agree, and the phase actually advances
+ * from one render to the next so `keyHash` sees a new value every tick
+ * (lesson 11 — the exact defect that once hit this page's `imageCrop`, and
+ * would just as easily freeze this animation after one frame).
+ */
+function volumePulsePhase(nowMs: number): number {
+  return (nowMs / VOLUME_THUMP_PERIOD_MS) * 2 * Math.PI
 }
 
 /**

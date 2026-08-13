@@ -199,6 +199,184 @@ describe('renderKey glyph optical centring (task 37)', () => {
 })
 
 /**
+ * Task 38: `glyphFont: 'emoji'` and `glyphPulse` on the SAME `glyph` field
+ * — the emoji transport row and the volume key's "thump," the user's pick
+ * over task 37's plain-text variant (still available via `glyphFont:
+ * 'text'`/absent, covered by the "glyph optical centring (task 37)" suite
+ * above, which is now a regression guard for the non-default path).
+ */
+describe('renderKey glyph emoji mode and pulse (task 38)', () => {
+  function inkCentroid(buf: Buffer): { cx: number; cy: number } {
+    let minX = KEY_SIZE, maxX = -1, minY = KEY_SIZE, maxY = -1
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) {
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
+          if (y < minY) minY = y
+          if (y > maxY) maxY = y
+        }
+      }
+    }
+    return { cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 }
+  }
+
+  function chromaticCount(buf: Buffer): number {
+    let n = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const [r, g, b] = probe(buf, x, y)
+        if (Math.max(Math.abs(r - g), Math.abs(g - b), Math.abs(r - b)) > 20) n++
+      }
+    }
+    return n
+  }
+
+  it('centres the ink of every emoji-mode transport glyph at the same y, within 1px', () => {
+    const glyphs = ['⏮️', '▶️', '⏸️', '⏭️', '🔊']
+    const centres = glyphs.map((glyph) =>
+      inkCentroid(renderKey({ kind: 'control', glyph, glyphFont: 'emoji' })),
+    )
+    const ys = centres.map((c) => c.cy)
+    for (const y of ys) {
+      expect(Math.abs(y - ys[0]!)).toBeLessThanOrEqual(1)
+    }
+  })
+
+  it('draws real colour, proving the emoji font (not the text fallback) actually rendered', () => {
+    const buf = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji' })
+    expect(chromaticCount(buf)).toBeGreaterThan(50)
+  })
+
+  it('draws visibly different pixels than the same codepoint drawn as a text glyph', () => {
+    // The task 37 measurement error this corrects: under the plain-text
+    // font, this codepoint has no coverage and falls back to `.notdef` —
+    // never chromatic, and a different shape than the real emoji.
+    const asEmoji = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji' })
+    const asText = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'text' })
+    expect(asEmoji.equals(asText)).toBe(false)
+    expect(chromaticCount(asText)).toBe(0)
+  })
+
+  it('dims the emoji glyph via globalAlpha, proven by a drop in chromatic pixels, not just any pixel difference', () => {
+    // Lesson 15: colour emoji ignore `fillStyle`. A test that only checked
+    // "the buffers differ" could pass even if dimming quietly did nothing
+    // to the emoji's own colour — this checks the SPECIFIC signal
+    // `globalAlpha` blending toward the near-black background produces:
+    // measurably fewer pixels read as chromatic once dimmed.
+    const bright = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji' })
+    const dimmed = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', dim: true })
+    const brightChroma = chromaticCount(bright)
+    const dimChroma = chromaticCount(dimmed)
+    expect(brightChroma).toBeGreaterThan(50)
+    expect(dimChroma).toBeLessThan(brightChroma * 0.6)
+  })
+
+  it('leaves the caption band clear of the emoji glyph at rest, same row as the text variant', () => {
+    const buf = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphCaption: '55%' })
+    // Row 52: background for the text-glyph variant (task 37's own gap
+    // test) — also background here, proving the taller emoji still clears
+    // the SAME reserved gap rather than needing a lower caption row.
+    for (let x = 0; x < KEY_SIZE; x++) {
+      expect(near3(probe(buf, x, 52), theme.bg)).toBe(true)
+    }
+    let inkInCaptionBand = false
+    for (let y = 60; y < 74 && !inkInCaptionBand; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(buf, x, y), theme.bg)) {
+          inkInCaptionBand = true
+          break
+        }
+      }
+    }
+    expect(inkInCaptionBand).toBe(true)
+  })
+
+  it('leaves the caption band clear even at the thump animation\'s LARGEST frame, not just at rest', () => {
+    // phase = π/2 is glyphPulse's maximum (sin = 1), the biggest the glyph
+    // ever gets — the case that could crowd the caption if it were going
+    // to at all.
+    const buf = renderKey({
+      kind: 'control', glyph: '🔊', glyphFont: 'emoji',
+      glyphPulse: { phase: Math.PI / 2 }, glyphCaption: '55%',
+    })
+    for (let x = 0; x < KEY_SIZE; x++) {
+      expect(near3(probe(buf, x, 55), theme.bg)).toBe(true)
+    }
+  })
+
+  it('keeps the widest realistic caption inside the 81px usable width at the pulse\'s LARGEST frame, not just at rest', () => {
+    // The widest realistic caption ("100%") rendered alongside the pulse's
+    // biggest frame (phase π/2, sin = 1) — the combination that would
+    // reveal it if the growing glyph somehow pushed the caption's own draw
+    // position, rather than trusting that they are independent draw calls
+    // because of how the code is structured.
+    const buf = renderKey({
+      kind: 'control', glyph: '🔊', glyphFont: 'emoji',
+      glyphPulse: { phase: Math.PI / 2 }, glyphCaption: '100%',
+    })
+    // Usable width is 81px (KEY_SIZE 96 - 3 border - 6 padding each side),
+    // so column 90 (96 - 6 padding) is the right edge of that budget. No
+    // caption ink should reach it, matching the "no ink past the edge"
+    // pattern the lineSizes tests already use elsewhere in this file.
+    for (let y = 60; y < 74; y++) {
+      expect(near3(probe(buf, 90, y), theme.bg)).toBe(true)
+    }
+  })
+
+  it('renders a visibly different frame at two different pulse phases', () => {
+    const a = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: 0 } })
+    const b = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: Math.PI / 2 } })
+    expect(a.equals(b)).toBe(false)
+  })
+
+  it('grows the glyph\'s ink footprint at the pulse peak versus its resting size', () => {
+    function inkCount(buf: Buffer): number {
+      let n = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          if (!near3(probe(buf, x, y), theme.bg)) n++
+        }
+      }
+      return n
+    }
+    const rest = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: 0 } })
+    const peak = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: Math.PI / 2 } })
+    expect(inkCount(peak)).toBeGreaterThan(inkCount(rest))
+  })
+
+  it('keeps the pulsing glyph\'s ink centred at every phase sampled across one cycle, within 1.5px', () => {
+    const phases = [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2]
+    const centres = phases.map((phase) =>
+      inkCentroid(renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase } })),
+    )
+    for (const c of centres) {
+      expect(Math.abs(c.cx - KEY_SIZE / 2)).toBeLessThanOrEqual(1.5)
+      expect(Math.abs(c.cy - centres[0]!.cy)).toBeLessThanOrEqual(1.5)
+    }
+  })
+
+  it('draws byte-identically to the un-pulsed glyph when glyphPulse is absent (scale defaults to 1)', () => {
+    const withoutField = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji' })
+    const explicitRest = renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase: 0 } })
+    // phase 0 -> sin(0) = 0 -> scale 1, so this should match the no-pulse
+    // path exactly, proving `glyphPulse` at rest changes nothing.
+    expect(withoutField.equals(explicitRest)).toBe(true)
+  })
+
+  it('leaves the plain-text glyph path byte-identical when glyphFont and glyphPulse are both absent (regression guard)', () => {
+    // The plain-text path (task 37, still available via `glyphFont: 'text'`
+    // or absent) must render exactly as it did before task 38's fields
+    // existed. This is the same guarantee lineSizes/lineY/labelBand each
+    // got when they were added.
+    const buf = renderKey({ kind: 'control', glyph: '♥', glyphColor: theme.red })
+    expect(sha256(buf)).toBe(
+      '5a1f8affe73ef43caa860fa0c2b26c24f24a091e29f999284373c9d851cb071f',
+    )
+  })
+})
+
+/**
  * Builds a 300 by 300 decoded image with a distinct solid colour in each
  * quadrant: red top-left, green top-right, blue bottom-left, yellow
  * bottom-right. This stands in for real album art (which arrives as JPEG),
@@ -1210,6 +1388,21 @@ describe('measured text width', () => {
     const ctx = c.getContext('2d')
     ctx.font = '16px Menlo'
     const width = ctx.measureText('95°/77°').width
+    expect(width).toBeLessThanOrEqual(81)
+  })
+
+  // Task 38: the volume key's caption is drawn at a FIXED size
+  // (GLYPH_CAPTION_SIZE, 11px), entirely independent of glyphPulse's scale
+  // — the pulse only ever resizes `glyph`, never `glyphCaption`'s own font.
+  // So the widest realistic caption cannot be "pushed" wider by the
+  // animation's largest frame; this measures it anyway, per the brief's
+  // explicit request, rather than asserting that from the code structure
+  // alone.
+  it('fits "100%" (the widest realistic volume caption) at 11px within the 81px usable width', () => {
+    const c = createCanvas(KEY_SIZE, KEY_SIZE)
+    const ctx = c.getContext('2d')
+    ctx.font = '11px Menlo'
+    const width = ctx.measureText('100%').width
     expect(width).toBeLessThanOrEqual(81)
   })
 })

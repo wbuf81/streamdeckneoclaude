@@ -3,6 +3,7 @@ import { createCanvas } from '@napi-rs/canvas'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
 import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
+import { keyHash } from '../../src/render/specs.js'
 import { theme } from '../../src/render/theme.js'
 import type { Image } from '@napi-rs/canvas'
 
@@ -90,21 +91,29 @@ describe('SpotifyPage layout', () => {
     }
   })
 
-  it('shows a pause glyph on key 2 while playing', () => {
+  // Task 38: every control glyph moved to the colour-emoji font, the user's
+  // pick over task 37's plain-text Geometric Shapes set.
+  it('shows a pause glyph on key 2 while playing, drawn in emoji mode', () => {
     const { page } = build(player({ isPlaying: true }))
-    expect(page.render(NOW).keys[2]!.glyph).toBe('▮▮')
+    const key = page.render(NOW).keys[2]!
+    expect(key.glyph).toBe('⏸️')
+    expect(key.glyphFont).toBe('emoji')
   })
 
-  it('shows a play glyph on key 2 while paused', () => {
+  it('shows a play glyph on key 2 while paused, drawn in emoji mode', () => {
     const { page } = build(player({ isPlaying: false }))
-    expect(page.render(NOW).keys[2]!.glyph).toBe('▶')
+    const key = page.render(NOW).keys[2]!
+    expect(key.glyph).toBe('▶️')
+    expect(key.glyphFont).toBe('emoji')
   })
 
-  it('shows the previous-track glyph on key 6 and the next-track glyph on key 7', () => {
+  it('shows the previous-track glyph on key 6 and the next-track glyph on key 7, both in emoji mode', () => {
     const { page } = build(player())
     const keys = page.render(NOW).keys
-    expect(keys[6]!.glyph).toBe('◀◀')
-    expect(keys[7]!.glyph).toBe('▶▶')
+    expect(keys[6]!.glyph).toBe('⏮️')
+    expect(keys[6]!.glyphFont).toBe('emoji')
+    expect(keys[7]!.glyph).toBe('⏭️')
+    expect(keys[7]!.glyphFont).toBe('emoji')
   })
 
   // Task 37: the volume key moved off the `lines`/`align` text path onto the
@@ -128,6 +137,61 @@ describe('SpotifyPage layout', () => {
     const { page } = build(player({ volumePercent: null }))
     const key = page.render(NOW).keys[3]!
     expect(key.glyphCaption).not.toMatch(/\d/)
+  })
+
+  // Task 38: only the volume key's speaker "thumps," and only while a
+  // track is actually PLAYING — a thumping speaker beside a paused track
+  // would be decoration with no meaning.
+  it('gives key 3 a glyphPulse while playing', () => {
+    const { page } = build(player({ isPlaying: true }))
+    expect(page.render(NOW).keys[3]!.glyphPulse).toBeDefined()
+  })
+
+  it('gives key 3 no glyphPulse while paused', () => {
+    const { page } = build(player({ isPlaying: false }))
+    expect(page.render(NOW).keys[3]!.glyphPulse).toBeUndefined()
+  })
+
+  it('gives key 3 no glyphPulse when there is no device', () => {
+    const { page } = build(null, 'no-device')
+    expect(page.render(NOW).keys[3]!.glyphPulse).toBeUndefined()
+  })
+
+  it('never calls Date.now() for the thump: the same nowMs always produces the same phase', () => {
+    const { page } = build(player({ isPlaying: true }))
+    const a = page.render(NOW, 12345).keys[3]!.glyphPulse!.phase
+    const b = page.render(NOW, 12345).keys[3]!.glyphPulse!.phase
+    expect(a).toBe(b)
+  })
+
+  it('advances the thump phase as nowMs advances', () => {
+    const { page } = build(player({ isPlaying: true }))
+    const phaseAt = (nowMs: number) => page.render(NOW, nowMs).keys[3]!.glyphPulse!.phase
+    expect(phaseAt(0)).not.toBe(phaseAt(200))
+  })
+
+  // Lesson 17: measure the actual rendered pixels, not just the spec field.
+  it('renders visibly different pixels for the volume key at two different clocks while playing', () => {
+    const { page } = build(player({ isPlaying: true }))
+    const bufA = renderKey(page.render(NOW, 0).keys[3]!)
+    const bufB = renderKey(page.render(NOW, 200).keys[3]!)
+    expect(bufA.equals(bufB)).toBe(false)
+  })
+
+  // The coordinator's specific concern: a tick that only advances the
+  // animation must touch exactly ONE key's hash (the volume key), so the
+  // daemon's dirty-key check (src/daemon.ts, `keyHash`) writes exactly one
+  // key to the device instead of redrawing all eight for a change that only
+  // affects one. `now` (the playback position clock) is held FIXED between
+  // the two renders — only `nowMs` (the animation clock) advances — so this
+  // isolates the thump from anything position-driven.
+  it('changes exactly one of the eight keys\' hash when only nowMs advances during playback', () => {
+    const { page } = build(player({ isPlaying: true }))
+    const before = page.render(NOW, 1000).keys.map((k) => keyHash(k))
+    const after = page.render(NOW, 1100).keys.map((k) => keyHash(k))
+    const changed = before.map((h, i) => h !== after[i]).filter(Boolean).length
+    expect(changed).toBe(1)
+    expect(before[3]).not.toBe(after[3])
   })
 
   it('dims keys 2, 3, 6 and 7 when there is no device', () => {
@@ -214,9 +278,19 @@ describe('SpotifyPage idle equaliser (nothing playing)', () => {
 })
 
 describe('SpotifyPage tickMs', () => {
-  it('is undefined (the 1000 ms default) while a track is loaded', () => {
-    const { page } = build(player())
+  // Task 38: a loaded, PAUSED track is the one "loaded" case left at the
+  // 1000 ms default — nothing on the page animates then. This used to be
+  // true for ANY loaded track (task 27); it stopped being true the moment
+  // the volume key's "thump" started animating during playback.
+  it('is undefined (the 1000 ms default) while a track is loaded but paused', () => {
+    const { page } = build(player({ isPlaying: false }))
     expect(page.tickMs).toBeUndefined()
+  })
+
+  it('is defined and faster than 1000 ms while a track is loaded and PLAYING (task 38\'s thump)', () => {
+    const { page } = build(player({ isPlaying: true }))
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
   })
 
   it('is defined and faster than 1000 ms while nothing is playing', () => {

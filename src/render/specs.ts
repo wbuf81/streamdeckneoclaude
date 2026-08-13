@@ -152,6 +152,29 @@ export interface KeySpec {
    * caption unset simply leaves that band as background.
    */
   glyphCaption?: string
+  /**
+   * Selects the font family `glyph` draws with. Absent (or `'text'`) is the
+   * ORIGINAL path — the plain-text `FONT` (Menlo), tintable via
+   * `glyphColor`, dimmed via `fillStyle` — byte-identical to before this
+   * field existed. `'emoji'` draws `glyph` with the colour-emoji font
+   * instead (the same font the standalone `emoji` field below already uses)
+   * and dims it via `globalAlpha` rather than `fillStyle`: colour emoji are
+   * bitmap glyphs that ignore `fillStyle` (lesson 15 in docs/LESSONS.md,
+   * task 24's original bug on THIS project). `glyphColor` is ignored in
+   * `'emoji'` mode — a bitmap glyph cannot be tinted. Task 38 (Spotify).
+   */
+  glyphFont?: 'text' | 'emoji'
+  /**
+   * Grows and shrinks `glyph` by a small fraction around its own optical
+   * centre, one sine cycle per `2π` of `phase` — the Spotify volume key's
+   * "thump" while a track plays (task 38). Re-measures the glyph's ink
+   * bounds at the ACTUAL size drawn on every frame (see `drawCenteredGlyph`
+   * in `render/canvas.ts`), so the glyph stays optically centred throughout
+   * the pulse rather than assuming the resting size's correction still
+   * applies at a different size. Absent, `glyph` draws at its fixed default
+   * size, exactly as before this field existed.
+   */
+  glyphPulse?: { phase: number }
   /** A single emoji, drawn large and centred. Used by the weather page. */
   emoji?: string
   /** An already-decoded image, for example album art. `keyHash` ignores this field. */

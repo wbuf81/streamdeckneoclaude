@@ -98,29 +98,43 @@ export const FLASH_RING_THICKNESS = 4
  * every weather emoji's ink between `y 17` and `y 48` — clear of the label
  * (ends by `y 12`) above and the temperature line (starts at `y 55`) below.
  */
+/** The one colour-emoji font this file draws with, for both the standalone
+ * `emoji` field (the weather page) and `glyph` in `'emoji'` mode (the
+ * Spotify page, task 38). One named constant so the two paths cannot drift
+ * to two different font strings. */
+const EMOJI_FONT = 'Apple Color Emoji'
 const EMOJI_SIZE = 32
 const EMOJI_Y = 38
 /**
  * Size and target ink-centre for the Spotify page's four transport-control
- * glyphs: play/pause, previous, next, and the volume "up" triangle.
+ * TEXT glyphs: play/pause, previous, next, and the volume "up" triangle.
+ * This is what task 37 shipped first; task 38 replaced it on the actual
+ * Spotify page with the EMOJI row below (`EMOJI_GLYPH_SIZE`/`EMOJI_GLYPH_Y`,
+ * selected via `glyphFont: 'emoji'` in `render/specs.ts`), per the user's
+ * choice. This text path stays in place as the non-emoji option — nothing
+ * currently calls it with `glyphFont` absent/`'text'` on a real page, but a
+ * future page or a reverted choice can use it with no new measurement.
  *
- * Measured (task 37, `docs/LESSONS.md` #17 and #15): the media-control
- * Unicode block (`⏮ ⏯ ⏭ ⏪ ⏩`) and the speaker emoji (`🔊 🔈`) — both offered
- * as candidates — render as an IDENTICAL tofu box on this machine's font
- * stack, not the intended icon; `ctx.getImageData` over each one gave the
- * same ink bounds regardless of which codepoint was drawn, the signature of
- * a missing-glyph fallback, not five different icons. Those were rejected
- * outright rather than shipped unseen.
+ * Measured (task 37, `docs/LESSONS.md` #17): `▶`, `▮▮`, `◀◀`, `▶▶` and `▲` —
+ * all from the Geometric Shapes block — share IDENTICAL ascent (7.44px) and
+ * descent (13.56px) at `GLYPH_SIZE`, both with `getImageData` and with
+ * `ctx.measureText().actualBoundingBox*`, so one centring correction
+ * (`drawCenteredGlyph`) serves every one of them with no per-glyph special
+ * case. The glyph this replaced for pause, `❙❙` (Miscellaneous Symbols
+ * block), did NOT share that metric — its own measured ascent/descent
+ * (12.44 / 16.56) is exactly why it read heavier and lower than its
+ * neighbours on the real device.
  *
- * `▶`, `▮▮`, `◀◀`, `▶▶` and `▲` — all from the Geometric Shapes block — were
- * measured instead, both with `getImageData` and with
- * `ctx.measureText().actualBoundingBox*`. All five share IDENTICAL ascent
- * (7.44px) and descent (13.56px) at `GLYPH_SIZE`, so one centring
- * correction (`drawCenteredGlyph`) serves every one of them with no
- * per-glyph special case. The glyph this replaced for pause, `❙❙`
- * (Miscellaneous Symbols block), did NOT share that metric — its own
- * measured ascent/descent (12.44 / 16.56) is exactly why it read heavier and
- * lower than its neighbours on the real device.
+ * Task 37's first pass also measured the media-control Unicode block
+ * (`⏮ ⏯ ⏭ ⏪ ⏩`) and the speaker emoji (`🔊 🔈`) rendering as an IDENTICAL
+ * tofu box and rejected them as unusable. That measurement was taken with
+ * `FONT` (Menlo, no emoji coverage) — the SAME font every codepoint falls
+ * back to `.notdef` under, hence the identical box regardless of which one
+ * was drawn. It was a font-choice bug in the measurement, not a fact about
+ * the glyphs: task 38 re-measured the same codepoints with `EMOJI_FONT` and
+ * they render correctly (see `EMOJI_GLYPH_SIZE` below). Lesson: an "empty"
+ * or "identical" result across several different inputs is itself a signal
+ * to check the harness, not just the inputs.
  */
 const GLYPH_SIZE = 34
 /** Target y for the glyph's ink centre, not the raw draw point —
@@ -129,12 +143,36 @@ const GLYPH_SIZE = 34
  * control key whether or not that particular key uses it. */
 const GLYPH_Y = 36
 /** Top of the small caption band beneath the glyph (for example the volume
- * key's percentage). 24px below the glyph's own ink (bottom edge, at
- * `GLYPH_Y` plus half its 21px ink height, sits at 46.5) — comfortably clear
- * per lesson 14, with room left below for the caption's own text before the
- * key's bottom padding. */
+ * key's percentage). Shared by both the text-glyph and emoji-glyph rows, so
+ * every control key's caption lands on the same row regardless of which
+ * font drew the icon above it — verified by pixel probe for both (task 37's
+ * gap test, and task 38's equivalent for the emoji row and its "thump"). */
 const GLYPH_CAPTION_Y = 60
 const GLYPH_CAPTION_SIZE = 11
+/**
+ * Size and target ink-centre for the Spotify page's EMOJI-mode transport
+ * row (task 38, `glyphFont: 'emoji'`). Measured separately from the text
+ * row above: colour emoji are square bitmaps with different metrics (ascent
+ * 26.5 / descent 13.5 at this size, versus the text glyphs' 7.44 / 13.56),
+ * so `EMOJI_GLYPH_Y` sits higher than `GLYPH_Y` to keep the taller glyph's
+ * ink clear of `GLYPH_CAPTION_Y` — confirmed by pixel probe, both at rest
+ * and at the "thump" animation's largest frame (`GLYPH_PULSE_AMPLITUDE`).
+ * `drawCenteredGlyph`'s runtime correction (from
+ * `ctx.measureText().actualBoundingBox*`) needed NO change to handle this
+ * font: it measured emoji ink within 0.5px of the requested target with no
+ * per-glyph special case, the same as it does for the text row.
+ */
+const EMOJI_GLYPH_SIZE = 40
+const EMOJI_GLYPH_Y = 30
+/**
+ * How far `glyphPulse` scales the glyph up and down from its resting size,
+ * as a fraction — the Spotify volume key's "thump" while a track plays
+ * (task 38). At this amplitude the largest frame (`EMOJI_GLYPH_SIZE` up by
+ * this fraction) still keeps the emoji's ink clear of `GLYPH_CAPTION_Y`,
+ * confirmed by pixel probe; a larger amplitude was not needed to read as
+ * motion once it was on-screen at 4x scale.
+ */
+const GLYPH_PULSE_AMPLITUDE = 0.1
 
 function css(c: Rgb, dim = false): string {
   const f = dim ? DIM_FACTOR : 1
@@ -422,9 +460,23 @@ function resolveLineSpecs(
  * non-finite (an environment or a future glyph this measurement cannot
  * read), so a bad measurement degrades to the old arithmetic centring
  * instead of throwing inside the render loop.
+ *
+ * `fontFamily` defaults to this file's plain-text `FONT` (Menlo). Task 38
+ * passes `EMOJI_FONT` instead for `glyphFont: 'emoji'` — verified (not
+ * assumed) against the actual colour-emoji font: it measured every emoji
+ * this page uses within 0.5px of its requested target, the same as it does
+ * for text glyphs, with no separate correction needed for the different
+ * font's metrics.
  */
-function drawCenteredGlyph(ctx: SKRSContext2D, glyph: string, size: number, cx: number, cy: number): void {
-  ctx.font = `${size}px ${FONT}`
+function drawCenteredGlyph(
+  ctx: SKRSContext2D,
+  glyph: string,
+  size: number,
+  cx: number,
+  cy: number,
+  fontFamily: string = FONT,
+): void {
+  ctx.font = `${size}px "${fontFamily}"`
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
   const m = ctx.measureText(glyph)
@@ -491,8 +543,30 @@ export function renderKey(spec: KeySpec): Buffer {
   }
 
   if (spec.glyph) {
-    ctx.fillStyle = css(spec.glyphColor ?? theme.text, dim)
-    drawCenteredGlyph(ctx, spec.glyph, GLYPH_SIZE, KEY_SIZE / 2, GLYPH_Y)
+    // `glyphPulse` re-derives the effective size EVERY frame and hands it
+    // straight to `drawCenteredGlyph`, which re-measures ink bounds at
+    // THAT size — so the "thump" never needs its own separate centring
+    // correction; it reuses the exact same measurement this file already
+    // does for the glyph's resting size. Absent, `scale` is 1 and this is
+    // byte-identical to before `glyphPulse` existed.
+    const scale = spec.glyphPulse ? 1 + GLYPH_PULSE_AMPLITUDE * Math.sin(spec.glyphPulse.phase) : 1
+    if (spec.glyphFont === 'emoji') {
+      // Colour emoji are bitmap glyphs and ignore `fillStyle` (lesson 15 in
+      // docs/LESSONS.md) — `glyphColor` is meaningless here, so it is never
+      // read in this branch. Dimming uses `globalAlpha` instead, restored
+      // in `finally` so a throw here cannot leave a later draw call on this
+      // context dimmed, matching the standalone `spec.emoji` path below.
+      const prevAlpha = ctx.globalAlpha
+      try {
+        if (dim) ctx.globalAlpha = DIM_FACTOR
+        drawCenteredGlyph(ctx, spec.glyph, EMOJI_GLYPH_SIZE * scale, KEY_SIZE / 2, EMOJI_GLYPH_Y, EMOJI_FONT)
+      } finally {
+        ctx.globalAlpha = prevAlpha
+      }
+    } else {
+      ctx.fillStyle = css(spec.glyphColor ?? theme.text, dim)
+      drawCenteredGlyph(ctx, spec.glyph, GLYPH_SIZE * scale, KEY_SIZE / 2, GLYPH_Y)
+    }
   }
 
   if (spec.glyphCaption) {
@@ -516,7 +590,7 @@ export function renderKey(spec: KeySpec): Buffer {
     const prevAlpha = ctx.globalAlpha
     try {
       if (dim) ctx.globalAlpha = DIM_FACTOR
-      ctx.font = `${EMOJI_SIZE}px "Apple Color Emoji"`
+      ctx.font = `${EMOJI_SIZE}px "${EMOJI_FONT}"`
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
       ctx.fillText(spec.emoji, KEY_SIZE / 2, EMOJI_Y)
