@@ -12,6 +12,20 @@ export const theme = {
   cyan: [80, 210, 220] as Rgb,
   gray: [80, 80, 88] as Rgb,
   barTrack: [40, 40, 46] as Rgb,
+  /**
+   * Press-feedback ring colours (task 36). Task 32's full-key fill used
+   * plain `white` and `red` at full strength, and the user reported it as
+   * "too bright" on real hardware. These are dimmer versions for the same
+   * two outcomes, meant only for the thin perimeter ring — never a fill —
+   * so full-strength `white`/`red` stay free for anything that still wants
+   * a bright, saturated colour. Both stay clearly apart from every other
+   * colour above: `flashWhite` sits below `text` (235) and above `textDim`
+   * (120) and `gray` (80); `flashRed` keeps `red`'s hue but at about 70% of
+   * its brightness, so it reads as the same "nothing happened" signal
+   * without the glare, and never reads as `amber`.
+   */
+  flashWhite: [185, 185, 190] as Rgb,
+  flashRed: [165, 55, 55] as Rgb,
 } as const
 
 /** Every value the `state` field can hold, plus the fallback. */

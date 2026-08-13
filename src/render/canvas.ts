@@ -46,6 +46,26 @@ const STRIP_LINE_2_Y = 21
  * constant so text, border and emoji all dim by the same amount. */
 const DIM_FACTOR = 0.45
 /**
+ * Geometry of the press-feedback flash ring (task 36's `KeySpec.flashRing`).
+ *
+ * `FLASH_RING_INSET` is how far the ring's outer edge sits from the key's
+ * true edge — a ring drawn flush with the edge (inset 0) is indistinguishable
+ * from a bezel-to-bezel fill at a glance, so a small gap is what makes it
+ * read as a deliberate outline. `FLASH_RING_THICKNESS` is the stroke width;
+ * the task's rendered previews (96 px key, scaled 4x) compared 3, 4 and 5 px
+ * before picking this value.
+ *
+ * Measured with `probe` at these settings: a key's own left-edge `border`
+ * (`BORDER` = 3 px, columns 0 to 2) loses its two innermost columns (1 and 2)
+ * to the ring, which is drawn afterwards and wins the overlap; only column 0
+ * — one pixel out of 96 — still shows the border's own colour. That is
+ * enough for the ring to read as the dominant signal over, for example, the
+ * Claude page's pulsing amber permission border, without this file needing
+ * to know that field exists or carve out a special case for it.
+ */
+const FLASH_RING_INSET = 1
+const FLASH_RING_THICKNESS = 4
+/**
  * Size and vertical centre of the emoji glyph.
  *
  * Measured with `ctx.getImageData` over every weather emoji this app draws
@@ -334,6 +354,32 @@ function resolveLineSpecs(
 }
 
 /**
+ * Draws a thin unfilled frame around the whole key perimeter, inset by
+ * `FLASH_RING_INSET` from the true edge and `FLASH_RING_THICKNESS` px thick
+ * on every side. Built from four `fillRect` strips rather than
+ * `ctx.strokeRect`, so the exact pixel band is the same simple math the rest
+ * of this file already uses (`drawBar`, `drawSpark`) — no reasoning about
+ * how a stroke's width straddles its path. The top and bottom strips span
+ * the full inset-to-inset width; the left and right strips fill only the
+ * remaining height between them, so the frame is one unbroken outline with
+ * no doubled paint at the corners.
+ *
+ * Called LAST in `renderKey`, after every other element, and never touches
+ * any pixel outside its own band — the interior (and whatever the key
+ * itself drew there) is untouched.
+ */
+function drawFlashRing(ctx: SKRSContext2D, color: Rgb): void {
+  const inset = FLASH_RING_INSET
+  const t = FLASH_RING_THICKNESS
+  const span = KEY_SIZE - inset * 2
+  ctx.fillStyle = css(color)
+  ctx.fillRect(inset, inset, span, t)
+  ctx.fillRect(inset, KEY_SIZE - inset - t, span, t)
+  ctx.fillRect(inset, inset + t, t, span - t * 2)
+  ctx.fillRect(KEY_SIZE - inset - t, inset + t, t, span - t * 2)
+}
+
+/**
  * Copies the canvas out as raw RGBA. The device takes raw pixel buffers and
  * has no PNG support, so the renderer never encodes an image format.
  */
@@ -430,6 +476,15 @@ export function renderKey(spec: KeySpec): Buffer {
 
   if (spec.bar) {
     drawBar(ctx, spec.bar, BORDER + PAD, BAR_Y, KEY_SIZE - BORDER - PAD * 2, BAR_H, dim)
+  }
+
+  // Drawn LAST and unconditionally at full strength (never `dim`): the flash
+  // is a fresh, real-time signal about a press that just happened, not part
+  // of a page's own content that stale data should dim. Every other element
+  // above stays exactly as it would render with no ring at all — only the
+  // ring's own thin band changes.
+  if (spec.flashRing) {
+    drawFlashRing(ctx, spec.flashRing)
   }
 
   return toRgba(ctx, KEY_SIZE, KEY_SIZE)

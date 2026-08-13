@@ -163,6 +163,20 @@ export interface KeySpec {
    */
   pulse?: PulseSpec
   dim?: boolean
+  /**
+   * A thin outline drawn around the whole key perimeter, on top of every
+   * other element — used only for the daemon's transient press-feedback
+   * flash (task 36). Unlike `border`, which this theme draws as a left-edge
+   * strip only (see `render/canvas.ts`), this ring wraps all four sides, so
+   * it stays visible regardless of where on the key a page already draws
+   * its own border. It never touches the interior: the key's own content
+   * (text, image, spark, and so on) stays exactly as it would render
+   * without this field, so the ring reads as an overlay, not a fill. Task
+   * 32's flash replaced the whole key with a solid colour; that read as too
+   * bright and jarring on real hardware, which is why this field exists
+   * instead of a `bg` fill.
+   */
+  flashRing?: Rgb
 }
 
 export interface StripSpec {

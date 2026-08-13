@@ -13,12 +13,15 @@ export const DEFAULT_BRIGHTNESS = 100
 const SLEEP_GAP_MIN_MS = 5000
 /**
  * How long a press's flash stays visible before the key reverts to its own
- * content. Task 26 tuned 250 ms for a full-key fill on the Claude page —
- * long enough to read clearly, short enough to never look like a real state
- * colour. Task 32 moves the mechanism itself into the daemon, so every page
- * gets it; the constant and its tuning are unchanged.
+ * content. Task 26 tuned 250 ms for a full-key fill on the Claude page.
+ * Task 32 moved the mechanism into the daemon, unchanged. Task 36 shortens
+ * it to 150 ms: real hardware feedback said the flash was "too bright" and
+ * lingered too long, once it covered the whole key. Now that it is a thin
+ * ring (see `KeySpec.flashRing`) rather than a fill, it needs less time on
+ * screen to read as feedback — long enough to notice, short enough to feel
+ * instant rather than like a state colour.
  */
-const FLASH_MS = 250
+const FLASH_MS = 150
 
 /**
  * A transient press-feedback flash on one key, index 0 to 7 — never the two
@@ -301,10 +304,19 @@ export class Daemon {
 
   /**
    * Overlays the press-feedback flash for `index`, if one is still active,
-   * replacing the key's own content with a solid fill: white for `handled`,
-   * red for `ignored` or `failed`. Moved here from the Claude page (task 32)
-   * so every page gets the same on-device feedback, not just the one page
-   * that happened to implement it first.
+   * by adding a thin ring around the key's whole perimeter (`flashRing`):
+   * a muted white for `handled`, a muted red for `ignored` or `failed`.
+   * Moved here from the Claude page (task 32) so every page gets the same
+   * on-device feedback, not just the one page that happened to implement it
+   * first.
+   *
+   * Task 32 replaced the key's own content with a solid fill. Real hardware
+   * feedback (task 36) called that "too bright" and "jarring" — pure white
+   * and saturated red at full brightness, covering the whole key, for
+   * 250 ms. This keeps the key's own content (`...key`) and only ADDS the
+   * ring on top, at a dimmer colour: the key stays legible underneath, and
+   * `canvas.ts`'s `drawFlashRing` draws it last, so it still wins visually
+   * over anything the page drew, including a pulsing border.
    *
    * The flash's `expiresAtMs` is set HERE, on the first render that reaches
    * this key while the flash is pending (`expiresAtMs === null`), using
@@ -325,7 +337,7 @@ export class Daemon {
       this.flashes[index] = null
       return key
     }
-    return { kind: key.kind, bg: flash.ok ? theme.white : theme.red }
+    return { ...key, flashRing: flash.ok ? theme.flashWhite : theme.flashRed }
   }
 
   private async writeFrame(frame: DeckFrame): Promise<void> {

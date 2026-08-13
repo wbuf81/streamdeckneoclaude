@@ -10,6 +10,7 @@ import {
   STRIP_HEIGHT,
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
+import type { KeySpec } from '../../src/render/specs.js'
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -1006,6 +1007,95 @@ describe('renderKey pulse (the Spotify idle equaliser)', () => {
     }
     const tops = [0, 1, 2, 3, 4].map(topOfBar)
     expect(new Set(tops).size).toBeGreaterThan(1)
+  })
+})
+
+/**
+ * Task 36: the daemon's press-feedback flash moved from a full-key `bg` fill
+ * (task 32, reported "too bright" on real hardware) to a thin perimeter
+ * ring. These tests prove the ring is visible on all four sides, prove the
+ * interior stays pixel-identical to the unflashed key (the whole point of an
+ * outline instead of a fill), and prove it wins the overlap with a page's
+ * own left-edge `border` — see `canvas.ts`'s `FLASH_RING_INSET`/
+ * `FLASH_RING_THICKNESS` doc comment for the exact measurement.
+ */
+describe('renderKey flashRing', () => {
+  it('draws nothing extra when flashRing is absent, exactly as before this field existed', () => {
+    const withoutField = renderKey({ kind: 'gauge', lines: ['A'], border: theme.amber, pulseOn: true })
+    const explicitlyUndefined = renderKey({
+      kind: 'gauge', lines: ['A'], border: theme.amber, pulseOn: true, flashRing: undefined,
+    })
+    expect(withoutField.equals(explicitlyUndefined)).toBe(true)
+  })
+
+  it('draws a visible ring on all four sides of the key', () => {
+    const buf = renderKey({ kind: 'gauge', flashRing: theme.flashWhite })
+    near(probe(buf, 2, 48), theme.flashWhite) // left
+    near(probe(buf, 93, 48), theme.flashWhite) // right
+    near(probe(buf, 48, 2), theme.flashWhite) // top
+    near(probe(buf, 48, 93), theme.flashWhite) // bottom
+  })
+
+  it('wins the overlap with a pulsing left-edge border, leaving only 1 of 96 columns showing the border colour', () => {
+    // Measured (see canvas.ts's doc comment): the border occupies columns 0
+    // to 2. The ring, drawn afterwards, covers columns 1 to 4, so only
+    // column 0 still shows the border's own colour.
+    const buf = renderKey({ kind: 'session', border: theme.amber, pulseOn: true, flashRing: theme.flashWhite })
+    near(probe(buf, 0, 48), theme.amber)
+    near(probe(buf, 1, 48), theme.flashWhite)
+    near(probe(buf, 2, 48), theme.flashWhite)
+  })
+
+  it('leaves the key interior pixel-identical to the unflashed key — only the ring band differs', () => {
+    const base: KeySpec = {
+      kind: 'session',
+      lines: ['THINKING', 'my-project'],
+      border: theme.amber,
+      pulseOn: true,
+    }
+    const plain = renderKey(base)
+    const flashed = renderKey({ ...base, flashRing: theme.flashWhite })
+    // The ring's measured band: columns/rows 0 to 4 and 91 to 95 (inset 1,
+    // thickness 4). Everything else must match exactly, pixel for pixel.
+    const inRingBand = (x: number, y: number) => x <= 4 || x >= 91 || y <= 4 || y >= 91
+    let checked = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (inRingBand(x, y)) continue
+        expect(probe(flashed, x, y)).toEqual(probe(plain, x, y))
+        checked++
+      }
+    }
+    // Sanity: the loop actually visited a substantial interior area, so a
+    // bug that shrank the skip-band to cover everything could not pass by
+    // accident.
+    expect(checked).toBeGreaterThan(7000)
+  })
+
+  it('differs visibly between the handled (white) and ignored/failed (red) rings', () => {
+    const white = renderKey({ kind: 'gauge', flashRing: theme.flashWhite })
+    const red = renderKey({ kind: 'gauge', flashRing: theme.flashRed })
+    expect(white.equals(red)).toBe(false)
+  })
+
+  it('uses colours dimmer than the old full-brightness white and red', () => {
+    const luma = (c: readonly [number, number, number]) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+    expect(luma(theme.flashWhite)).toBeLessThan(luma(theme.white))
+    expect(luma(theme.flashRed)).toBeLessThan(luma(theme.red))
+  })
+
+  it('keeps flashWhite and flashRed clearly apart from every other theme colour and from each other', () => {
+    const all = [
+      theme.bg, theme.text, theme.textDim, theme.white, theme.red, theme.green,
+      theme.amber, theme.blue, theme.cyan, theme.gray, theme.barTrack,
+    ]
+    const dist = (a: readonly number[], b: readonly number[]) =>
+      Math.sqrt(a.reduce((sum, v, i) => sum + (v - b[i]!) ** 2, 0))
+    for (const c of all) {
+      expect(dist(theme.flashWhite, c)).toBeGreaterThan(30)
+      expect(dist(theme.flashRed, c)).toBeGreaterThan(30)
+    }
+    expect(dist(theme.flashWhite, theme.flashRed)).toBeGreaterThan(30)
   })
 })
 

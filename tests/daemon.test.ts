@@ -606,8 +606,11 @@ describe('Daemon press-feedback flash', () => {
     return { device, page, manager, daemon, setMs: (v: number) => { ms = v } }
   }
 
-  const whiteFlash = () => renderKey({ kind: 'gauge', bg: theme.white })
-  const redFlash = () => renderKey({ kind: 'gauge', bg: theme.red })
+  // The flash keeps the key's own content (`lines: ['A']`) and only adds
+  // the ring on top -- task 36 moved away from a solid `bg` fill because it
+  // read as too bright on real hardware.
+  const whiteFlash = () => renderKey({ kind: 'gauge', lines: ['A'], flashRing: theme.flashWhite })
+  const redFlash = () => renderKey({ kind: 'gauge', lines: ['A'], flashRing: theme.flashRed })
   const plainKeyA = () => renderKey({ kind: 'gauge', lines: ['A'] })
 
   it('flashes a handled press white, then reverts to the page’s own content', async () => {
@@ -620,7 +623,7 @@ describe('Daemon press-feedback flash', () => {
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
 
     device.reset()
-    setMs(1260) // past the 250 ms window, anchored at the press-render (ms 1000)
+    setMs(1260) // past the 150 ms window, anchored at the press-render (ms 1000)
     await daemon.renderOnce(1, 1260)
     expect(device.keyImages.get(0)?.equals(plainKeyA())).toBe(true)
 
@@ -744,7 +747,8 @@ describe('Daemon press-feedback flash', () => {
   it('an expired flash leaves no trace in keyHash, so the key stops being redrawn', async () => {
     // The flash and the page's own content hash differently -- otherwise
     // there would be nothing to leave a trace of in the first place.
-    expect(keyHash({ kind: 'gauge', bg: theme.white })).not.toBe(keyHash({ kind: 'gauge', lines: ['A'] }))
+    expect(keyHash({ kind: 'gauge', lines: ['A'], flashRing: theme.flashWhite }))
+      .not.toBe(keyHash({ kind: 'gauge', lines: ['A'] }))
 
     const { device, daemon, setMs } = buildFlash()
     await daemon.start()
@@ -754,7 +758,7 @@ describe('Daemon press-feedback flash', () => {
     await flush()
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
 
-    // Well past the 250 ms window: the key reverts, written back to its own
+    // Well past the 150 ms window: the key reverts, written back to its own
     // plain content exactly once.
     device.reset()
     setMs(1500)
@@ -816,7 +820,7 @@ describe('Daemon press-feedback flash', () => {
     await flush()
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
 
-    setMs(1100) // still well within the 250 ms window
+    setMs(1100) // still well within the 150 ms window
     await daemon.renderOnce(1, 1100)
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
 

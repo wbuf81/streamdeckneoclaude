@@ -215,6 +215,28 @@ describe('keyHash', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
+  // Task 36's press-feedback ring. Lesson 11: a new field must affect
+  // keyHash, or the daemon never redraws a key whose only change was the
+  // flash appearing (or expiring), leaving a stale ring or a stale plain
+  // key on the glass.
+  it('differs when flashRing changes from absent to present', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['A'] }
+    const b: KeySpec = { kind: 'gauge', lines: ['A'], flashRing: [185, 185, 190] }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('differs when flashRing changes colour (handled vs. ignored/failed)', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['A'], flashRing: [185, 185, 190] }
+    const b: KeySpec = { kind: 'gauge', lines: ['A'], flashRing: [165, 55, 55] }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
+  it('matches when flashRing is equal, and keeps the rest of the key intact', () => {
+    const a: KeySpec = { kind: 'gauge', lines: ['A'], border: [255, 176, 0], flashRing: [185, 185, 190] }
+    const b: KeySpec = { kind: 'gauge', lines: ['A'], border: [255, 176, 0], flashRing: [185, 185, 190] }
+    expect(keyHash(a)).toBe(keyHash(b))
+  })
+
   it('differs when spark.labelBand changes, even with the same values, colour and no label', () => {
     const values = [1, 2, 3]
     const color: Rgb = [70, 200, 110]
