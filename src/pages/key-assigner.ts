@@ -1,6 +1,11 @@
 import type { Session } from '../sources/claude.js'
 
-export const SESSION_SLOTS = 4
+/**
+ * Task 26 dedicated key 3 to a permanent crab mascot tile, so only three
+ * keys are left for live sessions. A fourth live session is intentionally
+ * invisible rather than rotating or shrinking in — see the task brief.
+ */
+export const SESSION_SLOTS = 3
 
 export interface Assignment {
   /** Session id per key, index 0 to 3. `null` means the key is free. */

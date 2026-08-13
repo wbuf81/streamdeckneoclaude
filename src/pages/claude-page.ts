@@ -2,6 +2,7 @@ import type { Image } from '@napi-rs/canvas'
 import type { DeckFrame, KeySpec, StripSpec, Rgb } from '../render/specs.js'
 import { blankKey } from '../render/specs.js'
 import { theme, stateColor, stateLabel, barColor } from '../render/theme.js'
+import type { SessionStateName } from '../render/theme.js'
 import { truncate, formatDuration } from '../render/text.js'
 import { getSpriteFrame, getSpriteFrameIndex } from '../render/sprites.js'
 import type { Page } from './types.js'
@@ -13,24 +14,71 @@ import { KeyAssigner, SESSION_SLOTS } from './key-assigner.js'
 export const PROJECT_CHARS = 10
 const FIVE_HOURS = 5 * 3600
 
-/** Total keys the page draws: 4 session slots plus 4 gauges. Matches
- * `DeckFrame.keys`'s fixed length of 8. */
-const KEY_COUNT = SESSION_SLOTS + 4
+/** Key 3: the permanent crab mascot tile, between the session slots and the
+ * gauges. Never a session slot, never blank. */
+const CRAB_KEY_INDEX = SESSION_SLOTS
+
+/** Total keys the page draws: up to 3 session slots, the crab tile, plus 4
+ * gauges. Matches `DeckFrame.keys`'s fixed length of 8. */
+const KEY_COUNT = SESSION_SLOTS + 1 + 4
 
 /**
- * How long a press's white/red border flash stays visible before reverting
- * to the key's own colour. 200 ms is the project spec's figure. At this
- * page's 100 ms tick (`tickMs` above) that is two to three render frames —
- * enough to read as a flash on real hardware rather than nothing at all,
- * without lingering long enough to look like a state colour.
+ * How long a press's flash stays visible before reverting to the key's own
+ * content. Task 16's 200 ms was tuned for a thin left-edge border; task 26
+ * repaints the WHOLE key instead, which reads clearly even a little longer,
+ * and 250 ms still reverts fast enough that it never looks like a state
+ * colour.
  */
-const FLASH_MS = 200
+const FLASH_MS = 250
 
-/** A transient press-feedback border on one key: white for success, red for
- * failure, until `expiresAtMs`. */
+/**
+ * A transient press-feedback flash on one key: fills the whole key white
+ * for success or red for failure, replacing whatever the key would
+ * otherwise show — see `withFlash`. `expiresAtMs` is `null` until the FIRST
+ * render that actually draws this flash, which is the moment that anchors
+ * it. Anchoring at press time instead (off whatever clock the page happened
+ * to see last) is what let a flash arrive already expired: a stale
+ * `lastNowMs` from an unrelated change-triggered render could sit hundreds
+ * of milliseconds behind real time. Anchoring at first-draw time means a
+ * flash is impossible to be born already expired, and it works even when
+ * `onKeyPress` is called before this page has ever rendered at all.
+ */
 interface Flash {
   ok: boolean
-  expiresAtMs: number
+  expiresAtMs: number | null
+}
+
+/**
+ * Ranks each session state by how urgently it needs attention, most urgent
+ * first. Drives which state the permanent crab tile (key 3) animates when
+ * several sessions disagree — the tile is one mascot for the whole page, so
+ * it shows whichever session most needs the user's eye. Any state NOT in
+ * this list — `unknown`, or a future value `daisy-statusbar` has not
+ * documented, see docs/VERIFIED-FACTS.md — is treated as calm as `idle`,
+ * the last (least urgent) entry here, since there is nothing more specific
+ * to show.
+ */
+export const CRAB_STATE_PRIORITY: readonly SessionStateName[] = [
+  'permission',
+  'tool',
+  'thinking',
+  'done',
+  'idle',
+]
+
+/** The most urgent state across `sessions`, per `CRAB_STATE_PRIORITY`. No
+ * sessions at all is `idle` — the mascot has nothing to report, not nothing
+ * to show. */
+export function mostUrgentCrabState(sessions: Session[]): SessionStateName {
+  if (sessions.length === 0) return 'idle'
+  const idleRank = CRAB_STATE_PRIORITY.length - 1
+  let best = idleRank
+  for (const s of sessions) {
+    const rank = CRAB_STATE_PRIORITY.indexOf(s.state)
+    const effective = rank === -1 ? idleRank : rank
+    if (effective < best) best = effective
+  }
+  return CRAB_STATE_PRIORITY[best]!
 }
 
 /** The part of `ClaudeSource` this page needs. */
@@ -64,19 +112,11 @@ export class ClaudePage implements Page {
   readonly tickMs = 100
 
   private assigner = new KeyAssigner()
-  /** Session id per key 0 to 3, from the last render. A press reads it. */
+  /** Session id per key 0 to `SESSION_SLOTS - 1`, from the last render. A
+   * press reads it. */
   private slots: (string | null)[] = new Array(SESSION_SLOTS).fill(null)
   /** One transient flash per key, indices 0 to 7. `null` means no flash. */
   private flashes: (Flash | null)[] = new Array(KEY_COUNT).fill(null)
-  /**
-   * The millisecond clock from the most recent `render()` call. `onKeyPress`
-   * has no clock of its own — the daemon calls it with only the key index,
-   * and a page must never call `Date.now()` itself — so a new flash anchors
-   * its expiry to the last time this page actually saw the clock. The
-   * daemon always renders again immediately after handling a press, so this
-   * is at most one tick stale.
-   */
-  private lastNowMs = 0
 
   constructor(
     private readonly sessions: SessionReader,
@@ -85,8 +125,6 @@ export class ClaudePage implements Page {
   ) {}
 
   render(now: number, nowMs: number = now * 1000): DeckFrame {
-    this.lastNowMs = nowMs
-
     const live = this.sessions.getSessions()
     const { slots, overflow } = this.assigner.assign(live)
     this.slots = slots
@@ -97,13 +135,15 @@ export class ClaudePage implements Page {
     for (let i = 0; i < SESSION_SLOTS; i++) {
       const id = slots[i]
       const session = id ? byId.get(id) : undefined
-      const key = session ? this.sessionKey(session, now, nowMs) : blankKey()
+      const key = session ? this.sessionKey(session, now) : blankKey()
       keys.push(this.withFlash(i, key, nowMs))
     }
 
+    keys.push(this.withFlash(CRAB_KEY_INDEX, this.crabKey(live, nowMs), nowMs))
+
     const gauges = this.gaugeKeys(now)
     for (let i = 0; i < gauges.length; i++) {
-      keys.push(this.withFlash(SESSION_SLOTS + i, gauges[i]!, nowMs))
+      keys.push(this.withFlash(CRAB_KEY_INDEX + 1 + i, gauges[i]!, nowMs))
     }
 
     return {
@@ -115,31 +155,49 @@ export class ClaudePage implements Page {
 
   /**
    * Overlays the press-feedback flash for `index`, if one is still active.
-   * The flash wins over the key's own border and pulse — white or red is a
-   * direct answer to a human action a moment ago, and must not compete with
-   * the permission pulse for the eye.
+   * The flash fills the WHOLE key white (success) or red (failure) — not
+   * just the border, which this theme draws as a barely-visible left-edge
+   * strip — and drops the key's own lines, image and border for the
+   * flash's duration rather than drawing them underneath: white text on a
+   * white fill is a blank key, so the flash replaces the content instead of
+   * competing with it.
    *
-   * Once `nowMs` reaches the expiry, the stored flash is discarded and this
-   * function returns `key` untouched, so the key's hash goes back to
-   * exactly what it would have been with no flash ever recorded. That is
-   * what lets the daemon's dirty-key check stop redrawing it again.
+   * The flash's `expiresAtMs` is set HERE, on the first render that reaches
+   * this key while the flash is pending (`expiresAtMs === null`), using
+   * THIS render's own `nowMs`. Anchoring at press time instead — off
+   * whatever clock this page happened to see last — is what let a flash
+   * arrive already expired: a stale clock from an unrelated
+   * change-triggered render could sit hundreds of milliseconds behind real
+   * time. Anchoring at first-draw time means a flash cannot be born already
+   * expired and does not depend on any render having happened before the
+   * press.
+   *
+   * Once `nowMs` reaches the (now-anchored) expiry, the stored flash is
+   * discarded and this function returns `key` untouched, so the key's hash
+   * goes back to exactly what it would have been with no flash ever
+   * recorded. That is what lets the daemon's dirty-key check stop redrawing
+   * it again.
    */
   private withFlash(index: number, key: KeySpec, nowMs: number): KeySpec {
     const flash = this.flashes[index]
     if (!flash) return key
-    if (nowMs >= flash.expiresAtMs) {
+    if (flash.expiresAtMs === null) {
+      flash.expiresAtMs = nowMs + FLASH_MS
+    } else if (nowMs >= flash.expiresAtMs) {
       this.flashes[index] = null
       return key
     }
-    return { ...key, border: flash.ok ? theme.white : theme.red, pulseOn: undefined }
+    return { kind: key.kind, bg: flash.ok ? theme.white : theme.red }
   }
 
-  /** Records a flash for `index`, timed off the clock `render()` last saw. */
+  /** Records a pending flash for `index`. Its expiry is anchored later, by
+   * `withFlash`, at the first render that actually draws it — see the
+   * `Flash` interface's doc comment for why. */
   private setFlash(index: number, ok: boolean): void {
-    this.flashes[index] = { ok, expiresAtMs: this.lastNowMs + FLASH_MS }
+    this.flashes[index] = { ok, expiresAtMs: null }
   }
 
-  private sessionKey(s: Session, now: number, nowMs: number): KeySpec {
+  private sessionKey(s: Session, now: number): KeySpec {
     const lines = [stateLabel(s.state), truncate(s.project, PROJECT_CHARS)]
     const meta = this.usage.getMeta(s.sessionId)
     if (meta?.model) lines.push(meta.model)
@@ -150,17 +208,30 @@ export class ClaudePage implements Page {
       border: stateColor(s.state),
     }
 
-    // A pending permission pulses once per second, so the eye finds it. This
-    // stays driven by `now` (whole seconds), never `nowMs` — at a 100 ms tick,
-    // keying it to the millisecond clock would make it flicker instead.
+    // A pending permission pulses once per second, so the eye finds it.
     if (s.state === 'permission') key.pulseOn = now % 2 === 0
 
-    const crab = crabFrame(s.state, nowMs)
+    // No crab here, on purpose: task 22 drew the crab full-key, underneath
+    // all three text lines, and measured 41% ink coverage in the text band
+    // — lesson 14. The crab now lives only on its own tile, key 3.
+    return key
+  }
+
+  /**
+   * Key 3: the permanent Claude mascot tile. Always shows the crab, never
+   * text, whether or not any session is running — it is a mascot, not a
+   * status slot. Animates whichever state is most urgent across all live
+   * sessions, per `CRAB_STATE_PRIORITY`, so the ONE tile stays informative
+   * even with several sessions in different states.
+   */
+  private crabKey(live: Session[], nowMs: number): KeySpec {
+    const state = mostUrgentCrabState(live)
+    const key: KeySpec = { kind: 'image' }
+    const crab = crabFrame(state, nowMs)
     if (crab) {
       key.image = crab.image
       key.imageKey = crab.imageKey
     }
-
     return key
   }
 
@@ -304,9 +375,10 @@ export class ClaudePage implements Page {
   async onKeyPress(index: number): Promise<void> {
     if (index < 0 || index >= KEY_COUNT) return
 
-    // Keys 4 to 7 are gauges. They do nothing, but a press there still gets
-    // an answer — a brief red flash is honest feedback, rather than being
-    // indistinguishable from a press that did not register at all.
+    // Key 3 (the crab mascot tile) and keys 4 to 7 (the gauges) all do
+    // nothing, but a press there still gets an answer — a brief red flash
+    // is honest feedback, rather than being indistinguishable from a press
+    // that did not register at all.
     if (index >= SESSION_SLOTS) {
       this.setFlash(index, false)
       return
