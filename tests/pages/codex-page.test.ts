@@ -152,6 +152,53 @@ describe('CodexPage', () => {
     expect(build(snapshot({ tasks })).render(NOW).strip.lines[1]).toBe('+2 more')
   })
 
+  it("renders the usage sample's own time on the strip, right-aligned on line 2", () => {
+    // NOW (1786622400) is 2026-08-13T12:00:00Z, which is 8:00 AM EDT — a
+    // summer instant, so the zone must read EDT. Exact string, per
+    // docs/LESSONS.md #17.
+    expect(build().render(NOW).strip.right).toBe('8:00 AM EDT')
+  })
+
+  it('shows the explicit -- unknown state, not the timestamp, once the usage sample no longer describes the current window', () => {
+    // Same C2 rule the key percentages already follow (commit 360508d): a
+    // sample can sit unchanged for hours and stay TRUE, but once its window
+    // has ended the figure — and the time it was taken — is no longer
+    // presented as current.
+    const key = build(snapshot(), true, false, true)
+    expect(key.render(NOW).strip.right).toBe('--')
+  })
+
+  it('shows the -- unknown state with no timestamp when there is no usage sample at all', () => {
+    const page = build(snapshot({ usage: null }), true, false, false)
+    expect(page.render(NOW).strip.right).toBe('--')
+  })
+
+  it('never overlaps or clips the strip timestamp against line 2 text, for the widest realistic values', () => {
+    // The widest realistic clock string, `12:00 AM EDT` (12 chars, measured
+    // 93.9 px at 13 px Menlo), beside the widest realistic line-2 count,
+    // `3 active` (achieved with exactly TASK_SLOTS tasks and no overflow —
+    // measured 62.6 px, wider than any reachable `+N more` string, since
+    // the sqlite query caps at 10 rows and 10 - TASK_SLOTS leaves only 7).
+    const tasks = Array.from({ length: 3 }, (_, i) => task({
+      threadId: String(i), title: `Task ${i}`, updatedAt: NOW - i,
+    }))
+    // 2026-07-15T04:00:00Z is 12:00 AM EDT.
+    const wideTs = Math.floor(Date.parse('2026-07-15T04:00:00.000Z') / 1000)
+    const data = snapshot({
+      tasks,
+      usage: {
+        limits: [{ usedPct: 27, windowMinutes: 10080, resetsAt: NOW + 86400 }],
+        totalTokens: 1_250_000, plan: 'team', ts: wideTs,
+      },
+    })
+    const frame = build(data).render(NOW)
+    expect(frame.strip.right).toBe('12:00 AM EDT')
+    const buffer = renderStrip(frame.strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
+  })
+
   // C1 — a limit whose window is known but whose percentage field was
   // renamed must render `--`, dimmed, with NO bar — never a measured `0%`
   // with a confident green bar under it.

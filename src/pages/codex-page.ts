@@ -1,7 +1,7 @@
 import type { DeckFrame, KeySpec, StripSpec } from '../render/specs.js'
 import { barColor, theme } from '../render/theme.js'
-import { formatDuration, truncate } from '../render/text.js'
-import type { CodexLimit, CodexSnapshot } from '../sources/codex.js'
+import { formatDuration, formatEasternTime, truncate } from '../render/text.js'
+import type { CodexLimit, CodexSnapshot, CodexUsage } from '../sources/codex.js'
 import type { Page, PressOutcome } from './types.js'
 
 const TASK_SLOTS = 3
@@ -142,7 +142,7 @@ export class CodexPage implements Page {
 
     return {
       keys,
-      strip: this.strip(snapshot),
+      strip: this.strip(snapshot, usageUnknown),
       buttons: [theme.gray, theme.gray],
     }
   }
@@ -232,9 +232,16 @@ export class CodexPage implements Page {
     }
   }
 
-  private strip(snapshot: CodexSnapshot): StripSpec {
+  private strip(snapshot: CodexSnapshot, usageUnknown: boolean): StripSpec {
     if (!this.source.isAvailable()) return { lines: ['codex', 'task data unavailable'], dim: true }
-    if (snapshot.tasks.length === 0) return { lines: ['codex', 'no active tasks'], dim: true }
+    // The usage sample's own time, right-aligned on line 2 — the same slot
+    // and helper the Spotify page's idle clock uses. It goes on the strip,
+    // not a key: `12:00 AM EDT` measures 93.9 px at 13 px, and a limit key's
+    // usable width is only 81 px — beside a percentage there is no room. The
+    // strip's line 2 leaves comfortably over 70 px of gap either side, so it
+    // never crowds `first.project` or the active/overflow count.
+    const usageTime = this.usageTimeLabel(snapshot.usage, usageUnknown)
+    if (snapshot.tasks.length === 0) return { lines: ['codex', 'no active tasks'], right: usageTime, dim: true }
     const first = snapshot.tasks[0]!
     const overflow = Math.max(0, snapshot.tasks.length - TASK_SLOTS)
     return {
@@ -242,7 +249,20 @@ export class CodexPage implements Page {
         truncate(`${first.project} · ${first.title}`, STRIP_CHARS),
         overflow ? `+${overflow} more` : `${snapshot.tasks.length} active`,
       ],
+      right: usageTime,
     }
+  }
+
+  /** The usage sample's own timestamp, formatted for display, or the same
+   * explicit `--` a key shows when the figure itself is unknown (absent, or
+   * describing a window that has ended). A dimmed old timestamp presented
+   * as current would misinform exactly like a dimmed old percentage would —
+   * commit 360508d's rule, applied here too. `CodexUsage.ts` is epoch
+   * SECONDS (see `parseRolloutTail`), so it is converted to epoch
+   * milliseconds before reaching `formatEasternTime`. */
+  private usageTimeLabel(usage: CodexUsage | null, usageUnknown: boolean): string {
+    if (!usage || usageUnknown) return '--'
+    return formatEasternTime(usage.ts * 1000)
   }
 
   onKeyPress(_index: number): PressOutcome {
