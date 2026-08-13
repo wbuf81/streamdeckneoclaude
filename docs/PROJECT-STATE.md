@@ -210,6 +210,7 @@ atomically, restart only `com.wbard.deckd`, and verify the new PID and device co
 ### How to resume safely
 
 1. Read this file, `docs/VERIFIED-FACTS.md`, and `docs/LESSONS.md`.
+   Then follow `docs/DEPLOYMENT.md` for any live update.
 2. Run `git status --short`; begin from a clean tree.
 3. Run `npm test`, `npm run typecheck`, and `npm run build` before changing behavior.
 4. Do not run a hardware script while launchd owns the device. Follow **Restarting the daemon**

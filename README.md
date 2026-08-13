@@ -129,6 +129,9 @@ state instead of `~/.local/state/deckd`.
 labelled pattern on all 8 keys, the info strip, and both touch buttons. It then
 prints every press index.
 
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the installed-daemon restart,
+verification, hardware-check, and recovery procedure.
+
 Pass `--once` to draw the pattern and exit right away, with no wait for a key
 press. Use it for an automated check: `npm run smoke -- --once`.
 

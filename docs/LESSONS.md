@@ -135,3 +135,33 @@ right: an agent silently choosing between two authorities produces work nobody c
 Every layout number in this project is measured with canvas. `95°/77°` fits at 16 px and
 does not at 17 px; `2h11m` fits at 24 px and does not at 28 px. Guessing produced clipped
 text twice before the habit stuck.
+
+## 18. A missing platform signal is UNKNOWN, not a measured state
+
+The first lock detector queried `CGSSessionScreenIsLocked`. That property was absent on the
+target Mac, and the parser treated absence as unlocked. Automated tests passed while the real
+deck stayed active behind the lock screen.
+
+Measure the property on the target system. Here it is `IOConsoleLocked`. Keep compatibility
+fallbacks, but make absence explicit and logged. Fail open when permanent blanking would make
+the product unusable, then require a real hardware check for the privacy behavior.
+
+## 19. Persist stable identity, not collection position
+
+The UI originally saved only a numeric page index. Inserting the Codex page after Claude
+would have changed a saved Spotify index into Codex after restart.
+
+Persist the page name as the stable identity. Keep a narrow legacy-index migration for old
+state. This applies to pages, configured lists, and any user-visible collection whose order
+can change in a later release.
+
+## 20. Private schemas need one fail-safe boundary
+
+The Codex page reads a private local SQLite schema and rollout JSONL events. Those formats can
+change without notice. If their details leak through the application, one upstream change can
+break the daemon.
+
+Keep the schema inside one source. Read it without mutation, retain no prompt bodies, filter
+internal tasks, bound or incrementally scan large files, and preserve the last safe product
+state when reading fails. A private-schema failure may degrade its page; it must not stop the
+device, navigation, or unrelated sources.
