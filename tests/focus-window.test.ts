@@ -7,7 +7,6 @@ import {
   pickWindowIndex,
   buildRaiseWindowScript,
   focusWindow,
-  MIN_CANDIDATE_LENGTH,
 } from '../src/focus-window.js'
 import { createLogger } from '../src/log.js'
 
@@ -191,10 +190,6 @@ describe('pickWindowIndex', () => {
     expect(pickWindowIndex(titles, ['foo', '/Users/x/foo', '—'])).toBeNull()
   })
 
-  it('exports the minimum candidate length so the threshold is not a magic number', () => {
-    expect(MIN_CANDIDATE_LENGTH).toBeGreaterThanOrEqual(3)
-  })
-
   it('still matches normally when at least one candidate clears the minimum length', () => {
     // The short basename ("w", from a session in ~/w) gives up its vote, but
     // the project name is still a candidate and can still win.
@@ -224,29 +219,86 @@ describe('focusWindow', () => {
   it('logs a repeated failure only once, and logs again after it clears', async () => {
     const written: string[] = []
     const logger = createLogger((line) => written.push(line))
-    const failingRunner: Runner = async () => {
-      throw new Error('boom')
+    // The list call always finds no windows (never an error), so
+    // `tryFocusWindow` degrades through its ordinary "no match" path and
+    // only the app-level activate call's own once/clearOnce pair is under
+    // test here -- isolated with `.filter` below so the unrelated "no match"
+    // log line this also produces cannot affect the count.
+    const activateFails: Runner = async (_file, args) => {
+      if (scriptKind(args) === 'activate') throw new Error('boom')
+      return { stdout: '', stderr: '' }
     }
 
     // A user holding down the same key while macOS denies automation must
     // not fill the log with one line per press.
-    await focusWindow(123, 'ghostty', '/x', 'proj', failingRunner, logger)
-    await focusWindow(123, 'ghostty', '/x', 'proj', failingRunner, logger)
-    await focusWindow(123, 'ghostty', '/x', 'proj', failingRunner, logger)
-    expect(written).toHaveLength(1)
+    await focusWindow(123, 'ghostty', '/x', 'proj', activateFails, logger)
+    await focusWindow(123, 'ghostty', '/x', 'proj', activateFails, logger)
+    await focusWindow(123, 'ghostty', '/x', 'proj', activateFails, logger)
+    expect(written.filter((l) => l.includes('boom'))).toHaveLength(1)
 
-    // The list call fails for a reason unrelated to Accessibility here, so
-    // `tryFocusWindow` degrades silently (no new log key) and only the
-    // app-level activate call's own once/clearOnce pair is under test.
-    const okRunner: Runner = async (_file, args) => {
-      if (scriptKind(args) === 'list') throw new Error('boom-list')
-      return { stdout: '', stderr: '' }
-    }
+    const okRunner: Runner = async () => ({ stdout: '', stderr: '' })
 
     // A success clears the once-key, so a later failure logs again.
     await focusWindow(123, 'ghostty', '/x', 'proj', okRunner, logger)
-    await focusWindow(123, 'ghostty', '/x', 'proj', failingRunner, logger)
-    expect(written).toHaveLength(2)
+    await focusWindow(123, 'ghostty', '/x', 'proj', activateFails, logger)
+    expect(written.filter((l) => l.includes('boom'))).toHaveLength(2)
+  })
+
+  // M4: `tryFocusWindow`'s listing step used to `return false` with no log
+  // at all for any failure OTHER than a missing Accessibility grant -- a
+  // transient `osascript` error, or System Events not responding. The key
+  // still flashed white (app-level `activate` still ran and still
+  // succeeded), but nothing in the log explained why the window-targeting
+  // path never even tried to match a title.
+  it('logs a non-Accessibility listing failure once (M4), and clears it on the next successful listing', async () => {
+    const written: string[] = []
+    const logger = createLogger((line) => written.push(line))
+    const listFails: Runner = async (_file, args) => {
+      if (scriptKind(args) === 'list') throw new Error('System Events not responding')
+      return { stdout: '', stderr: '' }
+    }
+
+    await focusWindow(1, 'ghostty', '/x', 'proj', listFails, logger)
+    await focusWindow(1, 'ghostty', '/x', 'proj', listFails, logger)
+    expect(written.filter((l) => l.includes('listing windows'))).toHaveLength(1)
+
+    const listSucceeds: Runner = async () => ({ stdout: '', stderr: '' })
+    await focusWindow(1, 'ghostty', '/x', 'proj', listSucceeds, logger)
+    await focusWindow(1, 'ghostty', '/x', 'proj', listFails, logger)
+    expect(written.filter((l) => l.includes('listing windows'))).toHaveLength(2)
+  })
+
+  // M4: the raise step's own failure (a window closing between listing and
+  // raising, say) used to `return false` with no log at all either. The key
+  // still flashed white -- app-level `activate` still ran -- but the user
+  // saw the app come forward without the SPECIFIC window they wanted, with
+  // nothing to explain the difference.
+  it('logs a raise failure once (M4), and clears it on the next successful raise', async () => {
+    const written: string[] = []
+    const logger = createLogger((line) => written.push(line))
+    const cwd = '/Users/x/streamdeckneoclaude'
+    const project = 'streamdeckneoclaude'
+    const raiseFails: Runner = async (_file, args) => {
+      const kind = scriptKind(args)
+      if (kind === 'list') return { stdout: '~/streamdeckneoclaude — zsh', stderr: '' }
+      if (kind === 'raise') throw new Error('window closed before it could be raised')
+      return { stdout: '', stderr: '' }
+    }
+
+    const ok = await focusWindow(1, 'ghostty', cwd, project, raiseFails, logger)
+    expect(ok).toBe(true) // still falls back to app-level activate
+    expect(written.filter((l) => l.includes('raising window'))).toHaveLength(1)
+
+    await focusWindow(1, 'ghostty', cwd, project, raiseFails, logger)
+    expect(written.filter((l) => l.includes('raising window'))).toHaveLength(1)
+
+    const raiseSucceeds: Runner = async (_file, args) => {
+      if (scriptKind(args) === 'list') return { stdout: '~/streamdeckneoclaude — zsh', stderr: '' }
+      return { stdout: '', stderr: '' }
+    }
+    await focusWindow(1, 'ghostty', cwd, project, raiseSucceeds, logger)
+    await focusWindow(1, 'ghostty', cwd, project, raiseFails, logger)
+    expect(written.filter((l) => l.includes('raising window'))).toHaveLength(2)
   })
 
   it('resolves true on success and false on failure, without throwing', async () => {

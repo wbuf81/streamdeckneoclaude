@@ -1,27 +1,37 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { paths, enforceDirModes, buildPaths } from '../src/paths.js'
+import { enforceDirModes, buildPaths } from '../src/paths.js'
 import { homedir } from 'node:os'
 import { mkdtempSync, mkdirSync, chmodSync, statSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 describe('paths', () => {
+  // M6: these three used to assert against the module-level `paths`
+  // singleton, which reads `process.env.DECKD_STATE_DIR` at IMPORT time
+  // (`src/paths.ts:96`). That fails for anyone who has that variable
+  // exported -- including the ad-hoc diagnostic runs `src/paths.ts`'s own
+  // docblock recommends the override for -- even though nothing here is
+  // actually testing the override. `buildPaths(home, undefined)` builds the
+  // exact same shape without going anywhere near the real environment.
   it('puts runtime state under ~/.local/state/deckd', () => {
-    expect(paths.stateDir).toBe(`${homedir()}/.local/state/deckd`)
-    expect(paths.usageFile).toBe(`${paths.stateDir}/usage.json`)
-    expect(paths.sessionsDir).toBe(`${paths.stateDir}/sessions`)
-    expect(paths.spotifyFile).toBe(`${paths.stateDir}/spotify.json`)
-    expect(paths.artDir).toBe(`${paths.stateDir}/art`)
+    const isolated = buildPaths(homedir(), undefined)
+    expect(isolated.stateDir).toBe(`${homedir()}/.local/state/deckd`)
+    expect(isolated.usageFile).toBe(`${isolated.stateDir}/usage.json`)
+    expect(isolated.sessionsDir).toBe(`${isolated.stateDir}/sessions`)
+    expect(isolated.spotifyFile).toBe(`${isolated.stateDir}/spotify.json`)
+    expect(isolated.artDir).toBe(`${isolated.stateDir}/art`)
   })
 
   it('reads Claude session state from the daisy-statusbar directory', () => {
-    expect(paths.claudeStateDir).toBe(`${homedir()}/.claude/daisy-statusbar/state.d`)
-    expect(paths.claudeSettings).toBe(`${homedir()}/.claude/settings.json`)
+    const isolated = buildPaths(homedir(), undefined)
+    expect(isolated.claudeStateDir).toBe(`${homedir()}/.claude/daisy-statusbar/state.d`)
+    expect(isolated.claudeSettings).toBe(`${homedir()}/.claude/settings.json`)
   })
 
   it('names the launchd agent with a reverse-domain label', () => {
-    expect(paths.launchAgentLabel).toBe('com.wbard.deckd')
-    expect(paths.launchAgent).toBe(
+    const isolated = buildPaths(homedir(), undefined)
+    expect(isolated.launchAgentLabel).toBe('com.wbard.deckd')
+    expect(isolated.launchAgent).toBe(
       `${homedir()}/Library/LaunchAgents/com.wbard.deckd.plist`,
     )
   })

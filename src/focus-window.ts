@@ -250,6 +250,13 @@ async function tryFocusWindow(
           'System Settings > Privacy & Security > Accessibility. Falling back to ' +
           'app-level activate meanwhile, so a press still raises the app.',
       )
+    } else {
+      // M4: this branch used to fall straight to `return false` with no log
+      // at all — any listing failure OTHER than a missing Accessibility
+      // grant (a transient `osascript` failure, System Events not running)
+      // degraded silently to app-level `activate`, so a press still worked
+      // but nothing explained why the window-targeting path never did.
+      logger.once(`list-failed-${app}`, `listing windows for ${app} failed: ${String(e)}`)
     }
     return false
   }
@@ -259,6 +266,7 @@ async function tryFocusWindow(
   // granted-but-no-match outcome (the very next block) must not leave a
   // later, genuine denial suppressed forever.
   logger.clearOnce(`accessibility-${app}`)
+  logger.clearOnce(`list-failed-${app}`)
 
   const matchKey = `nomatch-${app}-${cwd}`
   let index: number | null
@@ -288,11 +296,19 @@ async function tryFocusWindow(
   const title = titles[index]
   if (title === undefined) return false
 
+  const raiseFailedKey = `raise-failed-${app}-${cwd}`
   try {
     await runner('/usr/bin/osascript', ['-e', buildRaiseWindowScript(app, title)])
     logger.clearOnce(matchKey)
+    logger.clearOnce(raiseFailedKey)
     return true
-  } catch {
+  } catch (e) {
+    // M4: this used to `return false` with no log at all — a window that
+    // closed between listing and raising, or any other `AXRaise` failure,
+    // degraded silently to app-level `activate`. The key flashed white and
+    // the app came forward, but not the specific window the user wanted,
+    // with nothing in the log to explain the difference.
+    logger.once(raiseFailedKey, `raising window ${JSON.stringify(title)} for ${app} failed: ${String(e)}`)
     return false
   }
 }
