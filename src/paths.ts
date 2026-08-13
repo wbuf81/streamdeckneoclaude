@@ -1,5 +1,5 @@
 import { homedir } from 'node:os'
-import { join, isAbsolute } from 'node:path'
+import { join, isAbsolute, resolve, sep } from 'node:path'
 import { mkdirSync, chmodSync } from 'node:fs'
 
 /**
@@ -12,13 +12,42 @@ import { mkdirSync, chmodSync } from 'node:fs'
  * fall back to the default, rather than caching into the wrong directory.
  */
 /**
- * M-4: `DECKD_STATE_DIR=$HOME` is a footgun worth rejecting outright, even
- * though it cannot weaken a mode (`enforceDirModes` always forces 0700, and
- * a mode cannot go looser than what it already was set to). It is
- * dangerous anyway: it would `chmod 700` the home directory itself, create
- * `~/sessions` and `~/art` directly inside it, make `deckd uninstall`
- * unlink `~/statusline-wrapper.sh`, and make the render-time wrapper
- * `chmod 700 $HOME` on every single render.
+ * True when `candidate` (already `resolve()`d) is exactly `of`, or a
+ * directory somewhere above it. Compares whole path SEGMENTS, not a bare
+ * string prefix -- `/Users` must match `/Users/tester`, but `/Users/test`
+ * (missing the trailing separator) must NOT match `/Users/tester`, even
+ * though the plain string is a prefix of it.
+ */
+function isAncestorOrSelf(candidate: string, of: string): boolean {
+  if (candidate === of) return true
+  const withSep = candidate.endsWith(sep) ? candidate : candidate + sep
+  return of.startsWith(withSep)
+}
+
+/**
+ * I-3: `DECKD_STATE_DIR=$HOME` used to be rejected only in that EXACT
+ * spelling (`stateOverride === home`), a plain string compare with no
+ * normalisation. Measured accepted: `$HOME/` (one keystroke off the
+ * rejected spelling), `$HOME/.`, `/`, and `/Users` -- every one of them
+ * still resolves to the home directory or an ancestor of it, and every
+ * consequence the docblock below lists follows just as surely from an
+ * ancestor as from home itself: `enforceDirModes` would `chmod 700` that
+ * ancestor (tightening a directory deckd does not own, and everything
+ * still under it), install would create `sessions` and `art` directly
+ * inside it, `deckd uninstall` would unlink a `statusline-wrapper.sh` that
+ * may not be deckd's, and the render-time wrapper would `chmod 700` it on
+ * every render. Worse, uninstall's own "state directory remains" message
+ * would then invite the user to delete their home directory (or its
+ * parent) by hand.
+ *
+ * `resolve()` normalises away the trailing-slash and `.`-segment spellings
+ * before comparing, and `isAncestorOrSelf` rejects the home directory
+ * itself AND every directory above it, not only an exact match. A path
+ * OUTSIDE home that is not one of its ancestors (a sibling directory, or an
+ * unrelated absolute path such as the OS temp directory a test uses) is
+ * deliberately still allowed -- this override exists precisely so a test,
+ * or a person who wants deckd's state somewhere else entirely, can point it
+ * off to one side of the home directory tree.
  */
 function resolveStateDir(home: string, stateOverride?: string): string {
   const fallback = join(home, '.local', 'state', 'deckd')
@@ -30,14 +59,16 @@ function resolveStateDir(home: string, stateOverride?: string): string {
     )
     return fallback
   }
-  if (stateOverride === home) {
+  const resolvedHome = resolve(home)
+  const resolved = resolve(stateOverride)
+  if (isAncestorOrSelf(resolved, resolvedHome)) {
     console.error(
-      `DECKD_STATE_DIR must not be the home directory itself; ignoring ` +
-        `${JSON.stringify(stateOverride)} and using ${fallback} instead.`,
+      `DECKD_STATE_DIR must not be the home directory, or any directory above it; ignoring ` +
+        `${JSON.stringify(stateOverride)} (resolves to ${resolved}) and using ${fallback} instead.`,
     )
     return fallback
   }
-  return stateOverride
+  return resolved
 }
 
 /** Builds all runtime paths. Tests and ad-hoc tools can isolate deckd state. */

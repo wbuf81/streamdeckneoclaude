@@ -554,6 +554,37 @@ describe('writeAtomic', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // M-3: a failed `renameSync` used to leave the temp file behind forever --
+  // a full duplicate of the new content, at `${file}.<pid>.<hex>.tmp`, with
+  // no pruner anywhere for that shape. Forcing the rename to fail (by
+  // sabotaging it directly, standing in for a full disk or a permissions
+  // error) must still clean the temp file up before the error propagates.
+  it('M-3: unlinks its temp file when renameSync fails, rather than leaving a duplicate behind', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-'))
+    const actual = actualRef.current!
+    try {
+      const f = join(dir, 'settings.json')
+      let capturedTmp = ''
+      const renameMock = vi.mocked(fsModule.renameSync)
+      renameMock.mockImplementation((...args: Parameters<typeof renameSync>) => {
+        capturedTmp = String(args[0])
+        throw new Error('simulated rename failure (disk full, permissions, ...)')
+      })
+
+      try {
+        expect(() => writeAtomic(f, '{"a":1}')).toThrow(/simulated rename failure/)
+      } finally {
+        renameMock.mockImplementation(actual.renameSync)
+      }
+
+      expect(capturedTmp).toContain('.tmp')
+      expect(actual.existsSync(capturedTmp)).toBe(false)
+      expect(actual.existsSync(f)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('install file rollback', () => {
@@ -934,6 +965,93 @@ describe('install() and uninstall()', () => {
     expect(existsSync(p.launchAgent)).toBe(false)
   })
 
+  // I-1: the review's own measured repro. A preflight script standing in
+  // for ANY concurrent writer -- Claude Code itself persists an approved
+  // `permissions.allow` entry into settings.json -- writes into
+  // settings.json and then exits 2 (which `preflightBuild` treats as
+  // success, the same shape its own usage() contract produces), simulating
+  // a real write landing squarely inside the preflight/verify window. The
+  // OLD code read settings.json once at the very top and wrote the
+  // in-memory copy back at the very end, silently discarding whatever was
+  // written in between. The fix must detect the change and abort instead,
+  // leaving the concurrent write intact and settings.json exactly as the
+  // "concurrent writer" left it -- not wrapped, and not clobbered.
+  it('I-1: aborts, and does not clobber, when settings.json changes during the preflight/verify window', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+
+    const racingScript = join(dir, 'racing-preflight.mjs')
+    writeFileSync(
+      racingScript,
+      [
+        "import { readFileSync, writeFileSync } from 'node:fs'",
+        `const target = ${JSON.stringify(p.claudeSettings)}`,
+        "const s = JSON.parse(readFileSync(target, 'utf8'))",
+        "s.permissions = { allow: ['Bash(rm:*)'] }",
+        'writeFileSync(target, JSON.stringify(s))',
+        'process.exit(2)',
+        '',
+      ].join('\n'),
+    )
+    const controller = fakeController()
+
+    await expect(
+      install({ paths: p, controller, script: racingScript }),
+    ).rejects.toThrow(/changed while install was verifying the wrap/)
+
+    // The concurrent write survived, untouched by install -- proof this is
+    // an abort, not a silent overwrite. statusLine must NOT have been
+    // wrapped either: nothing was written past the point of detecting the
+    // race.
+    const settings = JSON.parse(readFileSync(p.claudeSettings, 'utf8'))
+    expect(settings.permissions).toEqual({ allow: ['Bash(rm:*)'] })
+    expect(settings.statusLine).toBe("printf 'STATUS OK\\n'")
+    expect(existsSync(p.launchAgent)).toBe(false)
+    // The wrapper copy that happened before the race check fired was rolled
+    // back too -- this install never existed before, so nothing should be
+    // left behind by the attempt.
+    expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
+    // `isLoaded` is queried unconditionally before the try block (finding
+    // 4), well before this abort -- but launchd was never actually
+    // TOUCHED: no bootout, no bootstrap.
+    expect(controller.calls.filter((c) => c === 'bootout' || c === 'bootstrap')).toEqual([])
+  })
+
+  // M-5: install() creates settings.json when the file did not exist at
+  // all beforehand. The default `writeAtomic` mode (0644) would leave it
+  // world-readable even though nothing had a chance to loosen it first --
+  // `preserveExistingMode` finds nothing to stat.
+  it('M-5: a settings.json install() creates from nothing is written at 0600', async () => {
+    const p = makeTestPaths(dir)
+    // No settings.json at all beforehand -- install must create one.
+
+    await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+
+    expect(statSync(p.claudeSettings).mode & 0o777).toBe(0o600)
+  })
+
+  // M-6: the backup write itself must be atomic, like every other write in
+  // this file. A `renameSync` failure partway through the backup write
+  // must not leave a truncated backup, and must not leave a stray temp
+  // file behind either (M-3).
+  it('M-6: the backup is written atomically, via a temp file and a rename, not truncated in place', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    const backupPath = `${p.claudeSettings}.deckd-backup`
+
+    const renameMock = vi.mocked(fsModule.renameSync)
+    renameMock.mockClear()
+
+    await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+
+    const backupRenames = renameMock.mock.calls.filter(([, dest]) => String(dest) === backupPath)
+    expect(backupRenames.length).toBeGreaterThanOrEqual(1)
+    for (const [src] of backupRenames) {
+      expect(String(src)).not.toBe(backupPath)
+      expect(String(src)).toContain('.tmp')
+    }
+  })
+
   // M-6: `install()` always runs `enforceDirModes` and the I-2 stray-file
   // repair BEFORE reading settings.json, because the state directory is
   // wanted regardless of whether settings.json turns out to be readable.
@@ -1012,22 +1130,33 @@ describe('install() and uninstall()', () => {
     expect(settings.statusLine).toBe("printf 'STATUS OK\\n'")
   })
 
-  it('uninstall unwraps, removes the wrapper, and removes its own backup', async () => {
+  // Half one's negative guarantee: uninstall NEVER deletes the backup, on
+  // ANY code path -- not even the most ordinary, successful uninstall,
+  // which is exactly the path an earlier version of this same test asserted
+  // the OPPOSITE of (`existsSync(backup)` used to assert `false` here).
+  // Three straight review rounds each found a fresh way for uninstall to
+  // delete the last copy of the user's original statusLine; the fix that
+  // ends the whole harm class is refusing to delete it at all, regardless
+  // of which detection path got there. The cost is one leftover file,
+  // documented in `docs/DEPLOYMENT.md`.
+  it('uninstall unwraps, removes the wrapper, and leaves its own backup in place', async () => {
     const p = makeTestPaths(dir)
     writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
     const controller = fakeController()
     await install({ paths: p, controller, script: writeGoodScript(dir) })
     expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
+    const backupBefore = readFileSync(`${p.claudeSettings}.deckd-backup`, 'utf8')
 
     await uninstall({ paths: p, controller })
 
     const settings = JSON.parse(readFileSync(p.claudeSettings, 'utf8'))
     expect(settings.statusLine).toBe("printf 'STATUS OK\\n'")
     expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
-    expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(false)
+    expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
+    expect(readFileSync(`${p.claudeSettings}.deckd-backup`, 'utf8')).toBe(backupBefore)
   })
 
-  // C-1, THE critical finding's exact repro: the user (or an agent
+  // C-1, THE critical finding's round-2 repro: the user (or an agent
   // "cleaning up" the noisy trailing JSON) trims the `# deckd-wrapped {...}`
   // comment. The statusline keeps working -- it is only a shell comment --
   // so nothing signals anything changed. The OLD `isInstalled` was false
@@ -1036,9 +1165,8 @@ describe('install() and uninstall()', () => {
   // settings.json pointing at a file it had just deleted, with the backup
   // gone too. The fix must still recognise this as installed (by path,
   // C-1), fall back to the backup to recover the original (since the
-  // embedded blob is unreadable with the marker gone), and only then
-  // delete the wrapper and the backup -- ending in the SAME safe state as
-  // an ordinary uninstall, not a stranded one.
+  // embedded blob is unreadable with the marker gone), delete the wrapper --
+  // and, per half one, leave the backup exactly where it is.
   it('C-1: uninstall still recovers and cleans up when the marker comment was trimmed off', async () => {
     const p = makeTestPaths(dir)
     writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
@@ -1062,13 +1190,58 @@ describe('install() and uninstall()', () => {
     // at all after concluding, wrongly, that nothing was installed).
     expect(settings.statusLine).toBe("printf 'STATUS OK\\n'")
     expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
-    expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(false)
+    expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
+  })
+
+  // C-1, THE critical finding's round-3 repro, and the exact case I-4 named
+  // as missing: install with one state directory (A), then uninstall
+  // resolving a DIFFERENT one (B) -- the mirror image of the install-side
+  // test above ("refuses to wrap a statusLine that already looks like a
+  // DIFFERENT deckd wrap"). Measured against the OLD code: `isInstalled`
+  // was false (wrong path), so uninstall fell to its "never wrapped at
+  // all" branch, reported "deckd uninstalled", removed the plist, deleted
+  // the backup, and left `statusLine` invoking A's wrapper -- with the
+  // closing message naming B, the wrong directory. The fixed `detectWrap`
+  // recognises this as `'ambiguous'` and refuses outright, before touching
+  // launchd, the plist, or anything else.
+  it('C-1: uninstall refuses when the wrap points at a DIFFERENT state directory than this invocation resolved', async () => {
+    const home = join(dir, 'home')
+    const stateA = join(dir, 'state-a')
+    const stateB = join(dir, 'state-b')
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    const pA = buildPaths(home, stateA)
+    const pB = buildPaths(home, stateB)
+    const controller = fakeController()
+    writeFileSync(pA.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    await install({ paths: pA, controller, script: writeGoodScript(dir) })
+
+    const settingsBefore = readFileSync(pA.claudeSettings, 'utf8')
+    const backupBefore = readFileSync(`${pA.claudeSettings}.deckd-backup`, 'utf8')
+    const plistBefore = readFileSync(pA.launchAgent, 'utf8')
+    controller.calls.length = 0
+
+    // Same home, but resolved against stateB -- e.g. DECKD_STATE_DIR was
+    // set for install and not for this uninstall, or vice versa.
+    await expect(uninstall({ paths: pB, controller })).rejects.toThrow(/already looks like a deckd wrap/)
+
+    // Refused, changing NOTHING: settings.json, the backup, and the plist
+    // are all untouched, and launchd was never called -- not even the
+    // bootout an ordinary uninstall issues unconditionally.
+    expect(readFileSync(pA.claudeSettings, 'utf8')).toBe(settingsBefore)
+    expect(readFileSync(`${pA.claudeSettings}.deckd-backup`, 'utf8')).toBe(backupBefore)
+    expect(readFileSync(pA.launchAgent, 'utf8')).toBe(plistBefore)
+    expect(existsSync(stateA + '/statusline-wrapper.sh')).toBe(true)
+    expect(controller.calls).toEqual([])
   })
 
   // I-4: when recovery source is 'none' -- the embedded blob is unreadable
   // AND the backup itself will not parse -- the backup file is very likely
   // the last legible copy of the original left anywhere. Deleting it
   // destroys exactly what a person could otherwise have recovered by eye.
+  // (Half one makes this the SAME outcome as every other case now, since
+  // uninstall never deletes the backup regardless -- this test still earns
+  // its place because it is the one case where the OLD code deleted it
+  // even by its OWN, narrower rule.)
   it("I-4: uninstall keeps the backup when it could not recover anything (source: 'none')", async () => {
     const p = makeTestPaths(dir)
     writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
@@ -1092,6 +1265,47 @@ describe('install() and uninstall()', () => {
     // person could still have read by eye even though `JSON.parse` failed.
     expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
     expect(readFileSync(`${p.claudeSettings}.deckd-backup`, 'utf8')).toBe('not valid json at all')
+  })
+
+  // Half one, asserted directly rather than through any one scenario: sweep
+  // every uninstall path this suite exercises above and confirm every
+  // single one leaves the backup behind. This is the guarantee itself, not
+  // a repro of any one trigger -- the whole point is that it must hold no
+  // matter which detection branch runs.
+  it('half one: no uninstall code path in this suite ever deletes the backup', async () => {
+    const scenarios: Array<(p: ReturnType<typeof makeTestPaths>) => Promise<void>> = [
+      // Ordinary uninstall.
+      async (p) => {
+        writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'A\\n'" }))
+        await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+        await uninstall({ paths: p, controller: fakeController() })
+      },
+      // Marker trimmed -- recovers from the backup.
+      async (p) => {
+        writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'B\\n'" }))
+        await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+        const wrapped = JSON.parse(readFileSync(p.claudeSettings, 'utf8')) as { statusLine: string }
+        const markerAt = wrapped.statusLine.indexOf(WRAPPER_MARKER)
+        writeFileSync(
+          p.claudeSettings,
+          JSON.stringify({ statusLine: wrapped.statusLine.slice(0, markerAt).trimEnd() }),
+        )
+        await uninstall({ paths: p, controller: fakeController() })
+      },
+      // Never installed at all -- statusLine absent throughout.
+      async (p) => {
+        writeFileSync(`${p.claudeSettings}.deckd-backup`, JSON.stringify({ statusLine: 'x.sh' }))
+        await uninstall({ paths: p, controller: fakeController() })
+      },
+    ]
+
+    for (const [i, scenario] of scenarios.entries()) {
+      const scenarioDir = join(dir, `half-one-${String(i)}`)
+      mkdirSync(join(scenarioDir, 'home', '.claude'), { recursive: true })
+      const p = makeTestPaths(scenarioDir)
+      await scenario(p)
+      expect(existsSync(`${p.claudeSettings}.deckd-backup`)).toBe(true)
+    }
   })
 
   // Finding I2. The old probe ran with no DECKD_STATE_DIR override, so it
@@ -1400,5 +1614,45 @@ describe('refreshWrapper', () => {
     await expect(refreshWrapper({ paths: p })).rejects.toThrow(/could not recover the original/)
 
     expect(readFileSync(wrapperPath, 'utf8')).toBe(wrapperBefore)
+  })
+
+  // Half one: refreshWrapper uses the SAME shared `detectWrap` as install
+  // and uninstall. An ambiguous wrap (some other deckd wrapper, pointing at
+  // a different state directory) must refuse here too, exactly like the
+  // other two -- otherwise refreshing would re-verify the wrapper against
+  // the wrong recovered original.
+  it('refuses to refresh when statusLine looks like a DIFFERENT deckd wrap', async () => {
+    const p = makeTestPaths(dir)
+    const otherWrap = wrapStatusLine(
+      "printf 'STATUS OK\\n'",
+      join(dir, 'some-other-state-dir', 'statusline-wrapper.sh'),
+      join(dir, 'some-other-state-dir'),
+    )
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: otherWrap.statusLine }))
+    const before = readFileSync(p.claudeSettings, 'utf8')
+
+    await expect(refreshWrapper({ paths: p })).rejects.toThrow(/already looks like a deckd wrap/)
+
+    expect(readFileSync(p.claudeSettings, 'utf8')).toBe(before)
+    expect(existsSync(p.stateDir + '/statusline-wrapper.sh')).toBe(false)
+  })
+
+  // M-2: `writeAtomic`'s temp file needs somewhere to live. `install`
+  // always runs `enforceDirModes` before it ever touches settings.json, but
+  // `refreshWrapper` did not -- so an already-installed user whose state
+  // directory was later removed by hand got a bare ENOENT instead of the
+  // repair `docs/DEPLOYMENT.md` promises `refresh-wrapper` performs.
+  it('M-2: repairs a missing state directory instead of failing with a bare ENOENT', async () => {
+    const p = makeTestPaths(dir)
+    writeFileSync(p.claudeSettings, JSON.stringify({ statusLine: "printf 'STATUS OK\\n'" }))
+    await install({ paths: p, controller: fakeController(), script: writeGoodScript(dir) })
+    rmSync(p.stateDir, { recursive: true, force: true })
+    expect(existsSync(p.stateDir)).toBe(false)
+
+    const result = await refreshWrapper({ paths: p })
+
+    expect(result.path).toBe(p.stateDir + '/statusline-wrapper.sh')
+    expect(existsSync(result.path)).toBe(true)
+    expect(statSync(p.stateDir).mode & 0o777).toBe(0o700)
   })
 })

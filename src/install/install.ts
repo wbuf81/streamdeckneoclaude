@@ -247,44 +247,87 @@ export function recoverStatusLine(current: unknown, backupPath: string, wrapperP
 const WRAPPER_BASENAME = 'statusline-wrapper.sh'
 
 /**
- * Decides whether `settings` is already wrapped, by checking whether its
- * statusLine command actually INVOKES `wrapperPath` -- not by looking for
- * `WRAPPER_MARKER`.
- *
- * C-1: the marker is a `#`-prefixed shell comment, so it is cosmetic text a
- * person can trim (e.g. "cleaning up" the noisy trailing JSON) with ZERO
- * effect on how the statusline behaves -- the wrapper keeps working, so
- * nothing tells anyone the marker is gone. Gating `isInstalled` on that
- * comment meant a trimmed marker made `uninstall` think nothing was
- * installed, skip the unwrap entirely, and fall through to deleting the
- * wrapper and the backup anyway -- stranding a live reference. It also made
- * `install` fail to recognise an existing wrap and wrap it a second time.
- *
- * The wrapper path is not cosmetic: it is the literal file the shell is
- * about to execute. A command cannot both invoke it and "not really" be
- * wrapped, so this is load-bearing in the way a comment can never be.
- */
-export function isInstalled(settings: unknown, wrapperPath: string): boolean {
-  if (!settings || typeof settings !== 'object') return false
-  const sl = (settings as Record<string, unknown>).statusLine
-  if (sl === undefined) return false
-  return extractCommand(sl).includes(wrapperPath)
-}
-
-/**
  * True when a command looks like it invokes SOME deckd wrapper -- by the
  * fixed basename every copy shares, or by the marker -- even if it does not
- * match `wrapperPath` exactly. This is deliberately broader and less exact
- * than `isInstalled`, and it exists for exactly one job: giving `install` a
- * way to notice an AMBIGUOUS state (e.g. `DECKD_STATE_DIR` changed since a
- * prior install, so the old wrap points at a different path) and refuse
- * rather than guess. Guessing here means nesting a wrap inside another
- * wrap, which is the failure mode C-1 also produces from the other
- * direction. Never used for the unwrap/verify/delete decision itself --
- * only `isInstalled`, keyed on the exact path, decides that.
+ * match a specific `wrapperPath` exactly. Used only by `detectWrap` below,
+ * to tell "definitely not wrapped" from "wrapped by something, but we
+ * cannot tell what" -- never on its own as an install/uninstall/delete
+ * decision.
  */
 function looksWrapped(commandStr: string): boolean {
   return commandStr.includes(WRAPPER_BASENAME) || commandStr.includes(WRAPPER_MARKER)
+}
+
+/** What `detectWrap` decided about a settings object, relative to one
+ * specific `wrapperPath`. */
+export type WrapKind =
+  | 'none' // statusLine does not invoke any deckd wrapper at all.
+  | 'this' // statusLine invokes exactly wrapperPath.
+  | 'ambiguous' // statusLine invokes SOME deckd wrapper, but not wrapperPath.
+
+export interface WrapDetection {
+  kind: WrapKind
+}
+
+/**
+ * THE one function that answers "is this settings file wrapped, and by
+ * which wrapper path" -- install, uninstall, and refreshWrapper all call
+ * this and only this to decide.
+ *
+ * Round 3's C-1 defect happened because that question got answered
+ * independently at separate call sites: `install` reasoned about an
+ * ambiguous wrap with `looksWrapped` (below) at one line, while `uninstall`
+ * reasoned about "is it installed" with only the exact-path check at
+ * another line, and never asked the ambiguous question at all. A wrap
+ * pointing at a DIFFERENT state directory -- e.g. because `DECKD_STATE_DIR`
+ * changed between an install and a later uninstall -- satisfied neither
+ * check `uninstall` had: not "installed" (wrong path), and never even
+ * tested for "ambiguous". So `uninstall` fell to its "never wrapped at
+ * all" branch and deleted the backup, on a settings file that was, in
+ * fact, still wrapped -- just by a wrapper this invocation did not resolve.
+ * Two call sites reasoning independently about the same fact diverge; one
+ * function every caller shares cannot.
+ *
+ * `kind`:
+ *   - `'none'`       -- statusLine does not invoke any deckd wrapper.
+ *   - `'this'`       -- statusLine invokes exactly `wrapperPath`. Safe to
+ *     act on: unwrap, re-verify, or refuse a double-install.
+ *   - `'ambiguous'`  -- statusLine invokes SOME deckd wrapper (by the fixed
+ *     basename every copy shares, or by the marker) but not `wrapperPath`.
+ *     Every caller must refuse and explain here, changing nothing --
+ *     guessing which wrap is "the" wrap is exactly the failure mode C-1
+ *     produces, whichever direction it is guessed in.
+ */
+export function detectWrap(settings: unknown, wrapperPath: string): WrapDetection {
+  if (!settings || typeof settings !== 'object') return { kind: 'none' }
+  const sl = (settings as Record<string, unknown>).statusLine
+  if (sl === undefined) return { kind: 'none' }
+  const command = extractCommand(sl)
+  if (command.includes(wrapperPath)) return { kind: 'this' }
+  if (looksWrapped(command)) return { kind: 'ambiguous' }
+  return { kind: 'none' }
+}
+
+/**
+ * Thin, exact-path convenience wrapper over `detectWrap`, kept because
+ * `wrapperPath === true/false` reads more directly at most call sites (and
+ * throughout the tests) than matching on `.kind`. Never reimplements the
+ * decision itself -- `detectWrap` is the only place that logic lives.
+ */
+export function isInstalled(settings: unknown, wrapperPath: string): boolean {
+  return detectWrap(settings, wrapperPath).kind === 'this'
+}
+
+/** The message every caller uses to refuse an ambiguous wrap, changing
+ * nothing. One wording, so install, uninstall, and refreshWrapper cannot
+ * drift apart on what they tell the user about the exact same situation. */
+function ambiguousWrapMessage(wrapperPath: string): string {
+  return (
+    'statusLine already looks like a deckd wrap, but not the one at ' +
+    `${wrapperPath} (for example, DECKD_STATE_DIR may differ from the install that set this ` +
+    'up, or the wrapper moved). Refusing to guess which wrap is the right one -- nothing was ' +
+    'changed. Check DECKD_STATE_DIR, or fix statusLine in settings.json by hand, then retry.'
+  )
 }
 
 function extractCommand(v: unknown): string {
@@ -342,6 +385,15 @@ function shellQuote(s: string): string {
  * Exported so a test can drive it directly against a temporary file,
  * without going through `install()`/`uninstall()`, which default to the
  * real paths under `~` and must never do so in a test.
+ *
+ * M-3: if `renameSync` fails (a full disk, a permissions error, `file`'s
+ * parent replaced by something odd mid-run), the `tmp` file is unlinked
+ * before the error propagates. Without this, a failed rename left a full
+ * duplicate of `file`'s new content behind at `${file}.<pid>.<hex>.tmp`
+ * forever -- no code anywhere prunes that shape, unlike the wrapper's own
+ * `mktemp` leftovers, which the shell script prunes by age. The random
+ * suffix already makes `tmp` practically unique per call, so cleaning it up
+ * on this one failure path cannot delete anything another call created.
  */
 export function writeAtomic(
   file: string,
@@ -358,12 +410,22 @@ export function writeAtomic(
       // The target does not exist yet. Use the requested mode.
     }
   }
-  writeFileSync(tmp, content, { mode: targetMode })
-  // `mode` on `writeFileSync` applies only at creation (Lesson 1). The
-  // random suffix above means `tmp` is always newly created in practice, but
-  // this does not depend on that being true.
-  chmodSync(tmp, targetMode)
-  renameSync(tmp, file)
+  try {
+    writeFileSync(tmp, content, { mode: targetMode })
+    // `mode` on `writeFileSync` applies only at creation (Lesson 1). The
+    // random suffix above means `tmp` is always newly created in practice,
+    // but this does not depend on that being true.
+    chmodSync(tmp, targetMode)
+    renameSync(tmp, file)
+  } catch (e) {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp)
+    } catch {
+      // Best-effort cleanup. The original error below is the one that
+      // matters to the caller.
+    }
+    throw e
+  }
 }
 
 export interface FileSnapshot {
@@ -489,31 +551,28 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
   const changed: string[] = []
   const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
 
-  // Refuse to run twice. Checked first, before any file is touched, so a
-  // repeat run leaves the wrapper copy, the backup, and settings.json alone.
-  // Keyed on the wrapper PATH (C-1), not the marker comment, so a hand-edit
-  // that trims the marker cannot make this miss an existing wrap.
-  const settings = readSettingsForInstall(p)
-  if (isInstalled(settings, wrapperDst)) {
+  // Refuse to run twice, and refuse an ambiguous wrap, both decided by the
+  // ONE shared `detectWrap` (half one). Checked first, before any file is
+  // touched, so a repeat run -- or a wrap pointing at a different state
+  // directory -- leaves the wrapper copy, the backup, and settings.json
+  // alone.
+  //
+  // `initialRaw` is kept alongside the parsed object so the write, much
+  // later, can confirm the file has not changed underneath this install
+  // before overwriting it (I-1, below).
+  const { settings, raw: initialRaw } = readSettingsForInstall(p)
+  const detection = detectWrap(settings, wrapperDst)
+  if (detection.kind === 'this') {
     console.log('deckd is already installed. Run `deckd uninstall` first to redo it.')
     return
   }
-
-  // C-1, the other direction: the statusLine command looks like it invokes
-  // SOME deckd wrapper (by basename or marker) but not the one at
-  // `wrapperDst` -- e.g. `DECKD_STATE_DIR` changed since a prior install, or
-  // the file was moved. Wrapping this would nest a wrap inside another
-  // wrap: `verifyWrap` would still pass, because a double wrap reproduces
-  // the original output byte for byte, so it would go live unverified, and
-  // a later `uninstall` would restore the OLD wrap as "the original" and
-  // strand it. Refuse outright rather than guess.
-  const currentCmd = extractCommand(settings.statusLine)
-  if (looksWrapped(currentCmd)) {
-    throw new Error(
-      'statusLine already looks like a deckd wrap, but not the one this install would use ' +
-        `(${wrapperDst}). Refusing to wrap it again, to avoid nesting one wrap inside another. ` +
-        'Run `deckd uninstall` first, or fix statusLine in settings.json by hand, then retry.',
-    )
+  if (detection.kind === 'ambiguous') {
+    // C-1, the other direction: wrapping this would nest a wrap inside
+    // another wrap. `verifyWrap` would still pass, because a double wrap
+    // reproduces the original output byte for byte, so it would go live
+    // unverified, and a later `uninstall` would restore the OLD wrap as
+    // "the original" and strand it.
+    throw new Error(ambiguousWrapMessage(wrapperDst))
   }
 
   // 1. Copy the wrapper into the state directory, so an uninstalled repo
@@ -563,11 +622,15 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
     )
   }
 
-  const snapshots = [
+  // I-1: only the two snapshots that NOTHING outside deckd can change during
+  // the preflight/probe window above are taken here, up front. `settings.json`
+  // and the plist are each taken just-in-time, immediately before the write
+  // that would clobber them, inside the `try` block below -- see there for
+  // why. Rollback below still expects exactly four entries, in this same
+  // order (wrapperDst, backup, claudeSettings, launchAgent), reversed.
+  const snapshots: FileSnapshot[] = [
     snapshotFile(wrapperDst),
     snapshotFile(backup),
-    snapshotFile(p.claudeSettings),
-    snapshotFile(p.launchAgent),
   ]
 
   // Record whether the daemon is actually loaded right now, BEFORE this
@@ -589,22 +652,73 @@ export async function install(opts: InstallOptions = {}): Promise<void> {
     chmodSync(wrapperDst, 0o755)
     changed.push(`wrote ${wrapperDst}`)
 
+    // I-1: re-read `settings.json` and compare it, as raw TEXT, against
+    // `initialRaw` -- read back at the very top of this function, before the
+    // preflight build and the two `verifyWrap` probes, each allowed up to
+    // ten seconds. `settings.json` is a file Claude Code itself rewrites
+    // while a session runs (approving a `permissions.allow` entry persists
+    // there), so a read-modify-write spanning that whole window would
+    // silently discard whatever Claude Code wrote in between. Comparing
+    // TEXT, not the parsed object, catches every kind of concurrent edit,
+    // including one to a key this code never parses into anything at all.
+    // Doing this check, and taking the snapshot below, immediately before
+    // the write -- rather than back at the top of this function -- shrinks
+    // the window as far as it will go: everything slow has already
+    // happened by this point, and nothing between here and the write below
+    // touches `settings.json` at all.
+    const currentRaw = existsSync(p.claudeSettings) ? readFileSync(p.claudeSettings, 'utf8') : ''
+    if (currentRaw !== initialRaw) {
+      throw new Error(
+        `${p.claudeSettings} changed while install was verifying the wrap (most likely Claude ` +
+          'Code itself writing to it). Refusing to overwrite a newer version of the file with a ' +
+          'decision made from a stale read. Nothing else was changed here; run `deckd install` ' +
+          'again.',
+      )
+    }
+    // The snapshot rollback would need to restore is taken from the SAME
+    // read the race check above just confirmed is current -- never from a
+    // stale read taken before the window, which could not restore what is
+    // about to be overwritten.
+    snapshots.push(snapshotFile(p.claudeSettings))
+
     // 2. Wrap the statusline, after a backup.
+    //
+    // M-6: the backup used to be the one non-atomic write in this whole
+    // file -- `copyFileSync` truncates the destination and streams into it
+    // in place, so a `SIGKILL` mid-copy could leave a truncated backup.
+    // (Bounded harm in practice, since `statusLine` is not wrapped until
+    // the write right after this one -- but there is no reason for this
+    // write to be the exception.) `writeAtomic` with
+    // `preserveExistingMode: false` both closes that window AND replaces
+    // the separate `chmodSync` finding 6 needed: `copyFileSync` keeps an
+    // EXISTING destination's mode, so a stale backup left loose by an
+    // earlier version, an unzip, or a restore would otherwise receive a
+    // fresh copy of a possibly 0600, secrets-bearing settings file and
+    // stay loose. Forcing the mode is now `writeAtomic`'s job, not a
+    // second call after the fact. `currentRaw` is the exact content just
+    // confirmed above, not a fresh read -- the backup is a copy of THAT
+    // moment, never an independent, potentially different, read.
     if (existsSync(p.claudeSettings)) {
-      copyFileSync(p.claudeSettings, backup)
-      // `copyFileSync` keeps an EXISTING destination's mode (finding 6). A
-      // stale backup left at a looser mode by an earlier version, an
-      // unzip, or a restore would otherwise receive a fresh copy of a
-      // possibly 0600, secrets-bearing settings file and stay loose. Force
-      // the backup to the live file's current mode every time.
-      chmodSync(backup, statSync(p.claudeSettings).mode & 0o777)
+      writeAtomic(backup, currentRaw, statSync(p.claudeSettings).mode & 0o777, { preserveExistingMode: false })
       changed.push(`backed up ${p.claudeSettings} to ${backup}`)
     }
     settings.statusLine = finalWrap.statusLine
-    writeAtomic(p.claudeSettings, JSON.stringify(settings, null, 2))
+    // M-5: 0600, not the default 0644 -- `writeAtomic`'s `preserveExistingMode`
+    // finds nothing to stat on a settings.json install itself creates, so it
+    // falls through to `mode`. Only `statusLine` is in the file at this
+    // instant, but Claude Code can add an `env` block with a key to it
+    // later, and this file should never have been world-readable in the
+    // first place.
+    writeAtomic(p.claudeSettings, JSON.stringify(settings, null, 2), 0o600)
     changed.push(`wrapped statusLine in ${p.claudeSettings}`)
 
-    // 3. Write and load the launchd agent.
+    // 3. Write and load the launchd agent. Snapshotted here, just before the
+    // write, for the same reason as claudeSettings above -- nothing else
+    // touches the plist, so this could equally have been taken up front,
+    // but keeping every just-before-its-own-write snapshot in one place
+    // makes the pattern easier to audit than splitting it across two
+    // styles.
+    snapshots.push(snapshotFile(p.launchAgent))
     mkdirSync(dirname(p.launchAgent), { recursive: true })
     writeAtomic(
       p.launchAgent,
@@ -702,9 +816,29 @@ export async function refreshWrapper(opts: InstallOptions = {}): Promise<Refresh
   if (!existsSync(wrapperSrc)) throw new Error(`wrapper script missing: ${wrapperSrc}`)
   const wrapperDst = join(p.stateDir, 'statusline-wrapper.sh')
 
-  const settings = readSettingsForInstall(p)
-  if (!isInstalled(settings, wrapperDst)) {
+  // M-2: `writeAtomic` below needs somewhere to put its temp file. `install`
+  // always runs this before it ever touches settings.json, but
+  // `refreshWrapper` can be reached on an already-installed machine whose
+  // state directory was later removed by hand (a user "cleaning up", a
+  // restore that missed it) -- measured: a bare ENOENT with no explanation,
+  // because there was nowhere for the temp file to go. `settings.json`
+  // still points at the missing wrapper in that case, so this is exactly
+  // the "the wrapper is gone" repair `docs/DEPLOYMENT.md` points a user at
+  // `refresh-wrapper` for; it must not itself fail with a raw filesystem
+  // error.
+  enforceDirModes([p.stateDir, p.sessionsDir, p.artDir])
+
+  // Half one: the same shared `detectWrap` install and uninstall use. An
+  // ambiguous wrap (some other deckd wrapper, not this one) must refuse
+  // here too, exactly like install and uninstall -- refreshing INTO an
+  // ambiguous state would re-verify against the wrong original.
+  const { settings } = readSettingsForInstall(p)
+  const detection = detectWrap(settings, wrapperDst)
+  if (detection.kind === 'none') {
     throw new Error('deckd is not installed. Run `deckd install` first.')
+  }
+  if (detection.kind === 'ambiguous') {
+    throw new Error(ambiguousWrapMessage(wrapperDst))
   }
 
   // I-2: `settings.statusLine` here is the ALREADY-INSTALLED, already-wrapped
@@ -784,13 +918,27 @@ const DEFAULT_PROBE_TIMEOUT_MS = 10_000
  * `verifyWrap` can apply a different policy to it (see below). */
 class ProbeTimeoutError extends Error {}
 
+/** How much of the probed command's own stderr `ProbeExitError` keeps. */
+const PROBE_STDERR_LIMIT = 200
+
 /** Distinguishes a clean, fast, nonzero exit from every other kind of
  * failure (a timeout, a spawn error), so `verifyWrap` can tell "the original
  * and the wrapped command failed the same way" from "the wrapper introduced
- * a different failure" (finding 3). */
+ * a different failure" (finding 3).
+ *
+ * M-4: `stderr` is the USER'S OWN statusline command's error output, and
+ * `install` folds this whole message into what it prints and throws on a
+ * failed probe. A statusline that calls an authenticated API can put a
+ * bearer token, or anything else, into its own stderr -- this is not
+ * deckd's data to print in full. Truncated to a fixed, small budget, with
+ * the original byte count kept so nothing is silently pretended away. */
 class ProbeExitError extends Error {
   constructor(public readonly code: number | null, stderr: string) {
-    super(`exit ${String(code)}: ${stderr}`)
+    const trimmed =
+      stderr.length > PROBE_STDERR_LIMIT
+        ? `${stderr.slice(0, PROBE_STDERR_LIMIT)}… (${String(stderr.length)} bytes total, truncated)`
+        : stderr
+    super(`exit ${String(code)}: ${trimmed}`)
     this.name = 'ProbeExitError'
   }
 }
@@ -1049,21 +1197,38 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
   // completely untouched.
   const settings = readSettingsForUninstall(p)
 
+  // C-1, THE critical finding, round 3: decided by the SAME shared
+  // `detectWrap` `install` and `refreshWrapper` use -- not by `isInstalled`
+  // alone. `isInstalled` only ever answers "wrapped by exactly this path";
+  // it has no way to say "wrapped, but by something else", so a wrap
+  // pointing at a DIFFERENT state directory (DECKD_STATE_DIR changed
+  // between the install and this uninstall, or the wrapper moved) made the
+  // old code fall straight to "never wrapped at all" and delete the
+  // backup, remove the plist, and print success -- while the live wrap
+  // kept invoking a wrapper this invocation never touched. Checked here,
+  // as a pure decision with no side effect yet, BEFORE launchd or the
+  // plist are touched: refusing changes nothing at all, exactly like
+  // `install`'s mirror-image check.
+  const detection = detectWrap(settings, wrapper)
+  if (detection.kind === 'ambiguous') {
+    throw new Error(
+      `${ambiguousWrapMessage(wrapper)} (this invocation resolved the state directory to ` +
+        `${p.stateDir} -- if that is not where the wrap was installed, set DECKD_STATE_DIR to ` +
+        'the correct one and retry.)',
+    )
+  }
+
   await controller.bootout(p.launchAgentLabel)
   if (existsSync(p.launchAgent)) {
     unlinkSync(p.launchAgent)
     removed.push(`removed ${p.launchAgent}`)
   }
 
-  // C-1: keyed on the wrapper PATH, not the marker comment. A hand-edit that
-  // trims the trailing `# deckd-wrapped {...}` comment leaves the statusline
-  // working (it is only a shell comment) and used to make this `false` --
-  // skipping the unwrap entirely and falling through to unlinking the
-  // wrapper and the backup below, unconditionally. Checking the path
-  // instead means this is still `true` for exactly that case, so the unwrap
-  // below still runs.
+  // `detection.kind === 'this'` is the only branch that unwraps anything.
+  // `'none'` (settings.json never mentioned any deckd wrapper) falls
+  // straight through to the stray-file cleanup below, exactly as before.
   let recovered: RecoverResult | undefined
-  if (isInstalled(settings, wrapper)) {
+  if (detection.kind === 'this') {
     recovered = recoverStatusLine(settings.statusLine, backupPath, wrapper)
     if (recovered.warning) console.warn(recovered.warning)
     if (recovered.statusLine === undefined) delete settings.statusLine
@@ -1071,19 +1236,20 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
     writeAtomic(p.claudeSettings, JSON.stringify(settings, null, 2))
     removed.push(describeStatusLineOutcome(recovered, p.claudeSettings))
 
-    // Verify the unwrap actually landed on disk before deleting the file
-    // the old command pointed at. This is the exact ordering C1 found
-    // missing: unwrap, verify the unwrap, and only THEN delete -- never
-    // delete first, and never delete on the strength of an assumption that
-    // the write above worked. The check itself is now path-based too, so it
-    // catches the ambiguous case where the "recovered" original ITSELF still
-    // invokes the wrapper (e.g. a prior marker-absent double-wrap already
-    // nested one wrap inside another): if so, this still references the
-    // wrapper after the write, and the throw below refuses to delete
-    // anything rather than stranding it again.
-    if (isInstalled(readSettingsForUninstall(p), wrapper)) {
+    // Half one's positive guarantee: read the file back and confirm it no
+    // longer references ANY deckd wrapper -- not merely the exact path this
+    // invocation computed. Using `detectWrap` here (instead of the old
+    // `isInstalled`-only check) also catches the case where the RECOVERED
+    // original itself still looks like some other deckd wrap (e.g. a prior
+    // marker-absent double-wrap already nested one wrap inside another):
+    // that is `'ambiguous'`, not `'this'`, but it is just as unsafe to
+    // proceed past -- deleting the wrapper below would still strand a live
+    // reference, just to a DIFFERENT wrapper than the one being deleted.
+    // Never delete on the strength of an assumption that the write above
+    // worked; only on having just read the proof back off disk.
+    if (detectWrap(readSettingsForUninstall(p), wrapper).kind !== 'none') {
       throw new Error(
-        `${p.claudeSettings} still references the deckd wrapper after writing the unwrap. ` +
+        `${p.claudeSettings} still references a deckd wrapper after writing the unwrap. ` +
           'Refusing to delete the wrapper script, so nothing is stranded. Check the file by ' +
           'hand, then run `deckd uninstall` again.',
       )
@@ -1095,32 +1261,32 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
     removed.push(`removed ${wrapper}`)
   }
 
-  // Finding 6: deckd made this backup; deckd removes it. Leaving it behind
-  // forever meant a secrets-bearing duplicate of settings.json persisted
-  // indefinitely with no cleanup path at all.
-  //
-  // I-4: but only once recovery actually used it, or recovered something
-  // from the embedded blob -- never on the `source: 'none'` path. There,
-  // the embedded copy was unreadable AND the backup itself would not parse,
-  // so the backup is not a safe duplicate to discard: it is very likely the
-  // last legible copy of the original statusLine left anywhere, and
-  // deleting it destroys exactly the thing a person would otherwise have
-  // recovered by eye. `recovered` is `undefined` when settings.json was
-  // never wrapped at all (nothing to gate on); the backup, if any exists in
-  // that case, is still deckd's own and still safe to remove.
-  if (recovered === undefined || recovered.source !== 'none') {
-    if (existsSync(backupPath)) {
-      unlinkSync(backupPath)
-      removed.push(`removed ${backupPath}`)
-    }
-  } else {
-    console.warn(`kept ${backupPath}; the embedded original was unreadable and it did not parse either.`)
+  // Half one's negative guarantee, absolute: uninstall NEVER deletes the
+  // backup, under any code path, full stop. This is the single change that
+  // ends the harm class three straight review rounds have found a fresh
+  // trigger for -- a lenient parse (round 1), a marker-based check (round
+  // 2), an ambiguous wrap `isInstalled` alone could not see (round 3, C-1
+  // above). Each fix closed the trigger IT found; nothing closed the
+  // shared final step every one of them reached: deleting the one
+  // remaining copy of the user's original statusLine. A backup that is
+  // never deleted cannot be the last copy lost, no matter what a FUTURE
+  // detection bug gets wrong. The cost is one small leftover file --
+  // `docs/DEPLOYMENT.md` says so, so it reads as expected, not as a leak.
+  if (existsSync(backupPath)) {
+    removed.push(`left the pre-install backup at ${backupPath} in place (uninstall never deletes it -- see below)`)
   }
 
   console.log('deckd uninstalled.\n')
   for (const line of removed) console.log(`  . ${line}`)
   console.log(`\nThe state directory remains: ${p.stateDir}`)
   console.log('It holds your Spotify token. Delete it by hand if you want it gone.')
+  if (existsSync(backupPath)) {
+    console.log(
+      `\n${backupPath} also remains. deckd never deletes it, on any uninstall path, so it is ` +
+        'always there to recover from by hand. Delete it yourself once you have confirmed ' +
+        'settings.json is correct.',
+    )
+  }
 }
 
 /**
@@ -1134,11 +1300,21 @@ export async function uninstall(opts: UninstallOptions = {}): Promise<void> {
  * safe to keep. This appends a clarification rather than claiming zero
  * side effects; the original phrase stays a substring, so callers matching
  * on it still match.
+ *
+ * Returns the parsed object AND the exact raw text it was parsed from
+ * (`''` when the file is absent). `install` keeps `raw` alongside the
+ * parsed `settings` so the write, much later, can re-read the file and
+ * compare it by TEXT against this exact moment -- the I-1 fix. A parsed
+ * object could not serve that purpose: re-serialising it (`JSON.stringify`)
+ * can normalise away whitespace or key order a byte-for-byte compare would
+ * still catch, and would silently miss a key `settings` never parses into
+ * anything meaningful in the first place.
  */
-function readSettingsForInstall(p: Paths): Record<string, unknown> {
-  if (!existsSync(p.claudeSettings)) return {}
+function readSettingsForInstall(p: Paths): { settings: Record<string, unknown>; raw: string } {
+  if (!existsSync(p.claudeSettings)) return { settings: {}, raw: '' }
+  const raw = readFileSync(p.claudeSettings, 'utf8')
   try {
-    return parseSettingsObject(readFileSync(p.claudeSettings, 'utf8'), p.claudeSettings, 'install')
+    return { settings: parseSettingsObject(raw, p.claudeSettings, 'install'), raw }
   } catch (e) {
     throw new Error(
       `${String(e)} (deckd's own state directory setup, if any was needed, already ran and is safe to keep.)`,

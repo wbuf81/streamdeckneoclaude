@@ -78,6 +78,41 @@ describe('paths', () => {
       consoleError.mockRestore()
     }
   })
+
+  // I-3: measured accepted by the OLD exact-string compare, even though
+  // each one still names the home directory or an ancestor of it, once
+  // normalised.
+  it.each([
+    ['/Users/tester/', 'a trailing slash on the home directory'],
+    ['/Users/tester/.', 'a trailing dot segment on the home directory'],
+    ['/', 'the filesystem root'],
+    ['/Users', 'the direct parent of the home directory'],
+  ])('I-3: rejects DECKD_STATE_DIR=%s (%s)', (override) => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const isolated = buildPaths('/Users/tester', override)
+      expect(isolated.stateDir).toBe('/Users/tester/.local/state/deckd')
+      expect(consoleError).toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
+  // A sibling of home, or an unrelated absolute path, is not an ancestor of
+  // home and must still be accepted -- this override exists exactly so a
+  // test, or a person, can point deckd's state somewhere else entirely.
+  // Only home itself and its ancestors are rejected, never a directory that
+  // merely shares a string prefix with home's name.
+  it('I-3: accepts a sibling directory whose name merely starts with the same characters as home', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const isolated = buildPaths('/Users/tester', '/Users/testertwo')
+      expect(isolated.stateDir).toBe('/Users/testertwo')
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
 })
 
 describe('enforceDirModes', () => {

@@ -18,6 +18,13 @@
 # step tolerates an error, and the inner command always runs.
 
 set -u
+# I-2: enables job control, so a backgrounded inner command gets its OWN
+# process group, led by its pid -- not merely a pid this script happens to
+# know about. Needed below so a killing signal can reach a COMPOUND inner
+# command's children, not just the single process bash would otherwise
+# exec-optimise a simple one down to. This does not make the script
+# interactive; it only changes how background jobs are grouped.
+set -m
 
 STATE_DIR="${DECKD_STATE_DIR:-$HOME/.local/state/deckd}"
 INNER="${DECKD_INNER:-}"
@@ -43,8 +50,26 @@ cleanup() {
   # because nothing told it to stop. Killing `$INNER_PID` here forwards the
   # signal that reached the wrapper on to the command actually holding the
   # terminal, instead of leaving it to run unattended after its parent has
-  # already gone. A no-op once the inner command has already exited.
-  [ -z "$INNER_PID" ] || kill "$INNER_PID" 2>/dev/null || true
+  # already gone. A no-op once the inner command has already exited --
+  # M-1: including the normal, non-killed case, because the main flow below
+  # clears INNER_PID once `wait` returns on its own, before this EXIT trap
+  # ever runs.
+  #
+  # I-2: a NEGATIVE pid signals the whole PROCESS GROUP, not just the pid of
+  # `sh -c "$INNER"` itself. Measured: bash exec-optimises
+  # `sh -c '<one simple command>'` down to that one process with no
+  # children, so a plain `kill "$INNER_PID"` happens to reach it -- but for
+  # a compound inner command (a pipeline, an `&&` list), `sh -c` forks, and
+  # killing only the parent left the fork running for its full duration,
+  # orphaned. `set -m` above makes the backgrounded job its own process
+  # group, led by $INNER_PID, so the group form reaches a fork the plain
+  # form cannot. `wait` afterward blocks until the group's leader has
+  # actually finished dying, rather than returning immediately and letting
+  # this script exit while the group is still mid-shutdown.
+  if [ -n "$INNER_PID" ]; then
+    kill -TERM -"$INNER_PID" 2>/dev/null || true
+    wait "$INNER_PID" 2>/dev/null || true
+  fi
   [ -z "$TMPIN" ] || rm -f "$TMPIN"
   [ -z "$USAGE_TMP" ] || rm -f "$USAGE_TMP"
   [ -z "$SESSION_TMP" ] || rm -f "$SESSION_TMP"
@@ -154,6 +179,14 @@ if [ -n "$INNER" ]; then
   INNER_PID=$!
   wait "$INNER_PID"
   STATUS=$?
+  # M-1: clear it the instant `wait` returns ON ITS OWN -- a normal,
+  # non-killed exit. Once `wait` returns, the pid has been reaped and is
+  # free for the OS to hand to a completely unrelated process. Without this,
+  # the EXIT trap right after this line still runs `cleanup`, which used to
+  # `kill "$INNER_PID"` unconditionally -- on a busy machine, that pid can
+  # by then belong to someone else's process entirely. Clearing it here
+  # closes the window completely, rather than narrowing it.
+  INNER_PID=""
 else
   STATUS=0
 fi

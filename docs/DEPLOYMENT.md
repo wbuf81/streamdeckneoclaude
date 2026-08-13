@@ -39,6 +39,30 @@ Before `refresh-wrapper` existed, the only way to update an installed wrapper wa
 `deckd uninstall` followed by `deckd install` — the same path the C-1 defect lived on. Prefer
 `refresh-wrapper` for a wrapper-only change.
 
+`install` and `refresh-wrapper` also run the user's real statusline command as part of their
+own verification (`verifyWrap`), with a synthetic payload. This runs the real command an
+extra time per install, and twice more per `refresh-wrapper`. A statusline that keeps its own
+per-session cache could see it disturbed by this synthetic run. This has not been observed on
+this machine's own statusline, but is a known, latent property of how verification works.
+
+## Uninstalling
+
+`deckd uninstall` **never deletes `settings.json.deckd-backup`**, on any code path, no matter
+how the uninstall proceeds. This is deliberate: three separate review rounds each found a
+different way for a detection bug to make uninstall delete the one remaining copy of the
+original `statusLine` command, leaving the statusline blank with no way back. Never deleting
+the backup removes that whole class of failure — the cost is one small leftover file.
+
+After a normal uninstall, `~/.claude/settings.json.deckd-backup` is expected to remain.
+Delete it by hand once you have confirmed `settings.json` is correct. It is not a bug that it
+is still there.
+
+If `deckd uninstall` refuses with a message about statusLine already looking like a deckd
+wrap, but not at the expected path, do not force it. This means the installed wrap points at
+a different state directory than this invocation resolved (a changed `DECKD_STATE_DIR`, or a
+moved wrapper). Check `DECKD_STATE_DIR` and retry with the correct value, or fix `statusLine`
+in `settings.json` by hand.
+
 ## Restart the daemon
 
 1. Find the exact process:

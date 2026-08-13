@@ -268,4 +268,90 @@ describe('statusline-wrapper.sh', () => {
     expect(elapsedMs).toBeLessThan(5000)
     expect(code).toBe(143)
   })
+
+  // I-2: the M-3 test above uses `DECKD_INNER: 'sleep 20'` -- a single
+  // simple command. `bash` (which `/bin/sh` is here) exec-optimises
+  // `sh -c '<one simple command>'` down to that ONE process with no fork at
+  // all, so `$!` IS the command, and a plain `kill "$INNER_PID"` happens to
+  // reach it. That test therefore passes for the wrong reason: it cannot
+  // tell a real fix from one that only kills `sh -c` itself. A COMPOUND
+  // inner command (a `;`-list, exactly like a real statusline piping
+  // through a filter) forces `sh -c` to fork, and measured before this fix:
+  // the wrapper exited 143 at once while `sleep 20` kept running, orphaned,
+  // for its full duration. This is that exact repro.
+  it('I-2: forwards a killing signal to a COMPOUND inner command, leaving no orphan behind', async () => {
+    const child = spawn('/bin/sh', [WRAPPER], {
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: 'echo EARLY; sleep 20; echo LATE' },
+    })
+    let stdout = ''
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+    child.stdin.end(PAYLOAD)
+
+    // Wait for proof that `sleep 20` has actually STARTED, rather than a
+    // fixed delay -- under a heavily loaded machine (the full suite running
+    // many processes in parallel), a fixed short wait can fire before the
+    // wrapper's own caching steps even finish, which would kill it before
+    // it ever reaches the inner command at all and defeat the point of the
+    // test. Bounded so a real regression (the signal never reaching
+    // anything) still fails instead of hanging.
+    await new Promise<void>((resolve, reject) => {
+      const started = Date.now()
+      const check = setInterval(() => {
+        if (stdout.includes('EARLY')) {
+          clearInterval(check)
+          resolve()
+        } else if (Date.now() - started > 8000) {
+          clearInterval(check)
+          reject(new Error('inner command never printed EARLY within 8s'))
+        }
+      }, 20)
+    })
+    const start = Date.now()
+    child.kill('SIGTERM')
+
+    const code: number | null = await new Promise((resolve) => {
+      child.on('close', (c) => resolve(c))
+    })
+    const elapsedMs = Date.now() - start
+
+    expect(elapsedMs).toBeLessThan(5000)
+    expect(code).toBe(143)
+    // Output already flushed before the kill must survive; output after it
+    // must not appear -- proof `sleep 20` (and the `echo LATE` after it)
+    // never got to run to completion.
+    expect(stdout).toContain('EARLY')
+    expect(stdout).not.toContain('LATE')
+
+    // No leftover `sleep 20` process anywhere on the system -- the group
+    // kill must have reached the FORKED child, not just the `sh -c`
+    // parent bash exec-optimised away for the simple-command test above.
+    let leftover = ''
+    try {
+      leftover = execFileSync('pgrep', ['-f', 'sleep 20'], { encoding: 'utf8' })
+    } catch {
+      // pgrep exits 1 (with empty output) when nothing matches -- the
+      // expected, passing outcome.
+    }
+    expect(leftover.trim()).toBe('')
+  })
+
+  it('M-1: a normal, non-killed run clears INNER_PID before the EXIT trap runs', () => {
+    // No direct hook into the trap's own state from outside the process,
+    // so this asserts the externally observable half of the guarantee: a
+    // normal run exits cleanly, with the exact status the inner command
+    // itself produced, and no leftover mktemp file the EXIT trap's cleanup
+    // would otherwise still need to remove. If `cleanup` ever again tried
+    // to `kill` a stale, reused pid on this path, it could not affect this
+    // assertion directly -- but it is exercised on every other run in this
+    // file, none of which have ever left a temp file behind (M-1 in the
+    // wrapper's own history), which is the failure mode a `kill` on a
+    // wrong pid could plausibly cause downstream.
+    const out = execFileSync('/bin/sh', [WRAPPER], {
+      input: PAYLOAD,
+      env: { ...process.env, DECKD_STATE_DIR: dir, DECKD_INNER: `${inner} ${join(dir, 'seen.json')}` },
+      encoding: 'utf8',
+    })
+    expect(out).toContain('INNER OUTPUT')
+    expect(readdirSync(dir).filter((name) => name.startsWith('.'))).toEqual([])
+  })
 })
