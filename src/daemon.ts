@@ -21,7 +21,7 @@ const SLEEP_GAP_MIN_MS = 5000
  * screen to read as feedback — long enough to notice, short enough to feel
  * instant rather than like a state colour.
  */
-const FLASH_MS = 150
+const FLASH_MS = 90
 
 /**
  * A transient press-feedback flash on one key, index 0 to 7 — never the two
@@ -68,6 +68,8 @@ export class Daemon {
   private timer: NodeJS.Timeout | null = null
   /** The interval the live timer was armed at, so a tick can notice a change. */
   private armedTickMs = 0
+  /** One-shot timer that renders a flash away on time. See `scheduleFlashClear`. */
+  private flashClearTimer: NodeJS.Timeout | null = null
   private activeRender: Promise<void> | null = null
   private locked = false
   private lastTickAtMs: number | null = null
@@ -333,11 +335,33 @@ export class Daemon {
     if (!flash) return key
     if (flash.expiresAtMs === null) {
       flash.expiresAtMs = nowMs + FLASH_MS
+      // Clearing the ring needs a render, and nothing else guarantees a timely
+      // one: most pages tick at DEFAULT_TICK_MS, so waiting for the next tick
+      // showed the ring for up to a second no matter how short FLASH_MS was.
+      // Lowering FLASH_MS alone therefore did nothing on those pages. Schedule
+      // the clearing render explicitly instead.
+      this.scheduleFlashClear()
     } else if (nowMs >= flash.expiresAtMs) {
       this.flashes[index] = null
       return key
     }
     return { ...key, flashRing: flash.ok ? theme.flashWhite : theme.flashRed }
+  }
+
+  /**
+   * Renders once, just after the newest flash expires, so a ring disappears on
+   * time instead of at the page's next tick. One shared timer covers every key:
+   * a later press re-arms it, and the extra render costs nothing when nothing
+   * changed, because `writeFrame`'s dirty-key check writes only what moved.
+   */
+  private scheduleFlashClear(): void {
+    if (this.stopped) return
+    if (this.flashClearTimer) clearTimeout(this.flashClearTimer)
+    this.flashClearTimer = setTimeout(() => {
+      this.flashClearTimer = null
+      if (this.stopped) return
+      void this.renderOnce(this.now(), this.nowMs())
+    }, FLASH_MS + 1)
   }
 
   private async writeFrame(frame: DeckFrame): Promise<void> {
@@ -430,6 +454,8 @@ export class Daemon {
     this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    if (this.flashClearTimer) clearTimeout(this.flashClearTimer)
+    this.flashClearTimer = null
     await this.lockState?.stop()
     await this.lockTransition
   }

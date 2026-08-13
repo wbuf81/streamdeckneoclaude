@@ -656,6 +656,31 @@ describe('Daemon press-feedback flash', () => {
     await daemon.stop()
   })
 
+  it('clears the ring on its own, without waiting for the page tick', async () => {
+    // `ControlPage` sets no `tickMs`, so it renders at DEFAULT_TICK_MS (1000).
+    // Before task 36's follow-up nothing scheduled a render at expiry, so the
+    // ring survived until that next tick -- up to a full second on this page,
+    // whatever FLASH_MS said. Lowering FLASH_MS alone changed nothing here.
+    // This test uses REAL timers and waits far less than one tick, so a pass
+    // can only mean the daemon cleared the ring itself.
+    const { device, daemon, setMs } = buildFlash()
+    await daemon.start()
+    device.reset()
+
+    device.simulatePress(0)
+    await flush()
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    // Move the injected clock past the flash's expiry, then wait 250 real ms:
+    // long enough for the daemon's own clearing timer, far short of the 1000 ms
+    // page tick.
+    setMs(5000)
+    await new Promise((resolve) => setTimeout(resolve, 250))
+
+    expect(device.keyImages.get(0)?.equals(plainKeyA())).toBe(true)
+    await daemon.stop()
+  })
+
   it('a page that throws in onKeyPress flashes red and does not crash the daemon', async () => {
     const written: string[] = []
     setDefaultSink((line) => written.push(line))
@@ -816,12 +841,12 @@ describe('Daemon press-feedback flash', () => {
     await daemon.start() // ms = 1000
     device.reset()
 
-    device.simulatePress(0) // the press-render happens at ms 1000, anchoring expiry at 1250
+    device.simulatePress(0) // the press-render happens at ms 1000, anchoring expiry at 1090
     await flush()
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
 
-    setMs(1100) // still well within the 150 ms window
-    await daemon.renderOnce(1, 1100)
+    setMs(1040) // still inside the 90 ms window
+    await daemon.renderOnce(1, 1040)
     expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
 
     await daemon.stop()
