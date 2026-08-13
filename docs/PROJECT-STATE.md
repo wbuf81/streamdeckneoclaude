@@ -15,7 +15,7 @@ round buttons (8 = previous, 9 = next, wrapping both ways).
 | --- | --- | --- |
 | **Claude** | 4 session keys (state, project, crab, model) + 4 usage gauges; press focuses that terminal | live |
 | **Spotify** | album art spanning keys 0,1,4,5; play/pause 2; next 3; read-only heart 6; volume 7 | live |
-| **Stocks** | 8 tickers with price, daily change, sparkline, red/green | live |
+| **Stocks** | 8 tickers with price, daily change, sparkline, red/green. Press a ticker for a detail view across all 8 keys, BACK on key 7 | live |
 | **Weather** | 7 day tiles with colour emoji + temps + rain chance, wind tile | live |
 
 **Installed.** `deckd install` was run with the user's explicit approval:
@@ -94,7 +94,7 @@ Files: `src/sources/{claude,usage,spotify,spotify-auth,stocks,weather}.ts`,
 
 ---
 
-## Task ledger — 23 of 24 complete
+## Task ledger — 25 complete, 2 open
 
 Full detail is in `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck/progress.md`,
 but **that directory is git-ignored**, so this file is the durable record.
@@ -106,61 +106,82 @@ but **that directory is git-ignored**, so this file is the durable record.
 | 13 | Spotify source | complete |
 | 14 | Spotify page | complete |
 | 15 | install + launchd | complete, **run** |
-| 16 | per-window focus + press feedback | **pending** |
+| 16 | per-window focus + press feedback | complete, see the caveat below |
 | 17 | stock source | complete |
 | 18 | stocks page | complete |
 | 19 | weather source + page | complete |
 | 20 | Spotify redesign: 2×2 art, read-only heart | complete |
 | 21 | extract animated crab frames | complete |
-| 22 | animate the Claude crabs | complete, **NOT reviewed** |
-| 23 | gauge row legibility (`lineSizes`) | complete, **NOT reviewed** |
-| 24 | weather tile overlap + tint | **pending, needs 23** |
+| 22 | animate the Claude crabs | complete |
+| 23 | gauge row legibility (`lineSizes`) | complete |
+| 24 | weather tile overlap + tint | complete |
+| — | all 9 deferred minors | complete, commits `1b4ddca` `5c6f7d0` `d59e325` `09c3fc4` |
+| 25 | stock detail drill-down (`slice`, `fitSize`) | complete |
+| 26 | Claude page: dedicated crab tile, 3 sessions, full-key flash | **pending** |
+| 27 | Spotify page: cold-load bug, volume replaces heart, idle animation | **pending** |
 
 Briefs and reports for tasks 9–24 are in
 `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck-part2/`. **Git-ignored** — copy
 anything still needed before that directory is cleaned.
 
-### Remaining work, in dependency order
+### Remaining work
 
-Full briefs are preserved in `docs/pending-briefs/`.
+Full briefs are preserved in `docs/pending-briefs/`. Both items below come from the user's
+own reports on real hardware, so take them literally.
 
-1. **Task 24** — weather tiles. The 40 px emoji currently OVERLAPS the text, which the user
-   reported from the device, and the text is too small. Four non-overlapping bands: label
-   12 px, emoji 34 px centred at y 34, temps 16 px, rain 20 px. Plus a dark per-condition
-   background tint derived from the SAME keyword matcher as the emoji, heat-coloured
-   temperatures, and the emoji `globalAlpha` dim fix. Uses Task 23's `lineSizes`, which
-   has landed.
-2. **Task 16** — per-window terminal focus, and press feedback. Needs the user to grant
-   Accessibility to the bare `node` binary manually, and it may never prompt; say so
-   honestly if it does not work cleanly. Press feedback needs Task 22's faster tick, which
-   has landed, because a 200 ms flash is invisible at 1 fps.
+1. **Task 26** — the animated crab draws OVER its own tile's text. The user chose the fix:
+   keys 0–2 become three text-only session tiles, key 3 becomes a permanent crab tile with
+   no text. The crab shows the most urgent state across all sessions
+   (`permission > tool > thinking > done > idle`). A fourth session becomes invisible, and
+   that is intended. Also: the press flash recolours the **border**, which this theme draws
+   as a left-edge strip, so the user cannot see it — fill the whole key instead, at 250 ms.
+2. **Task 27** — three items. The Spotify page does not paint when nothing is playing until
+   the user flips away and back; **reproduce it with a failing test before fixing it**, and
+   report the real cause. The heart is removed and volume replaces it: key 2 play/pause,
+   key 3 volume, key 6 previous, key 7 next, and `previous()` does not exist yet. Plus a
+   procedural idle animation across the four art keys, each with its own phase.
 
-### Not yet reviewed
+### Task 16's real limitation
 
-Tasks 22 and 23 landed with strong self-evidence — measured `renderKey` cost of 0.032 ms,
-before/after hashing proving the other three pages are pixel-identical, and verified frame
-advance at 70 ms for all five states — and the controller independently confirmed the test
-counts, the opt-in legacy text path, the shared `elapsedPercent` helper, and the frame
-timing. **But neither went through the review loop.** That loop found real defects in most
-tasks this session, so review them before trusting them fully.
+Window targeting is built and Accessibility **is now granted**, so it is the live path. But
+Claude Code sets the terminal title to a **task summary**, not the directory, so a title
+carries no trace of the cwd, the path, or the project for any window running Claude Code.
+Measured: title `⠐ Build Elgato Stream Deck custom control software` against cwd
+`/Users/you/Vibecoding/streamdeckneoclaude`. Nothing matches, so it correctly falls back to
+app-level `activate` and logs once. A Claude window versus a plain shell switches correctly;
+**two Claude windows still only raise the app.** The fix is upstream in the title itself.
 
-## Deferred minors worth a sweep
+## Deferred minors — all cleared
 
-- **Dead code:** the `sprite` field on `KeySpec` and `getSprite` in `src/render/sprites.ts`
-  are now unused, because animation reuses `image`/`imageKey`. Task 22 left them rather than
-  edit files another agent held. Remove them.
+Every item on the old list is fixed. `getSessions()` and `getQuotes()` return copies,
+`runAuthFlow` closes after the response flushes, `artRetryAt` is bounded, a 401 on a control
+call refreshes and retries (a 403 never does), `uninstall` reports what really happened,
+`writeAtomic` preserves permissions, `buildPlist` escapes XML, `isSymbolStale` exists and the
+stocks page consumes it, the dead `sprite`/`getSprite` path is gone, and `tests/paths.test.ts`
+no longer touches `~` — it uses the `enforceDirModes` seam in `src/paths.ts`.
 
-- `runAuthFlow` calls `closeAllConnections()` right after `res.end()`, which could truncate
-  the browser's confirmation page. Close **after the response flushes** instead.
-- `artRetryAt` in `src/sources/spotify.ts` has no eviction, unlike the capped art cache.
-- 401 on a Spotify **control** call does not refresh-and-retry, unlike the poll path.
-- `uninstall`'s summary says "restored … from the backup" even when it actually deleted.
-- `writeAtomic` uses a fixed 0644 and does not preserve original permissions.
-- `buildPlist` does not XML-escape interpolated paths.
-- `StockSource.isStale()` is whole-source, so one lagging symbol is not dimmed alone.
-- `getQuotes()` / `getSessions()` return internal collections by reference.
-- `tests/paths.test.ts` still creates and chmods the real `~/.local/state/deckd` directories
-  — non-destructive, but it violates the no-`~` rule.
+### Review status
+
+Tasks 22 to 25 and the minors sweep — commits `3dbd748` through `7b89bfa` — went through one
+review pass, run as two scoped reviewers over `799d1ff..HEAD`: one on the renderer and the
+pages, one on the sources, install, focus and the daemon. Findings and their rulings are in
+`.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck-part2/review-A-render-pages.md` and
+`review-B-sources-install.md`. **That directory is git-ignored**, so copy anything load-bearing
+into this file before it is cleaned.
+
+### New invariants added by these tasks
+
+- `KeySpec.lineSizes` is **opt-in per key**. Its absence takes the exact legacy path: 11 px
+  text on a fixed 14 px advance. Three pages depend on that, so never make it non-optional.
+- `SparkSpec.slice` lets one chart span several keys. Absent `slice`, single-key drawing must
+  stay byte-identical. `slice` is in `keyHash`, and it must stay there — the three slices
+  share one series, so without it two of three would never redraw.
+- `fitSize` in `src/render/text.ts` picks the largest candidate size that **measures** within
+  the budget. Use it for anything whose width varies with the data. Do not compute widths from
+  the advance table in `VERIFIED-FACTS.md`; that table is a guide, not an oracle.
+- Weather tiles use four non-overlapping bands. The emoji sits at **32 px, y 38** — the
+  brief's own suggested 34 px at y 34 overlapped the label, found by pixel probe. Tests assert
+  the gaps are background, so drift fails the suite instead of reaching the glass.
 
 ---
 
