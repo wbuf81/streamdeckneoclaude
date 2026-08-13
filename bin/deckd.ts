@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { fileURLToPath } from 'node:url'
 import { Device, DeviceBusyError } from '../src/device.js'
 import { Daemon } from '../src/daemon.js'
 import { PageManager } from '../src/page-manager.js'
@@ -18,6 +19,32 @@ import { log } from '../src/log.js'
 import { readFileSync, writeFileSync, chmodSync } from 'node:fs'
 import { runAuthFlow, TokenStore } from '../src/sources/spotify-auth.js'
 import { install, uninstall } from '../src/install/install.js'
+
+/**
+ * Builds the listener each source's `change` event uses to redraw at once,
+ * rather than waiting for the next tick.
+ *
+ * Reads `clock()` exactly once and derives both the second clock and the
+ * millisecond clock from that single value, rather than calling `Date.now()`
+ * twice — the previous code called `daemon.renderOnce(Math.floor(Date.now() /
+ * 1000))` with no second argument, and `Daemon.renderOnce` used to default
+ * `nowMs` to `now * 1000`. That truncated the millisecond clock by up to 999
+ * ms on every source change, one tick after a press: a flash timed off the
+ * real clock a moment earlier could already read as expired (measured live:
+ * `border: undefined` where a real clock gives `[230, 60, 60]`), and the crab
+ * animation jumped back up to about fourteen frames. `renderOnce` no longer
+ * accepts a default for `nowMs` at all, so this cannot regress silently —
+ * omitting the second argument here is now a compile error, not a truncation.
+ *
+ * `clock` defaults to `Date.now`. A test injects a fixed one, so it can
+ * assert the exact values `renderOnce` receives without waiting on real time.
+ */
+export function makeChangeHandler(daemon: Daemon, clock: () => number = Date.now): () => void {
+  return () => {
+    const ms = clock()
+    void daemon.renderOnce(Math.floor(ms / 1000), ms)
+  }
+}
 
 async function start(): Promise<void> {
   ensureStateDir()
@@ -64,11 +91,12 @@ async function start(): Promise<void> {
   }
 
   // A source change redraws at once, rather than at the next tick.
-  claude.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
-  usage.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
-  spotify.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
-  stocks.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
-  weather.on('change', () => void daemon.renderOnce(Math.floor(Date.now() / 1000)))
+  const onChange = makeChangeHandler(daemon)
+  claude.on('change', onChange)
+  usage.on('change', onChange)
+  spotify.on('change', onChange)
+  stocks.on('change', onChange)
+  weather.on('change', onChange)
 
   const shutdown = async () => {
     log.info('deckd stopping')
@@ -150,41 +178,56 @@ async function authSpotify(): Promise<void> {
   console.log('Spotify is connected. Restart deckd to pick it up.')
 }
 
-const cmd = process.argv[2]
-switch (cmd) {
-  case 'start':
-    void start()
-    break
-  case 'install':
-    install().catch((e: unknown) => {
-      console.error(String(e))
-      process.exit(1)
-    })
-    break
-  case 'uninstall':
-    uninstall().catch((e: unknown) => {
-      console.error(String(e))
-      process.exit(1)
-    })
-    break
-  case 'auth':
-    if (process.argv[3] === 'spotify') {
-      // Catch the rejection. The flow can time out, or the callback state can
-      // mismatch, and an unhandled rejection would print a stack trace instead
-      // of the reason.
-      authSpotify().catch((e) => {
+/**
+ * True only when this file is the process's entry point (`node bin/deckd.js
+ * start`, exactly how launchd and a person on the command line both invoke
+ * it) rather than a module some other code imports. Without this guard, a
+ * test importing `makeChangeHandler` above would also run this whole
+ * dispatch block against whatever `process.argv` the TEST runner happened to
+ * have -- landing on `default` or `undefined` and calling `usage()`, which
+ * calls `process.exit(2)` and would kill the entire test process.
+ */
+function isMain(): boolean {
+  return !!process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]
+}
+
+if (isMain()) {
+  const cmd = process.argv[2]
+  switch (cmd) {
+    case 'start':
+      void start()
+      break
+    case 'install':
+      install().catch((e: unknown) => {
         console.error(String(e))
         process.exit(1)
       })
-    } else {
-      console.error('usage: deckd auth spotify')
-      process.exit(2)
-    }
-    break
-  case undefined:
-    usage()
-    break
-  default:
-    console.error(`unknown command: ${cmd}`)
-    usage()
+      break
+    case 'uninstall':
+      uninstall().catch((e: unknown) => {
+        console.error(String(e))
+        process.exit(1)
+      })
+      break
+    case 'auth':
+      if (process.argv[3] === 'spotify') {
+        // Catch the rejection. The flow can time out, or the callback state can
+        // mismatch, and an unhandled rejection would print a stack trace instead
+        // of the reason.
+        authSpotify().catch((e) => {
+          console.error(String(e))
+          process.exit(1)
+        })
+      } else {
+        console.error('usage: deckd auth spotify')
+        process.exit(2)
+      }
+      break
+    case undefined:
+      usage()
+      break
+    default:
+      console.error(`unknown command: ${cmd}`)
+      usage()
+  }
 }

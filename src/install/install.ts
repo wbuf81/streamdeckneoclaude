@@ -3,6 +3,7 @@ import {
   existsSync, chmodSync, mkdirSync, statSync,
 } from 'node:fs'
 import { join, dirname } from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { paths, ensureStateDir } from '../paths.js'
@@ -210,30 +211,46 @@ function shellQuote(s: string): string {
 /**
  * Writes a file through a temporary name, so a crash cannot truncate it.
  *
- * The temp file is always newly created, so `mode` does apply to it -- but
- * `renameSync` then makes that temp file BECOME `file`, and the temp file's
- * mode is not necessarily the mode `file` already had. A target that
- * existed with a tighter mode (a token file at 0600, say) would otherwise
- * silently loosen to `mode`'s default of 0644 the next time something
- * wrote through this function. So the target's own mode, when it already
- * exists, is preserved with an unconditional `chmodSync` after the rename --
- * `mode` only decides the mode for a file that does not exist yet.
+ * The target's own mode, when it already exists, is resolved BEFORE
+ * anything is written, and the temp file is created at that mode from the
+ * very start -- not written loose and tightened afterwards. Two defects
+ * shaped this:
+ *
+ *   - The temp file used to be created at the caller's `mode` default
+ *     (0o644) and only `chmodSync`'d to the target's tighter mode AFTER
+ *     `renameSync`. A 0600 target's content then sat at 0644 for the whole
+ *     write window -- and permanently, if the process died between the
+ *     rename and the chmod. Resolving the final mode first, and applying it
+ *     to the temp file before the rename, closes that window entirely:
+ *     `file` is never visible at a looser mode than it is supposed to end
+ *     up with, not even for an instant.
+ *   - `${file}.${pid}.tmp` is stable per pid, so a crashed EARLIER run of
+ *     the same pid could leave a stale temp file behind at a loose mode --
+ *     and `writeFileSync`'s `mode` option applies only when it CREATES the
+ *     file (Lesson 1), so it would be silently ignored on that leftover. A
+ *     random suffix makes a collision practically impossible; the
+ *     unconditional `chmodSync` below removes the remaining theoretical
+ *     case rather than relying on the random suffix alone -- the same
+ *     belt-and-braces the mode itself needed.
  *
  * Exported so a test can drive it directly against a temporary file,
  * without going through `install()`/`uninstall()`, which hard-code the
  * real paths under `~` and must never run in a test.
  */
 export function writeAtomic(file: string, content: string, mode = 0o644): void {
-  const tmp = `${file}.${process.pid}.tmp`
-  let existingMode: number | null = null
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  let targetMode = mode
   try {
-    existingMode = statSync(file).mode & 0o777
+    targetMode = statSync(file).mode & 0o777
   } catch {
-    // The target does not exist yet. Nothing to preserve.
+    // The target does not exist yet. Use the requested mode.
   }
-  writeFileSync(tmp, content, { mode })
+  writeFileSync(tmp, content, { mode: targetMode })
+  // `mode` on `writeFileSync` applies only at creation (Lesson 1). The
+  // random suffix above means `tmp` is always newly created in practice, but
+  // this does not depend on that being true.
+  chmodSync(tmp, targetMode)
   renameSync(tmp, file)
-  if (existingMode !== null) chmodSync(file, existingMode)
 }
 
 export async function install(): Promise<void> {

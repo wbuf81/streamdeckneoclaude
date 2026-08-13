@@ -1,7 +1,30 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync, statSync, rmSync } from 'node:fs'
+import * as fsModule from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+// `writeAtomic`'s B4/M5 regression tests below need to observe the ORDER
+// and ARGUMENTS of the raw `writeFileSync`/`chmodSync`/`renameSync` calls it
+// makes, not just the file's mode once the call has already returned --
+// `vi.spyOn` cannot redefine a built-in module's own exports in this
+// runtime, so `vi.mock` intercepts the module instead. Everything except
+// the three wrapped functions passes straight through to the real
+// implementation, so every OTHER test in this file (which uses
+// `mkdtempSync`, `readFileSync`, `statSync`, `rmSync` directly) is
+// unaffected. `actualRef` gives the wrapped tests a handle on the real
+// implementations to call through to.
+const actualRef = vi.hoisted(() => ({ current: null as null | typeof import('node:fs') }))
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  actualRef.current = actual
+  return {
+    ...actual,
+    writeFileSync: vi.fn(actual.writeFileSync),
+    chmodSync: vi.fn(actual.chmodSync),
+    renameSync: vi.fn(actual.renameSync),
+  }
+})
 import {
   buildPlist, wrapStatusLine, unwrapStatusLine, recoverStatusLine, isInstalled, verifyWrap,
   writeAtomic, describeStatusLineOutcome,
@@ -320,6 +343,97 @@ describe('writeAtomic', () => {
       writeAtomic(f, '{}', 0o600)
       expect(statSync(f).mode & 0o777).toBe(0o600)
       expect(readFileSync(f, 'utf8')).toBe('{}')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // Regression coverage for B4: the temp file used to be created at the
+  // caller's `mode` default (0o644) and only tightened to the target's real
+  // mode AFTER `renameSync`, so a 0600 target's content sat at 0644 for the
+  // whole write window -- and permanently if the process died in between.
+  // This does not wait for a real crash to prove it: it wraps the three fs
+  // calls `writeAtomic` makes and inspects both the arguments passed and the
+  // real mode on disk at each step, which is the earliest and only place the
+  // old code could still be caught creating the content loose.
+  it('creates the temp file at the target mode from the very first write, and chmods it before the rename, never after', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-'))
+    const actual = actualRef.current!
+    try {
+      const f = join(dir, 'settings.json')
+      actual.writeFileSync(f, '{}', { mode: 0o600 })
+
+      const order: string[] = []
+      const modeAtWrite: number[] = []
+      const modeAtChmod: number[] = []
+      const writeMock = vi.mocked(fsModule.writeFileSync)
+      const chmodMock = vi.mocked(fsModule.chmodSync)
+      const renameMock = vi.mocked(fsModule.renameSync)
+
+      writeMock.mockImplementation((...args: Parameters<typeof writeFileSync>) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = (actual.writeFileSync as any)(...args)
+        if (String(args[0]).includes('.tmp')) {
+          order.push('write')
+          modeAtWrite.push(actual.statSync(args[0] as string).mode & 0o777)
+        }
+        return result
+      })
+      chmodMock.mockImplementation((...args: Parameters<typeof chmodSync>) => {
+        if (String(args[0]).includes('.tmp')) {
+          order.push('chmod')
+          modeAtChmod.push(args[1] as number)
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (actual.chmodSync as any)(...args)
+      })
+      renameMock.mockImplementation((...args: Parameters<typeof renameSync>) => {
+        order.push('rename')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (actual.renameSync as any)(...args)
+      })
+
+      try {
+        writeAtomic(f, '{"a":1}')
+      } finally {
+        writeMock.mockImplementation(actual.writeFileSync)
+        chmodMock.mockImplementation(actual.chmodSync)
+        renameMock.mockImplementation(actual.renameSync)
+      }
+
+      // The temp file is 0600 from the very first `writeFileSync` -- never
+      // the caller's 0o644 default -- and `chmodSync` runs on it, at 0600
+      // again, strictly before `renameSync`.
+      expect(modeAtWrite).toEqual([0o600])
+      expect(modeAtChmod).toEqual([0o600])
+      expect(order).toEqual(['write', 'chmod', 'rename'])
+      expect(actual.statSync(f).mode & 0o777).toBe(0o600)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('never reuses the same temp file name across two calls, even from the same process (M5)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-atomic-'))
+    const actual = actualRef.current!
+    try {
+      const f = join(dir, 'settings.json')
+      const seenTmpNames = new Set<string>()
+      const writeMock = vi.mocked(fsModule.writeFileSync)
+      writeMock.mockImplementation((...args: Parameters<typeof writeFileSync>) => {
+        if (String(args[0]).includes('.tmp')) seenTmpNames.add(String(args[0]))
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (actual.writeFileSync as any)(...args)
+      })
+      try {
+        writeAtomic(f, '{"a":1}')
+        writeAtomic(f, '{"a":2}')
+      } finally {
+        writeMock.mockImplementation(actual.writeFileSync)
+      }
+      // Two calls, two distinct temp names -- the old `${file}.${pid}.tmp`
+      // scheme would have produced the same name both times.
+      expect(seenTmpNames.size).toBe(2)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

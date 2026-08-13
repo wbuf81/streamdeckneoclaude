@@ -25,6 +25,17 @@ export class Daemon {
   private lastButtons: (string | null)[] = [null, null]
   private timer: NodeJS.Timeout | null = null
   private rendering = false
+  /**
+   * Set once by `stop()` and never cleared. `device.onPress`'s listener is
+   * never unregistered, so a press can still arrive after `stop()` has
+   * already run -- the real scenario is `SIGTERM` → `shutdown()` → `await
+   * daemon.stop()`, then a press landing while the rest of shutdown (the
+   * sources, the device) is still stopping. Without this flag, that press
+   * called `armTimer()` and created a brand new interval, undoing `stop()`.
+   * Checked at the top of both `handlePress` and `armTimer`, not just one,
+   * since either could otherwise still arm a timer on its own.
+   */
+  private stopped = false
 
   constructor(
     private readonly device: DeckDevice,
@@ -55,30 +66,42 @@ export class Daemon {
    * one.
    */
   private armTimer(): void {
+    if (this.stopped) return
     if (this.timer) clearInterval(this.timer)
     const tickMs = this.pages.current().tickMs ?? DEFAULT_TICK_MS
     this.timer = setInterval(() => void this.renderOnce(this.now(), this.nowMs()), tickMs)
   }
 
   private async handlePress(index: number): Promise<void> {
+    if (this.stopped) return
+    const key = `press-${index}`
     try {
       if (index === BUTTON_LEFT) {
         this.pages.prev()
         this.armTimer()
         await this.renderOnce(this.now(), this.nowMs())
+        log.clearOnce(key)
         return
       }
       if (index === BUTTON_RIGHT) {
         this.pages.next()
         this.armTimer()
         await this.renderOnce(this.now(), this.nowMs())
+        log.clearOnce(key)
         return
       }
       if (index < 0 || index >= NEO_KEY_COUNT) return
       await this.pages.onKeyPress(index)
       await this.renderOnce(this.now(), this.nowMs())
+      log.clearOnce(key)
     } catch (e) {
-      log.error(`press handler failed for index ${index}: ${String(e)}`)
+      // `log.once`, not `log.error` (M2): a press repeats, and this is the
+      // catch-all for every press failure. A broken page reader failing on
+      // every press would otherwise write one line per press, with no
+      // limit. Keyed per index, so a failure on key 3 does not suppress a
+      // later, genuine failure on key 5. `clearOnce` above logs a later
+      // failure again once a press on the same index succeeds.
+      log.once(key, `press handler failed for index ${index}: ${String(e)}`)
     }
   }
 
@@ -92,12 +115,20 @@ export class Daemon {
   }
 
   /**
-   * Renders one frame. It writes only what changed. `nowMs` defaults to
-   * `now * 1000` so every existing caller that passes only whole seconds
-   * keeps working unchanged; the armed timer always passes a real
-   * millisecond clock so animation actually advances between whole seconds.
+   * Renders one frame. It writes only what changed.
+   *
+   * `nowMs` has no default on purpose — it used to be `now * 1000`, which
+   * truncates the millisecond clock to whichever whole second `now` names.
+   * Every caller that goes through the armed timer already passes a real
+   * millisecond clock, but the five `change` listeners in `bin/deckd.ts` used
+   * to call `renderOnce` with only `now` and rely on that default, which
+   * rewound the clock by up to 999 ms on every source change: a press flash
+   * anchored to the real clock a moment earlier could already read as
+   * expired, and the crab animation jumped back up to about fourteen frames.
+   * Requiring `nowMs` here makes that class of bug a compile error rather
+   * than a silent truncation.
    */
-  async renderOnce(now: number, nowMs: number = now * 1000): Promise<void> {
+  async renderOnce(now: number, nowMs: number): Promise<void> {
     if (this.rendering) return
     if (!this.device.isConnected()) return
     this.rendering = true
@@ -143,6 +174,7 @@ export class Daemon {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
   }
