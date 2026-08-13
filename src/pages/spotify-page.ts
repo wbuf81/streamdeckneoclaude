@@ -3,7 +3,7 @@ import { blankKey } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatClock, formatEasternTime } from '../render/text.js'
 import type { Image } from '@napi-rs/canvas'
-import type { Page } from './types.js'
+import type { Page, PressOutcome } from './types.js'
 import type { PlayerState, SpotifyStatus } from '../sources/spotify.js'
 
 const VOLUME_STEP = 10
@@ -186,31 +186,35 @@ export class SpotifyPage implements Page {
     }
   }
 
-  async onKeyPress(index: number): Promise<void> {
+  async onKeyPress(index: number): Promise<PressOutcome> {
     // Press handling needs playback flags and volume, not the interpolated
     // position. A fixed clock keeps the page pure and deterministic.
     const state = this.source.interpolate(0)
     const volume = state?.volumePercent ?? 50
 
     switch (index) {
-      case 2:
-        await (state?.isPlaying ? this.source.pause() : this.source.play())
-        return
-      case 3:
-        await this.source.setVolume(volume + VOLUME_STEP > 100 ? 0 : volume + VOLUME_STEP)
-        return
-      case 6:
-        await this.source.previous()
-        return
-      case 7:
-        await this.source.next()
-        return
+      case 2: {
+        const ok = await (state?.isPlaying ? this.source.pause() : this.source.play())
+        return ok ? 'handled' : 'failed'
+      }
+      case 3: {
+        const ok = await this.source.setVolume(volume + VOLUME_STEP > 100 ? 0 : volume + VOLUME_STEP)
+        return ok ? 'handled' : 'failed'
+      }
+      case 6: {
+        const ok = await this.source.previous()
+        return ok ? 'handled' : 'failed'
+      }
+      case 7: {
+        const ok = await this.source.next()
+        return ok ? 'handled' : 'failed'
+      }
       default:
         // Keys 0, 1, 4 and 5 (the album art) do nothing, and so does any
         // other index. Shuffle and repeat are gone: the user named
         // play/pause, volume, previous and next as what they use, and an
         // unused key invites a misfire.
-        return
+        return 'ignored'
     }
   }
 }

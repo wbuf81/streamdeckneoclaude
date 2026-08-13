@@ -289,6 +289,31 @@ describe('StocksPage presses: entering and leaving detail mode', () => {
   })
 })
 
+describe('StocksPage presses report the real outcome, keys 0 to 7', () => {
+  it('reports handled for every key on the grid, since all eight symbols have a quote', () => {
+    // A fresh page per key: pressing one key enters detail mode, which would
+    // change what every OTHER key reports — see the next test below.
+    for (let i = 0; i <= 7; i++) {
+      const { page } = build({ quotes: allQuotes() })
+      expect(page.onKeyPress(i)).toBe('handled')
+    }
+  })
+
+  it('reports ignored on the grid for a key with no quote behind it yet', () => {
+    const { page } = build({ quotes: new Map() })
+    expect(page.onKeyPress(0)).toBe('ignored')
+  })
+
+  it('reports handled for BACK (key 7), and ignored for every other key, once a symbol is selected', () => {
+    const { page } = build({ quotes: allQuotes() })
+    expect(page.onKeyPress(2)).toBe('handled') // enters detail mode
+    for (let i = 0; i <= 6; i++) {
+      expect(page.onKeyPress(i)).toBe('ignored')
+    }
+    expect(page.onKeyPress(7)).toBe('handled') // BACK
+  })
+})
+
 describe('StocksPage visibility', () => {
   it('tells the source when it becomes visible and when it leaves', () => {
     const { page, calls } = build()

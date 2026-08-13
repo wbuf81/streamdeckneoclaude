@@ -21,7 +21,7 @@ function fakePage(name: string): Page {
       strip: { lines: [name] },
       buttons: [[0, 0, 0], [0, 0, 0]],
     }),
-    onKeyPress: () => {},
+    onKeyPress: () => 'ignored',
   }
 }
 

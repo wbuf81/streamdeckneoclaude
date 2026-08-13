@@ -2,13 +2,46 @@ import type { DeckDevice } from './device.js'
 import { BUTTON_LEFT, BUTTON_RIGHT, NEO_KEY_COUNT } from './device.js'
 import type { PageManager } from './page-manager.js'
 import { renderKey, renderStrip } from './render/canvas.js'
-import { keyHash, stripHash, type DeckFrame, type Rgb } from './render/specs.js'
+import { keyHash, stripHash, type DeckFrame, type KeySpec, type Rgb } from './render/specs.js'
+import { theme } from './render/theme.js'
 import { log } from './log.js'
 import type { LockState } from './lock-state.js'
+import type { PressOutcome } from './pages/types.js'
 
 const DEFAULT_TICK_MS = 1000
 export const DEFAULT_BRIGHTNESS = 100
 const SLEEP_GAP_MIN_MS = 5000
+/**
+ * How long a press's flash stays visible before the key reverts to its own
+ * content. Task 26 tuned 250 ms for a full-key fill on the Claude page —
+ * long enough to read clearly, short enough to never look like a real state
+ * colour. Task 32 moves the mechanism itself into the daemon, so every page
+ * gets it; the constant and its tuning are unchanged.
+ */
+const FLASH_MS = 250
+
+/**
+ * A transient press-feedback flash on one key, index 0 to 7 — never the two
+ * round buttons (8, 9): they carry RGB backlights, not screens, and a page
+ * flip is already its own visible feedback, so there is nothing to flash.
+ *
+ * `ok` is true for a `handled` press (white) and false for `ignored` or
+ * `failed` (red) — see `PressOutcome`'s doc comment for why those two share
+ * one colour instead of getting a third.
+ *
+ * `expiresAtMs` is `null` until the FIRST render that actually draws this
+ * flash, which is the moment that anchors it. Anchoring at press time
+ * instead (off whatever clock the daemon happened to see last) is what let a
+ * flash arrive already expired: a stale clock from an unrelated
+ * change-triggered render could sit hundreds of milliseconds behind real
+ * time. Anchoring at first-draw time means a flash is impossible to be born
+ * already expired, and it works even when a press lands before the current
+ * page has ever been rendered at all.
+ */
+interface Flash {
+  ok: boolean
+  expiresAtMs: number | null
+}
 
 /** The lock-state methods the daemon needs. Kept narrow for deterministic tests. */
 export type LockStateReader = Pick<LockState, 'start' | 'stop' | 'isLocked' | 'refresh' | 'onChange'>
@@ -47,6 +80,9 @@ export class Daemon {
    * since either could otherwise still arm a timer on its own.
    */
   private stopped = false
+  /** One pending press-feedback flash per screen key, indices 0 to 7. `null`
+   * means no flash. See `Flash` and `applyFlash`. */
+  private flashes: (Flash | null)[] = new Array(NEO_KEY_COUNT).fill(null)
 
   constructor(
     private readonly device: DeckDevice,
@@ -136,6 +172,9 @@ export class Daemon {
     const key = `press-${index}`
     try {
       if (index === BUTTON_LEFT) {
+        // The two round buttons have RGB backlights, not screens: there is
+        // nothing to flash, and flipping the page is already its own
+        // visible feedback.
         this.pages.prev()
         this.armTimer()
         await this.renderOnce(this.now(), this.nowMs())
@@ -150,9 +189,16 @@ export class Daemon {
         return
       }
       if (index < 0 || index >= NEO_KEY_COUNT) return
-      await this.pages.onKeyPress(index)
+
+      const outcome = await this.callOnKeyPress(index, key)
+      this.setFlash(index, outcome === 'handled')
       await this.renderOnce(this.now(), this.nowMs())
-      log.clearOnce(key)
+      // A `failed` outcome already logged inside `callOnKeyPress` below; do
+      // not clear it here, or a repeating failure would log every time
+      // instead of once (M2). Any other outcome means the press itself did
+      // not throw, so a later genuine failure on this same key should log
+      // again.
+      if (outcome !== 'failed') log.clearOnce(key)
     } catch (e) {
       // `log.once`, not `log.error` (M2): a press repeats, and this is the
       // catch-all for every press failure. A broken page reader failing on
@@ -162,6 +208,31 @@ export class Daemon {
       // failure again once a press on the same index succeeds.
       log.once(key, `press handler failed for index ${index}: ${String(e)}`)
     }
+  }
+
+  /**
+   * Calls the current page's `onKeyPress` and awaits it, even when the page
+   * itself is synchronous — `await` on a plain value just returns it
+   * unchanged, so this is the one place that needs to know which. A page
+   * must never crash the daemon, so a thrown error becomes a `failed`
+   * outcome instead of escaping: the press still gets its red flash, exactly
+   * like a press that ran and failed cleanly, rather than silently doing
+   * nothing at all.
+   */
+  private async callOnKeyPress(index: number, logKey: string): Promise<PressOutcome> {
+    try {
+      return await this.pages.current().onKeyPress(index)
+    } catch (e) {
+      log.once(logKey, `press handler failed for index ${index}: ${String(e)}`)
+      return 'failed'
+    }
+  }
+
+  /** Records a pending flash for `index`. Its expiry is anchored later, by
+   * `applyFlash`, at the first render that actually draws it — see `Flash`'s
+   * doc comment for why. */
+  private setFlash(index: number, ok: boolean): void {
+    this.flashes[index] = { ok, expiresAtMs: null }
   }
 
   /** Forgets what is on the glass, so the next render writes everything. */
@@ -196,7 +267,10 @@ export class Daemon {
     // Keep page rendering inside the promise too. A page that throws while it
     // builds its frame must take the same logged, non-fatal path as a failed
     // device write.
-    const task = (async () => this.writeFrame(this.pages.current().render(now, nowMs)))()
+    const task = (async () => {
+      const frame = this.pages.current().render(now, nowMs)
+      await this.writeFrame(this.overlayFlashes(frame, nowMs))
+    })()
     this.activeRender = task
     try {
       await task
@@ -210,6 +284,48 @@ export class Daemon {
     } finally {
       if (this.activeRender === task) this.activeRender = null
     }
+  }
+
+  /**
+   * Applies every active press-feedback flash to `frame`'s keys, right
+   * before writing. This runs LAST, after the current page has built its own
+   * frame, so a flash wins over anything the page drew for that key — a
+   * border, a pulse, an image — and nothing drawn afterwards can cover it up
+   * in turn. `blankForLock`'s synthetic all-blank frame bypasses this
+   * entirely (it calls `writeFrame` directly), so a flash never survives
+   * into the privacy blank.
+   */
+  private overlayFlashes(frame: DeckFrame, nowMs: number): DeckFrame {
+    return { ...frame, keys: frame.keys.map((key, i) => this.applyFlash(i, key, nowMs)) }
+  }
+
+  /**
+   * Overlays the press-feedback flash for `index`, if one is still active,
+   * replacing the key's own content with a solid fill: white for `handled`,
+   * red for `ignored` or `failed`. Moved here from the Claude page (task 32)
+   * so every page gets the same on-device feedback, not just the one page
+   * that happened to implement it first.
+   *
+   * The flash's `expiresAtMs` is set HERE, on the first render that reaches
+   * this key while the flash is pending (`expiresAtMs === null`), using
+   * THIS render's own `nowMs` — see `Flash`'s doc comment for why anchoring
+   * at press time instead would let a flash arrive already expired.
+   *
+   * Once `nowMs` reaches the (now-anchored) expiry, the flash is discarded
+   * and this returns `key` untouched, so the key's hash goes back to exactly
+   * what it would have been with no flash ever recorded — letting the
+   * dirty-key check in `writeFrame` stop redrawing it.
+   */
+  private applyFlash(index: number, key: KeySpec, nowMs: number): KeySpec {
+    const flash = this.flashes[index]
+    if (!flash) return key
+    if (flash.expiresAtMs === null) {
+      flash.expiresAtMs = nowMs + FLASH_MS
+    } else if (nowMs >= flash.expiresAtMs) {
+      this.flashes[index] = null
+      return key
+    }
+    return { kind: key.kind, bg: flash.ok ? theme.white : theme.red }
   }
 
   private async writeFrame(frame: DeckFrame): Promise<void> {

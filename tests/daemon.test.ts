@@ -2,11 +2,13 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Daemon } from '../src/daemon.js'
 import { FakeDevice } from '../src/fake-device.js'
 import { PageManager } from '../src/page-manager.js'
-import { BUTTON_RIGHT } from '../src/device.js'
+import { BUTTON_LEFT, BUTTON_RIGHT } from '../src/device.js'
 import { setDefaultSink } from '../src/log.js'
-import type { Page } from '../src/pages/types.js'
+import type { Page, PressOutcome } from '../src/pages/types.js'
 import type { DeckFrame, KeySpec } from '../src/render/specs.js'
+import { keyHash } from '../src/render/specs.js'
 import { renderKey, renderStrip } from '../src/render/canvas.js'
+import { theme } from '../src/render/theme.js'
 import { DEFAULT_BRIGHTNESS, type LockStateReader } from '../src/daemon.js'
 
 /** Waits for every pending microtask queued so far to drain. A press's own
@@ -25,6 +27,11 @@ class ControlPage implements Page {
   presses: number[] = []
   enters = 0
   leaves = 0
+  /** What `onKeyPress` reports for each key index. Absent means `handled` —
+   * so every test that does not care about press feedback keeps working
+   * unchanged, and the flash-focused tests below can override one key at a
+   * time. */
+  outcomes = new Map<number, PressOutcome>()
 
   render(): DeckFrame {
     const keys: KeySpec[] = Array.from({ length: 8 }, (_, i) =>
@@ -36,8 +43,9 @@ class ControlPage implements Page {
     }
   }
 
-  onKeyPress(i: number): void {
+  onKeyPress(i: number): PressOutcome {
     this.presses.push(i)
+    return this.outcomes.get(i) ?? 'handled'
   }
 
   onEnter(): void {
@@ -311,7 +319,9 @@ class TickPage implements Page {
     }
   }
 
-  onKeyPress(): void {}
+  onKeyPress(): PressOutcome {
+    return 'ignored'
+  }
 }
 
 describe('Daemon per-page render interval', () => {
@@ -557,7 +567,7 @@ describe('Daemon press failure logging (M2)', () => {
       // Recovery: key 2 stops failing. The next success clears its key, so
       // a later, genuine failure on key 2 logs again instead of staying
       // suppressed forever (M4's sibling defect, applied here to M2).
-      page.onKeyPress = (i: number) => { page.presses.push(i) }
+      page.onKeyPress = (i: number) => { page.presses.push(i); return 'handled' }
       device.simulatePress(2)
       await flush()
 
@@ -570,5 +580,246 @@ describe('Daemon press failure logging (M2)', () => {
     } finally {
       setDefaultSink(() => {})
     }
+  })
+})
+
+/**
+ * Task 32: the press-feedback flash moved out of the Claude page (its only
+ * previous home) and into the daemon, so every page gets it. These tests
+ * exercise the mechanism itself, independent of any one page's own logic --
+ * the pages' own tests (`tests/pages/*.test.ts`) separately prove each page
+ * reports the right outcome for each of its keys.
+ */
+describe('Daemon press-feedback flash', () => {
+  /** A `ControlPage` behind a daemon whose clock is a plain mutable number,
+   * so a test can place a press and a later render at exact, deterministic
+   * millisecond offsets -- the flash's own anchoring logic is what these
+   * tests are proving, and that logic is defined entirely in terms of
+   * `nowMs`. */
+  function buildFlash() {
+    const device = new FakeDevice()
+    const page = new ControlPage()
+    const manager = new PageManager()
+    manager.add(page)
+    let ms = 1000
+    const daemon = new Daemon(device, manager, () => Math.floor(ms / 1000), () => ms)
+    return { device, page, manager, daemon, setMs: (v: number) => { ms = v } }
+  }
+
+  const whiteFlash = () => renderKey({ kind: 'gauge', bg: theme.white })
+  const redFlash = () => renderKey({ kind: 'gauge', bg: theme.red })
+  const plainKeyA = () => renderKey({ kind: 'gauge', lines: ['A'] })
+
+  it('flashes a handled press white, then reverts to the page’s own content', async () => {
+    const { device, daemon, setMs } = buildFlash()
+    await daemon.start() // ms = 1000; the first render draws no flash.
+    device.reset()
+
+    device.simulatePress(0) // ControlPage's default outcome is 'handled'.
+    await flush()
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    device.reset()
+    setMs(1260) // past the 250 ms window, anchored at the press-render (ms 1000)
+    await daemon.renderOnce(1, 1260)
+    expect(device.keyImages.get(0)?.equals(plainKeyA())).toBe(true)
+
+    await daemon.stop()
+  })
+
+  it('flashes an ignored press red', async () => {
+    const { device, page, daemon } = buildFlash()
+    await daemon.start()
+    device.reset()
+    page.outcomes.set(0, 'ignored')
+
+    device.simulatePress(0)
+    await flush()
+    expect(device.keyImages.get(0)?.equals(redFlash())).toBe(true)
+
+    await daemon.stop()
+  })
+
+  it('flashes a failed press red too — red already means "nothing happened", whether ignored or failed', async () => {
+    const { device, page, daemon } = buildFlash()
+    await daemon.start()
+    device.reset()
+    page.outcomes.set(0, 'failed')
+
+    device.simulatePress(0)
+    await flush()
+    expect(device.keyImages.get(0)?.equals(redFlash())).toBe(true)
+
+    await daemon.stop()
+  })
+
+  it('a page that throws in onKeyPress flashes red and does not crash the daemon', async () => {
+    const written: string[] = []
+    setDefaultSink((line) => written.push(line))
+    try {
+      const { device, page, daemon } = buildFlash()
+      await daemon.start()
+      device.reset()
+      page.onKeyPress = () => { throw new Error('boom') }
+
+      device.simulatePress(0)
+      await flush()
+      expect(device.keyImages.get(0)?.equals(redFlash())).toBe(true)
+
+      // The daemon survives the throw: a later, ordinary press on the same
+      // key still works, and still gets its own (white) flash.
+      page.onKeyPress = (i: number) => { page.presses.push(i); return 'handled' }
+      device.simulatePress(0)
+      await flush()
+      expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+      await daemon.stop()
+    } finally {
+      setDefaultSink(() => {})
+    }
+  })
+
+  /** A page whose `onKeyPress` does not resolve until the test releases it,
+   * so a test can prove the daemon waits for the real outcome instead of
+   * drawing a flash off a guess. */
+  class AsyncOutcomePage implements Page {
+    readonly name = 'async'
+    gate: Promise<void> = Promise.resolve()
+    outcome: PressOutcome = 'handled'
+
+    render(): DeckFrame {
+      const keys: KeySpec[] = Array.from({ length: 8 }, (_, i) =>
+        i === 0 ? { kind: 'gauge', lines: ['A'] } : { kind: 'blank' })
+      return { keys, strip: { lines: ['async'] }, buttons: [[0, 0, 0], [0, 0, 0]] }
+    }
+
+    async onKeyPress(): Promise<PressOutcome> {
+      await this.gate
+      return this.outcome
+    }
+  }
+
+  it('awaits an async page’s outcome before drawing the flash', async () => {
+    const device = new FakeDevice()
+    const page = new AsyncOutcomePage()
+    let release: () => void = () => {}
+    page.gate = new Promise((resolve) => { release = resolve })
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+    await daemon.start()
+    device.reset()
+
+    device.simulatePress(0)
+    await Promise.resolve()
+    await Promise.resolve()
+    // The press is parked inside the still-open gate: nothing has been
+    // written to the device yet, because the daemon has not rendered at all.
+    expect(device.keyWrites).toHaveLength(0)
+
+    release()
+    await flush()
+    // Now the outcome has resolved, and the flash it earned is on the glass.
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    await daemon.stop()
+  })
+
+  it('is per key: flashing key 0 does not touch key 1', async () => {
+    const { device, daemon } = buildFlash()
+    await daemon.start() // the first full render writes every key, key 1 blank.
+    const key1Before = device.keyImages.get(1)
+
+    device.simulatePress(0)
+    await flush()
+
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+    // Key 1's own content never changed, so the dirty-key check never
+    // rewrote it -- still the exact same buffer from the first render.
+    expect(device.keyImages.get(1)).toBe(key1Before)
+
+    await daemon.stop()
+  })
+
+  it('an expired flash leaves no trace in keyHash, so the key stops being redrawn', async () => {
+    // The flash and the page's own content hash differently -- otherwise
+    // there would be nothing to leave a trace of in the first place.
+    expect(keyHash({ kind: 'gauge', bg: theme.white })).not.toBe(keyHash({ kind: 'gauge', lines: ['A'] }))
+
+    const { device, daemon, setMs } = buildFlash()
+    await daemon.start()
+    device.reset()
+
+    device.simulatePress(0)
+    await flush()
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    // Well past the 250 ms window: the key reverts, written back to its own
+    // plain content exactly once.
+    device.reset()
+    setMs(1500)
+    await daemon.renderOnce(1, 1500)
+    expect(device.keyWrites).toEqual([{ index: 0, bytes: expect.any(Number) }])
+
+    // A LATER tick, nothing else changed: the hash the daemon compares
+    // against carries no lingering trace of the flash, so this is a true
+    // no-op -- exactly the guarantee lesson 11 exists to protect.
+    device.reset()
+    setMs(1600)
+    await daemon.renderOnce(1, 1600)
+    expect(device.keyWrites).toHaveLength(0)
+
+    await daemon.stop()
+  })
+
+  it('a round-button press flips the page without drawing any flash, for either button', async () => {
+    const device = new FakeDevice()
+    const pageA = new ControlPage()
+    const pageB = new ControlPage()
+    pageB.lines = ['B']
+    const manager = new PageManager()
+    manager.add(pageA)
+    manager.add(pageB)
+    const daemon = new Daemon(device, manager)
+    await daemon.start() // the first full render writes every key of pageA.
+
+    device.simulatePress(BUTTON_RIGHT) // pageA -> pageB
+    await flush()
+    expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['B'] }))).toBe(true)
+
+    device.simulatePress(BUTTON_LEFT) // pageB -> pageA
+    await flush()
+    expect(device.keyImages.get(0)?.equals(plainKeyA())).toBe(true)
+
+    // Every key ever written across start and both page flips -- never a
+    // flash fill, since neither round button ever calls `setFlash`.
+    const white = whiteFlash()
+    const red = redFlash()
+    for (const img of device.keyImages.values()) {
+      expect(img.equals(white)).toBe(false)
+      expect(img.equals(red)).toBe(false)
+    }
+
+    await daemon.stop()
+  })
+
+  it('the flash survives a change-driven render on the following tick', async () => {
+    // The exact regression two reviewers found independently: a render
+    // triggered by a source `change` event, moments after the press, must
+    // not swallow the flash. It must show for the flash's full window
+    // regardless of how many renders land inside it.
+    const { device, daemon, setMs } = buildFlash()
+    await daemon.start() // ms = 1000
+    device.reset()
+
+    device.simulatePress(0) // the press-render happens at ms 1000, anchoring expiry at 1250
+    await flush()
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    setMs(1100) // still well within the 250 ms window
+    await daemon.renderOnce(1, 1100)
+    expect(device.keyImages.get(0)?.equals(whiteFlash())).toBe(true)
+
+    await daemon.stop()
   })
 })

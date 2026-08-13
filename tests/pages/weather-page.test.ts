@@ -468,10 +468,11 @@ describe('WeatherPage strip', () => {
 })
 
 describe('WeatherPage presses', () => {
-  it('does nothing on any press', () => {
+  it('ignores every key, 0 to 7 — read-only, no refresh-on-press', () => {
     const { page } = build()
-    expect(page.onKeyPress(0)).toBeUndefined()
-    expect(page.onKeyPress(7)).toBeUndefined()
+    for (let i = 0; i <= 7; i++) {
+      expect(page.onKeyPress(i)).toBe('ignored')
+    }
   })
 })
 

@@ -1,7 +1,7 @@
 import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
-import type { Page } from './types.js'
+import type { Page, PressOutcome } from './types.js'
 import type { MarketState, Quote, StockStatus } from '../sources/stocks.js'
 import { SYMBOLS, downsample } from '../sources/stocks.js'
 
@@ -332,23 +332,25 @@ export class StocksPage implements Page {
     return { lines: [line1, truncate(line2, STRIP_CHARS)] }
   }
 
-  onKeyPress(index: number): void {
+  onKeyPress(index: number): PressOutcome {
     if (this.selected === null) {
       const symbol = SYMBOLS[index]
-      if (!symbol) return
+      if (!symbol) return 'ignored'
       // No quote at all for this key yet: nothing to show a detail view for.
       // The grid can hold fewer than eight known symbols before the first
       // successful refresh, and an empty key must not open detail for a
       // symbol that does not exist.
-      if (!this.source.getQuotes().has(symbol)) return
+      if (!this.source.getQuotes().has(symbol)) return 'ignored'
       this.selected = symbol
-      return
+      return 'handled'
     }
 
     if (index === 7) {
       this.selected = null
+      return 'handled'
     }
     // Keys 0 to 6 do nothing while a symbol is selected. Read-only: no
     // refresh-on-press, no browser.
+    return 'ignored'
   }
 }

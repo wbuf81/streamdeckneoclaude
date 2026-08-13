@@ -362,3 +362,39 @@ describe('SpotifyPage presses', () => {
     expect(calls).toEqual(['visible:true', 'visible:false'])
   })
 })
+
+describe('SpotifyPage presses report the real outcome, keys 0 to 7', () => {
+  it('reports handled for play/pause, volume, previous and next when the source call succeeds', async () => {
+    const { page } = build(player({ isPlaying: true, volumePercent: 50 }))
+    expect(await page.onKeyPress(2)).toBe('handled')
+    expect(await page.onKeyPress(3)).toBe('handled')
+    expect(await page.onKeyPress(6)).toBe('handled')
+    expect(await page.onKeyPress(7)).toBe('handled')
+  })
+
+  it('reports failed for play/pause, volume, previous and next when the source call itself fails', async () => {
+    const source = {
+      interpolate: () => player({ isPlaying: true, volumePercent: 50 }),
+      getStatus: () => 'ok' as SpotifyStatus,
+      getArt: () => null,
+      play: async () => false,
+      pause: async () => false,
+      next: async () => false,
+      previous: async () => false,
+      setVolume: async () => false,
+      setVisible: () => {},
+    }
+    const page = new SpotifyPage(source as never)
+    expect(await page.onKeyPress(2)).toBe('failed')
+    expect(await page.onKeyPress(3)).toBe('failed')
+    expect(await page.onKeyPress(6)).toBe('failed')
+    expect(await page.onKeyPress(7)).toBe('failed')
+  })
+
+  it('reports ignored for every album-art key, 0, 1, 4 and 5', async () => {
+    const { page } = build(player())
+    for (const i of [0, 1, 4, 5]) {
+      expect(await page.onKeyPress(i)).toBe('ignored')
+    }
+  })
+})

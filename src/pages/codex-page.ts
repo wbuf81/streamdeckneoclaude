@@ -2,7 +2,7 @@ import type { DeckFrame, KeySpec, StripSpec } from '../render/specs.js'
 import { barColor, theme } from '../render/theme.js'
 import { formatDuration, truncate } from '../render/text.js'
 import type { CodexLimit, CodexSnapshot } from '../sources/codex.js'
-import type { Page } from './types.js'
+import type { Page, PressOutcome } from './types.js'
 
 const TASK_SLOTS = 3
 /** Measured limit for one strip line, same constant every other page uses.
@@ -43,9 +43,12 @@ export interface CodexReader {
   isAvailable(): boolean
   /** True when the last successful sqlite read is too old. */
   isStale(): boolean
-  /** True when the newest usage SAMPLE's own timestamp is too old, or there
-   * is no sample yet — independent of `isStale()`. See `CodexSource`. */
-  isUsageStale(): boolean
+  /** True when the newest usage SAMPLE no longer describes the CURRENT
+   * rate-limit window, or there is no sample yet — independent of
+   * `isStale()`. The figure it carries is not merely old; it is unknowable,
+   * so a caller must render an explicit unknown, never a dimmed but wrong
+   * number. See `CodexSource.isUsageUnknown`. */
+  isUsageUnknown(): boolean
   setVisible(visible: boolean): void
 }
 
@@ -92,11 +95,15 @@ export class CodexPage implements Page {
     const snapshot = this.source.getSnapshot()
     const available = this.source.isAvailable()
     const readStale = this.source.isStale()
-    // Accounting tiles (the limits, the token count, the reset countdown) go
-    // stale for either reason: the sqlite read itself lagging, OR the newest
-    // usage SAMPLE's own timestamp aging out even while reads keep
-    // succeeding — see C2 and `CodexSource.isUsageStale`.
-    const accountingStale = readStale || this.source.isUsageStale()
+    // Accounting tiles (the limits, the token count, the reset countdown) can
+    // be wrong for two DIFFERENT reasons, and each renders differently:
+    //  - `readStale`: the sqlite READ itself is lagging. The numbers are
+    //    probably still true, so they show dimmed with a STALE label.
+    //  - `usageUnknown`: the usage SAMPLE no longer describes the current
+    //    rate-limit window (C2). The true figure is unknowable, so these
+    //    render an explicit `--` instead — a dimmed but wrong number still
+    //    reads as data, the same rule commit 185bcb4 set for schema drift.
+    const usageUnknown = this.source.isUsageUnknown()
     // Task tiles carry the retained snapshot from before a failure (lesson
     // 20's "preserve the last safe state"), so they need the SAME dim
     // treatment the accounting tiles already had, or a schema-drift or quit
@@ -126,12 +133,12 @@ export class CodexPage implements Page {
     })
 
     const limits = snapshot.usage?.limits ?? []
-    keys.push(this.limitKey(limits[0], accountingStale))
+    keys.push(this.limitKey(limits[0], usageUnknown, readStale))
     keys.push(limits[1]
-      ? this.limitKey(limits[1], accountingStale)
-      : this.planKey(snapshot.usage?.plan ?? '', accountingStale))
-    keys.push(this.tokensKey(snapshot.usage?.totalTokens ?? null, accountingStale))
-    keys.push(this.resetKey(limits[0], now, accountingStale))
+      ? this.limitKey(limits[1], usageUnknown, readStale)
+      : this.planKey(snapshot.usage?.plan ?? '', usageUnknown || readStale))
+    keys.push(this.tokensKey(snapshot.usage?.totalTokens ?? null, usageUnknown, readStale))
+    keys.push(this.resetKey(limits[0], now, usageUnknown, readStale))
 
     return {
       keys,
@@ -140,7 +147,7 @@ export class CodexPage implements Page {
     }
   }
 
-  private limitKey(limit: CodexLimit | undefined, stale: boolean): KeySpec {
+  private limitKey(limit: CodexLimit | undefined, unknown: boolean, readStale: boolean): KeySpec {
     if (!limit) {
       return {
         kind: 'gauge', lines: ['USAGE CAP', '--'], lineSizes: [11, 28],
@@ -148,10 +155,11 @@ export class CodexPage implements Page {
       }
     }
     const label = limitLabel(limit.windowMinutes)
-    if (limit.usedPct === null) {
-      // The window is known, but Codex's own percentage field is absent or
-      // renamed (C1) — unknown must render as `--`, never a measured `0%`
-      // with a confident green bar under it.
+    if (limit.usedPct === null || unknown) {
+      // Either the percentage field itself is absent or renamed (C1), or the
+      // sample no longer describes the current window (C2) — both leave the
+      // true figure unknowable, so both render the same explicit `--`, never
+      // a measured (or stale-but-dimmed) percentage with a confident bar.
       return {
         kind: 'gauge', lines: [label, '--'], lineSizes: [11, 28],
         align: 'center', dim: true,
@@ -163,7 +171,7 @@ export class CodexPage implements Page {
     // bar's own fill fraction clamps separately in `drawBar`.
     const pct = Math.min(999, Math.max(0, Math.floor(limit.usedPct)))
     const value = `${pct}%`
-    if (stale) {
+    if (readStale) {
       return {
         kind: 'gauge', lines: [label, value, 'STALE'],
         lineSizes: [11, PERCENT_SIZES, 11], align: 'center', dim: true,
@@ -186,23 +194,41 @@ export class CodexPage implements Page {
     }
   }
 
-  private tokensKey(tokens: number | null, stale: boolean): KeySpec {
+  private tokensKey(tokens: number | null, unknown: boolean, readStale: boolean): KeySpec {
+    if (tokens === null || unknown) {
+      // Same rule as `limitKey`: an unknowable figure renders `--` outright,
+      // never the last known count dimmed under a STALE label.
+      return {
+        kind: 'gauge',
+        lines: ['TASK TOKENS', '--'],
+        lineSizes: [11, TOKENS_SIZES],
+        align: 'center',
+        dim: true,
+      }
+    }
     return {
       kind: 'gauge',
-      lines: ['TASK TOKENS', tokens === null ? '--' : formatTokenCount(tokens), stale ? 'STALE' : ''],
+      lines: ['TASK TOKENS', formatTokenCount(tokens), readStale ? 'STALE' : ''],
       lineSizes: [11, TOKENS_SIZES, 11],
       align: 'center',
-      dim: tokens === null || stale,
+      dim: readStale,
     }
   }
 
-  private resetKey(limit: CodexLimit | undefined, now: number, stale: boolean): KeySpec {
+  private resetKey(limit: CodexLimit | undefined, now: number, unknown: boolean, readStale: boolean): KeySpec {
+    let value = formatResetIn(limit?.resetsAt ?? null, now)
+    // `unknown` covers two shapes: the countdown already reads `ELAPSED` (an
+    // honest signal on its own, so it stays), or `resetsAt` describes a
+    // window that — from `now`'s own perspective — has not started yet. That
+    // second shape is a REAL but WRONG countdown, and must not render as if
+    // it were current data.
+    if (unknown && value !== '--' && value !== 'ELAPSED') value = '--'
     return {
       kind: 'gauge',
-      lines: ['RESETS IN', formatResetIn(limit?.resetsAt ?? null, now), stale ? 'STALE' : ''],
+      lines: ['RESETS IN', value, readStale && !unknown ? 'STALE' : ''],
       lineSizes: [11, RESET_SIZES, 11],
       align: 'center',
-      dim: !limit || stale,
+      dim: !limit || unknown || readStale,
     }
   }
 
@@ -219,8 +245,10 @@ export class CodexPage implements Page {
     }
   }
 
-  onKeyPress(): void {
+  onKeyPress(_index: number): PressOutcome {
     // Codex does not currently expose a stable local URL or CLI command for
-    // focusing a task by thread id. Tiles remain intentionally read-only.
+    // focusing a task by thread id. Tiles remain intentionally read-only, so
+    // every key, 0 to 7, ignores a press.
+    return 'ignored'
   }
 }

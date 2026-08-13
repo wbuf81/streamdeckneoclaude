@@ -29,13 +29,13 @@ function build(
   data = snapshot(),
   available = true,
   stale = false,
-  usageStale = stale,
+  usageUnknown = false,
 ) {
   return new CodexPage({
     getSnapshot: () => data,
     isAvailable: () => available,
     isStale: () => stale,
-    isUsageStale: () => usageStale,
+    isUsageUnknown: () => usageUnknown,
     setVisible: () => {},
   })
 }
@@ -84,12 +84,53 @@ describe('CodexPage', () => {
     expect(frame.strip).toEqual({ lines: ['codex', 'task data unavailable'], dim: true })
   })
 
-  it('marks usage stale without hiding the last known values', () => {
-    // Available and read-fresh, but the usage SAMPLE itself has aged out —
-    // exactly the C2 scenario, where the read keeps succeeding.
+  it('renders an explicit unknown, not the last known percentage dimmed, once the usage sample no longer describes the current window', () => {
+    // Available and read-fresh (not `readStale`), but `isUsageUnknown()`
+    // reports the C2 scenario: the sample's own window has ended, so the
+    // true figure is unknowable. A dimmed `27%` under a STALE label would
+    // still read as data — the same rule commit 185bcb4 set for schema
+    // drift — so this must show `--` outright, with no bar.
     const key = build(snapshot(), true, false, true).render(NOW).keys[4]!
+    expect(key.lines).toEqual(['WEEK CAP', '--'])
+    expect(key.bar).toBeUndefined()
+    expect(key.dim).toBe(true)
+  })
+
+  it('still shows the dimmed percentage under a STALE label when only the sqlite read is lagging, not the usage sample', () => {
+    // The mirror case: `readStale` true, `isUsageUnknown()` false. The
+    // number is probably still true, just not freshly confirmed, so it stays
+    // visible — this is the ONE case that keeps the old STALE-label
+    // behaviour.
+    const key = build(snapshot(), true, true, false).render(NOW).keys[4]!
     expect(key.lines).toEqual(['WEEK CAP', '27%', 'STALE'])
     expect(key.bar).toBeUndefined()
+    expect(key.dim).toBe(true)
+  })
+
+  it('shows -- for task tokens too, once the usage sample no longer describes the current window', () => {
+    const key = build(snapshot(), true, false, true).render(NOW).keys[6]!
+    expect(key.lines).toEqual(['TASK TOKENS', '--'])
+    expect(key.dim).toBe(true)
+  })
+
+  it('shows an explicit -- for the reset countdown when unknown, never a real but WRONG duration', () => {
+    // `resetsAt` is a full day out — a real, positive duration if trusted —
+    // but `isUsageUnknown()` says the sample does not describe the current
+    // window, so the countdown itself cannot be trusted either.
+    const key = build(snapshot(), true, false, true).render(NOW).keys[7]!
+    expect(key.lines?.[1]).toBe('--')
+    expect(key.dim).toBe(true)
+  })
+
+  it('keeps ELAPSED for the reset countdown when unknown, since that is already an honest signal on its own', () => {
+    const data = snapshot({
+      usage: {
+        limits: [{ usedPct: 27, windowMinutes: 10080, resetsAt: NOW - 5 }],
+        totalTokens: 1_250_000, plan: 'team', ts: NOW,
+      },
+    })
+    const key = build(data, true, false, true).render(NOW).keys[7]!
+    expect(key.lines?.[1]).toBe('ELAPSED')
   })
 
   it('dims task tiles when the last sqlite read has gone stale, even while available', () => {
@@ -198,6 +239,15 @@ describe('CodexPage', () => {
     const buffer = renderStrip(strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
       expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
+  })
+})
+
+describe('CodexPage presses', () => {
+  it('ignores every key, 0 to 7 — task tiles are read-only, with no stable URL or command to focus one', () => {
+    const page = build()
+    for (let i = 0; i <= 7; i++) {
+      expect(page.onKeyPress(i)).toBe('ignored')
     }
   })
 })

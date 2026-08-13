@@ -1,7 +1,7 @@
 import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
-import type { Page } from './types.js'
+import type { Page, PressOutcome } from './types.js'
 import type { Conditions, DayForecast, WeatherStatus } from '../sources/weather.js'
 import { ZIP } from '../sources/weather.js'
 
@@ -237,7 +237,8 @@ export class WeatherPage implements Page {
     return { lines: [truncate(line1, STRIP_CHARS), truncate(line2, STRIP_CHARS)] }
   }
 
-  onKeyPress(_index: number): void {
-    // Read-only. No refresh-on-press.
+  onKeyPress(_index: number): PressOutcome {
+    // Read-only. No refresh-on-press. Every key, 0 to 7, ignores a press.
+    return 'ignored'
   }
 }

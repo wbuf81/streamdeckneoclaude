@@ -5,7 +5,7 @@ import { theme, stateColor, stateLabel, barColor } from '../render/theme.js'
 import type { SessionStateName } from '../render/theme.js'
 import { truncate, formatDuration } from '../render/text.js'
 import { getSpriteFrame, getSpriteFrameIndex } from '../render/sprites.js'
-import type { Page } from './types.js'
+import type { Page, PressOutcome } from './types.js'
 import type { Session } from '../sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../sources/usage.js'
 import { computePace, elapsedPercent } from '../sources/usage.js'
@@ -21,32 +21,6 @@ const CRAB_KEY_INDEX = SESSION_SLOTS
 /** Total keys the page draws: up to 3 session slots, the crab tile, plus 4
  * gauges. Matches `DeckFrame.keys`'s fixed length of 8. */
 const KEY_COUNT = SESSION_SLOTS + 1 + 4
-
-/**
- * How long a press's flash stays visible before reverting to the key's own
- * content. Task 16's 200 ms was tuned for a thin left-edge border; task 26
- * repaints the WHOLE key instead, which reads clearly even a little longer,
- * and 250 ms still reverts fast enough that it never looks like a state
- * colour.
- */
-const FLASH_MS = 250
-
-/**
- * A transient press-feedback flash on one key: fills the whole key white
- * for success or red for failure, replacing whatever the key would
- * otherwise show — see `withFlash`. `expiresAtMs` is `null` until the FIRST
- * render that actually draws this flash, which is the moment that anchors
- * it. Anchoring at press time instead (off whatever clock the page happened
- * to see last) is what let a flash arrive already expired: a stale
- * `lastNowMs` from an unrelated change-triggered render could sit hundreds
- * of milliseconds behind real time. Anchoring at first-draw time means a
- * flash is impossible to be born already expired, and it works even when
- * `onKeyPress` is called before this page has ever rendered at all.
- */
-interface Flash {
-  ok: boolean
-  expiresAtMs: number | null
-}
 
 /**
  * Ranks each session state by how urgently it needs attention, most urgent
@@ -115,8 +89,6 @@ export class ClaudePage implements Page {
   /** Session id per key 0 to `SESSION_SLOTS - 1`, from the last render. A
    * press reads it. */
   private slots: (string | null)[] = new Array(SESSION_SLOTS).fill(null)
-  /** One transient flash per key, indices 0 to 7. `null` means no flash. */
-  private flashes: (Flash | null)[] = new Array(KEY_COUNT).fill(null)
 
   constructor(
     private readonly sessions: SessionReader,
@@ -135,66 +107,19 @@ export class ClaudePage implements Page {
     for (let i = 0; i < SESSION_SLOTS; i++) {
       const id = slots[i]
       const session = id ? byId.get(id) : undefined
-      const key = session ? this.sessionKey(session, now) : blankKey()
-      keys.push(this.withFlash(i, key, nowMs))
+      keys.push(session ? this.sessionKey(session, now) : blankKey())
     }
 
-    keys.push(this.withFlash(CRAB_KEY_INDEX, this.crabKey(live, nowMs), nowMs))
+    keys.push(this.crabKey(live, nowMs))
 
     const gauges = this.gaugeKeys(now)
-    for (let i = 0; i < gauges.length; i++) {
-      keys.push(this.withFlash(CRAB_KEY_INDEX + 1 + i, gauges[i]!, nowMs))
-    }
+    for (const gauge of gauges) keys.push(gauge)
 
     return {
       keys,
       strip: this.strip(live, overflow, now),
       buttons: [theme.gray, theme.gray],
     }
-  }
-
-  /**
-   * Overlays the press-feedback flash for `index`, if one is still active.
-   * The flash fills the WHOLE key white (success) or red (failure) — not
-   * just the border, which this theme draws as a barely-visible left-edge
-   * strip — and drops the key's own lines, image and border for the
-   * flash's duration rather than drawing them underneath: white text on a
-   * white fill is a blank key, so the flash replaces the content instead of
-   * competing with it.
-   *
-   * The flash's `expiresAtMs` is set HERE, on the first render that reaches
-   * this key while the flash is pending (`expiresAtMs === null`), using
-   * THIS render's own `nowMs`. Anchoring at press time instead — off
-   * whatever clock this page happened to see last — is what let a flash
-   * arrive already expired: a stale clock from an unrelated
-   * change-triggered render could sit hundreds of milliseconds behind real
-   * time. Anchoring at first-draw time means a flash cannot be born already
-   * expired and does not depend on any render having happened before the
-   * press.
-   *
-   * Once `nowMs` reaches the (now-anchored) expiry, the stored flash is
-   * discarded and this function returns `key` untouched, so the key's hash
-   * goes back to exactly what it would have been with no flash ever
-   * recorded. That is what lets the daemon's dirty-key check stop redrawing
-   * it again.
-   */
-  private withFlash(index: number, key: KeySpec, nowMs: number): KeySpec {
-    const flash = this.flashes[index]
-    if (!flash) return key
-    if (flash.expiresAtMs === null) {
-      flash.expiresAtMs = nowMs + FLASH_MS
-    } else if (nowMs >= flash.expiresAtMs) {
-      this.flashes[index] = null
-      return key
-    }
-    return { kind: key.kind, bg: flash.ok ? theme.white : theme.red }
-  }
-
-  /** Records a pending flash for `index`. Its expiry is anchored later, by
-   * `withFlash`, at the first render that actually draws it — see the
-   * `Flash` interface's doc comment for why. */
-  private setFlash(index: number, ok: boolean): void {
-    this.flashes[index] = { ok, expiresAtMs: null }
   }
 
   private sessionKey(s: Session, now: number): KeySpec {
@@ -372,30 +297,22 @@ export class ClaudePage implements Page {
     return { lines: [parts.join(' · '), second] }
   }
 
-  async onKeyPress(index: number): Promise<void> {
-    if (index < 0 || index >= KEY_COUNT) return
-
-    // Key 3 (the crab mascot tile) and keys 4 to 7 (the gauges) all do
-    // nothing, but a press there still gets an answer — a brief red flash
-    // is honest feedback, rather than being indistinguishable from a press
-    // that did not register at all.
-    if (index >= SESSION_SLOTS) {
-      this.setFlash(index, false)
-      return
-    }
+  /**
+   * Key 0 to 2 focus the session in that slot, when one is bound and focus
+   * succeeds. Key 3 (the crab mascot tile) and keys 4 to 7 (the gauges) are
+   * always `ignored` — nothing is bound to them. The daemon, not this page,
+   * draws the on-device feedback for every outcome; see `PressOutcome`.
+   */
+  async onKeyPress(index: number): Promise<PressOutcome> {
+    if (index < 0 || index >= KEY_COUNT) return 'ignored'
+    if (index >= SESSION_SLOTS) return 'ignored'
 
     const id = this.slots[index]
-    if (!id) {
-      this.setFlash(index, false)
-      return
-    }
+    if (!id) return 'ignored'
     const session = this.sessions.getSessions().find((s) => s.sessionId === id)
-    if (!session) {
-      this.setFlash(index, false)
-      return
-    }
+    if (!session) return 'ignored'
     const ok = await this.focus(session.pid, session.termProgram, session.cwd, session.project)
-    this.setFlash(index, ok)
+    return ok ? 'handled' : 'failed'
   }
 }
 

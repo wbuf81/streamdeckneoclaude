@@ -3,7 +3,7 @@ import { makeChangeHandler } from '../../bin/deckd.js'
 import { Daemon } from '../../src/daemon.js'
 import { FakeDevice } from '../../src/fake-device.js'
 import { PageManager } from '../../src/page-manager.js'
-import type { Page } from '../../src/pages/types.js'
+import type { Page, PressOutcome } from '../../src/pages/types.js'
 import type { DeckFrame, KeySpec } from '../../src/render/specs.js'
 
 /** Waits for every pending microtask queued so far to drain, so an
@@ -25,7 +25,9 @@ class SpyPage implements Page {
     return { keys, strip: { lines: [] }, buttons: [[0, 0, 0], [0, 0, 0]] }
   }
 
-  onKeyPress(): void {}
+  onKeyPress(): PressOutcome {
+    return 'ignored'
+  }
 }
 
 describe('makeChangeHandler (B3)', () => {
@@ -64,12 +66,13 @@ describe('makeChangeHandler (B3)', () => {
 })
 
 /**
- * Mirrors the flash mechanic `ClaudePage` uses (`src/pages/claude-page.ts`,
- * out of scope for this fix -- another task owns it): a press arms a flash
- * timed off the millisecond clock the page's own last `render()` call saw,
- * and a later render shows it until `nowMs` reaches that recorded expiry.
- * Modeled locally, rather than importing the real page, so this regression
- * test does not depend on a file this task must not touch.
+ * Mirrors the shape of a press-feedback flash (now owned by `src/daemon.ts`,
+ * not any one page): a press arms a flash timed off the millisecond clock
+ * the page's own last `render()` call saw, and a later render shows it
+ * until `nowMs` reaches that recorded expiry. Modeled locally, rather than
+ * driving the real daemon-level mechanism, so this regression test stays
+ * about `makeChangeHandler`'s own clock plumbing — the thing this file
+ * actually owns — independent of the daemon's internals.
  */
 const FLASH_MS = 200
 
@@ -88,12 +91,11 @@ class FlashPage implements Page {
     return { keys, strip: { lines: ['flash'] }, buttons: [[0, 0, 0], [0, 0, 0]] }
   }
 
-  onKeyPress(): void {
-    // Anchors off the clock the LAST render saw -- exactly like
-    // `ClaudePage.setFlash` anchors off `this.lastNowMs` -- never
-    // `Date.now()` itself, since a page must never call the wall clock
-    // directly.
+  onKeyPress(): PressOutcome {
+    // Anchors off the clock the LAST render saw, never `Date.now()` itself,
+    // since a page must never call the wall clock directly.
     this.flashUntilMs = this.lastNowMs + FLASH_MS
+    return 'handled'
   }
 }
 

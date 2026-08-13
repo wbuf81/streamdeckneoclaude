@@ -6,7 +6,6 @@ import { createCanvas } from '@napi-rs/canvas'
 import { ClaudePage, crabFrame, CRAB_STATE_PRIORITY, mostUrgentCrabState } from '../../src/pages/claude-page.js'
 import { theme } from '../../src/render/theme.js'
 import { loadCrabFrames } from '../../src/render/sprites.js'
-import { keyHash } from '../../src/render/specs.js'
 import { renderKey, probe } from '../../src/render/canvas.js'
 import type { Session } from '../../src/sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../../src/sources/usage.js'
@@ -489,182 +488,56 @@ describe('ClaudePage presses', () => {
   })
 })
 
-describe('ClaudePage press feedback (flash)', () => {
-  it('flashes the pressed key white on a successful press, then reverts', async () => {
+/**
+ * Task 32 moves the press-feedback flash itself out of this page and into
+ * the daemon (`src/daemon.ts`), so every page gets it, not just this one.
+ * What THIS page owns now is reporting the real `PressOutcome` for every key
+ * — the daemon trusts that report completely, so a wrong one here would
+ * silently break the feature for the whole page.
+ */
+describe('ClaudePage presses report the real outcome, keys 0 to 7', () => {
+  it('reports handled when a session slot focuses successfully', async () => {
     const { page } = build({ sessions: [session({ state: 'tool' })] })
-    page.render(NOW, 0) // seeds the page's clock at nowMs 0
-    await page.onKeyPress(0)
-
-    const during = page.render(NOW, 100).keys[0]!
-    expect(during.bg).toEqual(theme.white)
-    // The flash replaces the key's content — no border, no lines — rather
-    // than drawing white text on a white fill, which would be a blank key.
-    expect(during.border).toBeUndefined()
-    expect(during.lines).toBeUndefined()
-
-    const after = page.render(NOW, 350).keys[0]!
-    expect(after.bg).toBeUndefined()
-    expect(after.border).toEqual(theme.cyan) // the tool state's own colour
+    page.render(NOW)
+    expect(await page.onKeyPress(0)).toBe('handled')
   })
 
-  it('flashes the pressed key red on a failed press', async () => {
+  it('reports failed when focus itself fails', async () => {
     const { page } = build({ sessions: [session({ state: 'tool' })], focusResult: false })
-    page.render(NOW, 0)
-    await page.onKeyPress(0)
-
-    const during = page.render(NOW, 100).keys[0]!
-    expect(during.bg).toEqual(theme.red)
-
-    const after = page.render(NOW, 350).keys[0]!
-    expect(after.border).toEqual(theme.cyan)
+    page.render(NOW)
+    expect(await page.onKeyPress(0)).toBe('failed')
   })
 
-  it('flashes red on an empty session slot, since nothing happened', async () => {
+  it('reports ignored for an empty session slot, keys 0 to 2', async () => {
     const { page } = build()
-    page.render(NOW, 0)
-    await page.onKeyPress(0)
-    expect(page.render(NOW, 100).keys[0]!.bg).toEqual(theme.red)
+    page.render(NOW)
+    expect(await page.onKeyPress(0)).toBe('ignored')
+    expect(await page.onKeyPress(1)).toBe('ignored')
+    expect(await page.onKeyPress(2)).toBe('ignored')
   })
 
-  it('flashes red on the crab tile, since a press there does nothing', async () => {
-    const { page } = build()
-    page.render(NOW, 0)
-    await page.onKeyPress(3)
-    expect(page.render(NOW, 100).keys[3]!.bg).toEqual(theme.red)
+  it('reports ignored for the crab tile, key 3', async () => {
+    const { page } = build({ sessions: [session()], usage: freshUsage() })
+    page.render(NOW)
+    expect(await page.onKeyPress(3)).toBe('ignored')
   })
 
-  it('flashes red on a gauge key, since a press there does nothing', async () => {
-    const { page } = build({ usage: freshUsage() })
-    page.render(NOW, 0)
-    await page.onKeyPress(4)
-    expect(page.render(NOW, 100).keys[4]!.bg).toEqual(theme.red)
-  })
-
-  it('holds for the full 250 ms from the render that first draws it, then reverts', async () => {
-    const { page } = build({ sessions: [session({ state: 'tool' })] })
-    page.render(NOW, 0) // seeds this.slots, so the press resolves to the session
-    await page.onKeyPress(0)
-    // The render at nowMs=1000 is the FIRST one to see this flash, so THAT
-    // is what anchors its expiry, at 1000 + 250 = 1250 — not the earlier
-    // render(NOW, 0) above, which happened before the press even existed.
-    expect(page.render(NOW, 1000).keys[0]!.bg).toEqual(theme.white)
-    expect(page.render(NOW, 1249).keys[0]!.bg).toEqual(theme.white)
-    expect(page.render(NOW, 1250).keys[0]!.bg).toBeUndefined()
-  })
-
-  it('overrides the permission pulse while active, and the pulse resumes after', async () => {
-    const { page } = build({ sessions: [session({ state: 'permission' })] })
-    page.render(NOW, 0)
-    await page.onKeyPress(0)
-
-    const during = page.render(NOW, 100).keys[0]!
-    expect(during.bg).toEqual(theme.white)
-    expect(during.pulseOn).toBeUndefined()
-    expect(during.border).toBeUndefined()
-
-    const after = page.render(NOW, 350).keys[0]!
-    expect(after.border).toEqual(theme.amber)
-    expect(after.pulseOn).toBe(NOW % 2 === 0)
-  })
-
-  it('is per key: flashing key 0 does not touch key 1', async () => {
-    const { page } = build({
-      sessions: [
-        session({ sessionId: 'a', pid: 1, ts: NOW, state: 'tool' }),
-        session({ sessionId: 'b', pid: 2, ts: NOW - 1, state: 'tool' }),
-      ],
-    })
-    page.render(NOW, 0)
-    await page.onKeyPress(0)
-
-    const frame = page.render(NOW, 100)
-    expect(frame.keys[0]!.bg).toEqual(theme.white)
-    expect(frame.keys[1]!.border).toEqual(theme.cyan)
-  })
-
-  it('leaves no trace in keyHash once the flash has expired', async () => {
-    const { page } = build({ sessions: [session({ state: 'tool' })] })
-    const before = keyHash(page.render(NOW, 0).keys[0]!)
-
-    await page.onKeyPress(0)
-    expect(keyHash(page.render(NOW, 100).keys[0]!)).not.toBe(before)
-
-    const after = keyHash(page.render(NOW, 350).keys[0]!)
-    expect(after).toBe(before)
-  })
-
-  it('paints the WHOLE key white during a successful flash, not just a left border strip', async () => {
-    const { page } = build({ sessions: [session({ state: 'tool' })] })
-    page.render(NOW, 0)
-    await page.onKeyPress(0)
-    const buf = renderKey(page.render(NOW, 100).keys[0]!)
-    // Sample points spread across the key, including the far corner well
-    // away from the old 3 px left-edge border strip.
-    near(probe(buf, 48, 48), theme.white)
-    near(probe(buf, 90, 90), theme.white)
-    near(probe(buf, 90, 5), theme.white)
-    near(probe(buf, 1, 1), theme.white)
-  })
-
-  it('leaves no readable text ink on a flashing key: a uniform fill, not white-on-white', async () => {
-    const { page } = build({ sessions: [session({ state: 'tool', project: 'streamdeckneoclaude' })] })
-    page.render(NOW, 0)
-    await page.onKeyPress(0)
-    const buf = renderKey(page.render(NOW, 100).keys[0]!)
-    // If text were still drawn under the fill, sampling many points across
-    // the key would find pixels that deviate from a uniform white — glyph
-    // edges, anti-aliasing, or (for coloured text) a different hue. Every
-    // sample staying within tolerance of white proves the fill is the only
-    // thing drawn.
-    for (let y = 4; y < 92; y += 8) {
-      for (let x = 4; x < 92; x += 8) {
-        near(probe(buf, x, y), theme.white, 5)
-      }
+  it('reports ignored for every gauge key, 4 to 7', async () => {
+    const { page } = build({ sessions: [session()], usage: freshUsage() })
+    page.render(NOW)
+    for (const i of [4, 5, 6, 7]) {
+      expect(await page.onKeyPress(i)).toBe('ignored')
     }
   })
 
-  it('does not swallow the flash after a change-driven render already advanced the clock', async () => {
-    // Simulates the scenario the review found in bin/deckd.ts: a
-    // source-change render passes a `nowMs` that trails real time (there,
-    // by up to 999 ms, from `renderOnce`'s `now * 1000` fallback). Anchoring
-    // the flash's expiry at PRESS time off that stale clock would make the
-    // very next render see it as already expired. Anchoring at first-DRAW
-    // time instead means the render immediately after the press is what
-    // sets the expiry, using ITS OWN nowMs, so the flash always shows.
-    const { page } = build({ sessions: [session({ state: 'tool' })] })
-    page.render(NOW, 1_000_000) // a change-triggered render, clock behind
-    await page.onKeyPress(0)
-    const during = page.render(NOW, 1_000_950).keys[0]! // the real press-time clock
-    expect(during.bg).toEqual(theme.white)
-  })
-
-  it('shows the flash on the very first render, even when the press came before any render at all', async () => {
-    const { page } = build()
-    // No render() call at all before the press — `this.slots` is still
-    // every key's initial null, so this press hits the "empty session key"
-    // path and flashes red. That is a SEPARATE, pre-existing limitation
-    // (slot identity is only known after a render), not what this test
-    // proves. What it proves is narrower and is the actual A1 fix: the
-    // flash mechanism itself must not depend on a render having happened
-    // before the press — the very first render afterwards must still show
-    // it, not treat it as already expired.
-    await page.onKeyPress(0)
-    const first = page.render(NOW, 5_000).keys[0]!
-    expect(first.bg).toEqual(theme.red)
-  })
-
-  it('never sticks: a flash recorded while the page was not visible still expires on schedule once rendering resumes', async () => {
-    const { page } = build({ sessions: [session({ state: 'tool' })] })
-    page.render(NOW, 0)
-    await page.onKeyPress(0)
-    // A long gap with no render at all (the page was not visible), then
-    // rendering resumes. The flash must still expire 250 ms after the
-    // render that FIRST draws it, not sit forever, and not have expired
-    // before it was ever drawn.
-    const first = page.render(NOW, 50_000).keys[0]!
-    expect(first.bg).toEqual(theme.white)
-    const later = page.render(NOW, 50_260).keys[0]!
-    expect(later.bg).toBeUndefined()
+  it('resolves the right session before reporting handled, when two are live', async () => {
+    const { page, f } = build({
+      sessions: [session({ sessionId: 'a', pid: 1, ts: NOW }),
+                 session({ sessionId: 'b', pid: 2, ts: NOW - 5 })],
+    })
+    page.render(NOW)
+    expect(await page.onKeyPress(1)).toBe('handled')
+    expect(f.focused[0]!.pid).toBe(2)
   })
 })
 

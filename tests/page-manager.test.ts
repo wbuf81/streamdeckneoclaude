@@ -12,7 +12,7 @@ function fakePage(name: string, log: string[] = [], tickMs?: number): Page {
       strip: { lines: [name] },
       buttons: [[0, 0, 0], [0, 0, 0]],
     }),
-    onKeyPress: (i) => { log.push(`${name}:${i}`) },
+    onKeyPress: (i) => { log.push(`${name}:${i}`); return 'handled' },
     onEnter: () => { log.push(`${name}:enter`) },
     onLeave: () => { log.push(`${name}:leave`) },
   }
