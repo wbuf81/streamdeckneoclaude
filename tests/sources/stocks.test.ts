@@ -5,6 +5,7 @@ import {
   parseQuote,
   deriveMarketState,
   downsample,
+  YEARLY_REFRESH_SECONDS,
 } from '../../src/sources/stocks.js'
 
 const NOW = 1_755_000_000
@@ -165,6 +166,26 @@ describe('parseQuote', () => {
     )!
     expect(q.spark).toEqual([1, 2])
   })
+
+  it('M4: rejects a body whose meta.symbol names a DIFFERENT symbol than requested, same as the yearly path', () => {
+    // Before this fix, this path disagreed with `doFetchYearly`'s own
+    // cross-check: it kept the aliased body and resolved `quote.symbol` to
+    // the WRONG name, which the detail view renders directly. Treating it
+    // as a failed parse — like a malformed body — keeps the two paths
+    // consistent, per the review's M4 finding.
+    expect(parseQuote('TSLA', chartBody({}, { symbol: 'AAPL' }))).toBeNull()
+  })
+
+  it('M4: still accepts a body with no meta.symbol at all — nothing to cross-check', () => {
+    const q = parseQuote('TSLA', chartBody({}, { symbol: undefined }))!
+    expect(q).not.toBeNull()
+    expect(q.symbol).toBe('TSLA')
+  })
+
+  it('accepts a body whose meta.symbol matches the requested symbol exactly', () => {
+    const q = parseQuote('TSLA', chartBody({}, { symbol: 'TSLA' }))!
+    expect(q.symbol).toBe('TSLA')
+  })
 })
 
 describe('deriveMarketState', () => {
@@ -197,12 +218,23 @@ describe('deriveMarketState', () => {
     expect(deriveMarketState(p, 400)).toBe('closed')
   })
 
-  it('reports closed for a malformed or absent period', () => {
-    expect(deriveMarketState(null, 250)).toBe('closed')
-    expect(deriveMarketState(undefined, 250)).toBe('closed')
-    expect(deriveMarketState({}, 250)).toBe('closed')
-    expect(deriveMarketState({ regular: 'nope' }, 250)).toBe('closed')
-    expect(deriveMarketState('garbage', 250)).toBe('closed')
+  it('reports unknown, never a fabricated closed, for a malformed or absent period (I1, lesson 18)', () => {
+    // A market state that was never measured is unknown, not closed — the
+    // previous behaviour reported "closed" for data that never arrived at
+    // all, which reads as a measured fact beside a render-clock timestamp.
+    expect(deriveMarketState(null, 250)).toBe('unknown')
+    expect(deriveMarketState(undefined, 250)).toBe('unknown')
+    expect(deriveMarketState({}, 250)).toBe('unknown')
+    expect(deriveMarketState({ regular: 'nope' }, 250)).toBe('unknown')
+    expect(deriveMarketState('garbage', 250)).toBe('unknown')
+  })
+
+  it('still reports closed when a REAL window exists and now genuinely falls outside every one of them', () => {
+    // Distinct from the malformed case above: here at least one window is
+    // well-formed, so "outside all three" is an actual measurement, not an
+    // absent signal.
+    expect(deriveMarketState(p, 50)).toBe('closed')
+    expect(deriveMarketState({ regular: p.regular }, 50)).toBe('closed')
   })
 })
 
@@ -259,6 +291,21 @@ describe('StockSource', () => {
     expect(src.getQuotes().size).toBe(0)
   })
 
+  it('reports the market state as unknown before anything has ever been measured (I1)', () => {
+    const src = new StockSource(SYMS, neverFetch as never, () => NOW)
+    expect(src.getMarketState()).toBe('unknown')
+  })
+
+  it('keeps the market state unknown after a refresh that never carries a currentTradingPeriod for any symbol', async () => {
+    const { fetchFn } = build({
+      AAA: chartBody({}, { symbol: 'AAA', currentTradingPeriod: undefined }),
+      BBB: chartBody({}, { symbol: 'BBB', currentTradingPeriod: undefined }),
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+    expect(src.getMarketState()).toBe('unknown')
+  })
+
   it('fetches all symbols concurrently and reports ok', async () => {
     const { fetchFn } = build({
       AAA: chartBody({}, { symbol: 'AAA' }),
@@ -290,6 +337,27 @@ describe('StockSource', () => {
     expect(src.getStatus()).toBe('ok')
     expect(src.getQuotes().get('AAA')!.price).toBe(999)
     expect(src.getQuotes().get('BBB')).toEqual(bbbBefore)
+  })
+
+  it('M4: keeps the last known quote for a symbol whose reply named a DIFFERENT symbol, rather than caching the aliased body under it', async () => {
+    const { fetchFn } = build({
+      AAA: chartBody({}, { symbol: 'AAA' }),
+      BBB: chartBody({}, { symbol: 'BBB' }),
+    })
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    await src.refresh()
+    const aaaBefore = src.getQuotes().get('AAA')
+
+    const { fetchFn: fetchFn2 } = build({
+      // Requested AAA, but the reply itself is BBB's — same class of
+      // aliased reply `doFetchYearly` already rejects for the yearly path.
+      AAA: chartBody({}, { symbol: 'BBB', regularMarketPrice: 999 }),
+      BBB: chartBody({}, { symbol: 'BBB' }),
+    })
+    src.setFetchForTest(fetchFn2 as never)
+    await src.refresh()
+
+    expect(src.getQuotes().get('AAA')).toEqual(aaaBefore)
   })
 
   it('reports offline and keeps the last prices when every symbol fails', async () => {
@@ -820,5 +888,90 @@ describe('StockSource yearly series (the detail chart\'s 52-week data)', () => {
     const state = src.getYearlyState('AAA')
     expect(state.status).toBe('ok')
     if (state.status === 'ok') expect(state.values).toHaveLength(43)
+  })
+})
+
+describe('StockSource.setWatchedSymbol (M1: keeps render() pure)', () => {
+  // Per M1's ruling: a page must never perform network I/O from `render()`.
+  // The old design had `StocksPage.render()` call `requestYearly` itself
+  // whenever the cached yearly series looked stale. This moves that trigger
+  // into the SOURCE: the page only ever calls `setWatchedSymbol`, from
+  // `onKeyPress`, and the source re-checks the watched symbol's freshness on
+  // its own intraday poll tick from then on.
+
+  it('kicks off an immediate yearly fetch for the newly-watched symbol', async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => chartBody({}, { symbol: 'AAA' }),
+    }))
+    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    src.setWatchedSymbol('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    expect(src.getYearlyState('AAA').status).toBe('ok')
+  })
+
+  it('does nothing and never throws when cleared with null', () => {
+    const src = new StockSource(SYMS, neverFetch as never, () => NOW)
+    expect(() => src.setWatchedSymbol(null)).not.toThrow()
+  })
+
+  it('re-checks the watched symbol on every INTRADAY poll, refetching once the cached yearly series goes stale', async () => {
+    vi.useFakeTimers()
+    let clock = NOW
+    const body = chartBody({}, { symbol: 'AAA' })
+    const { fetchFn } = build({ AAA: body, BBB: body })
+    const src = new StockSource(SYMS, fetchFn as never, () => clock)
+    src.setVisible(true) // starts the intraday poll (market is open in `body`)
+    await vi.advanceTimersByTimeAsync(0)
+
+    src.setWatchedSymbol('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    const yearlyCallsAfterWatch = fetchFn.mock.calls.filter((c) => String(c[0]).includes('range=1y')).length
+    expect(yearlyCallsAfterWatch).toBe(1)
+
+    // Still fresh: the next intraday poll tick must not refetch.
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(fetchFn.mock.calls.filter((c) => String(c[0]).includes('range=1y')).length).toBe(1)
+
+    // Age the cached yearly series past its refresh window, then let the
+    // next intraday poll tick run.
+    clock += YEARLY_REFRESH_SECONDS + 1
+    await vi.advanceTimersByTimeAsync(60_000)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn.mock.calls.filter((c) => String(c[0]).includes('range=1y')).length).toBe(2)
+
+    await src.stop()
+  })
+
+  it('stops re-checking once cleared with null, even though the cached series stays stale', async () => {
+    vi.useFakeTimers()
+    let clock = NOW
+    const body = chartBody({}, { symbol: 'AAA' })
+    const { fetchFn } = build({ AAA: body, BBB: body })
+    const src = new StockSource(SYMS, fetchFn as never, () => clock)
+    src.setVisible(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    src.setWatchedSymbol('AAA')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    src.setWatchedSymbol(null)
+
+    clock += YEARLY_REFRESH_SECONDS + 1
+    await vi.advanceTimersByTimeAsync(60_000)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fetchFn.mock.calls.filter((c) => String(c[0]).includes('range=1y')).length).toBe(1)
+
+    await src.stop()
   })
 })

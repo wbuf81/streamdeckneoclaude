@@ -222,7 +222,7 @@ export class WeatherPage implements Page {
   readonly name = 'weather'
 
   /**
-   * The selected day's stable identity (`DayForecast.date`), or null on the
+   * The selected day's stable identity (`DayForecast.id`), or null on the
    * grid. `onLeave` always clears this, so the page reopens on the grid
    * every time it becomes visible again.
    *
@@ -232,9 +232,14 @@ export class WeatherPage implements Page {
    * expire — the day that was at index 1 can become index 0 on the very next
    * poll. Keying on the array position meant the open detail view silently
    * followed whatever day slid into that index next, not the day the user
-   * actually opened. `date` never changes for the same real day, so this
+   * actually opened. `id` never changes for the same real day-half, so this
    * keys on that instead — the same stable-identity fix the stocks page
    * already gets for free by keying on the symbol.
+   *
+   * Per finding C1: a bare calendar date is NOT unique (an overnight period
+   * and the next day's daytime period can share one), so `id` is never
+   * empty for a real, selectable tile — see `activeDay` and `onKeyPress`,
+   * which both refuse to select a tile whose `id` is `''`.
    */
   private selected: string | null = null
 
@@ -261,7 +266,7 @@ export class WeatherPage implements Page {
    */
   private activeDay(days: DayForecast[]): DayForecast | null {
     if (this.selected === null) return null
-    return days.find((d) => d.date === this.selected) ?? null
+    return days.find((d) => d.id !== '' && d.id === this.selected) ?? null
   }
 
   render(_now: number): DeckFrame {
@@ -335,12 +340,19 @@ export class WeatherPage implements Page {
     const key: KeySpec = {
       kind: 'gauge',
       lines: ['WIND', wind, ZIP, place],
-      // Only the label and the ZIP line get a bigger size. ZIP is always
-      // exactly 5 digits; the wind reading can run up to a 12-character
-      // range (for example "10 to 15 mph"), which already fills the 11 px
-      // budget — a bigger font there would clip it. See VERIFIED-FACTS.md's
-      // text budget table.
-      lineSizes: [12, 11, 16, 11],
+      // Only the label and the ZIP line get a bigger, unmeasured size — ZIP
+      // is always exactly 5 digits, and "WIND" never changes. Per M3: a
+      // plain `number` here is drawn AS GIVEN, with no measuring at all (see
+      // `resolveLineSpecs`'s own doc comment) — this page must not reason
+      // about whether the raw `windSpeed` string fits, per
+      // docs/LESSONS.md #17. `[11]` is a one-candidate ARRAY, which routes
+      // through the same measure-and-`shrinkToFit` path every other
+      // variable-length line on this page already uses, so an
+      // unexpectedly long reading degrades to an ellipsis instead of
+      // clipping silently. Measured: the widest real value on record,
+      // `"10 to 15 mph"` (12 characters), is 79.5 px at 11 px — see
+      // docs/VERIFIED-FACTS.md's "Weather" section.
+      lineSizes: [12, [11], 16, 11],
     }
     if (dim) key.dim = true
     return key
@@ -492,21 +504,27 @@ export class WeatherPage implements Page {
    * half's `detailedForecast`, line 2 the night half's, each truncated to
    * the strip's usable width. A missing half shows `--`.
    *
-   * Per M2: the grid strip's `updated …`/`offline` honesty signal used to
-   * disappear entirely in detail mode — a stale or offline forecast still
-   * showed two forecast paragraphs with nothing to say they might be old.
-   * Both lines are already spoken for by the two forecast paragraphs, so
-   * this reuses `right` (the same field the stocks detail strip's own
-   * `renderStrip` mechanism is built for) rather than dropping either
-   * paragraph, matching the stocks page's own drill-down, which keeps its
-   * status text on the strip too.
+   * Per M2 (this round): the grid strip's `updated …`/`offline` honesty
+   * signal used to disappear entirely in detail mode — a stale or offline
+   * forecast still showed two forecast paragraphs with nothing to say they
+   * might be old. Both lines are already spoken for by the two forecast
+   * paragraphs, so this reuses `right` (the same field the stocks detail
+   * strip's own `renderStrip` mechanism is built for) rather than dropping
+   * either paragraph, matching the stocks page's own drill-down, which
+   * keeps its status text on the strip too.
+   *
+   * Per THIS review's M2: a bare timestamp here (`10:46 AM EDT`, with no
+   * `updated` label) reads as part of the forecast paragraph beside it —
+   * unlike the grid strip, which keeps the `updated ` word. `offline` and
+   * `--` already read as status words on their own and keep no prefix.
    */
   private detailStrip(day: DayForecast): StripSpec {
     const dayText = day.day?.detailedForecast || '--'
     const nightText = day.night?.detailedForecast || '--'
     const status = this.source.getStatus()
     const updatedAt = this.source.getLastUpdatedAt()
-    const right = status === 'offline' ? 'offline' : updatedAt > 0 ? formatUpdated(updatedAt) : '--'
+    const right =
+      status === 'offline' ? 'offline' : updatedAt > 0 ? `updated ${formatUpdated(updatedAt)}` : '--'
     return {
       lines: [truncate(dayText, STRIP_CHARS), truncate(nightText, STRIP_CHARS)],
       right,
@@ -547,7 +565,12 @@ export class WeatherPage implements Page {
       // does not exist.
       const day = days[index]
       if (!day) return 'ignored'
-      this.selected = day.date
+      // Per C1: a day with no usable `startTime` has no identity (`id` is
+      // `''`) and must never be selectable — there is no stable way to find
+      // it again on the next poll, and re-using the empty string would risk
+      // colliding with another identity-less tile.
+      if (day.id === '') return 'ignored'
+      this.selected = day.id
       return 'handled'
     }
 

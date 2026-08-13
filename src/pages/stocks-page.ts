@@ -47,6 +47,10 @@ const STATE_LABELS: Record<MarketState, string> = {
   pre: 'PRE-MARKET',
   post: 'AFTER HOURS',
   closed: 'MARKET CLOSED',
+  // Per I1: a market state that was never measured (no symbol has ever
+  // carried a usable `currentTradingPeriod`) must say so, not claim
+  // "closed" — lesson 18, an absent signal is unknown, not a fact.
+  unknown: 'MARKET UNKNOWN',
 }
 
 type Trend = 'up' | 'down' | 'flat' | 'unknown'
@@ -110,6 +114,18 @@ function formatAsOf(epochSeconds: number): string {
   return formatEasternTime(epochSeconds * 1000)
 }
 
+/**
+ * `asOf`, formatted, or `--` when unknown. Per I1: `asOf` is 0 when a
+ * quote's `regularMarketTime` never arrived, and both strips used to
+ * substitute the RENDER clock there — a page must never do that (never
+ * `Date.now()`, and never the `now` it is handed either, standing in for a
+ * measurement that was never taken). `--` is the same honesty convention
+ * every other unknown value on this page already uses.
+ */
+function formatAsOfOrUnknown(asOf: number | null): string {
+  return asOf !== null && asOf > 0 ? formatAsOf(asOf) : '--'
+}
+
 /** The part of `StockSource` this page needs. */
 export interface StockReader {
   getQuotes(): Map<string, Quote>
@@ -120,12 +136,17 @@ export interface StockReader {
    * its own instead of the whole board dimming for it. */
   isSymbolStale(symbol: string): boolean
   setVisible(visible: boolean): void
-  /** Read-only. Never triggers a fetch — see `requestYearly`. */
+  /** Read-only. Never triggers a fetch — see `setWatchedSymbol`. */
   getYearlyState(symbol: string): YearlyState
-  /** Kicks off a lazy, cached fetch of the 52-week series for one symbol.
-   * The page calls this once, at the moment a symbol is selected for the
-   * detail view — never on every render, and never for all eight symbols. */
-  requestYearly(symbol: string): void
+  /**
+   * Tells the source which symbol's detail view is open (or `null` when
+   * none is). Per M1, this is the ONLY way this page ever asks for a yearly
+   * fetch — `render()` must stay pure, so the source itself is what
+   * re-checks freshness on its own poll while a symbol stays watched. The
+   * page calls this from `onKeyPress` alone, on selection and on leaving
+   * detail mode — never from `render`.
+   */
+  setWatchedSymbol(symbol: string | null): void
 }
 
 /**
@@ -150,6 +171,7 @@ export class StocksPage implements Page {
 
   onLeave(): void {
     this.selected = null
+    this.source.setWatchedSymbol(null)
     this.source.setVisible(false)
   }
 
@@ -175,7 +197,7 @@ export class StocksPage implements Page {
     const keys = SYMBOLS.map((symbol) => this.tickerKey(quotes.get(symbol), symbol))
     return {
       keys,
-      strip: this.strip(quotes, now),
+      strip: this.strip(quotes),
       buttons: [theme.gray, theme.gray],
     }
   }
@@ -233,35 +255,34 @@ export class StocksPage implements Page {
 
     return {
       keys,
-      strip: this.detailStrip(quote, now),
+      strip: this.detailStrip(quote),
       buttons: [theme.gray, theme.gray],
     }
   }
 
   /**
    * Picks what the wide chart (keys 4, 5 and 6) draws: the 52-week daily
-   * series once `requestYearly` has loaded it, or the intraday series —
-   * clearly labelled either way — while that fetch is still loading, has
-   * never succeeded for this symbol, or the symbol simply has no yearly data
-   * yet. Never hands back the intraday series under the `52 WK` label: the
-   * label always matches the values it goes with, so a still-loading or
-   * failed yearly fetch shows the grid's own honest range instead of
-   * silently mislabelling a day as a year.
+   * series once it has loaded, or the intraday series — clearly labelled
+   * either way — while that fetch is still loading, has never succeeded for
+   * this symbol, or the symbol simply has no yearly data yet. Never hands
+   * back the intraday series under the `52 WK` label: the label always
+   * matches the values it goes with, so a still-loading or failed yearly
+   * fetch shows the grid's own honest range instead of silently
+   * mislabelling a day as a year.
    *
-   * Per I5: `requestYearly` used to fire only at the instant of selection,
-   * so a detail view left open past the 6-hour refresh interval kept
-   * drawing the SAME closes forever with nothing to say they had gone
-   * stale. This gives the caller `stale` — the age the page can see — and
-   * asks the source for a fresh copy right here. That is safe to call on
-   * every render: `requestYearly` is itself cooldown- and in-flight-guarded
-   * (docs/LESSONS.md lesson 10), so this can only ever start the ONE fetch
-   * the staleness actually justifies, never a request per render tick.
+   * Per I5, only READS the yearly state — per M1, it triggers no fetch of
+   * its own: `render()` must stay pure (AGENTS.md's "does not access ...
+   * the network"). `setWatchedSymbol` (called from `onKeyPress`, never from
+   * `render`) is what asks the source to keep this symbol's yearly series
+   * fresh on the source's own poll, so a detail view left open past the
+   * 6-hour refresh interval still gets a fresh copy without this method
+   * doing any I/O itself. `stale` still tells the caller the age it can
+   * see, purely for dimming.
    */
   private chartSeries(symbol: string, quote: Quote, now: number): { values: number[]; label: string; stale: boolean } {
     const yearly = this.source.getYearlyState(symbol)
     if (yearly.status === 'ok' && yearly.values.length >= 2) {
       const stale = now - yearly.updatedAt > YEARLY_REFRESH_SECONDS
-      if (stale) this.source.requestYearly(symbol)
       return { values: yearly.values, label: '52 WK', stale }
     }
     return { values: quote.spark, label: '1D', stale: false }
@@ -409,19 +430,20 @@ export class StocksPage implements Page {
     }
   }
 
-  private detailStrip(quote: Quote, now: number): StripSpec {
+  private detailStrip(quote: Quote): StripSpec {
     const marketState = this.source.getMarketState()
-    const asOf = quote.asOf > 0 ? quote.asOf : now
     const line1 = truncate(quote.name, STRIP_CHARS)
-    const line2 = truncate(`${STATE_LABELS[marketState]} · ${formatAsOf(asOf)}`, STRIP_CHARS)
+    const line2 = truncate(
+      `${STATE_LABELS[marketState]} · ${formatAsOfOrUnknown(quote.asOf > 0 ? quote.asOf : null)}`,
+      STRIP_CHARS,
+    )
     return { lines: [line1, line2] }
   }
 
-  private strip(quotes: Map<string, Quote>, now: number): StripSpec {
+  private strip(quotes: Map<string, Quote>): StripSpec {
     const status = this.source.getStatus()
     const marketState = this.source.getMarketState()
-    const asOf = latestAsOf(quotes) ?? now
-    const line1 = truncate(`${STATE_LABELS[marketState]} · ${formatAsOf(asOf)}`, STRIP_CHARS)
+    const line1 = truncate(`${STATE_LABELS[marketState]} · ${formatAsOfOrUnknown(latestAsOf(quotes))}`, STRIP_CHARS)
 
     let line2: string
     if (status === 'offline') {
@@ -456,14 +478,18 @@ export class StocksPage implements Page {
       this.selected = symbol
       // Lazily kicks off the 52-week fetch for THIS symbol only, right at
       // the moment its detail view opens — never for all eight symbols on
-      // every poll. `requestYearly` is itself a no-op when a fresh cache,
-      // an in-flight fetch, or a failure cooldown already covers it.
-      this.source.requestYearly(symbol)
+      // every poll. `setWatchedSymbol` is a no-op fetch-wise when a fresh
+      // cache, an in-flight fetch, or a failure cooldown already covers it;
+      // it also tells the source to keep re-checking freshness on its own
+      // poll for as long as this symbol stays watched (see the finding
+      // about `render()` never doing network I/O itself).
+      this.source.setWatchedSymbol(symbol)
       return 'handled'
     }
 
     if (index === 7) {
       this.selected = null
+      this.source.setWatchedSymbol(null)
       return 'handled'
     }
     // Keys 0 to 6 do nothing while a symbol is selected. Read-only: no

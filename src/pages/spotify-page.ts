@@ -155,7 +155,18 @@ export class SpotifyPage implements Page {
   get tickMs(): number | undefined {
     if (this.source.getStatus() === 'unauthorized') return undefined
     const state = this.source.interpolate(0)
+    // The idle equaliser needs the fast tick whenever nothing is loaded,
+    // REGARDLESS of `status` — it animates through a normal `no-device` or
+    // `offline` idle state just as much as a genuinely empty one.
     if (!state) return PULSE_TICK_MS
+    // Per M5: `status` can report `no-device` (a failed transport command)
+    // while `state` — the last known player snapshot — still says a track
+    // was playing, since a control failure never clears it. Checked here,
+    // AFTER the idle-equaliser case above but BEFORE `state.isPlaying`, so
+    // a stale "was playing" snapshot cannot keep the fast tick (and the
+    // volume key's "thump", which `render()` below no longer even draws for
+    // a dead device) alive for a device that is gone.
+    if (this.source.getStatus() === 'no-device') return undefined
     return state.isPlaying ? PULSE_TICK_MS : undefined
   }
 
@@ -183,11 +194,16 @@ export class SpotifyPage implements Page {
           glyph: VOLUME_UP_GLYPH,
           glyphFont: 'emoji',
           glyphCaption: volumeLabel(state),
-          // The "thump" — only while a track is actually PLAYING. A
-          // thumping speaker beside a paused track would be decoration with
-          // no meaning; static here matches static everywhere else on a
-          // paused or idle page.
-          glyphPulse: state?.isPlaying ? { phase: volumePulsePhase(nowMs) } : undefined,
+          // The "thump" — only while a track is actually PLAYING AND the
+          // device is not dead. Per M5: `state?.isPlaying` alone survived a
+          // failed transport command (the source sets `status: 'no-device'`
+          // on a 403/404 but leaves `state` in place until the next poll),
+          // so this page kept animating a device it was simultaneously
+          // reporting as gone. A thumping speaker beside a paused track, or
+          // a dimmed dead one, would be decoration with no meaning; static
+          // here matches static everywhere else on a paused, idle, or dead
+          // page.
+          glyphPulse: state?.isPlaying && !dead ? { phase: volumePulsePhase(nowMs) } : undefined,
           dim: dead,
         },
         this.spanArtKey(state, status, art, CROP_BOTTOM_LEFT, nowMs, 2),

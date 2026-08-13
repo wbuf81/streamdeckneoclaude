@@ -13,7 +13,13 @@ export const SYMBOLS: readonly string[] = [
   'AMZN',
 ] as const
 
-export type MarketState = 'pre' | 'open' | 'post' | 'closed'
+/**
+ * `'unknown'` per finding I1 and docs/LESSONS.md lesson 18: an absent or
+ * malformed `currentTradingPeriod` is a signal that never arrived, not a
+ * measured closed market. Only a real window that `now` genuinely falls
+ * outside of earns `'closed'`.
+ */
+export type MarketState = 'pre' | 'open' | 'post' | 'closed' | 'unknown'
 export type StockStatus = 'ok' | 'offline' | 'empty'
 
 export interface Quote {
@@ -119,6 +125,20 @@ export function parseQuote(symbol: string, body: unknown): Quote | null {
   const meta = extractMeta(body)
   if (!meta) return null
 
+  // Per M4: the yearly path (`doFetchYearly`) already discards a body whose
+  // `meta.symbol` names a DIFFERENT symbol than the one requested, rather
+  // than caching it under the requested key. This path used to disagree —
+  // it kept such a body and resolved `quote.symbol` to the ALIASED name,
+  // which the detail view renders directly (`priceKey`'s `quote.symbol`
+  // line), so an aliased reply could show the wrong ticker's name on the
+  // symbol the user actually pressed. Treating it as a failed parse, the
+  // same as the yearly path, keeps the two consistent. A body with no
+  // `meta.symbol` at all carries nothing to cross-check and is accepted, as
+  // before.
+  if (typeof meta.symbol === 'string' && meta.symbol && meta.symbol !== symbol) {
+    return null
+  }
+
   const resolvedSymbol =
     typeof meta.symbol === 'string' && meta.symbol ? meta.symbol : symbol
 
@@ -148,24 +168,36 @@ export function parseQuote(symbol: string, body: unknown): Quote | null {
   }
 }
 
-/** True when `now` falls in `[start, end)` of a `{ start, end }` window. */
-function within(window: unknown, now: number): boolean {
+/** True when `window` is a usable `{ start, end }` pair — both numeric. */
+function isWindow(window: unknown): boolean {
   if (!window || typeof window !== 'object') return false
   const start = (window as Record<string, unknown>).start
   const end = (window as Record<string, unknown>).end
-  if (typeof start !== 'number' || typeof end !== 'number') return false
-  return now >= start && now < end
+  return typeof start === 'number' && typeof end === 'number'
+}
+
+/** True when `now` falls in `[start, end)` of a `{ start, end }` window. */
+function within(window: unknown, now: number): boolean {
+  if (!isWindow(window)) return false
+  const w = window as Record<string, unknown>
+  return now >= (w.start as number) && now < (w.end as number)
 }
 
 /**
  * Derives the market state from `currentTradingPeriod`. Yahoo's chart body
- * has no `marketState` field, so this is the only source of truth. A
- * malformed or absent period gives `closed`. Boundaries are inclusive of
- * start and exclusive of end.
+ * has no `marketState` field, so this is the only source of truth.
+ *
+ * Per finding I1: a malformed or absent period carries NO signal at all —
+ * `'unknown'`, never a fabricated `'closed'` (lesson 18). `'closed'` is
+ * reserved for the case this function can actually measure: at least one
+ * real `{ start, end }` window is present, and `now` genuinely falls
+ * outside every one of them. Boundaries are inclusive of start and
+ * exclusive of end.
  */
 export function deriveMarketState(period: unknown, now: number): MarketState {
-  if (!period || typeof period !== 'object') return 'closed'
+  if (!period || typeof period !== 'object') return 'unknown'
   const p = period as Record<string, unknown>
+  if (!isWindow(p.regular) && !isWindow(p.pre) && !isWindow(p.post)) return 'unknown'
   if (within(p.regular, now)) return 'open'
   if (within(p.pre, now)) return 'pre'
   if (within(p.post, now)) return 'post'
@@ -239,7 +271,8 @@ interface YearlyEntry {
 export class StockSource extends EventEmitter {
   private quotes = new Map<string, Quote>()
   private status: StockStatus = 'empty'
-  private marketState: MarketState = 'closed'
+  /** Per I1: `'unknown'`, never `'closed'` — nothing has been measured yet. */
+  private marketState: MarketState = 'unknown'
   private timer: NodeJS.Timeout | null = null
   private visible = false
   /** Set by `stop()`, so a refresh continuation already in flight cannot arm
@@ -259,6 +292,15 @@ export class StockSource extends EventEmitter {
   /** Epoch seconds before which a failed symbol will not be retried. A
    * cooldown, not a guard cleared in `finally` — see docs/LESSONS.md #10. */
   private yearlyCooldownUntil = new Map<string, number>()
+  /**
+   * The symbol whose detail view is open right now, or null. Per M1: a page
+   * must never perform network I/O from `render()` (AGENTS.md's "Keep pages
+   * pure"), so this source — not the page — is what re-checks the watched
+   * symbol's yearly freshness, on the SAME intraday poll tick it already
+   * runs on. `setWatchedSymbol` is the only way this changes, and the page
+   * calls it from `onKeyPress`, never from `render`.
+   */
+  private watchedSymbol: string | null = null
 
   constructor(
     private readonly symbols: readonly string[] = SYMBOLS,
@@ -328,6 +370,21 @@ export class StockSource extends EventEmitter {
       clearTimeout(this.timer)
       this.timer = null
     }
+  }
+
+  /**
+   * Tells the source which symbol's detail view is open, or clears it with
+   * `null`. Per M1: this is the seam that lets `render()` stay pure — it
+   * kicks off an immediate `requestYearly` for a newly-watched symbol (the
+   * same "fetch once, at selection" behaviour the page used to trigger
+   * itself), and `doRefresh` re-checks the watched symbol's freshness on
+   * every INTRADAY poll after that, so a detail view left open past
+   * `YEARLY_REFRESH_SECONDS` still gets a fresh yearly series without the
+   * page ever touching the network from `render`.
+   */
+  setWatchedSymbol(symbol: string | null): void {
+    this.watchedSymbol = symbol
+    if (symbol) this.requestYearly(symbol)
   }
 
   private schedule(): void {
@@ -422,6 +479,13 @@ export class StockSource extends EventEmitter {
     // Keep the last known market state when every symbol failed this round;
     // a total outage must not reset the state to `closed`.
     if (period !== null) this.marketState = deriveMarketState(period, this.now())
+
+    // M1: re-check the watched symbol's yearly freshness on the source's own
+    // poll tick, so `render()` never has to call `requestYearly` itself.
+    // `requestYearly` is already in-flight-, freshness- and
+    // cooldown-guarded (docs/LESSONS.md #10), so this can only ever start
+    // the one fetch a real staleness justifies, never one per poll.
+    if (this.watchedSymbol) this.requestYearly(this.watchedSymbol)
 
     const key = JSON.stringify({
       quotes: [...this.quotes.entries()],

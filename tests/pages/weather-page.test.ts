@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
+import { createCanvas } from '@napi-rs/canvas'
 import { WeatherPage, conditionTint, heatColor, wrapText } from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
-import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT, FONT } from '../../src/render/canvas.js'
 import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
 import type { Conditions, DayForecast, PeriodDetail, WeatherStatus } from '../../src/sources/weather.js'
 
@@ -39,10 +40,11 @@ function day(label: string, over: Partial<DayForecast> = {}): DayForecast {
     label,
     // Defaults to the label itself: every real LABELS entry is already
     // distinct, so this keeps the existing fixtures usable as stable
-    // identities (I1) without every call site having to invent a fake ISO
-    // date. Tests that specifically exercise the identity-vs-position fix
-    // pass an explicit `date` override instead.
-    date: label,
+    // identities (I1/C1) without every call site having to invent a fake
+    // `date:half` identity. Tests that specifically exercise the
+    // identity-vs-position fix, or the C1 collision, pass an explicit `id`
+    // override instead.
+    id: label,
     emoji: '☀️',
     high: 90,
     low: 70,
@@ -372,14 +374,20 @@ describe('WeatherPage day tile layout details', () => {
     // Per M2: TEMP_SIZE used to be a fixed 16 px with no fitting at all.
     // `-10°/-25°` measures over budget at 16 px (86.7 px, see the review),
     // so the renderer must drop to a smaller candidate. Measured with a
-    // real pixel probe: no ink at or past the right margin (x = 90).
+    // real pixel probe: no ink at or past the right margin.
+    //
+    // Test quality (I2 scan): a single-column probe at x=90 alone cannot
+    // fail against ink one column further right. This probes the whole
+    // margin band, x=90 to the key's last column, instead.
     const days = sevenDays()
     days[0] = day('NOW', { high: -10, low: -25 })
     const { page } = build({ days })
     const key = page.render(NOW).keys[0]!
     const buf = renderKey(key)
     for (let y = 0; y < KEY_SIZE; y++) {
-      expect(near3(probe(buf, 90, y), key.bg!)).toBe(true)
+      for (let x = 90; x < KEY_SIZE; x++) {
+        expect(near3(probe(buf, x, y), key.bg!)).toBe(true)
+      }
     }
   })
 
@@ -387,10 +395,29 @@ describe('WeatherPage day tile layout details', () => {
     const { page } = build()
     const key = page.render(NOW).keys[7]!
     // Line 1 (the wind reading) can run to 12 variable-length characters, so
-    // it stays at the default 11 px and cannot clip. Line 2 (the ZIP code)
-    // is always exactly 5 digits, so it is safe to enlarge.
-    expect(key.lineSizes?.[1]).toBe(11)
+    // it passes a one-candidate ARRAY (M3) — measured and shrunk if needed,
+    // never drawn unchecked — rather than a bare number. Line 2 (the ZIP
+    // code) is always exactly 5 digits, so it is safe to enlarge unmeasured.
+    expect(key.lineSizes?.[1]).toEqual([11])
     expect(key.lineSizes?.[2]).toBeGreaterThan(11)
+  })
+
+  it('measures the WIND line rather than trusting it fits, for the widest real windSpeed value (M3)', () => {
+    // Measured (see docs/VERIFIED-FACTS.md's "Weather" section): "10 to 15
+    // mph" (12 characters) is 79.5 px at 11 px, inside the 81 px budget with
+    // only 1.5 px to spare. A `renderKey` pixel probe is what actually
+    // proves this, not the arithmetic, per docs/LESSONS.md #17 — and this
+    // string is deliberately right at the documented ceiling, not padded
+    // with slack, so a regression that removed the measuring path (M3)
+    // would show up here.
+    const { page } = build({ conditions: { windSpeed: '10 to 15 mph', temperature: 90, shortForecast: 'Sunny' } })
+    const key = page.render(NOW).keys[7]!
+    const buf = renderKey(key)
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 90; x < KEY_SIZE; x++) {
+        expect(near3(probe(buf, x, y), theme.bg)).toBe(true)
+      }
+    }
   })
 })
 
@@ -516,10 +543,27 @@ describe('WeatherPage strip', () => {
     // Measured: `updated 4:05 PM EDT` is 148.7 px against the strip's 236 px
     // usable width — verified by pixel probe, not arithmetic, per
     // docs/LESSONS.md #17.
-    const { page } = build()
+    //
+    // Test quality (I2 scan): this grid strip carries no right-aligned
+    // field, so there is no second run of text it could overlap — unlike
+    // the detail strip below (see the `right`-vs-line-2 overlap test),
+    // there is nothing here for a real ink-vs-ink check to compare against.
+    // The renderer's own `shrinkToFit` (tested in tests/render/canvas.ts,
+    // outside this page's ownership) is what actually keeps text off the
+    // margin; probing a single column at the true edge cannot fail for ANY
+    // input, per the review, so this now uses near-maximal content (the
+    // same long place/forecast strings as the character-count test above)
+    // and probes the whole margin band, not one column, as the strongest
+    // proof available from this page's own public surface.
+    const { page } = build({
+      place: 'A Very Long Place Name Indeed FL',
+      conditions: { windSpeed: '8 mph', temperature: 90, shortForecast: 'Chance Showers And Thunderstorms Likely' },
+    })
     const buffer = renderStrip(page.render(NOW).strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+      for (let x = STRIP_WIDTH - 6; x < STRIP_WIDTH; x++) {
+        expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
+      }
     }
   })
 })
@@ -638,20 +682,20 @@ describe('WeatherPage identity (I1 / lesson 19): selection follows the day, neve
     // [NOW(Sat), SUN...] — SAT's own data now sits at index 0, not index 1.
     // A page keyed on the array position would silently show SUN's data
     // under whatever heading index 1 now carries. This page must keep
-    // showing SAT's numbers (90°/75°), found by date, wherever they moved.
+    // showing SAT's numbers (90°/75°), found by id, wherever they moved.
     const days = [
-      day('NOW', { date: '2026-08-14', high: 70, low: 60 }),
-      day('SAT', { date: '2026-08-15', high: 90, low: 75 }),
-      day('SUN', { date: '2026-08-16', high: 88, low: 74 }),
+      day('NOW', { id: '2026-08-14:day', high: 70, low: 60 }),
+      day('SAT', { id: '2026-08-15:day', high: 90, low: 75 }),
+      day('SUN', { id: '2026-08-16:day', high: 88, low: 74 }),
     ]
     const { page, f } = build({ days })
-    page.onKeyPress(1) // selects SAT, date 2026-08-15
+    page.onKeyPress(1) // selects SAT, id 2026-08-15:day
 
     // The next poll: the Friday-night period drops out of the source's own
     // periods, SAT becomes NOW, and SUN slides from index 2 to index 1.
     f.days = [
-      day('NOW', { date: '2026-08-15', high: 90, low: 75 }),
-      day('SUN', { date: '2026-08-16', high: 88, low: 74 }),
+      day('NOW', { id: '2026-08-15:day', high: 90, low: 75 }),
+      day('SUN', { id: '2026-08-16:day', high: 88, low: 74 }),
     ]
     const key0 = page.render(NOW).keys[0]!
     expect(key0.lines![1]).toBe('90°/75°') // still the originally-selected day
@@ -660,12 +704,12 @@ describe('WeatherPage identity (I1 / lesson 19): selection follows the day, neve
 
   it('falls back to the grid, honestly, once the selected day is truly gone — never shows another day under the old heading', () => {
     const days = [
-      day('NOW', { date: '2026-08-14' }),
-      day('SAT', { date: '2026-08-15', high: 90, low: 75 }),
+      day('NOW', { id: '2026-08-14:day' }),
+      day('SAT', { id: '2026-08-15:day', high: 90, low: 75 }),
     ]
     const { page, f } = build({ days })
-    page.onKeyPress(1) // selects SAT, date 2026-08-15
-    f.days = [day('NOW', { date: '2026-08-16' })] // 2026-08-15 is gone entirely
+    page.onKeyPress(1) // selects SAT, id 2026-08-15:day
+    f.days = [day('NOW', { id: '2026-08-16:day' })] // 2026-08-15:day is gone entirely
     const keys = page.render(NOW).keys
     expect(keys).toHaveLength(8) // the grid, not a mislabelled detail view
     expect(keys[0]!.lines![0]).toBe('NOW')
@@ -673,14 +717,38 @@ describe('WeatherPage identity (I1 / lesson 19): selection follows the day, neve
   })
 
   it('re-selecting the same identity after a fallback still works (onKeyPress and render agree on what is selected)', () => {
-    const days = [day('NOW', { date: '2026-08-14' }), day('SAT', { date: '2026-08-15' })]
+    const days = [day('NOW', { id: '2026-08-14:day' }), day('SAT', { id: '2026-08-15:day' })]
     const { page, f } = build({ days })
     page.onKeyPress(1) // selects SAT
-    f.days = [day('NOW', { date: '2026-08-16' })] // SAT vanishes
+    f.days = [day('NOW', { id: '2026-08-16:day' })] // SAT vanishes
     page.render(NOW) // falls back to the grid (without mutating `selected`, per M3)
     expect(page.onKeyPress(0)).toBe('handled') // the grid still responds normally
     const key0 = page.render(NOW).keys[0]!
     expect(key0.lines![0]).toBe('NOW')
+  })
+
+  it('C1: a bare calendar date is not unique — an overnight-only tile and the next day tile that shares its calendar date must resolve to DIFFERENT identities', () => {
+    // The review's exact measured shape: between midnight and 06:00, NOW is
+    // an overnight-only tile whose date equals THU's own date. `id` must
+    // carry the day/night half too, or `activeDay` collapses the two tiles
+    // into one and opens the wrong data.
+    const days = [
+      day('NOW', { id: '2026-08-14:night', high: 72, low: 72, precipPercent: 20 }),
+      day('THU', { id: '2026-08-14:day', high: 95, low: 70, precipPercent: 10 }),
+    ]
+    const { page } = build({ days })
+    expect(page.onKeyPress(1)).toBe('handled')
+    const key0 = page.render(NOW).keys[0]!
+    // Opens THU's own data, not NOW's overnight tile.
+    expect(key0.lines).toEqual(['THU', '95°/70°', '10%'])
+  })
+
+  it('C1: a day tile with no usable startTime (empty id) can never be selected, and pressing it is ignored', () => {
+    const days = [day('NOW', { id: '' }), day('THU', { id: '2026-08-14:day' })]
+    const { page } = build({ days })
+    expect(page.onKeyPress(0)).toBe('ignored')
+    // Still the grid — no detail view opened for the identity-less tile.
+    expect(page.render(NOW).keys).toHaveLength(8)
   })
 })
 
@@ -858,8 +926,56 @@ describe('WeatherPage detail view strip', () => {
     page.onKeyPress(0)
     const buffer = renderStrip(page.render(NOW).strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+      for (let x = STRIP_WIDTH - 6; x < STRIP_WIDTH; x++) {
+        expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
+      }
     }
+  })
+
+  it('never overlaps line 2 (the night forecast) with the right-hand update time, even at the longest real forecast text (I2)', () => {
+    // This is the exact shape I2 called out: the detail strip is the one
+    // place in this page where page text (line 2, the wrapped/truncated
+    // night forecast) and a right-aligned indicator (`right`, the update
+    // time) share one line. Probing only the strip's true edge cannot see
+    // an overlap between the two, because the edge itself is unreachable by
+    // either one on its own (see the tests above) — this instead compares
+    // the SAME strip rendered with line 2 blanked out, over the exact
+    // footprint `right` occupies, following the same technique
+    // tests/pages/spotify-page.test.ts already uses for its own I5 finding.
+    const longest =
+      'A slight chance of showers and thunderstorms before 9pm. Partly cloudy. Low around 77, with temperatures rising to around 78 overnight. Heat index values as high as 103. Southwest wind around 7 mph. Chance of precipitation is 20%. New rainfall amounts less than a tenth of an inch possible.'
+    const days = sevenDays()
+    days[0] = fullDay('NOW', {
+      day: periodDetail({ detailedForecast: longest }),
+      night: periodDetail({ detailedForecast: longest }),
+    })
+    const { page } = build({ days, updatedAt: NOW - 3600 }) // right: 'updated 10:46 AM EDT'
+    page.onKeyPress(0)
+    const strip = page.render(NOW).strip
+    expect(strip.right).toBe('updated 10:46 AM EDT')
+
+    // Measure `right`'s own rendered width with the SAME font the renderer
+    // draws it with, per lesson 17 — not a guess.
+    const ctx = createCanvas(1, 1).getContext('2d')
+    ctx.font = `13px ${FONT}`
+    const rightWidth = ctx.measureText(strip.right!).width
+    const rightStart = Math.floor(STRIP_WIDTH - 6 - rightWidth) // 6 = the strip's own PAD
+
+    const withLine2 = renderStrip(strip)
+    // A reference render of the SAME strip with line 2 blanked. If line 2's
+    // real (truncated) content painted anything inside `right`'s own
+    // footprint, the two buffers diverge there — identical pixels in that
+    // whole region is the only way this passes.
+    const withoutLine2 = renderStrip({ ...strip, lines: [strip.lines[0]!, ''] })
+
+    let comparedAnyColumn = false
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      for (let x = rightStart; x < STRIP_WIDTH; x++) {
+        comparedAnyColumn = true
+        expect(probe(withLine2, x, y, STRIP_WIDTH)).toEqual(probe(withoutLine2, x, y, STRIP_WIDTH))
+      }
+    }
+    expect(comparedAnyColumn).toBe(true)
   })
 
   // M2: the grid strip's `updated …`/`offline` honesty signal used to
@@ -867,10 +983,13 @@ describe('WeatherPage detail view strip', () => {
   // on the two forecast paragraphs, with nothing left to say the data might
   // be old. This reuses `StripSpec.right`, the same mechanism other pages
   // already use to share line 2 without dropping either half.
-  it('carries the updated time as `right` on the detail strip, same as the grid', () => {
+  it('carries the updated time as `right` on the detail strip, with the "updated" label, same as the grid (M2, this review)', () => {
+    // Per this round's M2: a bare timestamp here read as part of the
+    // forecast paragraph beside it, losing the `updated` word the grid
+    // strip keeps.
     const { page } = build({ updatedAt: NOW - 3600 }) // 10:46 AM EDT, per the grid strip test
     page.onKeyPress(0)
-    expect(page.render(NOW).strip.right).toBe('10:46 AM EDT')
+    expect(page.render(NOW).strip.right).toBe('updated 10:46 AM EDT')
   })
 
   it('carries "offline" as `right` on the detail strip when the source is offline, instead of dropping the signal', () => {
@@ -896,7 +1015,9 @@ describe('WeatherPage detail view strip', () => {
     page.onKeyPress(0)
     const buffer = renderStrip(page.render(NOW).strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+      for (let x = STRIP_WIDTH - 6; x < STRIP_WIDTH; x++) {
+        expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
+      }
     }
   })
 })

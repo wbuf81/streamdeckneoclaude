@@ -215,23 +215,47 @@ Measured locally on 2026-08-13:
   absent, per the table above, `mode=ro` fails outright. **Do not re-derive this from
   memory of an earlier version of this file; the table above is the measurement.**
 - **The exclusive-lock trap measured previously still stands, and is exactly why the
-  restored fallback is tagged rather than trusted outright.** A live writer holding the
-  database under `PRAGMA locking_mode=exclusive` makes the primary `mode=ro` attempt
+  restored fallback is tagged rather than trusted outright — but "tagged" now depends on
+  the `-wal` sidecar's own size, not on which URI mode answered.** A live writer holding
+  the database under `PRAGMA locking_mode=exclusive` makes the primary `mode=ro` attempt
   fail with `Error: in prepare, database is locked (5)` — and makes the SAME
   `immutable=1` fallback SUCCEED, handing back pre-checkpoint rows as current, exit code
   0, no warning on stderr, because `immutable=1` does not read the WAL at all. The exact
-  condition that makes the fallback unsafe is also the condition that triggers it. This
-  is why a fallback read is never treated as equivalent to a primary one: it is tagged
-  degraded, rendered dimmed on the page, and never allowed to satisfy a freshness
-  check — the user would rather see a slightly old task list, clearly marked, than an
-  empty page, but only for as long as it cannot masquerade as current.
+  condition that makes the fallback unsafe is also the condition that triggers it. A
+  fallback read is therefore never AUTOMATICALLY treated as equivalent to a primary
+  one — but whether it actually IS unsafe on any given read depends on whether the `-wal`
+  held anything for it to miss. See the correction directly below.
+- **CORRECTION (round 3).** An earlier version of this file (and the source code it
+  described) tagged EVERY fallback read degraded, unconditionally, on the reasoning that
+  `immutable=1` never reads the WAL so it might always be missing something. Measured
+  directly on a scratch WAL database, reproducing both states in turn on the SAME file:
+
+  | `-wal` state | `immutable=1` result |
+  | --- | --- |
+  | absent (removed entirely after an auto-checkpoint on connection close) | returned every row a plain `mode=ro` read of the same file did, at the same moment |
+  | present, truncated to exactly 0 bytes (`PRAGMA wal_checkpoint(TRUNCATE)`) | same — exact |
+  | present, non-empty (a writer connection open with a committed-but-uncheckpointed row) | silently OMITTED that row, while a plain `mode=ro` read of the same file, at the same moment, returned it |
+
+  So an absent OR zero-length `-wal` proves the `immutable=1` read is byte-exact — there
+  was nothing in the WAL for it to miss — and unconditional tagging was wrong: it made
+  "degraded" the PERMANENT resting state, because Codex normally has the database open,
+  which makes the fallback the everyday path rather than a rare one. A permanent signal
+  carries no information and trains the user to ignore the one case that matters. The
+  fix checks the `-wal` sidecar's own byte size (one `statSync`, `ENOENT` treated the same
+  as zero) at the moment of the fallback read: zero reports the read as EXACT, non-zero
+  reports it genuinely degraded. This is now the REAL exclusive-lock trap's exact
+  boundary too: the lock only makes the fallback unsafe while a writer has actually left
+  something uncheckpointed in the WAL, which the same byte check catches directly instead
+  of assuming from which URI mode happened to answer.
 - **Current design.** Primary read: `file:<path>?mode=ro` (no `-readonly` flag — the
   table above shows it composes identically with the URI's own `mode=ro` in every case
   tried, so it added nothing). On failure, ONE fallback attempt: `mode=ro&immutable=1`,
-  its result always tagged degraded. If BOTH attempts fail, the page shows the honest
-  unavailable state, exactly as before. The database is never opened read-write, which
-  would create the `-shm` and mutate Codex's own on-disk state — that is the one thing
-  this source must never do, whichever read mode it is trying.
+  its result tagged degraded ONLY when the `-wal` sidecar is non-empty at read time (see
+  the correction above) — an absent or empty `-wal` reports the fallback as exact, the
+  same as a primary read. If BOTH attempts fail, the page shows the honest unavailable
+  state, exactly as before. The database is never opened read-write, which would create
+  the `-shm` and mutate Codex's own on-disk state — that is the one thing this source must
+  never do, whichever read mode it is trying.
 - `window_minutes` needs the same sanity bound `resets_at` already had: a value at or
   beyond roughly a year of minutes is far more likely to be the same figure in
   milliseconds (Codex's own sqlite already writes `updated_at_ms`/`created_at_ms` that
@@ -365,6 +389,16 @@ US National Weather Service, **no API key**. **Rejects requests without a `User-
 - **User decision: percent chance only, NO rainfall amounts.** So `forecastGridData` is
   never fetched and there is no millimetre conversion. (Amounts *are* available there as
   `quantitativePrecipitation` in mm, if that ever changes.)
+- **The conditions tile's raw `windSpeed` line, measured at the key's 11 px font (M3,
+  2026-08-13):** `"8 mph"` (5 characters) is 33.1 px; `"3 to 8 mph"`/`"5 to 8 mph"` (10
+  characters) are 66.2 px; `"10 to 15 mph"` (12 characters, the widest shape a day/night
+  range plus `mph` can realistically take) is **79.5 px**, inside the 81 px usable width
+  with only 1.5 px to spare. This is the same `12 characters` row `@napi-rs/canvas`'s own
+  measured advance table already gives for 11 px (`docs/VERIFIED-FACTS.md`'s "Text budget —
+  a key"), confirmed directly for this specific string rather than assumed from the general
+  row. The margin is thin enough that this line is passed to `renderKey` as a one-candidate
+  array (`[11]`), not a bare `11`, so it is measured and `shrinkToFit`-protected rather than
+  drawn unchecked — a bare `number` in `lineSizes` skips measuring entirely.
 
 ---
 

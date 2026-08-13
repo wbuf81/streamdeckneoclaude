@@ -157,6 +157,18 @@ describe('SpotifyPage layout', () => {
     expect(page.render(NOW).keys[3]!.glyphPulse).toBeUndefined()
   })
 
+  it('M5: gives key 3 no glyphPulse when a failed transport command leaves a STALE "isPlaying" state behind a no-device status', () => {
+    // The real defect: `SpotifySource` sets `status: 'no-device'` on a
+    // 403/404 from a control call but leaves `state` (with `isPlaying`
+    // still true from before the failure) in place until the next poll.
+    // `state?.isPlaying` alone survived that: the key kept thumping beside
+    // a device the source was simultaneously reporting as gone.
+    const { page } = build(player({ isPlaying: true }), 'no-device')
+    const key3 = page.render(NOW).keys[3]!
+    expect(key3.glyphPulse).toBeUndefined()
+    expect(key3.dim).toBe(true)
+  })
+
   it('never calls Date.now() for the thump: the same nowMs always produces the same phase', () => {
     const { page } = build(player({ isPlaying: true }))
     const a = page.render(NOW, 12345).keys[3]!.glyphPulse!.phase
@@ -297,6 +309,16 @@ describe('SpotifyPage tickMs', () => {
     const { page } = build(null, 'no-device')
     expect(page.tickMs).toBeDefined()
     expect(page.tickMs!).toBeLessThan(1000)
+  })
+
+  it('M5: is undefined for a STALE "isPlaying" state behind a no-device status, even though the idle-equaliser case above stays fast', () => {
+    // Distinct from the test above: here `state` is NOT null (a control
+    // failure left the last known snapshot in place, still `isPlaying`),
+    // so the idle-equaliser branch does not apply. The render loop must
+    // not keep ticking at 100 ms for an animation `render()` no longer even
+    // draws for a device the source reports as gone.
+    const { page } = build(player({ isPlaying: true }), 'no-device')
+    expect(page.tickMs).toBeUndefined()
   })
 
   it('is undefined while unauthorized, since key 0 shows the sign-in text, not the animation', () => {

@@ -110,20 +110,66 @@ function period(overrides: Record<string, unknown> = {}) {
   }
 }
 
-/** A realistic 14-period series: today's afternoon, then 6 more full days. */
+/**
+ * Real NWS `startTime`s for one calendar date: the day period starts 06:00
+ * local, the night period 18:00 local — measured live on 2026-08-13, see
+ * docs/VERIFIED-FACTS.md's "Weather" section. `dateStr` is `YYYY-MM-DD`.
+ */
+function dayStart(dateStr: string): string {
+  return `${dateStr}T06:00:00-04:00`
+}
+function nightStart(dateStr: string): string {
+  return `${dateStr}T18:00:00-04:00`
+}
+
+/** `2026-08-14` plus `n` calendar days, so a fixture can build a run of
+ * consecutive real dates without hand-writing each one. */
+function plusDays(base: string, n: number): string {
+  const d = new Date(`${base}T00:00:00Z`)
+  d.setUTCDate(d.getUTCDate() + n)
+  return d.toISOString().slice(0, 10)
+}
+
+/**
+ * A realistic 14-period series: today's afternoon, then 6 more full days.
+ * Per C1: every period MUST carry its own real `startTime` — the review
+ * found this fixture giving every period the SAME default `startTime`,
+ * which parsed to "seven days with one distinct date" and hid the identity
+ * collision entirely. These dates increase one per day, exactly like the
+ * live NWS response.
+ */
 function fullPeriods() {
   const days = ['Thursday', 'Friday', 'Saturday', 'Sunday', 'Monday', 'Tuesday']
+  const today = '2026-08-13'
   const periods = [
-    period({ name: 'This Afternoon', isDaytime: true, temperature: 95, probabilityOfPrecipitation: { value: 96 } }),
-    period({ name: 'Tonight', isDaytime: false, temperature: 77, shortForecast: 'Showers', probabilityOfPrecipitation: { value: 40 } }),
+    period({
+      name: 'This Afternoon',
+      isDaytime: true,
+      temperature: 95,
+      startTime: `${today}T14:00:00-04:00`,
+      endTime: `${today}T18:00:00-04:00`,
+      probabilityOfPrecipitation: { value: 96 },
+    }),
+    period({
+      name: 'Tonight',
+      isDaytime: false,
+      temperature: 77,
+      shortForecast: 'Showers',
+      startTime: nightStart(today),
+      endTime: dayStart(plusDays(today, 1)),
+      probabilityOfPrecipitation: { value: 40 },
+    }),
   ]
   for (const [i, name] of days.entries()) {
+    const date = plusDays(today, i + 1)
     periods.push(
       period({
         name,
         isDaytime: true,
         temperature: 95 - i,
         shortForecast: i % 2 === 0 ? 'Sunny' : 'Partly Sunny',
+        startTime: dayStart(date),
+        endTime: nightStart(date),
         probabilityOfPrecipitation: { value: 33 - i },
       }),
       period({
@@ -131,11 +177,59 @@ function fullPeriods() {
         isDaytime: false,
         temperature: 77 - i,
         shortForecast: 'Clear',
+        startTime: nightStart(date),
+        endTime: dayStart(plusDays(date, 1)),
         probabilityOfPrecipitation: { value: null },
       }),
     )
   }
   return periods
+}
+
+/**
+ * C1's exact measured collision shape: between midnight and 06:00 local, NWS
+ * emits a leading "Overnight" period (isDaytime false) whose `startTime`
+ * falls on the SAME calendar date as the daytime period that follows it.
+ * Measured live: dates `2026-08-14, 2026-08-14, 2026-08-15` for labels
+ * `NOW, THU, FRI` — a bare calendar date collapses tiles 0 and 1.
+ */
+function overnightFirstPeriods() {
+  return [
+    period({
+      name: 'Overnight',
+      isDaytime: false,
+      temperature: 72,
+      shortForecast: 'Patchy Fog',
+      detailedForecast: 'Patchy fog before 8am.',
+      startTime: '2026-08-14T00:00:00-04:00',
+      endTime: dayStart('2026-08-14'),
+      probabilityOfPrecipitation: { value: 20 },
+    }),
+    period({
+      name: 'Thursday',
+      isDaytime: true,
+      temperature: 95,
+      startTime: dayStart('2026-08-14'),
+      endTime: nightStart('2026-08-14'),
+      probabilityOfPrecipitation: { value: 10 },
+    }),
+    period({
+      name: 'Thursday Night',
+      isDaytime: false,
+      temperature: 70,
+      startTime: nightStart('2026-08-14'),
+      endTime: dayStart('2026-08-15'),
+      probabilityOfPrecipitation: { value: 5 },
+    }),
+    period({
+      name: 'Friday',
+      isDaytime: true,
+      temperature: 93,
+      startTime: dayStart('2026-08-15'),
+      endTime: nightStart('2026-08-15'),
+      probabilityOfPrecipitation: { value: 15 },
+    }),
+  ]
 }
 
 function forecastBody(periods: unknown[]) {
@@ -290,6 +384,59 @@ describe('parseForecast', () => {
     ]
     const { days } = parseForecast(forecastBody(periods), NOW)
     expect(days[0]!.emoji).toBe('☀️')
+  })
+
+  // -------------------------------------------------------------------------
+  // day identity (C1): `id` must be UNIQUE per tile, not just stable.
+  // -------------------------------------------------------------------------
+
+  it('gives every tile of a realistic 7-day forecast a distinct id', () => {
+    const { days } = parseForecast(forecastBody(fullPeriods()), NOW)
+    expect(days).toHaveLength(7)
+    expect(new Set(days.map((d) => d.id)).size).toBe(days.length)
+  })
+
+  it('C1: a leading overnight period and the next day both landing on the SAME calendar date still get DIFFERENT ids', () => {
+    // Reproduces the review's exact measured shape: dates
+    // 2026-08-14, 2026-08-14, 2026-08-15 for labels NOW, THU, FRI. A bare
+    // calendar date collides tiles 0 and 1; `id` must not.
+    const { days } = parseForecast(forecastBody(overnightFirstPeriods()), NOW)
+    expect(days).toHaveLength(3)
+    expect(days[0]!.label).toBe('NOW')
+    expect(days[1]!.label).toBe('THU')
+    expect(days[2]!.label).toBe('FRI')
+    // The two colliding tiles really do share a calendar date...
+    expect(days[0]!.id.slice(0, 10)).toBe('2026-08-14')
+    expect(days[1]!.id.slice(0, 10)).toBe('2026-08-14')
+    // ...but their full identities must differ, and every tile's id must be
+    // distinct, so `activeDay`'s `find` can never pick the wrong one.
+    expect(days[0]!.id).not.toBe(days[1]!.id)
+    expect(new Set(days.map((d) => d.id)).size).toBe(days.length)
+    // NOW carries the overnight-only data; THU carries Thursday's own.
+    expect(days[0]!.high).toBeNull() // no day half for the overnight tile
+    expect(days[1]!.high).toBe(95) // Thursday's real high, not the overnight low
+  })
+
+  it('C1: a period with no usable startTime gets the empty-string id, never a fabricated or colliding one', () => {
+    const periods = [
+      period({ startTime: '' }),
+      period({ name: 'Tonight', isDaytime: false, temperature: 77, startTime: '' }),
+    ]
+    const { days } = parseForecast(forecastBody(periods), NOW)
+    expect(days[0]!.id).toBe('')
+  })
+
+  it('logs, but never throws, when two tiles somehow resolve to the same non-empty id', () => {
+    // Pathological input: two "day" periods sharing one startTime. This must
+    // not happen from a real NWS response (per the C1 tests above), but a
+    // collision must fail loudly in the log rather than silently letting
+    // `find` pick the wrong tile later, and it must never throw.
+    const periods = [
+      period({ name: 'Thursday', isDaytime: true, startTime: dayStart('2026-08-14') }),
+      period({ name: 'Thursday Night', isDaytime: false, startTime: nightStart('2026-08-14') }),
+      period({ name: 'Friday', isDaytime: true, startTime: dayStart('2026-08-14') }), // same as Thursday's
+    ]
+    expect(() => parseForecast(forecastBody(periods), NOW)).not.toThrow()
   })
 })
 

@@ -41,8 +41,7 @@ interface Fakes {
   /** Symbols `isSymbolStale` reports true for. */
   staleSymbols: Set<string>
   /** Per-symbol 52-week state. A symbol absent here reports `'unknown'`,
-   * matching the real source before `requestYearly` has ever been called
-   * for it. */
+   * matching the real source before it has ever been watched. */
   yearlyStates: Map<string, YearlyState>
 }
 
@@ -56,7 +55,12 @@ function build(over: Partial<Fakes> = {}) {
     ...over,
   }
   const calls: string[] = []
-  const yearlyRequests: string[] = []
+  // Per M1: the page's only path to a yearly fetch is `setWatchedSymbol`,
+  // called from `onKeyPress`. `watchedSymbolCalls` records every call
+  // (including the `null` that clears it on BACK/leave), so a test can
+  // prove `render()` itself never touches this — the whole point of the
+  // fix — as well as proving `onKeyPress` calls it at the right moments.
+  const watchedSymbolCalls: (string | null)[] = []
   const source = {
     getQuotes: () => f.quotes,
     getStatus: () => f.status,
@@ -64,9 +68,9 @@ function build(over: Partial<Fakes> = {}) {
     isSymbolStale: (symbol: string) => f.staleSymbols.has(symbol),
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
     getYearlyState: (symbol: string): YearlyState => f.yearlyStates.get(symbol) ?? { status: 'unknown' },
-    requestYearly: (symbol: string) => { yearlyRequests.push(symbol) },
+    setWatchedSymbol: (symbol: string | null) => { watchedSymbolCalls.push(symbol) },
   }
-  return { page: new StocksPage(source as never), calls, f, yearlyRequests }
+  return { page: new StocksPage(source as never), calls, f, watchedSymbolCalls }
 }
 
 describe('StocksPage layout', () => {
@@ -245,10 +249,19 @@ describe('StocksPage strip', () => {
     // Measured: `MARKET CLOSED · 4:05 PM EDT` is 211.3 px against the
     // strip's 236 px usable width — verified by pixel probe here, not
     // arithmetic, per docs/LESSONS.md #17.
+    //
+    // Test quality (I2 scan): this grid strip carries no right-aligned
+    // field, so `probe(buffer, STRIP_WIDTH - 1, ...)` alone cannot fail for
+    // ANY input — `renderStrip`'s own `shrinkToFit` (outside this page's
+    // ownership) keeps every line off the true margin regardless of what
+    // this page hands it. This probes the whole margin band, not one
+    // column, as the strongest proof available from this page's surface.
     const { page } = build({ quotes: allQuotes(), marketState: 'closed' })
     const buffer = renderStrip(page.render(NOW).strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+      for (let x = STRIP_WIDTH - 6; x < STRIP_WIDTH; x++) {
+        expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
+      }
     }
   })
 })
@@ -268,6 +281,13 @@ describe('StocksPage presses: entering and leaving detail mode', () => {
     const keys = page.render(NOW).keys
     expect(keys).toHaveLength(8)
     keys.forEach((k, i) => expect(k.lines![0]).toBe(SYMBOLS[i]))
+  })
+
+  it('clears the watched symbol on BACK, so the source stops re-checking a closed detail view', () => {
+    const { page, watchedSymbolCalls } = build({ quotes: allQuotes() })
+    page.onKeyPress(2)
+    page.onKeyPress(7)
+    expect(watchedSymbolCalls).toEqual([SYMBOLS[2], null])
   })
 
   it('does nothing when pressing a key with no quote behind it at all', () => {
@@ -296,6 +316,13 @@ describe('StocksPage presses: entering and leaving detail mode', () => {
     const keys = page.render(NOW).keys
     keys.forEach((k, i) => expect(k.lines![0]).toBe(SYMBOLS[i]))
   })
+
+  it('clears the watched symbol on onLeave too, not just BACK', () => {
+    const { page, watchedSymbolCalls } = build({ quotes: allQuotes() })
+    page.onKeyPress(1)
+    page.onLeave!()
+    expect(watchedSymbolCalls).toEqual([SYMBOLS[1], null])
+  })
 })
 
 describe('StocksPage presses report the real outcome, keys 0 to 7', () => {
@@ -316,13 +343,13 @@ describe('StocksPage presses report the real outcome, keys 0 to 7', () => {
   it('reports ignored, never handled, for a quote with no price (M1): a press that opens nothing must not flash white', () => {
     const quotes = allQuotes()
     quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { price: null, changePercent: null }))
-    const { page, yearlyRequests } = build({ quotes })
+    const { page, watchedSymbolCalls } = build({ quotes })
     expect(page.onKeyPress(0)).toBe('ignored')
     // Confirms the press really did nothing, not just the return value:
     // no detail view opened and no yearly fetch was kicked off.
     expect(page.render(NOW).keys).toHaveLength(8)
     expect(page.render(NOW).keys[0]!.lines![0]).toBe(SYMBOLS[0])
-    expect(yearlyRequests).toEqual([])
+    expect(watchedSymbolCalls).toEqual([])
   })
 
   it('reports handled for BACK (key 7), and ignored for every other key, once a symbol is selected', () => {
@@ -438,23 +465,23 @@ describe('StocksPage detail view layout', () => {
     // chart is drawing the intraday one" by the VALUES, not just the label.
     const yearlyValues = [10, 20, 30, 40, 50]
 
-    it('requests the yearly series for the symbol at the moment it is selected', () => {
+    it('watches the symbol (which itself kicks off the yearly fetch) at the moment it is selected', () => {
       const quotes = allQuotes()
       quotes.set(SYMBOLS[2]!, tslaLikeQuote())
-      const { page, yearlyRequests } = build({ quotes })
+      const { page, watchedSymbolCalls } = build({ quotes })
       page.onKeyPress(2)
-      expect(yearlyRequests).toEqual([SYMBOLS[2]])
+      expect(watchedSymbolCalls).toEqual([SYMBOLS[2]])
     })
 
-    it('does not re-request on every render — only on selection', () => {
+    it('never calls setWatchedSymbol from render — only onKeyPress touches the source about this (M1: render must stay pure)', () => {
       const quotes = allQuotes()
       quotes.set(SYMBOLS[0]!, tslaLikeQuote())
-      const { page, yearlyRequests } = build({ quotes })
+      const { page, watchedSymbolCalls } = build({ quotes })
       page.onKeyPress(0)
       page.render(NOW)
       page.render(NOW)
       page.render(NOW)
-      expect(yearlyRequests).toEqual([SYMBOLS[0]])
+      expect(watchedSymbolCalls).toEqual([SYMBOLS[0]])
     })
 
     it.each(['unknown', 'loading', 'error'] as const)(
@@ -680,23 +707,26 @@ describe('StocksPage detail view layout', () => {
       for (const key of keys.slice(4, 7)) expect(key.dim).not.toBe(true)
     })
 
-    it('asks the source for a fresh copy while the view stays open on a stale cached series (never re-requests once fresh)', () => {
+    it('M1: never asks the source for a fresh copy from render, even while the view stays open on a stale cached series', () => {
+      // Per M1's ruling: `render()` must stay pure (AGENTS.md forbids
+      // network I/O from a page's render path). Keeping the stale-but-open
+      // detail view fresh is now `StockSource`'s own job — it re-checks the
+      // WATCHED symbol on its own intraday poll (proven in
+      // tests/sources/stocks.test.ts) — so this page must call
+      // `setWatchedSymbol` only once, at selection, and never again just
+      // because `render()` ran.
       const quotes = allQuotes()
       quotes.set(SYMBOLS[0]!, tslaLikeQuote())
       const staleUpdatedAt = NOW - (YEARLY_REFRESH_SECONDS + 1)
-      const { page, yearlyRequests } = build({
+      const { page, watchedSymbolCalls } = build({
         quotes,
         yearlyStates: new Map([[SYMBOLS[0]!, { status: 'ok', values: staleYearly, updatedAt: staleUpdatedAt }]]),
       })
-      page.onKeyPress(0) // clears yearlyRequests below, since selection itself always requests once
-      yearlyRequests.length = 0
+      page.onKeyPress(0)
+      watchedSymbolCalls.length = 0
       page.render(NOW)
       page.render(NOW)
-      expect(yearlyRequests).toEqual([SYMBOLS[0], SYMBOLS[0]])
-      // (The real source's own cooldown/in-flight guards, proven in
-      // tests/sources/stocks.test.ts, are what keep this from becoming an
-      // actual network request per render tick — this page is only asking,
-      // never fetching directly.)
+      expect(watchedSymbolCalls).toEqual([])
     })
 
     it('never draws stale closes under the 52 WK label while a fresh copy is still loading — the label always matches the cached values', () => {
@@ -855,13 +885,21 @@ describe('StocksPage detail view strip', () => {
   })
 
   it('never draws detail-strip text past the strip edge', () => {
+    // Test quality (I2 scan): this detail strip also carries no
+    // right-aligned field (both lines are plain text), so a single-column
+    // probe at the true edge cannot fail for ANY input — widened to a band,
+    // and driven with the longest real company name on record
+    // (docs/VERIFIED-FACTS.md's "Space Exploration Technologies Corp.") so
+    // the content is not trivially short of the margin either.
     const quotes = allQuotes()
-    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { name: 'Space Exploration Technologies Corp.' }))
     const { page } = build({ quotes, marketState: 'closed' })
     page.onKeyPress(0)
     const buffer = renderStrip(page.render(NOW).strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
-      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+      for (let x = STRIP_WIDTH - 6; x < STRIP_WIDTH; x++) {
+        expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
+      }
     }
   })
 })

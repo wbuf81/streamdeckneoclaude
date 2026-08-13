@@ -20,17 +20,32 @@ export interface DayForecast {
   /** Short label for the key, for example `THU`. `NOW` for the current period. */
   label: string
   /**
-   * A stable calendar-date identity for this day tile, `YYYY-MM-DD`, taken
-   * from the anchor period's own `startTime`. Per docs/LESSONS.md lesson 19:
-   * the array this came from is rebuilt from scratch on every poll, and its
-   * length and contents shift as periods expire (the period at `label` "NOW"
-   * changes which real day it is every time the current period ends). A page
-   * that keeps only the array INDEX of the day the user opened would silently
-   * follow whatever day slides into that index next, not the day the user
-   * actually selected. `date` never changes for the same real day, so it is
-   * what a page should persist across a poll instead of the index.
+   * A stable, UNIQUE identity for this day tile, taken from the anchor
+   * period's own `startTime` plus whether the anchor is a day or a night
+   * period: `"2026-08-14:day"`, never a bare calendar date. Per
+   * docs/LESSONS.md lesson 19: the array this came from is rebuilt from
+   * scratch on every poll, and its length and contents shift as periods
+   * expire (the period at `label` "NOW" changes which real day it is every
+   * time the current period ends). A page that keeps only the array INDEX
+   * of the day the user opened would silently follow whatever day slides
+   * into that index next, not the day the user actually selected. `id`
+   * never changes for the same real day-half, so it is what a page should
+   * persist across a poll instead of the index.
+   *
+   * A bare calendar date is NOT enough: between midnight and 06:00 local,
+   * NWS emits a leading "Overnight" period (isDaytime false) whose
+   * `startTime` falls on the SAME calendar date as the daytime period that
+   * follows it, so tile 0 (NOW, the overnight half) and tile 1 (that same
+   * date's day-plus-night pair) would collide on a bare date — a real
+   * defect measured live, see docs/PROJECT-STATE.md's review history. The
+   * `:day`/`:night` suffix is what makes the two tiles distinguishable.
+   *
+   * Empty when the anchor period carries no usable `startTime` — this tile
+   * then has NO identity at all and a page must never let it be selected
+   * (see `WeatherPage.activeDay`/`onKeyPress`), rather than risk two
+   * identity-less tiles colliding on the same empty string.
    */
-  date: string
+  id: string
   emoji: string
   high: number | null
   low: number | null
@@ -147,6 +162,20 @@ function dateOf(period: unknown): string {
   return strOf(period, 'startTime').slice(0, 10)
 }
 
+/**
+ * The tile identity for `anchor`: its calendar date plus `:day` or `:night`,
+ * so two tiles anchored on the SAME calendar date (an overnight period and
+ * the daytime period that follows it, per C1) never collide. Empty when
+ * `anchor` is null or carries no usable `startTime` — a tile with no
+ * identity, which `WeatherPage` must never treat as selectable.
+ */
+function identityOf(anchor: unknown | null): string {
+  if (anchor === null) return ''
+  const date = dateOf(anchor)
+  if (!date) return ''
+  return `${date}:${boolOf(anchor, 'isDaytime') ? 'day' : 'night'}`
+}
+
 function boolOf(period: unknown, key: string): boolean {
   return asObj(period)[key] === true
 }
@@ -224,7 +253,7 @@ function buildDay(label: string, day: unknown | null, night: unknown | null): Da
   const shortForecast = strOf(anchor, 'shortForecast')
   return {
     label,
-    date: dateOf(anchor),
+    id: identityOf(anchor),
     emoji: weatherEmoji(shortForecast),
     high,
     low,
@@ -272,7 +301,33 @@ export function parseForecast(
     i += hasNight ? 2 : 1
   }
 
+  checkIdentitiesUnique(days)
   return { days, conditions }
+}
+
+/**
+ * Per C1: an identity that is not actually unique is the same failure as no
+ * identity at all — `Array.prototype.find` silently returns the wrong tile.
+ * This never throws (a page must keep working), but a collision between two
+ * REAL identities (both non-empty) is a defect in the data or in
+ * `identityOf` itself, so it is logged loudly rather than trusted silently.
+ * A period with no `startTime` gives the empty-string identity, which is
+ * expected to repeat (every identity-less tile is equally unselectable) and
+ * is not logged here.
+ */
+function checkIdentitiesUnique(days: readonly DayForecast[]): void {
+  const seen = new Set<string>()
+  for (const d of days) {
+    if (d.id === '') continue
+    if (seen.has(d.id)) {
+      log.once(
+        `weather-day-identity-collision-${d.id}`,
+        `Two day tiles resolved to the same identity (${d.id}); the day tile is unreliable this poll.`,
+      )
+      continue
+    }
+    seen.add(d.id)
+  }
 }
 
 function parseZipBody(body: unknown): Coordinates | null {
