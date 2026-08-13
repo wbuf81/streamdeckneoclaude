@@ -19,20 +19,35 @@ export interface ImageCrop {
   sh: number
 }
 
-export interface PulseSpec {
+/**
+ * The three cyberpunk idle animations task 39 built to replace the old green
+ * equaliser (see `IdleSpec` below). `spotify-page.ts`'s `IDLE_VARIANT`
+ * constant is the one switch between them — the user picks, not the agent.
+ */
+export type IdleVariant = 'grid' | 'rain' | 'glitch'
+
+export interface IdleSpec {
+  /** Which animation `render/canvas.ts` draws. */
+  variant: IdleVariant
   /**
-   * Radians, already advanced by both the render clock and this key's own
-   * offset. The Spotify page computes this fresh on every `render(now,
-   * nowMs)` call from `nowMs` plus a fixed per-key offset, so two renders at
-   * different clocks — or two of the four idle art keys at the SAME clock —
-   * carry different values here. That is what lets the four keys
-   * phase-shift against each other and lets time actually move the bars; a
-   * static spec would freeze after the first frame.
+   * The render clock, forwarded unchanged from the page's own `nowMs` — never
+   * `Date.now()`, so the renderer can compute the whole animation from one
+   * deterministic value. The Spotify page recomputes this on every `render`
+   * call, so two renders at different clocks carry different values here;
+   * that is what lets time actually move the animation instead of freezing
+   * after the first frame (lesson 11 in docs/LESSONS.md — the exact defect
+   * this field's predecessor, `PulseSpec.phase`, existed to avoid).
    */
-  phase: number
-  /** Number of vertical bars drawn across the key. */
-  bars: number
-  color: Rgb
+  nowMs: number
+  /**
+   * This key's position in the 2x2 album-art block: `col` 0 is left, 1 is
+   * right; `row` 0 is top, 1 is bottom. Each of the four keys renders its own
+   * quadrant of one shared design deterministically from `nowMs` plus this
+   * position — no two keys share both values, so `keyHash` (which includes
+   * this whole object) always tells them apart.
+   */
+  col: 0 | 1
+  row: 0 | 1
 }
 
 export interface SparkSpec {
@@ -192,15 +207,15 @@ export interface KeySpec {
   /** A small series drawn as vertical bars. Used by the stocks page. */
   spark?: SparkSpec
   /**
-   * A slow-breathing equaliser animation, drawn as vertical bars, for a key
-   * with nothing else to show. Used by the Spotify page's four album-art
-   * keys while nothing is playing. `keyHash` uses this like any other
-   * field — `phase` changes on every render call, and without it in the
-   * hash the daemon's dirty-key check would see no difference and the
-   * animation would freeze after one frame, the exact defect lesson 11 in
+   * A slow, ambient cyberpunk animation for a key with nothing else to show —
+   * used by the Spotify page's four album-art keys while nothing is playing
+   * (task 39, replacing the earlier green equaliser). `keyHash` uses this
+   * like any other field — `nowMs` changes on every render call, and without
+   * it in the hash the daemon's dirty-key check would see no difference and
+   * the animation would freeze after one frame, the exact defect lesson 11 in
    * docs/LESSONS.md describes for the same four keys' `imageCrop`.
    */
-  pulse?: PulseSpec
+  idle?: IdleSpec
   dim?: boolean
   /**
    * A thin outline drawn around the whole key perimeter, on top of every

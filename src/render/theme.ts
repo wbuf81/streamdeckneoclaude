@@ -26,6 +26,17 @@ export const theme = {
    */
   flashWhite: [185, 185, 190] as Rgb,
   flashRed: [165, 55, 55] as Rgb,
+  /**
+   * Task 39's cyberpunk idle animation (Spotify page, `IdleSpec` in
+   * `render/specs.ts`), replacing the old green equaliser. `neonMagenta` is
+   * the one new hue this task adds — every other idle colour reuses `cyan`
+   * (already in this palette) and `bg`/`text`, so the animation stays inside
+   * a small, deliberate set rather than inventing a wide new range. Named
+   * `neonMagenta` rather than plain `magenta` so it reads, at the call site,
+   * as a deliberate design choice for this animation rather than a generic
+   * colour any page might reach for.
+   */
+  neonMagenta: [255, 45, 175] as Rgb,
 } as const
 
 /** Every value the `state` field can hold, plus the fallback. */

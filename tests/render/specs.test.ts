@@ -218,29 +218,45 @@ describe('keyHash', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
-  // Task 27's idle equaliser: the Spotify page recomputes `pulse.phase` from
-  // `nowMs` on every render call, and that is the ONLY thing that changes
-  // frame to frame — bars, color and kind all stay fixed. If `phase` were
-  // ever missing from the hash, the daemon's dirty-key check would see no
-  // difference between two ticks and the animation would freeze after its
-  // first frame — lesson 11 in docs/LESSONS.md, the same defect that once
-  // hit this page's `imageCrop`.
-  it('differs when the pulse phase changes, so the daemon keeps redrawing the idle animation', () => {
-    const a: KeySpec = { kind: 'control', pulse: { phase: 0, bars: 6, color: [70, 200, 110] } }
-    const b: KeySpec = { kind: 'control', pulse: { phase: 1, bars: 6, color: [70, 200, 110] } }
+  // Task 39's cyberpunk idle animation (replacing task 27's green
+  // equaliser): the Spotify page recomputes `idle.nowMs` on every render
+  // call, and that is the ONLY thing that changes frame to frame — variant,
+  // col and row all stay fixed for a given key. If `nowMs` were ever missing
+  // from the hash, the daemon's dirty-key check would see no difference
+  // between two ticks and the animation would freeze after its first frame —
+  // lesson 11 in docs/LESSONS.md, the same defect that once hit this page's
+  // `imageCrop`.
+  it('differs when idle.nowMs changes, so the daemon keeps redrawing the idle animation', () => {
+    const a: KeySpec = { kind: 'control', idle: { variant: 'grid', nowMs: 0, col: 0, row: 0 } }
+    const b: KeySpec = { kind: 'control', idle: { variant: 'grid', nowMs: 1000, col: 0, row: 0 } }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
-  it('matches when the pulse spec is equal', () => {
-    const a: KeySpec = { kind: 'control', pulse: { phase: 0.5, bars: 6, color: [70, 200, 110] } }
-    const b: KeySpec = { kind: 'control', pulse: { phase: 0.5, bars: 6, color: [70, 200, 110] } }
+  // The four idle art keys share `variant` and `nowMs` at one instant but
+  // never share BOTH `col` and `row` — without that pair in the hash, three
+  // of the four quadrants would collide on one hash and never redraw
+  // independently, the same class of bug lesson 11 describes for
+  // `imageCrop` spanning the same four keys.
+  it('differs when idle.col or idle.row changes, even with the same variant and nowMs', () => {
+    const a: KeySpec = { kind: 'control', idle: { variant: 'grid', nowMs: 500, col: 0, row: 0 } }
+    const b: KeySpec = { kind: 'control', idle: { variant: 'grid', nowMs: 500, col: 1, row: 0 } }
+    const c: KeySpec = { kind: 'control', idle: { variant: 'grid', nowMs: 500, col: 0, row: 1 } }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+    expect(keyHash(a)).not.toBe(keyHash(c))
+    expect(keyHash(b)).not.toBe(keyHash(c))
+  })
+
+  it('matches when the idle spec is equal', () => {
+    const a: KeySpec = { kind: 'control', idle: { variant: 'rain', nowMs: 500, col: 1, row: 0 } }
+    const b: KeySpec = { kind: 'control', idle: { variant: 'rain', nowMs: 500, col: 1, row: 0 } }
     expect(keyHash(a)).toBe(keyHash(b))
   })
 
   // Task 33's 52-week detail chart: without `label` in the hash, switching
   // the caption from `1D` to `52 WK` once the yearly fetch resolves would
   // leave the OLD caption on the glass — the same defect lesson 11 already
-  // caught for `imageCrop` and `pulse.phase`, now for a spark caption.
+  // caught for `imageCrop` and the idle animation's `nowMs`, now for a spark
+  // caption.
   it('differs when spark.label changes, even with the same values and colour', () => {
     const values = [1, 2, 3]
     const color: Rgb = [70, 200, 110]

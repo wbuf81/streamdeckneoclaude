@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import { createCanvas } from '@napi-rs/canvas'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
@@ -84,10 +85,10 @@ describe('SpotifyPage layout', () => {
     const { page } = build(null, 'unauthorized')
     const keys = page.render(NOW).keys
     expect(keys[0]!.lines!.join(' ')).toContain('SIGN IN')
-    expect(keys[0]!.pulse).toBeUndefined()
+    expect(keys[0]!.idle).toBeUndefined()
     for (const i of [1, 4, 5]) {
       expect(keys[i]!.kind).toBe('blank')
-      expect(keys[i]!.pulse).toBeUndefined()
+      expect(keys[i]!.idle).toBeUndefined()
     }
   })
 
@@ -224,41 +225,58 @@ describe('SpotifyPage layout', () => {
   })
 })
 
-describe('SpotifyPage idle equaliser (nothing playing)', () => {
-  it('gives keys 0, 1, 4 and 5 a pulse spec, and no lines, glyph or image', () => {
+describe('SpotifyPage idle animation (nothing playing) — task 39, replacing the old green equaliser', () => {
+  it('gives keys 0, 1, 4 and 5 an idle spec, and no lines, glyph or image', () => {
     const { page } = build(null, 'no-device')
     const keys = page.render(NOW).keys
     for (const i of [0, 1, 4, 5]) {
-      expect(keys[i]!.pulse).toBeDefined()
+      expect(keys[i]!.idle).toBeDefined()
       expect(keys[i]!.lines).toBeUndefined()
       expect(keys[i]!.glyph).toBeUndefined()
       expect(keys[i]!.image).toBeUndefined()
     }
   })
 
-  it('gives the four idle keys four different phases at the same instant', () => {
+  // Key 0 is top-left (col 0, row 0), key 1 is top-right (col 1, row 0),
+  // key 4 is bottom-left (col 0, row 1), key 5 is bottom-right (col 1,
+  // row 1) — matching the same 2x2 layout the album-art crops already use.
+  // Without each key naming its own distinct corner, three of the four
+  // quadrants of a scene-based animation would draw the identical corner,
+  // the same class of defect lesson 11 describes for `imageCrop`.
+  it('gives each of the four idle keys its own distinct col/row position', () => {
+    const { page } = build(null, 'no-device')
+    const keys = page.render(NOW).keys
+    expect(keys[0]!.idle).toMatchObject({ col: 0, row: 0 })
+    expect(keys[1]!.idle).toMatchObject({ col: 1, row: 0 })
+    expect(keys[4]!.idle).toMatchObject({ col: 0, row: 1 })
+    expect(keys[5]!.idle).toMatchObject({ col: 1, row: 1 })
+  })
+
+  it('gives all four idle keys the same variant and the same nowMs at one instant', () => {
     const { page } = build(null, 'no-device')
     const keys = page.render(NOW, 5000).keys
-    const phases = [0, 1, 4, 5].map((i) => keys[i]!.pulse!.phase)
-    expect(new Set(phases).size).toBe(4)
+    for (const i of [0, 1, 4, 5]) {
+      expect(keys[i]!.idle!.variant).toBe(keys[0]!.idle!.variant)
+      expect(keys[i]!.idle!.nowMs).toBe(5000)
+    }
   })
 
-  it('advances the phase as nowMs advances', () => {
+  it('advances idle.nowMs as nowMs advances', () => {
     const { page } = build(null, 'no-device')
-    const phaseAt = (nowMs: number) => page.render(NOW, nowMs).keys[0]!.pulse!.phase
-    expect(phaseAt(0)).not.toBe(phaseAt(2000))
+    const nowMsAt = (nowMs: number) => page.render(NOW, nowMs).keys[0]!.idle!.nowMs
+    expect(nowMsAt(0)).not.toBe(nowMsAt(2000))
   })
 
-  it('never calls Date.now(): the same nowMs always produces the same phase', () => {
+  it('never calls Date.now(): the same nowMs always produces the same idle spec', () => {
     const { page } = build(null, 'no-device')
-    const a = page.render(NOW, 12345).keys[0]!.pulse!.phase
-    const b = page.render(NOW, 12345).keys[0]!.pulse!.phase
-    expect(a).toBe(b)
+    const a = page.render(NOW, 12345).keys[0]!.idle
+    const b = page.render(NOW, 12345).keys[0]!.idle
+    expect(a).toEqual(b)
   })
 
   // Lesson 17: measure the actual rendered pixels, not just the spec fields.
   // A render at two different clocks must produce two different key buffers,
-  // proving the bars themselves move, not just some inert number in the spec.
+  // proving the animation itself moves, not just some inert number in the spec.
   it('renders visibly different pixels for the same key at two different clocks', () => {
     const { page } = build(null, 'no-device')
     const bufA = renderKey(page.render(NOW, 0).keys[0]!)
@@ -267,8 +285,8 @@ describe('SpotifyPage idle equaliser (nothing playing)', () => {
   })
 
   // And the four keys, rendered at the SAME clock, must differ from each
-  // other too — proving the per-key phase offset actually reaches the pixels,
-  // not just the spec.
+  // other too — proving the per-key col/row actually reaches the pixels, not
+  // just the spec.
   it('renders visibly different pixels for all four idle keys at the same clock', () => {
     const { page } = build(null, 'no-device')
     const frame = page.render(NOW, 1500)
@@ -284,7 +302,47 @@ describe('SpotifyPage idle equaliser (nothing playing)', () => {
     const { page } = build(player({ isPlaying: false }), 'ok', null)
     const keys = page.render(NOW).keys
     for (const i of [0, 1, 4, 5]) {
-      expect(keys[i]!.pulse).toBeUndefined()
+      expect(keys[i]!.idle).toBeUndefined()
+    }
+  })
+
+  // The coordinator's specific concern for this task: a tick that only
+  // advances the idle animation must touch exactly the FOUR art keys' hashes
+  // (0, 1, 4 and 5) — never all eight, and never a different set of four —
+  // so the daemon's dirty-key check (src/daemon.ts, `keyHash`) writes only
+  // those four keys to the device. `now` (the playback position clock) plays
+  // no role here since nothing is loaded; only `nowMs` (the animation clock)
+  // advances.
+  it('changes exactly the four art keys\' hashes (0, 1, 4, 5) when only nowMs advances while idle', () => {
+    const { page } = build(null, 'no-device')
+    const before = page.render(NOW, 1000).keys.map((k) => keyHash(k))
+    const after = page.render(NOW, 1100).keys.map((k) => keyHash(k))
+    const changedIndices = before.map((h, i) => (h !== after[i] ? i : -1)).filter((i) => i >= 0)
+    expect(changedIndices).toEqual([0, 1, 4, 5])
+  })
+})
+
+describe('SpotifyPage playing state stays untouched by the idle-animation rewrite (task 39)', () => {
+  // Golden hashes captured from the pre-task-39 implementation (the old
+  // green equaliser), for the exact same fixture this file already uses
+  // everywhere else. Task 39 only touches the idle-state branches
+  // (`primaryArtKey`/`spanArtKey`'s `!state` case) — the play/pause, volume
+  // "thump," previous and next keys must render BYTE-IDENTICAL to before,
+  // proving the rewrite left the playing state alone rather than merely
+  // "probably" leaving it alone.
+  const GOLDEN_SHA256: Record<number, string> = {
+    2: 'ecccfec53d18d947937fcb88520e2b64ed320327fd2918c377f149ee9c3e9ccb',
+    3: '5b5c93cce80786cddbe57a4ecd5b194e4869ba4f5d35224a55e5f97cfdbb04ff',
+    6: '4e55e2edd99a626a6c304b105a624f81c189cdfcb592ea37cb7870b345893c51',
+    7: '3ba9b075332a7c7e243074a477cf126319b24b46be9a920b727dcf2f33df1865',
+  }
+
+  it('renders keys 2, 3, 6 and 7 byte-identical to the pre-task-39 build while playing', () => {
+    const { page } = build(player({ isPlaying: true }))
+    const frame = page.render(NOW, 1000)
+    for (const i of [2, 3, 6, 7]) {
+      const sha = createHash('sha256').update(renderKey(frame.keys[i]!)).digest('hex')
+      expect(sha).toBe(GOLDEN_SHA256[i])
     }
   })
 })

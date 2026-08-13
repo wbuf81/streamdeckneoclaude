@@ -1,5 +1,5 @@
 import { createCanvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
-import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, PulseSpec } from './specs.js'
+import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, IdleSpec } from './specs.js'
 import { theme } from './theme.js'
 
 export const KEY_SIZE = 96
@@ -28,11 +28,13 @@ const SPARK_FULL_H = 84
  * the text never touches the bars.
  */
 const SPARK_LABEL_BAND_H = 18
-/** The idle equaliser uses the same full-height band as a chart-only spark:
- * a pulse key carries no text, so it may as well use nearly the whole tile
- * instead of the smaller lower band a key with labels would leave for it. */
-const PULSE_Y = 6
-const PULSE_H = 84
+/**
+ * Shared geometry for the three cyberpunk idle animations (task 39): the
+ * scene each of the four album-art keys deterministically draws its own
+ * quadrant of. `IDLE_SCENE` is exactly two key widths, so `col`/`row` (0 or
+ * 1) place a key's own 96x96 window at one corner of it.
+ */
+const IDLE_SCENE = KEY_SIZE * 2
 /**
  * Usable text width of one key: 96 − 3 border − 6 padding each side.
  * Matches docs/VERIFIED-FACTS.md's measured text budget table. Used to
@@ -179,9 +181,30 @@ function css(c: Rgb, dim = false): string {
   return `rgb(${Math.round(c[0] * f)},${Math.round(c[1] * f)},${Math.round(c[2] * f)})`
 }
 
+/** Same colour rule as `css`, but with an explicit alpha channel — used by
+ * the idle animations for translucent scanlines and fading trails, where a
+ * fully opaque fill would be too heavy for a background decoration. */
+function cssAlpha(c: Rgb, alpha: number, dim = false): string {
+  const f = dim ? DIM_FACTOR : 1
+  return `rgba(${Math.round(c[0] * f)},${Math.round(c[1] * f)},${Math.round(c[2] * f)},${alpha})`
+}
+
 function clamp01(n: number): number {
   if (!Number.isFinite(n)) return 0
   return Math.min(1, Math.max(0, n))
+}
+
+/**
+ * Deterministic pseudo-random value in [0, 1) from an integer seed. No
+ * internal state and never `Math.random()` — the same seed always returns
+ * the same value, which is what lets two renders at the same `nowMs`
+ * produce byte-identical frames (lesson 11 in docs/LESSONS.md). Used by the
+ * idle animations to pick stable-looking "random" positions and characters
+ * from plain arithmetic on `nowMs`, a column index, or a key's position.
+ */
+function pseudoRandom(seed: number): number {
+  const x = Math.sin(seed * 12.9898) * 43758.5453
+  return x - Math.floor(x)
 }
 
 function drawBar(
@@ -298,39 +321,252 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
   }
 }
 
-/**
- * Draws a slow-breathing equaliser: `bars` vertical bars, each one's height
- * a sine wave of `phase`, offset from its neighbours so the bars do not all
- * move in lockstep. Bars are bottom-anchored, spanning the same `x0`-to-`x1`
- * margin `drawSpark` uses, over the `PULSE_Y`/`PULSE_H` band. `bars <= 0`
- * draws nothing, so a bad spec cannot throw inside the render loop.
- */
-function drawPulse(ctx: SKRSContext2D, pulse: PulseSpec, dim: boolean): void {
-  const { phase, bars, color } = pulse
-  if (bars <= 0) return
+// --- Task 39: cyberpunk idle animations (Spotify page, nothing playing) ---
+//
+// Three variants replace the old green equaliser. Each key draws its own
+// 96x96 window of one shared `IDLE_SCENE`x`IDLE_SCENE` (192x192) design,
+// picked out by `idle.col`/`idle.row` — `ctx.translate` shifts the whole
+// scene so this key's own corner lands at (0, 0), and the canvas's own
+// bounds crop away the rest, so no explicit clipping is needed. `grid` and
+// `glitch` use this virtual-scene approach; `rain` instead gives each key
+// its own independent columns, seeded by its position — both are valid
+// choices per the task brief, and each variant says which it took above its
+// own function.
+//
+// All three are driven only by `idle.nowMs` (never `Date.now()`) and by
+// `idle.col`/`idle.row`, so two renders at the same `nowMs` are always
+// byte-identical and the four keys always draw distinguishably from one
+// another — the same determinism `PulseSpec.phase` guaranteed for the
+// animation this replaces.
 
+/** Vertical centre, at rest, of the synthwave sun in `drawIdleGrid`'s scene
+ * coordinates — high enough that its lower slats sit near the horizon. */
+const GRID_SUN_BASE_Y = 74
+const GRID_SUN_RADIUS = 46
+/** How far, and how often, the sun bobs up and down. Small and slow: this is
+ * what keeps the two SKY keys (row 0) animating too, since nothing else in
+ * that half of the scene moves. */
+const GRID_SUN_BOB_AMPLITUDE = 4
+const GRID_SUN_BOB_PERIOD_MS = 9000
+/** Background-coloured slats cut across the sun's lower half, classic
+ * synthwave style — gaps grow wider toward the bottom via the `1.6` power
+ * curve below, rather than being evenly spaced. */
+const GRID_SUN_SLAT_COUNT = 5
+/** Boundary between the sky (row 0 keys) and the grid floor (row 1 keys) —
+ * exactly the middle of the 192px scene, so it falls precisely on the seam
+ * between the two key rows. */
+const GRID_HORIZON_Y = KEY_SIZE
+/** One full cycle of the floor scrolling toward the viewer, in milliseconds.
+ * Slow, so the grid reads as gliding rather than racing. */
+const GRID_SCROLL_PERIOD_MS = 6000
+const GRID_HLINE_COUNT = 7
+const GRID_VLINE_COUNT = 6
+
+/**
+ * Neon grid horizon. Virtual-192x192-scene variant: a synthwave sun made of
+ * horizontal slats sits on a horizon line spanning the top two keys, and a
+ * perspective floor of converging lines scrolls toward the viewer across the
+ * bottom two.
+ */
+function drawIdleGrid(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
+  const originX = idle.col * KEY_SIZE
+  const originY = idle.row * KEY_SIZE
+  ctx.save()
+  ctx.translate(-originX, -originY)
+
+  const cx = IDLE_SCENE / 2
+  const bob = GRID_SUN_BOB_AMPLITUDE * Math.sin((idle.nowMs / GRID_SUN_BOB_PERIOD_MS) * 2 * Math.PI)
+  const sunY = GRID_SUN_BASE_Y + bob
+
+  ctx.fillStyle = css(theme.neonMagenta, dim)
+  ctx.beginPath()
+  ctx.arc(cx, sunY, GRID_SUN_RADIUS, 0, Math.PI * 2)
+  ctx.fill()
+
+  // Slats are background-coloured, so they read as gaps regardless of `dim`
+  // — the background itself is what shows through, never a separate colour
+  // that would need its own dimming.
+  ctx.fillStyle = css(theme.bg)
+  for (let i = 0; i < GRID_SUN_SLAT_COUNT; i++) {
+    const frac = Math.pow((i + 1) / (GRID_SUN_SLAT_COUNT + 1), 1.6)
+    const bandY = sunY + frac * GRID_SUN_RADIUS
+    const bandH = 2 + i * 1.4
+    ctx.fillRect(cx - GRID_SUN_RADIUS - 2, bandY, GRID_SUN_RADIUS * 2 + 4, bandH)
+  }
+
+  ctx.fillStyle = css(theme.cyan, dim)
+  ctx.fillRect(0, GRID_HORIZON_Y - 1, IDLE_SCENE, 2)
+
+  // Perspective floor, below the horizon only. Lines bunch up near the
+  // horizon and spread out toward the viewer; `scrollFrac` advances them
+  // over time and loops, so the floor appears to travel toward the camera.
+  const depth = IDLE_SCENE - GRID_HORIZON_Y
+  const scrollFrac = (idle.nowMs % GRID_SCROLL_PERIOD_MS) / GRID_SCROLL_PERIOD_MS
+  ctx.fillStyle = css(theme.cyan, dim)
+  for (let i = 0; i < GRID_HLINE_COUNT; i++) {
+    const t = (i + scrollFrac) / GRID_HLINE_COUNT
+    if (t <= 0 || t >= 1) continue
+    const y = GRID_HORIZON_Y + depth * t * t
+    ctx.fillRect(0, Math.round(y), IDLE_SCENE, 1)
+  }
+
+  ctx.strokeStyle = css(theme.cyan, dim)
+  ctx.lineWidth = 1
+  for (let i = 0; i <= GRID_VLINE_COUNT; i++) {
+    const bottomX = (i / GRID_VLINE_COUNT) * IDLE_SCENE
+    ctx.beginPath()
+    ctx.moveTo(cx, GRID_HORIZON_Y)
+    ctx.lineTo(bottomX, IDLE_SCENE)
+    ctx.stroke()
+  }
+
+  ctx.restore()
+}
+
+/** Columns per key. Spread across the same usable width `drawSpark` uses. */
+const RAIN_COLS = 6
+/** Characters kept trailing behind each column's lead glyph. */
+const RAIN_TRAIL = 6
+const RAIN_CHAR_H = 13
+const RAIN_FONT_SIZE = 12
+/**
+ * Plain ASCII only — no emoji, no Unicode block that risks a `.notdef` tofu
+ * box on a font that does not cover it (task 37's lesson in
+ * `render/canvas.ts`'s own `GLYPH_SIZE` comment). Menlo, this file's one
+ * text font, covers all of these.
+ */
+const RAIN_CHARSET = ['0', '1', '$', '%', '#', '@', '&', '+', '=', '-', '/', '\\', '<', '>', '*']
+/** How long one column takes to fall the full height of the key, before its
+ * per-column random variation and its own per-column offset. Slow and
+ * ambient, never a fast scroll. */
+const RAIN_SPEED_BASE_MS = 3800
+const RAIN_SPEED_VARIANCE_MS = 2600
+
+/**
+ * Glyph rain. Per-key variant (each key owns its own independent columns,
+ * seeded from its `col`/`row` position rather than from a shared scene) —
+ * cyan and near-white rather than the Matrix's green, sparse enough to read
+ * as atmosphere behind the deck rather than dense noise.
+ */
+function drawIdleRain(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
+  const keyIndex = idle.row * 2 + idle.col
   const x0 = BORDER + PAD
   const x1 = KEY_SIZE - PAD
-  const width = x1 - x0
-  const barW = width / bars
-  const bottom = PULSE_Y + PULSE_H
-  // Never fully flat: even the quietest bar keeps a sliver, so the key reads
-  // as an equaliser "at rest" rather than something that occasionally turns
-  // off entirely.
-  const minH = PULSE_H * 0.1
-  const maxH = PULSE_H
+  const colSpacing = (x1 - x0) / RAIN_COLS
+  // The full distance a drop travels before it loops, including its own
+  // trail length, so the whole trail exits the bottom before a new drop
+  // starts at the top — otherwise the loop point would visibly pop.
+  const travel = KEY_SIZE + RAIN_TRAIL * RAIN_CHAR_H
 
-  ctx.fillStyle = css(color, dim)
-  for (let i = 0; i < bars; i++) {
-    // Each bar samples the same wave a fraction further along, so within one
-    // key the bars ripple rather than all breathing together.
-    const t = phase + i * ((2 * Math.PI) / bars)
-    const frac = 0.5 + 0.5 * Math.sin(t)
-    const h = minH + frac * (maxH - minH)
-    const x = x0 + i * barW
-    const w = Math.max(1, barW - 2)
-    const y = bottom - h
-    ctx.fillRect(x, y, w, h)
+  ctx.font = `${RAIN_FONT_SIZE}px ${FONT}`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+
+  for (let c = 0; c < RAIN_COLS; c++) {
+    const seed = keyIndex * 97 + c * 13
+    const speed = RAIN_SPEED_BASE_MS + pseudoRandom(seed) * RAIN_SPEED_VARIANCE_MS
+    const phase = pseudoRandom(seed + 1) * speed
+    const t = ((idle.nowMs + phase) % speed) / speed
+    const headY = -RAIN_TRAIL * RAIN_CHAR_H + t * travel
+    const x = x0 + c * colSpacing + colSpacing / 2
+
+    for (let i = 0; i < RAIN_TRAIL; i++) {
+      const y = headY - i * RAIN_CHAR_H
+      if (y < -RAIN_CHAR_H || y > KEY_SIZE + RAIN_CHAR_H) continue
+      const glyphIndex = Math.floor(pseudoRandom(seed * 31 + i * 7) * RAIN_CHARSET.length)
+      const glyph = RAIN_CHARSET[glyphIndex]!
+      // The lead glyph reads brightest, near-white; the trail fades toward
+      // the background in cyan, so the column reads as one deliberate
+      // colour rather than two unrelated hues.
+      const brightness = i === 0 ? 1 : Math.max(0.12, 1 - i / RAIN_TRAIL)
+      const color = i === 0 ? theme.text : theme.cyan
+      ctx.fillStyle = cssAlpha(color, brightness, dim)
+      ctx.fillText(glyph, x, y)
+    }
+  }
+}
+
+const GLITCH_SCANLINE_SPACING = 6
+const GLITCH_SCROLL_PERIOD_MS = 5000
+/** One "signal slip" band's full cycle, and how long within that cycle it is
+ * actually visible — occasional, not constant. */
+const GLITCH_BAND_PERIOD_MS = 5200
+const GLITCH_BAND_DURATION_MS = 220
+const GLITCH_BAND_HEIGHT = 6
+const GLITCH_TEXT = 'OFFLINE'
+const GLITCH_TEXT_SIZE = 14
+/** The neon text's slow breathing cycle — never a fast blink, which would
+ * strobe. It also dips sharply, but briefly, exactly when this key's own
+ * glitch band fires, so the flicker reads as connected to the glitch rather
+ * than as two unrelated animations. */
+const GLITCH_TEXT_BREATHE_MS = 3200
+const GLITCH_TEXT_DROPOUT_MS = 90
+
+/**
+ * Glitch scanline. Per-key variant: scanlines and the occasional slip band
+ * are independent per key, each on its own phase (seeded from `col`/`row`)
+ * so the four keys never glitch in lockstep — a synchronised flash across
+ * the whole 2x2 block would read as a strobe. Only the top-left key (`col`
+ * 0, `row` 0) carries the flickering "OFFLINE" text.
+ */
+function drawIdleGlitch(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
+  const keyIndex = idle.row * 2 + idle.col
+  const seed = keyIndex * 211
+
+  // Each key's scanlines start from their own offset, so two quadrants with
+  // no glitch band active at a given instant still never render identically
+  // — the four keys of the block should always be tellable apart, the same
+  // invariant `imageCrop` and `pulse.phase` had to protect in earlier tasks.
+  const scanPhase = pseudoRandom(seed + 500) * GLITCH_SCANLINE_SPACING
+  const scrollOffset =
+    (scanPhase + ((idle.nowMs / GLITCH_SCROLL_PERIOD_MS) * GLITCH_SCANLINE_SPACING)) % GLITCH_SCANLINE_SPACING
+  for (let y = -GLITCH_SCANLINE_SPACING; y < KEY_SIZE + GLITCH_SCANLINE_SPACING; y += GLITCH_SCANLINE_SPACING) {
+    const yy = Math.round(y + scrollOffset)
+    if (yy < 0 || yy >= KEY_SIZE) continue
+    ctx.fillStyle = cssAlpha(theme.cyan, 0.18, dim)
+    ctx.fillRect(0, yy, KEY_SIZE, 1)
+  }
+
+  const bandPhase = pseudoRandom(seed) * GLITCH_BAND_PERIOD_MS
+  const cycleIndex = Math.floor((idle.nowMs + bandPhase) / GLITCH_BAND_PERIOD_MS)
+  const bandT = (idle.nowMs + bandPhase) % GLITCH_BAND_PERIOD_MS
+  const bandActive = bandT < GLITCH_BAND_DURATION_MS
+  if (bandActive) {
+    const bandY = Math.round(pseudoRandom(seed + cycleIndex) * (KEY_SIZE - GLITCH_BAND_HEIGHT))
+    ctx.fillStyle = cssAlpha(theme.neonMagenta, 0.3, dim)
+    ctx.fillRect(0, bandY, KEY_SIZE, GLITCH_BAND_HEIGHT)
+    ctx.fillStyle = cssAlpha(theme.cyan, 0.45, dim)
+    for (let i = 0; i < 4; i++) {
+      const tickX = Math.round(pseudoRandom(seed + cycleIndex * 7 + i) * KEY_SIZE)
+      const tickW = 5 + Math.round(pseudoRandom(seed + cycleIndex * 11 + i) * 10)
+      ctx.fillRect(tickX, bandY, tickW, GLITCH_BAND_HEIGHT)
+    }
+  }
+
+  if (idle.col === 0 && idle.row === 0) {
+    const breathe = 0.55 + 0.45 * Math.sin((idle.nowMs / GLITCH_TEXT_BREATHE_MS) * 2 * Math.PI)
+    const alpha = bandActive && bandT < GLITCH_TEXT_DROPOUT_MS ? 0.08 : breathe
+    ctx.fillStyle = cssAlpha(theme.cyan, alpha, dim)
+    ctx.font = `${GLITCH_TEXT_SIZE}px ${FONT}`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText(GLITCH_TEXT, KEY_SIZE / 2, KEY_SIZE / 2)
+  }
+}
+
+/** Dispatches to the one of the three functions above named by
+ * `idle.variant` — the only place this file needs to know all three exist. */
+function drawIdle(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
+  switch (idle.variant) {
+    case 'grid':
+      drawIdleGrid(ctx, idle, dim)
+      break
+    case 'rain':
+      drawIdleRain(ctx, idle, dim)
+      break
+    case 'glitch':
+      drawIdleGlitch(ctx, idle, dim)
+      break
   }
 }
 
@@ -652,8 +888,8 @@ export function renderKey(spec: KeySpec): Buffer {
     drawSpark(ctx, spec.spark, dim)
   }
 
-  if (spec.pulse) {
-    drawPulse(ctx, spec.pulse, dim)
+  if (spec.idle) {
+    drawIdle(ctx, spec.idle, dim)
   }
 
   if (spec.bar) {

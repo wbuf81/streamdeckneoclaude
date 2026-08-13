@@ -1,4 +1,4 @@
-import type { DeckFrame, KeySpec, StripSpec, ImageCrop, PulseSpec } from '../render/specs.js'
+import type { DeckFrame, KeySpec, StripSpec, ImageCrop, IdleSpec, IdleVariant } from '../render/specs.js'
 import { blankKey } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatClock, formatEasternTime } from '../render/text.js'
@@ -60,21 +60,24 @@ const VOLUME_UP_GLYPH = '🔊'
  * not synced to the music.
  */
 const VOLUME_THUMP_PERIOD_MS = 800
-/** How often the render loop should tick while the idle equaliser is
+/** How often the render loop should tick while the idle animation is
  * showing instead of album art — see the `tickMs` getter below. Matches the
  * rate already proven smooth for the Claude page's crab animation, well
  * inside what a handful of 96x96 keys can sustain (docs/VERIFIED-FACTS.md's
  * throughput table: `renderKey` costs 0.032 ms, all eight keys sustain
  * 45 fps). */
-const PULSE_TICK_MS = 100
-/** One full rise-and-fall cycle, in milliseconds. Slow, so the idle keys
- * read as an equaliser at rest rather than a strobe. */
-const PULSE_PERIOD_MS = 4000
-/** Radians between one idle art key's phase and the next, so a wave appears
- * to travel across the four keys instead of them all breathing in lockstep. */
-const PULSE_PHASE_STEP = Math.PI / 2
-/** Bars drawn across one idle art key. */
-const PULSE_BARS = 6
+const IDLE_TICK_MS = 100
+/**
+ * Which of `render/canvas.ts`'s three cyberpunk idle animations ships on the
+ * four album-art keys while nothing is playing (task 39, replacing the
+ * earlier green equaliser): `'grid'` (a synthwave horizon with a sliced sun),
+ * `'rain'` (falling cyan/near-white character streams), or `'glitch'` (drifting
+ * scanlines, an occasional slip band, and a flickering `OFFLINE` on key 0).
+ * This ONE constant is the whole switch between them — change it here, no
+ * other file needs to know. The user picks the shipped default, not the
+ * agent; see the task's preview images.
+ */
+const IDLE_VARIANT: IdleVariant = 'grid'
 /**
  * Coarse, character-count pre-limits — NOT the thing that guarantees a fit.
  * `renderStrip` (`src/render/canvas.ts`) is what actually measures both
@@ -130,7 +133,7 @@ export class SpotifyPage implements Page {
   constructor(private readonly source: PlayerReader) {}
 
   /**
-   * Raises the render rate while the idle equaliser is showing, OR while a
+   * Raises the render rate while the idle animation is showing, OR while a
    * track is playing (task 38's volume-key "thump" — see `glyphPulse` on
    * key 3 below). A loaded but PAUSED track is the one case left at the
    * daemon's default 1000 ms, because nothing on the page animates then; a
@@ -155,19 +158,19 @@ export class SpotifyPage implements Page {
   get tickMs(): number | undefined {
     if (this.source.getStatus() === 'unauthorized') return undefined
     const state = this.source.interpolate(0)
-    // The idle equaliser needs the fast tick whenever nothing is loaded,
+    // The idle animation needs the fast tick whenever nothing is loaded,
     // REGARDLESS of `status` — it animates through a normal `no-device` or
     // `offline` idle state just as much as a genuinely empty one.
-    if (!state) return PULSE_TICK_MS
+    if (!state) return IDLE_TICK_MS
     // Per M5: `status` can report `no-device` (a failed transport command)
     // while `state` — the last known player snapshot — still says a track
     // was playing, since a control failure never clears it. Checked here,
-    // AFTER the idle-equaliser case above but BEFORE `state.isPlaying`, so
+    // AFTER the idle-animation case above but BEFORE `state.isPlaying`, so
     // a stale "was playing" snapshot cannot keep the fast tick (and the
     // volume key's "thump", which `render()` below no longer even draws for
     // a dead device) alive for a device that is gone.
     if (this.source.getStatus() === 'no-device') return undefined
-    return state.isPlaying ? PULSE_TICK_MS : undefined
+    return state.isPlaying ? IDLE_TICK_MS : undefined
   }
 
   onEnter(): void {
@@ -187,7 +190,7 @@ export class SpotifyPage implements Page {
     return {
       keys: [
         this.primaryArtKey(state, status, art, CROP_TOP_LEFT, nowMs),
-        this.spanArtKey(state, status, art, CROP_TOP_RIGHT, nowMs, 1),
+        this.spanArtKey(state, status, art, CROP_TOP_RIGHT, nowMs, 1, 0),
         { kind: 'control', glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH, glyphFont: 'emoji', dim: dead },
         {
           kind: 'control',
@@ -206,8 +209,8 @@ export class SpotifyPage implements Page {
           glyphPulse: state?.isPlaying && !dead ? { phase: volumePulsePhase(nowMs) } : undefined,
           dim: dead,
         },
-        this.spanArtKey(state, status, art, CROP_BOTTOM_LEFT, nowMs, 2),
-        this.spanArtKey(state, status, art, CROP_BOTTOM_RIGHT, nowMs, 3),
+        this.spanArtKey(state, status, art, CROP_BOTTOM_LEFT, nowMs, 0, 1),
+        this.spanArtKey(state, status, art, CROP_BOTTOM_RIGHT, nowMs, 1, 1),
         { kind: 'control', glyph: PREVIOUS_GLYPH, glyphFont: 'emoji', dim: dead },
         { kind: 'control', glyph: NEXT_GLYPH, glyphFont: 'emoji', dim: dead },
       ],
@@ -220,8 +223,9 @@ export class SpotifyPage implements Page {
    * Key 0. Carries the top-left quadrant when art is available, and is the
    * ONLY key that shows the "sign in" text while unauthorized — a partial
    * image across the 2x2 block is worse than none. While nothing is
-   * playing (and the user is not stuck at a sign-in prompt), it carries
-   * phase 0 of the idle equaliser instead of the old static fallback text.
+   * playing (and the user is not stuck at a sign-in prompt), it carries the
+   * top-left quadrant (`col` 0, `row` 0) of the idle animation instead of the
+   * old static fallback text.
    */
   private primaryArtKey(
     state: PlayerState | null,
@@ -234,7 +238,7 @@ export class SpotifyPage implements Page {
       return { kind: 'control', lines: ['SPOTIFY', 'SIGN IN'], align: 'center', dim: true }
     }
     if (!state) {
-      return { kind: 'control', pulse: pulseSpec(nowMs, 0) }
+      return { kind: 'control', idle: idleSpec(nowMs, 0, 0) }
     }
     if (art) {
       return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop }
@@ -251,18 +255,20 @@ export class SpotifyPage implements Page {
    * sign-in text there) and blank whenever key 0 would show the album-name
    * fallback (state present but art not downloaded yet), so the block never
    * shows three quadrants of art beside one line of text. While nothing is
-   * playing, each carries its own phase (`phaseIndex` 1, 2 or 3) of the idle
-   * equaliser, so the four keys ripple instead of breathing in lockstep. */
+   * playing, each carries its own quadrant (`col`, `row`) of the idle
+   * animation, so the four keys form one coherent design instead of each
+   * inventing its own. */
   private spanArtKey(
     state: PlayerState | null,
     status: SpotifyStatus,
     art: Image | null,
     crop: ImageCrop,
     nowMs: number,
-    phaseIndex: number,
+    col: 0 | 1,
+    row: 0 | 1,
   ): KeySpec {
     if (status === 'unauthorized') return blankKey()
-    if (!state) return { kind: 'control', pulse: pulseSpec(nowMs, phaseIndex) }
+    if (!state) return { kind: 'control', idle: idleSpec(nowMs, col, row) }
     if (!art) return blankKey()
     return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop }
   }
@@ -329,7 +335,7 @@ function volumeLabel(state: PlayerState | null): string {
 
 /**
  * Phase for the volume key's "thump", the same `nowMs`-driven pattern
- * `pulseSpec` below uses for the idle equaliser: never `Date.now()`, so two
+ * `idleSpec` below uses for the idle animation: never `Date.now()`, so two
  * calls with the same `nowMs` always agree, and the phase actually advances
  * from one render to the next so `keyHash` sees a new value every tick
  * (lesson 11 — the exact defect that once hit this page's `imageCrop`, and
@@ -340,14 +346,14 @@ function volumePulsePhase(nowMs: number): number {
 }
 
 /**
- * Builds the pulse spec for one of the four idle art keys. `phaseIndex`
- * (0 to 3) gives each key its own offset, and `nowMs` — never `Date.now()`,
- * supplied by the daemon's render clock — advances the shared phase, so
+ * Builds the idle-animation spec for one of the four idle art keys. `col`
+ * and `row` (each 0 or 1) place this key at its own corner of the shared 2x2
+ * design, and `nowMs` — never `Date.now()`, supplied by the daemon's render
+ * clock — is what `render/canvas.ts` advances the animation from, so
  * `keyHash` sees a new value on every tick and the daemon keeps redrawing
  * (lesson 11 in docs/LESSONS.md: a field that never changes freezes the
  * animation after one frame).
  */
-function pulseSpec(nowMs: number, phaseIndex: number): PulseSpec {
-  const phase = (nowMs / PULSE_PERIOD_MS) * 2 * Math.PI + phaseIndex * PULSE_PHASE_STEP
-  return { phase, bars: PULSE_BARS, color: theme.green }
+function idleSpec(nowMs: number, col: 0 | 1, row: 0 | 1): IdleSpec {
+  return { variant: IDLE_VARIANT, nowMs, col, row }
 }

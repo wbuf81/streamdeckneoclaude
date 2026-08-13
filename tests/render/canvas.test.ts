@@ -13,6 +13,14 @@ import {
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
 import type { KeySpec } from '../../src/render/specs.js'
+// Read-only, for the cross-page regression test at the bottom of this file:
+// task 39 only owns the Spotify page's idle animation, and these four pages
+// must render byte-identically to before that work — see
+// "the other four pages" describe block.
+import { ClaudePage } from '../../src/pages/claude-page.js'
+import { CodexPage } from '../../src/pages/codex-page.js'
+import { WeatherPage } from '../../src/pages/weather-page.js'
+import { StocksPage } from '../../src/pages/stocks-page.js'
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -1323,71 +1331,180 @@ describe('renderKey lineSizes as an array of candidates (A3: the renderer resolv
   })
 })
 
-describe('renderKey pulse (the Spotify idle equaliser)', () => {
-  it('draws something (not blank) when a pulse is present', () => {
-    const blank = renderKey({ kind: 'control' })
-    const withPulse = renderKey({ kind: 'control', pulse: { phase: 0, bars: 6, color: theme.green } })
-    expect(withPulse.equals(blank)).toBe(false)
-  })
+/**
+ * Task 39: three cyberpunk idle animations replaced the old green equaliser
+ * on the Spotify page's four album-art keys. Each variant gets its own
+ * "draws something, dims, animates, and the four quadrants tell each other
+ * apart" battery, plus one shape-specific probe of real pixels (lesson 17:
+ * measure, do not reason) rather than trusting the spec fields alone.
+ *
+ * A shared helper counts non-background pixels in a whole RECTANGLE, never a
+ * single row or column (lesson 22 — a one-column probe is background for
+ * almost any real overflow or, here, almost any real animation frame).
+ */
+function inkCountInRegion(
+  buf: Buffer,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  bg: readonly number[] = theme.bg,
+): number {
+  let count = 0
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      if (!near3(probe(buf, x, y), bg)) count++
+    }
+  }
+  return count
+}
 
-  it('draws nothing for zero bars, and does not throw', () => {
-    const blank = renderKey({ kind: 'control' })
-    expect(() =>
-      renderKey({ kind: 'control', pulse: { phase: 0, bars: 0, color: theme.green } }),
-    ).not.toThrow()
-    const buf = renderKey({ kind: 'control', pulse: { phase: 0, bars: 0, color: theme.green } })
-    expect(buf.equals(blank)).toBe(true)
-  })
+const IDLE_QUADRANTS: { col: 0 | 1; row: 0 | 1 }[] = [
+  { col: 0, row: 0 },
+  { col: 1, row: 0 },
+  { col: 0, row: 1 },
+  { col: 1, row: 1 },
+]
 
-  it('dims the pulse bars like every other element', () => {
-    const bright = renderKey({ kind: 'control', pulse: { phase: 0.4, bars: 6, color: theme.green } })
-    const dimmed = renderKey({
-      kind: 'control', pulse: { phase: 0.4, bars: 6, color: theme.green }, dim: true,
+describe('renderKey idle animations (the Spotify cyberpunk idle screens, task 39)', () => {
+  describe.each([
+    { variant: 'grid' as const, label: 'neon grid horizon' },
+    { variant: 'rain' as const, label: 'glyph rain' },
+    { variant: 'glitch' as const, label: 'glitch scanline' },
+  ])('$label ($variant)', ({ variant }) => {
+    it('draws something (not blank) for every quadrant', () => {
+      const blank = renderKey({ kind: 'control' })
+      for (const { col, row } of IDLE_QUADRANTS) {
+        const buf = renderKey({ kind: 'control', idle: { variant, nowMs: 1234, col, row } })
+        expect(buf.equals(blank)).toBe(false)
+      }
     })
-    expect(bright.equals(dimmed)).toBe(false)
-  })
 
-  it('renders different pixels at two different phases — an animation test that actually probes pixels', () => {
-    // Lesson 17: measure, do not reason. Two phases a quarter turn apart on a
-    // single bar move it from its mid-height rest point to its tallest point,
-    // so this is not a coincidence of floating-point noise.
-    const a = renderKey({ kind: 'control', pulse: { phase: 0, bars: 1, color: theme.green } })
-    const b = renderKey({ kind: 'control', pulse: { phase: Math.PI / 2, bars: 1, color: theme.green } })
-    expect(a.equals(b)).toBe(false)
-  })
+    it('never calls Date.now(): the same nowMs always renders byte-identical pixels', () => {
+      const a = renderKey({ kind: 'control', idle: { variant, nowMs: 42_000, col: 0, row: 0 } })
+      const b = renderKey({ kind: 'control', idle: { variant, nowMs: 42_000, col: 0, row: 0 } })
+      expect(a.equals(b)).toBe(true)
+    })
 
-  it('reaches higher up the key at the loud point of the wave than at the quiet point, measured directly', () => {
-    const topInkRow = (buf: Buffer): number => {
-      for (let y = 0; y < KEY_SIZE; y++) {
-        for (let x = 0; x < KEY_SIZE; x++) {
-          if (!near3(probe(buf, x, y), theme.bg)) return y
+    it('dims like every other element', () => {
+      const bright = renderKey({ kind: 'control', idle: { variant, nowMs: 500, col: 0, row: 0 } })
+      const dimmed = renderKey({
+        kind: 'control', idle: { variant, nowMs: 500, col: 0, row: 0 }, dim: true,
+      })
+      expect(bright.equals(dimmed)).toBe(false)
+    })
+
+    it('renders visibly different pixels for the same quadrant at two different clocks', () => {
+      for (const { col, row } of IDLE_QUADRANTS) {
+        const a = renderKey({ kind: 'control', idle: { variant, nowMs: 0, col, row } })
+        const b = renderKey({ kind: 'control', idle: { variant, nowMs: 3000, col, row } })
+        expect(a.equals(b)).toBe(false)
+      }
+    })
+
+    it('renders visibly different pixels for all four quadrants at the same clock', () => {
+      const bufs = IDLE_QUADRANTS.map(({ col, row }) =>
+        renderKey({ kind: 'control', idle: { variant, nowMs: 1500, col, row } }),
+      )
+      for (let i = 0; i < bufs.length; i++) {
+        for (let j = i + 1; j < bufs.length; j++) {
+          expect(bufs[i]!.equals(bufs[j]!)).toBe(false)
         }
       }
-      return KEY_SIZE
-    }
-    // One bar, so `phase` alone drives its height: sin(0) = 0 (mid-height,
-    // "at rest") vs sin(pi/2) = 1 (the tallest the bar ever gets).
-    const quiet = renderKey({ kind: 'control', pulse: { phase: 0, bars: 1, color: theme.green } })
-    const loud = renderKey({ kind: 'control', pulse: { phase: Math.PI / 2, bars: 1, color: theme.green } })
-    expect(topInkRow(loud)).toBeLessThan(topInkRow(quiet))
+    })
   })
 
-  it('gives each of several bars its own height from one phase, via the per-bar offset', () => {
-    // Distinct bar count so the per-bar phase spread (2*PI / bars) does not
-    // land every bar on an identical multiple of PI, which would make every
-    // bar the same height by coincidence rather than by proving the offset.
-    const buf = renderKey({ kind: 'control', pulse: { phase: 0.3, bars: 5, color: theme.green } })
-    const x0 = 9 // BORDER + PAD
-    const barW = (90 - 9) / 5 // x1 - x0, over 5 bars
-    const topOfBar = (i: number): number => {
-      const x = Math.floor(x0 + i * barW + 1)
-      for (let y = 0; y < KEY_SIZE; y++) {
-        if (!near3(probe(buf, x, y), theme.bg)) return y
+  describe('neon grid horizon shape', () => {
+    it('draws the sun in magenta, reaching well into both top-row keys', () => {
+      // The sun is centred on the seam between columns, so both the left
+      // (col 0) and right (col 1) key of the top row should carry visible
+      // magenta ink near their own inner edge.
+      const left = renderKey({ kind: 'control', idle: { variant: 'grid', nowMs: 0, col: 0, row: 0 } })
+      const right = renderKey({ kind: 'control', idle: { variant: 'grid', nowMs: 0, col: 1, row: 0 } })
+      const isMagenta = (buf: Buffer, x: number, y: number) => near3(probe(buf, x, y), theme.neonMagenta, 30)
+      expect(isMagenta(left, 90, 74)).toBe(true)
+      expect(isMagenta(right, 5, 74)).toBe(true)
+    })
+
+    it('draws perspective floor lines only below the horizon, on the bottom-row keys', () => {
+      const buf = renderKey({ kind: 'control', idle: { variant: 'grid', nowMs: 800, col: 0, row: 1 } })
+      // The floor lines are cyan on a near-black background; a bottom-row
+      // key must carry SOME cyan ink somewhere in its lower two-thirds.
+      expect(inkCountInRegion(buf, 0, 32, KEY_SIZE, KEY_SIZE)).toBeGreaterThan(0)
+    })
+  })
+
+  describe('glyph rain shape', () => {
+    it('draws text-shaped ink spread across the key, not concentrated in one corner', () => {
+      // Sample several nowMs values (columns fall continuously) and require
+      // that at least one produces visible ink in the left half AND the
+      // right half of the key — proving the columns really do spread across
+      // the width rather than piling into a single spot.
+      const nowValues = [0, 700, 1400, 2100, 2800]
+      const anyLeft = nowValues.some((nowMs) => {
+        const buf = renderKey({ kind: 'control', idle: { variant: 'rain', nowMs, col: 0, row: 0 } })
+        return inkCountInRegion(buf, 3, 0, KEY_SIZE / 2, KEY_SIZE) > 0
+      })
+      const anyRight = nowValues.some((nowMs) => {
+        const buf = renderKey({ kind: 'control', idle: { variant: 'rain', nowMs, col: 0, row: 0 } })
+        return inkCountInRegion(buf, KEY_SIZE / 2, 0, KEY_SIZE - 3, KEY_SIZE) > 0
+      })
+      expect(anyLeft).toBe(true)
+      expect(anyRight).toBe(true)
+    })
+  })
+
+  describe('glitch scanline shape', () => {
+    it('draws the flickering OFFLINE text only on the top-left quadrant (col 0, row 0)', () => {
+      // nowMs = 800 lands well outside this key's own glitch-band dropout
+      // window (seed 0 puts the first band at nowMs 0-220), so the text is
+      // near its brightest here — a real, generous rectangle probe (lesson
+      // 22), not a single column.
+      const withText = renderKey({ kind: 'control', idle: { variant: 'glitch', nowMs: 800, col: 0, row: 0 } })
+      const centerInk = inkCountInRegion(withText, 20, 40, 76, 56)
+      expect(centerInk).toBeGreaterThan(20)
+
+      // The other three quadrants never draw this text at all, at the same
+      // clock — their own centre band should show far less ink.
+      for (const { col, row } of [{ col: 1 as const, row: 0 as const }, { col: 0 as const, row: 1 as const }, { col: 1 as const, row: 1 as const }]) {
+        const other = renderKey({ kind: 'control', idle: { variant: 'glitch', nowMs: 800, col, row } })
+        expect(inkCountInRegion(other, 20, 40, 76, 56)).toBeLessThan(centerInk)
       }
-      return KEY_SIZE
-    }
-    const tops = [0, 1, 2, 3, 4].map(topOfBar)
-    expect(new Set(tops).size).toBeGreaterThan(1)
+    })
+
+    it('breathes slowly rather than flickering: brightness cannot swing across most of its range in one small time step', () => {
+      // A strobe is a FAST swing, not a big one — the text is meant to
+      // breathe all the way from dim to bright, just slowly. So this
+      // measures brightness (total channel deviation from the background,
+      // over the whole text region — not a pixel count, which cannot tell a
+      // dim frame from a bright one once any ink is present at all) at
+      // 150 ms steps across several seconds, well clear of the one brief
+      // glitch dropout near nowMs 0, and requires that no two adjacent
+      // samples swing by more than 40% of the full range seen. A period as
+      // slow as the real one stays under about 17%; cutting the period down
+      // to something that would actually read as flicker pushes this ratio
+      // toward 100% and fails here.
+      const totalDeviation = (buf: Buffer): number => {
+        let sum = 0
+        for (let y = 40; y < 56; y++) {
+          for (let x = 20; x < 76; x++) {
+            const p = probe(buf, x, y)
+            sum += Math.abs(p[0]! - theme.bg[0]) + Math.abs(p[1]! - theme.bg[1]) + Math.abs(p[2]! - theme.bg[2])
+          }
+        }
+        return sum
+      }
+      const stepMs = 150
+      const samples: number[] = []
+      for (let nowMs = 300; nowMs < 4300; nowMs += stepMs) {
+        samples.push(totalDeviation(renderKey({ kind: 'control', idle: { variant: 'glitch', nowMs, col: 0, row: 0 } })))
+      }
+      const range = Math.max(...samples) - Math.min(...samples)
+      expect(range).toBeGreaterThan(0) // the property only means something if brightness moves at all
+      let maxStep = 0
+      for (let i = 1; i < samples.length; i++) maxStep = Math.max(maxStep, Math.abs(samples[i]! - samples[i - 1]!))
+      expect(maxStep / range).toBeLessThan(0.4)
+    })
   })
 })
 
@@ -1530,3 +1647,82 @@ async function solidImage(r: number, g: number, b: number): Promise<Image> {
   ctx.fillRect(0, 0, 96, 96)
   return loadImage(c.toBuffer('image/jpeg'))
 }
+
+const NOW = 1786549560
+
+/**
+ * Task 39 only touches the Spotify page's idle-state branches. These four
+ * OTHER pages never read `KeySpec.idle`, so nothing about this task should
+ * change one pixel of theirs — but "should" is not proof (lesson 22). Each
+ * golden hash was captured from the pre-task-39 build, rendering the SAME
+ * fixture every other test for that page already uses, so a real regression
+ * here (for example, an accidental change to a shared theme colour or to
+ * `renderKey`'s shared line/border/bar drawing) fails loudly instead of
+ * slipping through unnoticed.
+ */
+describe('the other four pages render identically after the Spotify idle-animation rewrite (task 39)', () => {
+  it('ClaudePage key 0 is byte-identical to the pre-task-39 build', () => {
+    const page = new ClaudePage(
+      {
+        getSessions: () => [{
+          sessionId: 'aaaa', state: 'tool' as const, label: 'Running command', tool: 'Bash',
+          project: 'streamdeckneoclaude', cwd: '/x', termProgram: 'ghostty',
+          pid: 4242, startedAt: NOW - 840, ts: NOW,
+        }],
+        directoryExists: () => true,
+      },
+      { getUsage: () => null, isStale: () => false, getMeta: () => null },
+      async () => true,
+    )
+    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
+    expect(sha).toBe('aca891c042a855c6db250fe08411dc769d1d1a67708e55d503bf909d2ca35114')
+  })
+
+  it('CodexPage key 0 is byte-identical to the pre-task-39 build', () => {
+    const page = new CodexPage({
+      getSnapshot: () => ({
+        tasks: [{
+          threadId: 'thread-1', title: 'Improve the Stream Deck integration', project: 'deckd',
+          model: 'gpt-5.6-sol', updatedAt: NOW, tokensUsed: 1_250_000,
+        }],
+        usage: {
+          limits: [{ usedPct: 27, windowMinutes: 10080, resetsAt: NOW + 86400 }],
+          totalTokens: 1_250_000, plan: 'team', ts: NOW,
+        },
+      }),
+      isAvailable: () => true,
+      isStale: () => false,
+      isUsageUnknown: () => false,
+    } as never)
+    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
+    expect(sha).toBe('e2d0b02586033f0ae0422b9a95f9fda64fe2fc9bd313580aaf2945f7b0a81174')
+  })
+
+  it('WeatherPage key 0 is byte-identical to the pre-task-39 build', () => {
+    const page = new WeatherPage({
+      getDays: () => [],
+      getConditions: () => null,
+      getStatus: () => 'ok',
+      getLastUpdatedAt: () => NOW,
+      getPlace: () => 'x',
+      isStale: () => false,
+      setVisible: () => {},
+    } as never)
+    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
+    expect(sha).toBe('e49484a4f42389f3a60e074b3dd012a45e8e42f79ca741bd335905cc946e47c9')
+  })
+
+  it('StocksPage key 0 is byte-identical to the pre-task-39 build', () => {
+    const page = new StocksPage({
+      getQuotes: () => new Map(),
+      getStatus: () => 'ok',
+      getMarketState: () => 'closed',
+      isSymbolStale: () => false,
+      setVisible: () => {},
+      getYearlyState: () => 'idle',
+      setWatchedSymbol: () => {},
+    } as never)
+    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
+    expect(sha).toBe('8e42b735d7db44b94def7d656205b8f88344ef4ce3b9ee2956867ce77f4b005d')
+  })
+})
