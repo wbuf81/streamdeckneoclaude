@@ -57,6 +57,35 @@ These are the user's standing decisions. They apply to every page, now and in fu
   thin perimeter ring at 90 ms is the corrected middle ground — do not revert to either extreme.
 - This applies to gauge keys, empty slots, decorative tiles, and any page added later.
 
+## Fix briefs and review loops
+
+These rules exist because four review rounds found ~12 Critical defects, and most were
+repeat occurrences of a harm whose "fix" had already landed. The evidence is in
+`docs/LESSONS.md`, lessons 21 and 22. The rules bind whoever writes a fix brief and
+whoever implements one.
+
+- A reviewer's repro is evidence of a broken invariant. It is not the bug. Brief the
+  invariant plus the known route, never the route alone.
+- Before implementing a fix, list three other routes to the same harm. Fix the class,
+  or state why it is bounded. The second route has existed every time so far.
+- Prefer making the harm impossible over making the trigger unreachable. "Uninstall
+  never deletes the backup" ended a three-round Critical streak.
+- A prescribed implementation in a brief is a hypothesis. If the evidence contradicts
+  it, stop and report — do not build it. Implementers have used this correctly.
+- The sibling sweep is part of the fix, not an extra. When you fix one page, verb, or
+  source, check its siblings for the same hole before you finish. Family drift is this
+  project's dominant defect pattern.
+- Every new test: break the fix, watch the test fail, restore. A test that cannot fail
+  reports safety that does not exist. Probe regions, never single pixel columns. Build
+  fixtures from real captured output — `sqlite3 -json` prints nothing for zero rows.
+- One writer per file at a time, docs included. Concurrent agents commit with the
+  pathspec form only.
+- A point-in-time proof (a golden hash pinning another page's bytes) retires when its
+  change lands. Do not leave it to fire on the next legitimate change.
+- A measurement is valid only with its preconditions recorded. The same command can
+  give opposite answers in different states — re-measure in the failing state before
+  reversing a design.
+
 ## Live-system safety
 
 - The launchd daemon normally owns the Stream Deck. Do not open the device concurrently.
