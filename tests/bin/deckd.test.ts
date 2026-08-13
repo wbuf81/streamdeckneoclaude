@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { makeChangeHandler } from '../../bin/deckd.js'
+import { describe, it, expect, vi } from 'vitest'
+import { makeChangeHandler, dispatch, isEntryPoint, type CliHandlers } from '../../bin/deckd.js'
 import { Daemon } from '../../src/daemon.js'
 import { FakeDevice } from '../../src/fake-device.js'
 import { PageManager } from '../../src/page-manager.js'
@@ -168,5 +168,183 @@ describe('a page-local flash model exercises makeChangeHandler’s clock plumbin
     expect(frame.keys[0]).toMatchObject({ border: [230, 60, 60] })
 
     await daemon.stop()
+  })
+})
+
+/**
+ * I-6: `dispatch` had zero tests before this -- every verb's routing, the
+ * missing-verb and unknown-verb usage paths, and the exit codes were only
+ * ever verified by hand. Every handler here is a spy that never runs a real
+ * install, uninstall, or start; `exit`, `err`, and `out` are spies too, so
+ * nothing here prints to the real console or calls the real
+ * `process.exit`.
+ */
+function fakeHandlers(): CliHandlers {
+  return {
+    start: vi.fn(async () => {}),
+    install: vi.fn(async () => {}),
+    uninstall: vi.fn(async () => {}),
+    refreshWrapper: vi.fn(async () => ({ path: '/fake/wrapper.sh' })),
+    authSpotify: vi.fn(async () => {}),
+  }
+}
+
+/** Waits for the microtask chain a fire-and-forget `.catch(...)` handler
+ * runs on to settle, so an assertion after `dispatch` can see its effect. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+describe('dispatch (I-6)', () => {
+  it('routes "start" to the start handler', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    dispatch(['node', 'deckd', 'start'], handlers, exit)
+    expect(handlers.start).toHaveBeenCalledTimes(1)
+    expect(handlers.install).not.toHaveBeenCalled()
+    expect(exit).not.toHaveBeenCalled()
+  })
+
+  it('routes "install" to the install handler', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    dispatch(['node', 'deckd', 'install'], handlers, exit)
+    expect(handlers.install).toHaveBeenCalledTimes(1)
+    expect(exit).not.toHaveBeenCalled()
+  })
+
+  it('routes "uninstall" to the uninstall handler', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    dispatch(['node', 'deckd', 'uninstall'], handlers, exit)
+    expect(handlers.uninstall).toHaveBeenCalledTimes(1)
+    expect(exit).not.toHaveBeenCalled()
+  })
+
+  it('routes "refresh-wrapper" to the refreshWrapper handler and prints its resulting path', async () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    const out = vi.fn()
+    dispatch(['node', 'deckd', 'refresh-wrapper'], handlers, exit, vi.fn(), out)
+    await settle()
+    expect(handlers.refreshWrapper).toHaveBeenCalledTimes(1)
+    expect(out).toHaveBeenCalledWith(expect.stringContaining('/fake/wrapper.sh'))
+    expect(exit).not.toHaveBeenCalled()
+  })
+
+  it('routes "auth spotify" to the authSpotify handler', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    dispatch(['node', 'deckd', 'auth', 'spotify'], handlers, exit)
+    expect(handlers.authSpotify).toHaveBeenCalledTimes(1)
+    expect(exit).not.toHaveBeenCalled()
+  })
+
+  it('"auth" with no sub-verb prints usage and exits 2, without calling authSpotify', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    const err = vi.fn()
+    dispatch(['node', 'deckd', 'auth'], handlers, exit, err)
+    expect(handlers.authSpotify).not.toHaveBeenCalled()
+    expect(err).toHaveBeenCalledWith('usage: deckd auth spotify')
+    expect(exit).toHaveBeenCalledWith(2)
+  })
+
+  it('"auth" with an unrecognised sub-verb prints usage and exits 2', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    const err = vi.fn()
+    dispatch(['node', 'deckd', 'auth', 'github'], handlers, exit, err)
+    expect(handlers.authSpotify).not.toHaveBeenCalled()
+    expect(exit).toHaveBeenCalledWith(2)
+  })
+
+  it('no verb at all prints usage and exits 2, calling no handler', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    const err = vi.fn()
+    dispatch(['node', 'deckd'], handlers, exit, err)
+    expect(err).toHaveBeenCalledWith('usage: deckd <start|install|uninstall|refresh-wrapper|auth>')
+    expect(exit).toHaveBeenCalledWith(2)
+    expect(handlers.start).not.toHaveBeenCalled()
+    expect(handlers.install).not.toHaveBeenCalled()
+    expect(handlers.uninstall).not.toHaveBeenCalled()
+    expect(handlers.refreshWrapper).not.toHaveBeenCalled()
+    expect(handlers.authSpotify).not.toHaveBeenCalled()
+  })
+
+  it('an unknown verb reports it by name, still prints usage, and exits 2', () => {
+    const handlers = fakeHandlers()
+    const exit = vi.fn()
+    const err = vi.fn()
+    dispatch(['node', 'deckd', 'frobnicate'], handlers, exit, err)
+    expect(err).toHaveBeenCalledWith('unknown command: frobnicate')
+    expect(err).toHaveBeenCalledWith('usage: deckd <start|install|uninstall|refresh-wrapper|auth>')
+    expect(exit).toHaveBeenCalledWith(2)
+    expect(handlers.start).not.toHaveBeenCalled()
+  })
+
+  it('a rejecting handler logs the error and exits 1, for every verb that runs one', async () => {
+    for (const argv of [
+      ['node', 'deckd', 'start'],
+      ['node', 'deckd', 'install'],
+      ['node', 'deckd', 'uninstall'],
+      ['node', 'deckd', 'refresh-wrapper'],
+      ['node', 'deckd', 'auth', 'spotify'],
+    ]) {
+      const handlers: CliHandlers = {
+        start: vi.fn(async () => { throw new Error('start boom') }),
+        install: vi.fn(async () => { throw new Error('install boom') }),
+        uninstall: vi.fn(async () => { throw new Error('uninstall boom') }),
+        refreshWrapper: vi.fn(async () => { throw new Error('refresh boom') }),
+        authSpotify: vi.fn(async () => { throw new Error('auth boom') }),
+      }
+      const exit = vi.fn()
+      const err = vi.fn()
+      dispatch(argv, handlers, exit, err)
+      await settle()
+      expect(exit).toHaveBeenCalledWith(1)
+      expect(err).toHaveBeenCalledTimes(1)
+    }
+  })
+})
+
+/**
+ * `isEntryPoint` is the pure logic behind `isMain()`'s guard, which keeps
+ * this whole file's dispatch block from running when a test merely IMPORTS
+ * it. Pulled apart so a test can drive it directly with synthetic paths,
+ * instead of mutating the real `process.argv` -- nothing exercised the
+ * `realpath` (symlink) branch at all before this.
+ */
+describe('isEntryPoint', () => {
+  it('is true when argv1 is exactly the resolved module path', () => {
+    expect(isEntryPoint('/repo/dist/bin/deckd.js', '/repo/dist/bin/deckd.js')).toBe(true)
+  })
+
+  it('is false when argv1 is absent (e.g. some non-file invocation)', () => {
+    expect(isEntryPoint(undefined, '/repo/dist/bin/deckd.js')).toBe(false)
+  })
+
+  it('is true when argv1 is a symlink whose realpath resolves to the module path', () => {
+    // The `npm link` / global-install case: `argv1` is
+    // `/usr/local/bin/deckd`, a symlink, and only `realpath` reveals it
+    // points at the same file.
+    const realpath = (p: string): string => {
+      expect(p).toBe('/usr/local/bin/deckd')
+      return '/repo/dist/bin/deckd.js'
+    }
+    expect(isEntryPoint('/usr/local/bin/deckd', '/repo/dist/bin/deckd.js', realpath)).toBe(true)
+  })
+
+  it('is false when argv1 resolves to a different file entirely', () => {
+    const realpath = (): string => '/repo/dist/bin/some-other-tool.js'
+    expect(isEntryPoint('/usr/local/bin/other-tool', '/repo/dist/bin/deckd.js', realpath)).toBe(false)
+  })
+
+  it('is false, not throwing, when argv1 does not exist on disk at all', () => {
+    const realpath = (): string => {
+      throw new Error('ENOENT: no such file or directory')
+    }
+    expect(isEntryPoint('-e', '/repo/dist/bin/deckd.js', realpath)).toBe(false)
   })
 })

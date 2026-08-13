@@ -149,6 +149,17 @@ export class Daemon {
    * is what stops that from re-arming at delay 0 forever.
    */
   private renderFailureStreak = 0
+  /**
+   * Whether the current page believes it is on screen (has had `onEnter`
+   * without a later `onLeave`). `PageManager.add` already calls `onEnter`
+   * for the first page, so this starts `true`. Used only to keep the
+   * daemon's own enter/leave calls idempotent: `start()`'s locked branch and
+   * `syncLockState`'s lock branch can both decide to leave the page when the
+   * lock changes mid-`connect()` (M2) -- without this, the page's `onLeave`
+   * fired twice with no `onEnter` between, a contract no page implementation
+   * should have to tolerate.
+   */
+  private pageVisible = true
 
   constructor(
     private readonly device: DeckDevice,
@@ -169,12 +180,22 @@ export class Daemon {
 
     if (!this.device.isConnected()) await this.device.connect()
     if (this.locked) {
-      this.pages.current().onLeave?.()
+      this.leavePage()
       await this.blankForLock()
       log.info('screen locked; deck blanked')
     } else {
-      await this.device.setBrightness(DEFAULT_BRIGHTNESS)
-      await this.renderOnce(this.now(), this.nowMs())
+      // Guarded (C1): `connect()` above resolves WITHOUT a handle when no
+      // deck is plugged in -- that is its documented, correct behaviour, and
+      // the retry loop it already armed is what is supposed to paint the
+      // first frame once one appears. An unguarded `setBrightness` here
+      // threw straight out of `start()`, which `bin/deckd.ts` had no
+      // special case for beyond `DeviceBusyError`: `exit(1)`, launchd
+      // respawns, forever, and `onConnect` below -- the only thing that
+      // could ever recover -- was never even reached. `renderOnce` already
+      // guards its own `isConnected()` check, so only this one call needed
+      // it.
+      await this.setBrightnessSafe(DEFAULT_BRIGHTNESS)
+      await this.renderNow()
     }
 
     // Register the reconnect handler only after the first render. Registering
@@ -222,7 +243,13 @@ export class Daemon {
     const previous = this.lastTickAtMs
     this.lastTickAtMs = ms
     const sleepGap = Math.max(SLEEP_GAP_MIN_MS, this.armedTickMs * 3)
-    if (previous !== null && ms - previous > sleepGap) {
+    // Absolute value (M3): a FORWARD jump this large means the machine
+    // slept. A BACKWARD jump of the same size -- an NTP correction, a
+    // manual clock change -- used to skip both `invalidateFrame()` and the
+    // lock re-probe, and it also made every later tick's own gap compute
+    // against a `previous` that is now in the machine's future, hiding a
+    // real forward jump behind it too.
+    if (previous !== null && Math.abs(ms - previous) > sleepGap) {
       this.invalidateFrame()
       if (this.lockState) {
         await this.lockState.refresh()
@@ -243,14 +270,14 @@ export class Daemon {
         // visible feedback.
         this.pages.prev()
         this.armTimer()
-        await this.renderOnce(this.now(), this.nowMs())
+        await this.renderNow()
         log.clearOnce(key)
         return
       }
       if (index === BUTTON_RIGHT) {
         this.pages.next()
         this.armTimer()
-        await this.renderOnce(this.now(), this.nowMs())
+        await this.renderNow()
         log.clearOnce(key)
         return
       }
@@ -269,7 +296,7 @@ export class Daemon {
       const pressAtMs = this.nowMs()
       const outcome = await this.callOnKeyPress(index, key)
       this.setFlash(index, outcome === 'handled', pressPage, pressAtMs)
-      await this.renderOnce(this.now(), this.nowMs())
+      await this.renderNow()
     } catch (e) {
       // `log.once`, not `log.error`: a press repeats, and this is the
       // catch-all for a failure that reaches here WITHOUT going through
@@ -328,15 +355,36 @@ export class Daemon {
     }
   }
 
-  /** Forgets what is on the glass, so the next render writes everything. */
+  /**
+   * Forgets what is on the glass, so the next render writes everything.
+   *
+   * Guarded by `stopped` (I3): every other entry point checks it --
+   * `renderOnce`, `armTimer`, `scheduleFlashPump`, `handlePress`,
+   * `syncLockState` -- but this one did not, so a reconnect after
+   * `daemon.stop()` (a retry racing shutdown, or `Device.connect()`'s I2
+   * hole reopening a handle post-`disconnect()`) still pushed brightness to
+   * `DEFAULT_BRIGHTNESS` against a stopped daemon that would never render
+   * over it: a bright, stale, stopped deck.
+   */
   async handleReconnect(): Promise<void> {
+    if (this.stopped) return
     log.clearOnce('render')
     this.invalidateFrame()
     if (this.locked) {
       await this.blankForLock()
     } else {
-      await this.device.setBrightness(DEFAULT_BRIGHTNESS)
-      await this.renderOnce(this.now(), this.nowMs())
+      await this.setBrightnessSafe(DEFAULT_BRIGHTNESS)
+      // Self-healing (C2): `syncLockState`'s unlock branch can fail before
+      // it ever reaches `armTimer()`, leaving a running, unlocked daemon
+      // with no live render loop -- a permanently frozen deck until another
+      // full lock/unlock cycle or a press. A reconnect is the moment the
+      // user (or the retry loop) proves the device is reachable again, so
+      // it re-arms unconditionally rather than trusting whatever state an
+      // earlier failed transition left behind. `armTimer` already clears
+      // any existing interval before creating a new one, so this is a
+      // harmless no-op on the ordinary path where nothing was ever broken.
+      this.armTimer()
+      await this.renderNow()
     }
   }
 
@@ -393,7 +441,83 @@ export class Daemon {
     // never keep working after `stop()`, while locked, or once disconnected.
     while (this.renderRequested && !this.stopped && !this.locked && this.device.isConnected()) {
       this.renderRequested = false
-      await this.runRender(this.now(), this.nowMs())
+      const retry = this.clockNow()
+      await this.runRender(retry.now, retry.nowMs)
+    }
+  }
+
+  /**
+   * Reads the millisecond clock exactly once and derives the second clock
+   * from it, the same rule `handleTick` and `bin/deckd.ts`'s
+   * `makeChangeHandler` already held. Every OTHER call site used to spell
+   * `this.now()` and `this.nowMs()` as two independent reads (M1) — probed,
+   * measured `now` a full second behind `nowMs` in the same frame, because
+   * nothing guarantees which side of a millisecond boundary two separate
+   * clock calls land on. `this.now` stays a constructor parameter (tests
+   * inject it directly, and it is still the default `renderOnce` documents
+   * for a caller with only a whole-second clock available), but nothing
+   * inside this class calls it anymore.
+   */
+  private clockNow(): { now: number; nowMs: number } {
+    const nowMs = this.nowMs()
+    return { now: Math.floor(nowMs / 1000), nowMs }
+  }
+
+  /** Renders one frame at the current instant, reading the clock exactly
+   * once (M1). */
+  private async renderNow(): Promise<void> {
+    const { now, nowMs } = this.clockNow()
+    await this.renderOnce(now, nowMs)
+  }
+
+  /**
+   * Sets brightness without letting a disconnected device -- or any other
+   * device failure -- escape to the caller. The render loop's survival must
+   * never depend on this succeeding (lesson 21): `start()`'s unlocked
+   * branch, `handleReconnect`, and `syncLockState`'s unlock branch all call
+   * this with essential bookkeeping (arming the timer, the retry loop
+   * getting a chance to run) that must happen regardless of whether a
+   * device write succeeds. C1 was `start()` letting this throw with no
+   * `isConnected()` guard at all; C2 was `syncLockState` letting it throw
+   * BEFORE `armTimer()`. Both are fixed at their call sites too, but routing
+   * every startup/reconnect/unlock brightness write through here as well
+   * means a device failure of any OTHER shape (not just "never connected")
+   * cannot reopen either hole.
+   */
+  private async setBrightnessSafe(percent: number): Promise<void> {
+    if (!this.device.isConnected()) return
+    try {
+      await this.device.setBrightness(percent)
+    } catch (e) {
+      log.once('brightness', `setBrightness failed: ${String(e)}`)
+    }
+  }
+
+  /**
+   * Calls the current page's `onLeave`, at most once between two matching
+   * `enterPage()` calls (M2), and never lets a throw from it escape (C2's
+   * second route): a lock transition's remaining bookkeeping -- clearing
+   * the timer, blanking the device -- must not depend on a page hook
+   * succeeding, or even running just once.
+   */
+  private leavePage(): void {
+    if (!this.pageVisible) return
+    this.pageVisible = false
+    try {
+      this.pages.current().onLeave?.()
+    } catch (e) {
+      log.once('page-onleave', `onLeave failed: ${String(e)}`)
+    }
+  }
+
+  /** The `onEnter` counterpart to `leavePage`. See its doc comment. */
+  private enterPage(): void {
+    if (this.pageVisible) return
+    this.pageVisible = true
+    try {
+      this.pages.current().onEnter?.()
+    } catch (e) {
+      log.once('page-onenter', `onEnter failed: ${String(e)}`)
     }
   }
 
@@ -567,7 +691,7 @@ export class Daemon {
     this.flashPumpTimer = setTimeout(() => {
       this.flashPumpTimer = null
       if (this.stopped) return
-      void this.renderOnce(this.now(), this.nowMs())
+      void this.renderNow()
     }, delay)
   }
 
@@ -636,16 +760,29 @@ export class Daemon {
       this.timer = null
       const active = this.activeRender
       if (active) await active.catch(() => {})
-      this.pages.current().onLeave?.()
+      this.leavePage()
       await this.blankForLock()
     } else {
       this.locked = false
-      await this.device.setBrightness(DEFAULT_BRIGHTNESS)
-      this.invalidateFrame()
-      this.pages.current().onEnter?.()
       this.lastTickAtMs = this.nowMs()
+      // Armed FIRST (C2), before any other unlock step. Every step below --
+      // the brightness write, `onEnter`, the render -- is now best-effort:
+      // `setBrightnessSafe` and `enterPage` never throw, and `renderOnce`
+      // catches its own failures, so nothing left below CAN reach
+      // `queueLockTransition`'s catch anymore. Arming first anyway is the
+      // "prefer impossible over unreachable" fix (lesson 21): it makes the
+      // render loop's survival structurally independent of whatever runs
+      // after it, rather than relying on every one of those calls staying
+      // safe forever. The old order -- arm LAST -- let a throw from
+      // `setBrightness` (a disconnected device) or a page's `onEnter` reach
+      // the catch with `locked = false` and `timer = null`: the deck then
+      // froze on its last frame until another full lock/unlock cycle or a
+      // press, with no discoverable recovery in between.
       this.armTimer()
-      await this.renderOnce(this.now(), this.nowMs())
+      await this.setBrightnessSafe(DEFAULT_BRIGHTNESS)
+      this.invalidateFrame()
+      this.enterPage()
+      await this.renderNow()
       log.info('screen unlocked; deck restored')
     }
     log.clearOnce('lock-transition')
@@ -660,10 +797,21 @@ export class Daemon {
         strip: { lines: [] },
         buttons: [[0, 0, 0], [0, 0, 0]],
       })
+    } catch (e) {
+      // A privacy blank must never throw out of this method (lesson 21):
+      // `start()`'s locked branch and `handleReconnect`'s locked branch both
+      // call this with nothing downstream to catch a throw. Before this, a
+      // pixel write failing here (device connected at entry, then lost
+      // mid-write) could reject `start()` outright -- the same crash-loop
+      // shape as C1, reached through the locked branch instead of the
+      // unlocked one. The brightness backstop below still runs regardless.
+      log.once('blank-for-lock', `privacy blank failed: ${String(e)}`)
     } finally {
       // Brightness is the privacy backstop if a pixel write fails while the
-      // cable or device is unstable. Pixel blanking still runs first.
-      await this.device.setBrightness(0)
+      // cable or device is unstable. Pixel blanking still runs first. Routed
+      // through `setBrightnessSafe` so a disconnect discovered mid-write
+      // cannot itself throw out of this `finally`.
+      await this.setBrightnessSafe(0)
     }
   }
 
@@ -688,5 +836,30 @@ export class Daemon {
     this.flashPumpTimer = null
     await this.lockState?.stop()
     await this.lockTransition
+    // I1: a render already in flight when `stop()` was called must finish
+    // before `stop()` resolves. Measured: without this, a held device write
+    // completed AFTER `await daemon.stop()` had already returned, and
+    // `bin/deckd.ts`'s shutdown had already gone on to call
+    // `device.disconnect()` -- the resumed write then hit a closing or
+    // closed handle and logged the "render failed" WARN, a real unawaited
+    // operation, not cosmetic noise. `runRender` already catches every
+    // failure of its own, so this can only ever wait, never reject; the
+    // `.catch` is defensive only, matching the pattern `syncLockState`'s own
+    // lock branch already uses when it awaits `activeRender` above.
+    await this.activeRender?.catch(() => {})
+  }
+
+  /**
+   * Best-effort privacy blank for orderly shutdown (I4). Callable only after
+   * `stop()`. `bin/deckd.ts`'s shutdown used to blank nothing: the
+   * documented `launchctl bootout` recovery path, or the few seconds
+   * between a `pkill` and launchd's respawn, left the last frame lit at full
+   * brightness -- session names, task tiles -- on a Mac that might then be
+   * locked with the daemon no longer running to blank it. Reuses
+   * `blankForLock`'s guards, so a failing write here can never block process
+   * exit: it checks `isConnected()` itself and never throws.
+   */
+  async shutdownBlank(): Promise<void> {
+    await this.blankForLock()
   }
 }

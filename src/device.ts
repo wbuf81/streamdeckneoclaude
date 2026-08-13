@@ -57,8 +57,28 @@ export class Device implements DeckDevice {
     return this.deck !== null
   }
 
+  /**
+   * A fresh, EXTERNALLY requested connect. Only this resets `stopped`
+   * (lesson 8: `stopped` must be one-way for the retry path) — the internal
+   * retry loop below calls `attemptConnect` directly, never this method, so
+   * an in-flight retry can never undo a concurrent `disconnect()`'s
+   * `stopped = true` (I2).
+   */
   async connect(): Promise<void> {
     this.stopped = false
+    await this.attemptConnect()
+  }
+
+  /**
+   * Does the actual enumerate-and-open work, without ever resetting
+   * `stopped`. Used by both `connect()` (after it resets the flag) and the
+   * retry loop (which must not). Bails immediately if `disconnect()` has
+   * already run — `tryOpen` also re-checks after each of its own awaits, so
+   * a `disconnect()` that lands mid-enumeration or mid-open is caught there
+   * too, not just at entry here.
+   */
+  private async attemptConnect(): Promise<void> {
+    if (this.stopped) return
     await this.tryOpen()
     if (!this.deck) this.scheduleRetry()
   }
@@ -69,9 +89,9 @@ export class Device implements DeckDevice {
       this.retry = null
       // A scheduled retry must never reject into nothing. A busy device throws
       // from `tryOpen`, and an unhandled rejection can end the process. The
-      // throw also happens before `connect` reaches `scheduleRetry`, so without
-      // this catch the retry loop stops for good and never reconnects.
-      this.connect().catch((e) => {
+      // throw also happens before `attemptConnect` reaches `scheduleRetry`, so
+      // without this catch the retry loop stops for good and never reconnects.
+      this.attemptConnect().catch((e) => {
         log.once('open-failed', String(e))
         this.scheduleRetry()
       })
@@ -86,6 +106,9 @@ export class Device implements DeckDevice {
       log.once('enumerate', `cannot list devices: ${String(e)}`)
       return
     }
+    // `disconnect()` may have run while enumeration was in flight (I2). Bail
+    // before touching `this.deck` or opening anything on its behalf.
+    if (this.stopped) return
     const neo = found.find((d) => d.model === 'neo')
     if (!neo) {
       log.once('no-device', 'no Stream Deck Neo found. Retrying every 2 seconds.')
@@ -101,6 +124,18 @@ export class Device implements DeckDevice {
           'Quit the Elgato Stream Deck app or another deckd instance. ' +
           `Cause: ${String(e)}`,
       )
+    }
+    if (this.stopped) {
+      // `disconnect()` ran while `openStreamDeck` was in flight (I2, the
+      // probed case): a handle finished opening after shutdown already asked
+      // for the device to be closed. Close it rather than adopting it, so
+      // `isConnected()` cannot report `true` after `disconnect()` resolved.
+      try {
+        await opened.close()
+      } catch (e) {
+        log.once('device-close-failed', `failed to close a late-opened handle: ${String(e)}`)
+      }
+      return
     }
     this.deck = opened
     log.clearOnce('no-device')

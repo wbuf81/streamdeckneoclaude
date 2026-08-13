@@ -88,6 +88,69 @@ describe('Device onDisconnect parity', () => {
   })
 })
 
+describe('Device.disconnect() racing an in-flight connect (I2)', () => {
+  // Probe C from the review: `connect()` used to reset `stopped = false`
+  // unconditionally, so a retry's own internal call to `connect()` undid a
+  // CONCURRENT `disconnect()`'s `stopped = true` -- and `tryOpen` adopted
+  // whatever handle it was mid-opening regardless. Measured on the real
+  // `Device`: `isConnected()` was `true` after `await disconnect()` had
+  // already resolved. The redeploy path this matters for is
+  // `pkill -f "dist/bin/deckd.js start"` while the deck is unplugged or the
+  // retry loop is mid-enumeration.
+  it('does not adopt a handle that finishes opening after disconnect() already ran, held mid-enumeration', async () => {
+    let releaseList: (() => void) | undefined
+    const deck = fakeDeck()
+    const listStreamDecks = vi.fn(
+      () =>
+        new Promise<StreamDeckDeviceInfo[]>((resolve) => {
+          releaseList = () => resolve([{ model: DeviceModelId.NEO, path: '/fake/neo' }])
+        }),
+    )
+    const openStreamDeck = vi.fn(async (): Promise<StreamDeck> => deck)
+    const device = new Device({ listStreamDecks, openStreamDeck })
+
+    const connecting = device.connect() // parks inside the held listStreamDecks
+    await Promise.resolve()
+
+    await device.disconnect() // shutdown runs while enumeration is still in flight
+    expect(device.isConnected()).toBe(false)
+
+    releaseList?.() // enumeration now finds the device and would normally open it
+    await connecting
+
+    expect(device.isConnected()).toBe(false) // must NOT have reopened after disconnect()
+    expect(openStreamDeck).not.toHaveBeenCalled()
+  })
+
+  it('closes a handle that finishes opening after disconnect() already ran, held mid-open', async () => {
+    let releaseOpen: (() => void) | undefined
+    const deck = { ...fakeDeck(), close: vi.fn(async () => {}) } as unknown as StreamDeck
+    const listStreamDecks = vi.fn(
+      async (): Promise<StreamDeckDeviceInfo[]> => [{ model: DeviceModelId.NEO, path: '/fake/neo' }],
+    )
+    const openStreamDeck = vi.fn(
+      () =>
+        new Promise<StreamDeck>((resolve) => {
+          releaseOpen = () => resolve(deck)
+        }),
+    )
+    const device = new Device({ listStreamDecks, openStreamDeck })
+
+    const connecting = device.connect()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    await device.disconnect() // shutdown runs while `openStreamDeck` is still in flight
+    expect(device.isConnected()).toBe(false)
+
+    releaseOpen?.() // the open finishes AFTER disconnect() already resolved
+    await connecting
+
+    expect(device.isConnected()).toBe(false) // must NOT have adopted the late handle
+    expect(deck.close).toHaveBeenCalledTimes(1) // closed rather than leaked
+  })
+})
+
 describe('Device loss ownership', () => {
   it('closes a failed handle and reconnects', async () => {
     vi.useFakeTimers()

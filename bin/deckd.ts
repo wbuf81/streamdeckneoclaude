@@ -110,6 +110,14 @@ async function start(): Promise<void> {
     log.info('deckd stopping')
     savePage(pages)
     await daemon.stop()
+    // I4: an orderly shutdown used to disconnect with the last frame still
+    // lit at full brightness. The documented `launchctl bootout` recovery
+    // path, or the few seconds between a `pkill` and launchd's respawn,
+    // then left session names and task tiles on the glass with nothing
+    // running to blank them -- on a Mac that might be locked moments later.
+    // `shutdownBlank` is best-effort and never throws, so it cannot block
+    // the rest of shutdown even if the device is already gone.
+    await daemon.shutdownBlank()
     await claude.stop()
     await usage.stop()
     await codex.stop()
@@ -181,10 +189,7 @@ export function savePage(
   }
 }
 
-function usage(): never {
-  console.error('usage: deckd <start|install|uninstall|refresh-wrapper|auth>')
-  process.exit(2)
-}
+const USAGE = 'usage: deckd <start|install|uninstall|refresh-wrapper|auth>'
 
 /** Reads the client id from the CLI flag or the config file. */
 function readClientId(): string {
@@ -234,52 +239,92 @@ async function authSpotify(): Promise<void> {
  * it) rather than a module some other code imports. Without this guard, a
  * test importing `makeChangeHandler` above would also run this whole
  * dispatch block against whatever `process.argv` the TEST runner happened to
- * have -- landing on `default` or `undefined` and calling `usage()`, which
- * calls `process.exit(2)` and would kill the entire test process.
+ * have -- landing on `default` or `undefined` and printing usage with an
+ * exit code, which would kill the entire test process.
  *
- * `fileURLToPath(import.meta.url)` is this file's RESOLVED real path.
- * `process.argv[1]` is the literal string the caller passed, which is only
- * the same string in the two cases above. `package.json` also declares
- * `"bin": { "deckd": "./dist/bin/deckd.js" }`, so after `npm link` or a
- * global install, `process.argv[1]` is a SYMLINK in some bin directory
- * instead — a different string pointing at the same real file, which would
- * make this return false and `deckd start` exit 0 having done nothing at
- * all (M11). Resolving `process.argv[1]` through `realpathSync` first
- * removes that whole class of mismatch; a path that does not exist at all
- * (any other invocation shape) falls back to the direct string compare,
- * which can only ever be false in that case anyway.
+ * Pulled apart into a pure `isEntryPoint` (this doc comment's actual logic,
+ * parameterized so a test can supply synthetic paths) and a thin `isMain`
+ * wrapper that reads the two real global values. Before this split, nothing
+ * exercised the `realpathSync` branch at all: a test would have had to
+ * mutate the real `process.argv`, which risks corrupting the test runner's
+ * own process state.
+ *
+ * `here` is this file's RESOLVED real path. `argv1` is the literal string
+ * the caller passed, which is only the same string in the two cases above.
+ * `package.json` also declares `"bin": { "deckd": "./dist/bin/deckd.js" }`,
+ * so after `npm link` or a global install, `argv1` is a SYMLINK in some bin
+ * directory instead — a different string pointing at the same real file,
+ * which would make a plain string compare return false and `deckd start`
+ * exit 0 having done nothing at all (M11). Resolving `argv1` through
+ * `realpath` first removes that whole class of mismatch; a path that does
+ * not exist at all (any other invocation shape) falls back to the direct
+ * string compare, which can only ever be false in that case anyway.
  */
-function isMain(): boolean {
-  const argv1 = process.argv[1]
+export function isEntryPoint(
+  argv1: string | undefined,
+  here: string,
+  realpath: (p: string) => string = realpathSync,
+): boolean {
   if (!argv1) return false
-  const here = fileURLToPath(import.meta.url)
   if (here === argv1) return true
   try {
-    return here === realpathSync(argv1)
+    return here === realpath(argv1)
   } catch {
     return false
   }
 }
 
-if (isMain()) {
-  const cmd = process.argv[2]
+function isMain(): boolean {
+  return isEntryPoint(process.argv[1], fileURLToPath(import.meta.url))
+}
+
+/** The real command implementations `dispatch` routes to in production. */
+export interface CliHandlers {
+  start: () => Promise<void>
+  install: () => Promise<void>
+  uninstall: () => Promise<void>
+  refreshWrapper: () => Promise<{ path: string }>
+  authSpotify: () => Promise<void>
+}
+
+/**
+ * Routes one CLI invocation to the right handler and picks the right exit
+ * code. Pulled out of the `isMain()` block (I-6: this dispatch had zero
+ * tests) so a test can drive every verb, the missing-verb case, and the
+ * unknown-verb case directly — injecting a spy for each handler and a
+ * non-real `exit` — without spawning a process, running a real
+ * install/uninstall, or touching `~`.
+ *
+ * `argv` is the full `process.argv`-shaped array: `argv[2]` is the verb,
+ * `argv[3]` is `auth`'s required sub-verb. `exit`, `err`, and `out` default
+ * to the real `process.exit`, `console.error`, and `console.log`, matching
+ * this file's behaviour before the split exactly.
+ */
+export function dispatch(
+  argv: readonly string[],
+  handlers: CliHandlers,
+  exit: (code: number) => void = process.exit,
+  err: (message: string) => void = console.error,
+  out: (message: string) => void = console.log,
+): void {
+  const cmd = argv[2]
   switch (cmd) {
     case 'start':
-      void start().catch((e: unknown) => {
-        console.error(String(e))
-        process.exit(1)
+      void handlers.start().catch((e: unknown) => {
+        err(String(e))
+        exit(1)
       })
       break
     case 'install':
-      install().catch((e: unknown) => {
-        console.error(String(e))
-        process.exit(1)
+      handlers.install().catch((e: unknown) => {
+        err(String(e))
+        exit(1)
       })
       break
     case 'uninstall':
-      uninstall().catch((e: unknown) => {
-        console.error(String(e))
-        process.exit(1)
+      handlers.uninstall().catch((e: unknown) => {
+        err(String(e))
+        exit(1)
       })
       break
     case 'refresh-wrapper':
@@ -288,34 +333,41 @@ if (isMain()) {
       // or launchd. This is the ONLY way an already-installed user gets a
       // wrapper fix without a full uninstall/install cycle -- and that
       // cycle is exactly the path C-1 lived on. Safe to run repeatedly.
-      refreshWrapper()
+      handlers
+        .refreshWrapper()
         .then((r) => {
-          console.log(`refreshed the wrapper at ${r.path}.`)
+          out(`refreshed the wrapper at ${r.path}.`)
         })
         .catch((e: unknown) => {
-          console.error(String(e))
-          process.exit(1)
+          err(String(e))
+          exit(1)
         })
       break
     case 'auth':
-      if (process.argv[3] === 'spotify') {
+      if (argv[3] === 'spotify') {
         // Catch the rejection. The flow can time out, or the callback state can
         // mismatch, and an unhandled rejection would print a stack trace instead
         // of the reason.
-        authSpotify().catch((e) => {
-          console.error(String(e))
-          process.exit(1)
+        handlers.authSpotify().catch((e) => {
+          err(String(e))
+          exit(1)
         })
       } else {
-        console.error('usage: deckd auth spotify')
-        process.exit(2)
+        err('usage: deckd auth spotify')
+        exit(2)
       }
       break
     case undefined:
-      usage()
+      err(USAGE)
+      exit(2)
       break
     default:
-      console.error(`unknown command: ${cmd}`)
-      usage()
+      err(`unknown command: ${cmd}`)
+      err(USAGE)
+      exit(2)
   }
+}
+
+if (isMain()) {
+  dispatch(process.argv, { start, install, uninstall, refreshWrapper, authSpotify })
 }

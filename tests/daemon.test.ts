@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Daemon } from '../src/daemon.js'
 import { FakeDevice } from '../src/fake-device.js'
 import { PageManager } from '../src/page-manager.js'
-import { BUTTON_LEFT, BUTTON_RIGHT } from '../src/device.js'
+import { BUTTON_LEFT, BUTTON_RIGHT, type DeckDevice } from '../src/device.js'
 import { setDefaultSink } from '../src/log.js'
 import type { Page, PressOutcome } from '../src/pages/types.js'
 import type { DeckFrame, KeySpec } from '../src/render/specs.js'
@@ -68,12 +68,24 @@ class FakeLockState implements LockStateReader {
   stopCalls = 0
   refreshCalls = 0
   private callbacks: (() => void)[] = []
+  /**
+   * Set by a test to make the NEXT `refresh()` behave like a real poll that
+   * found the OS lock property had actually changed since the last read
+   * (M7). Before this, the fake's `refresh` was a bare counter with no way
+   * to change what `isLocked()` answers, so a test asserting
+   * `refreshCalls === 1` could prove `refresh` was CALLED but not that its
+   * result was ever honoured.
+   */
+  private refreshResult: boolean | null = null
 
   constructor(private locked: boolean) {}
 
   async start(): Promise<void> { this.startCalls += 1 }
   async stop(): Promise<void> { this.stopCalls += 1 }
-  async refresh(): Promise<void> { this.refreshCalls += 1 }
+  async refresh(): Promise<void> {
+    this.refreshCalls += 1
+    if (this.refreshResult !== null) this.locked = this.refreshResult
+  }
   isLocked(): boolean { return this.locked }
   onChange(cb: () => void): void { this.callbacks.push(cb) }
 
@@ -81,6 +93,54 @@ class FakeLockState implements LockStateReader {
     if (locked === this.locked) return
     this.locked = locked
     this.callbacks.forEach((cb) => cb())
+  }
+
+  /** See `refreshResult`. Fires no `onChange` callback -- a real poll
+   * changing the property does not call back on its own; `handleTick` is
+   * what notices, by calling `queueLockTransition` right after `refresh()`. */
+  setRefreshResult(locked: boolean): void {
+    this.refreshResult = locked
+  }
+}
+
+/**
+ * A device that behaves exactly like an unplugged Stream Deck: `connect()`
+ * resolves (as `Device.connect()` does when enumeration finds nothing) but
+ * never establishes a handle, and `onConnect`'s callback fires only when the
+ * test calls `simulateConnect()` -- standing in for a cable being plugged in
+ * later. `FakeDevice.connect()` always succeeds immediately, so it cannot
+ * model the C1 scenario (`deckd start` with nothing plugged in) at all.
+ */
+class NeverConnectingDevice implements DeckDevice {
+  connected = false
+  keyWrites: number[] = []
+  private connectCbs: (() => void)[] = []
+  private pressCbs: ((i: number) => void)[] = []
+
+  isConnected(): boolean { return this.connected }
+  async connect(): Promise<void> { /* no device found; stays disconnected */ }
+  async disconnect(): Promise<void> { this.connected = false }
+
+  private ensureConnected(): void {
+    if (!this.connected) throw new Error('device is not connected')
+  }
+
+  async setKeyImage(index: number): Promise<void> {
+    this.ensureConnected()
+    this.keyWrites.push(index)
+  }
+  async setStrip(): Promise<void> { this.ensureConnected() }
+  async setButtonColor(): Promise<void> { this.ensureConnected() }
+  async setBrightness(): Promise<void> { this.ensureConnected() }
+  onPress(cb: (i: number) => void): void { this.pressCbs.push(cb) }
+  onRelease(): void {}
+  onConnect(cb: () => void): void { this.connectCbs.push(cb) }
+  onDisconnect(): void {}
+
+  /** Simulates a cable being plugged in after `start()` already ran. */
+  simulateConnect(): void {
+    this.connected = true
+    this.connectCbs.forEach((cb) => cb())
   }
 }
 
@@ -177,6 +237,82 @@ describe('Daemon', () => {
     await expect(daemon.renderOnce(2, 2000)).resolves.not.toThrow()
     device.setKeyImage = original
     await daemon.stop()
+  })
+})
+
+describe('Daemon startup and reconnect with no device present (C1)', () => {
+  // The exact review scenario: `deckd start` while the Stream Deck is
+  // unplugged, or during the USB enumeration window after a reboot. Before
+  // the fix, `start()`'s unlocked branch called `device.setBrightness(100)`
+  // with no `isConnected()` guard; `Device.setBrightness` throws when no
+  // handle is open, so `start()` rejected, `bin/deckd.ts` re-threw to its
+  // top-level catch, and the process exited -- which launchd's `KeepAlive`
+  // then respawned forever, never giving the retry loop (armed by
+  // `connect()` itself) a chance to run at all.
+  it('start() resolves even with no device present, leaving the retry loop armed', async () => {
+    const device = new NeverConnectingDevice()
+    const page = new ControlPage()
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+
+    await expect(daemon.start()).resolves.toBeUndefined()
+    expect(device.keyWrites).toHaveLength(0) // nothing to write to; never threw trying
+
+    // The retry loop's `onConnect` registration is what recovers: a later
+    // connect paints the full frame, exactly as if the cable were plugged
+    // in moments after `deckd start` ran.
+    device.simulateConnect()
+    await flush()
+    expect(device.keyWrites).toHaveLength(8)
+
+    await daemon.stop()
+  })
+
+  it('a later reconnect after a no-device start also arms a live render timer', async () => {
+    vi.useFakeTimers()
+    try {
+      const device = new NeverConnectingDevice()
+      // An animating page, so a live timer produces NEW key writes on every
+      // tick rather than the dirty-key hash suppressing them as unchanged --
+      // a static page would look identical whether or not the timer ever
+      // ran after the one reconnect paint.
+      const page = new TickPage(100)
+      page.animate = true
+      const manager = new PageManager()
+      manager.add(page)
+      const daemon = new Daemon(device, manager)
+
+      await daemon.start()
+      device.simulateConnect()
+      await vi.advanceTimersByTimeAsync(0)
+      device.keyWrites = []
+
+      // If the timer never armed, no further ticks occur after the initial
+      // reconnect paint, so nothing more would be written no matter how
+      // much time passes.
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(device.keyWrites.length).toBeGreaterThan(0)
+
+      await daemon.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('Daemon.handleReconnect after stop() (I3)', () => {
+  it('does nothing at all -- no brightness write, no render -- once the daemon has stopped', async () => {
+    const { device, daemon } = build()
+    await daemon.start()
+    await daemon.stop()
+    device.reset()
+    device.brightness = 0 // as if a shutdown blank already ran
+
+    await daemon.handleReconnect()
+
+    expect(device.brightness).toBe(0)
+    expect(device.keyWrites).toHaveLength(0)
   })
 })
 
@@ -300,6 +436,206 @@ describe('Daemon screen lock privacy', () => {
     expect(lock.refreshCalls).toBe(1)
     expect(device.keyWrites).toHaveLength(8)
     await daemon.stop()
+  })
+
+  // M7: the test above proves `refresh()` was CALLED, but `FakeLockState`'s
+  // `refresh` used to be a bare counter that could never change what
+  // `isLocked()` answers -- so nothing proved the daemon actually ACTED on
+  // what a real poll would find. This drives the same sleep-sized jump, but
+  // makes the poll discover the screen is now locked.
+  it('acts on what refresh discovers: a sleep-sized jump revealing the screen is locked blanks the deck instead of repainting it (M7)', async () => {
+    vi.useFakeTimers()
+    let ms = 1000
+    const clocks = { seconds: () => Math.floor(ms / 1000), millis: () => ms }
+    const { device, page, lock, daemon } = buildWithLock(false, clocks)
+    await daemon.start()
+    device.reset()
+
+    lock.setRefreshResult(true)
+    ms = 12_000
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(lock.refreshCalls).toBe(1)
+    expect(device.brightness).toBe(0)
+    const blank = renderKey({ kind: 'blank' })
+    for (let i = 0; i < 8; i++) expect(device.keyImages.get(i)?.equals(blank)).toBe(true)
+    expect(page.leaves).toBe(1)
+    await daemon.stop()
+  })
+
+  // M7: nothing exercised a reconnect while locked before this. The code was
+  // already correct by inspection (`handleReconnect`'s locked branch calls
+  // `blankForLock`, never a repaint), but nothing would have caught a
+  // regression.
+  it('reconnecting while locked re-blanks instead of repainting the page (M7)', async () => {
+    const { device, lock, daemon } = buildWithLock(false)
+    await daemon.start()
+    lock.setLocked(true)
+    await flush()
+    device.reset()
+
+    await daemon.handleReconnect()
+
+    expect(device.brightness).toBe(0)
+    const blank = renderKey({ kind: 'blank' })
+    for (let i = 0; i < 8; i++) expect(device.keyImages.get(i)?.equals(blank)).toBe(true)
+    await daemon.stop()
+  })
+
+  // C2 -- the review's exact scenario: lock, unplug, unlock. Before the fix,
+  // `syncLockState`'s unlock branch awaited `device.setBrightness` BEFORE
+  // `armTimer()`; a disconnected device made that throw, the rejection
+  // reached `queueLockTransition`'s catch (which only logs), and the daemon
+  // was left with `locked = false` and no timer at all -- permanently
+  // frozen until a full further lock/unlock cycle or a press, neither
+  // discoverable from the user's side.
+  it('lock, unplug, unlock: the render loop recovers instead of freezing permanently (C2)', async () => {
+    vi.useFakeTimers()
+    try {
+      const device = new FakeDevice()
+      // Animating, so a live timer produces NEW writes on every tick rather
+      // than the dirty-key hash suppressing them as unchanged -- a static
+      // page would look identical whether or not the timer ever ran after
+      // the reconnect's own one-time repaint.
+      const page = new TickPage(100)
+      page.animate = true
+      const manager = new PageManager()
+      manager.add(page)
+      const lock = new FakeLockState(false)
+      const daemon = new Daemon(device, manager, undefined, undefined, lock)
+      await daemon.start()
+
+      lock.setLocked(true)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(device.brightness).toBe(0)
+
+      await device.disconnect() // the cable is knocked loose while locked
+      expect(device.isConnected()).toBe(false)
+
+      lock.setLocked(false) // unlocking while still disconnected
+      await vi.advanceTimersByTimeAsync(0)
+
+      await device.connect() // the cable is plugged back in
+      await vi.advanceTimersByTimeAsync(0)
+      device.reset()
+
+      // A live render loop keeps writing on its own, with no further press
+      // or lock change needed -- proof the interval actually exists, not
+      // just that one reconnect frame got painted.
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(device.keyWrites.length).toBeGreaterThan(0)
+
+      await daemon.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // C2's second route: `this.pages.current().onEnter?.()` throwing, reached
+  // BEFORE `armTimer()` in the old code, with no try/catch anywhere near it.
+  it('an onEnter that throws during unlock still leaves the render loop armed (C2, second route)', async () => {
+    vi.useFakeTimers()
+    try {
+      const device = new FakeDevice()
+      const page = new TickPage(100)
+      page.animate = true
+      const manager = new PageManager()
+      manager.add(page)
+      const lock = new FakeLockState(false)
+      const daemon = new Daemon(device, manager, undefined, undefined, lock)
+      await daemon.start()
+
+      lock.setLocked(true)
+      await vi.advanceTimersByTimeAsync(0)
+
+      // `TickPage` declares no `onEnter` of its own; casting through `Page`
+      // adds one for this test only, matching the shape `ControlPage`'s
+      // (optional, per `Page`) already has.
+      ;(page as Page).onEnter = () => {
+        throw new Error('onEnter boom')
+      }
+      lock.setLocked(false)
+      await vi.advanceTimersByTimeAsync(0)
+
+      // The failing hook must not have blocked the unlock's own brightness
+      // restore or the timer it arms.
+      expect(device.brightness).toBe(DEFAULT_BRIGHTNESS)
+      device.reset()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(device.keyWrites.length).toBeGreaterThan(0)
+
+      await daemon.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // M2: `lockState.onChange` is registered before `await device.connect()`
+  // in `start()`. If the lock changes mid-connect, the queued transition
+  // sets `locked = true` and calls `onLeave` while the device is not yet
+  // connected (so `blankForLock` early-returns); when `connect()` resolves,
+  // `start()` reads the now-true `locked` and used to call `onLeave` AGAIN,
+  // with no `onEnter` between the two calls.
+  it('does not call onLeave twice when the lock changes during a slow connect (M2)', async () => {
+    const device = new FakeDevice()
+    const page = new ControlPage()
+    const manager = new PageManager()
+    manager.add(page)
+    const lock = new FakeLockState(false)
+    const daemon = new Daemon(device, manager, undefined, undefined, lock)
+
+    const realConnect = device.connect.bind(device)
+    let releaseConnect: (() => void) | undefined
+    device.connect = () =>
+      new Promise<void>((resolve) => {
+        releaseConnect = () => {
+          void realConnect().then(resolve)
+        }
+      })
+
+    const starting = daemon.start()
+    await flush() // let start() run past lockState.start()/onChange registration and reach the held connect()
+
+    lock.setLocked(true)
+    await flush() // let the queued syncLockState run its lock branch against the still-unconnected device
+
+    releaseConnect?.()
+    await starting
+
+    expect(page.leaves).toBe(1)
+    await daemon.stop()
+  })
+})
+
+describe('Daemon clock jump detection (M3)', () => {
+  afterEach(() => vi.useRealTimers())
+
+  // `handleTick`'s sleep-gap check used to compare `ms - previous`
+  // directly, so only a FORWARD jump this large counted as a sleep. A
+  // BACKWARD step of the same size -- an NTP correction, a manual clock
+  // change -- skipped `invalidateFrame()` entirely, and with unchanged page
+  // content the next render's dirty-key hash matched the cached one, so
+  // literally nothing was written.
+  it('treats a large backward clock jump as a sleep too, forcing a full repaint', async () => {
+    vi.useFakeTimers()
+    try {
+      let ms = 100_000
+      const device = new FakeDevice()
+      const page = new ControlPage()
+      const manager = new PageManager()
+      manager.add(page)
+      const daemon = new Daemon(device, manager, () => Math.floor(ms / 1000), () => ms)
+      await daemon.start()
+      device.reset()
+
+      ms -= 20_000 // a 20 s backward step, well past the 5 s minimum sleep gap
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(device.keyWrites.length).toBeGreaterThan(0)
+      await daemon.stop()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -530,6 +866,59 @@ describe('Daemon.stop (M1)', () => {
     expect(device.keyWrites).toHaveLength(0) // no interval is running
   })
 
+  // I1: `stop()` used to resolve without awaiting `activeRender`. Measured
+  // against `FakeDevice` with a device write held open across `stop()`: a
+  // key write landed AFTER `await daemon.stop()` had already returned.
+  // Against the real device, that resumed write hits a closing or closed
+  // handle and logs the "render failed" WARN -- a real unawaited operation,
+  // not cosmetic noise.
+  //
+  // Lesson 8: the write is held open and `stop()` is raced against a flush
+  // BEFORE releasing it, so `stop()` genuinely has to wait -- with no held
+  // promise, `stop()` would resolve before the render ever got a chance to
+  // still be in flight, and this test would pass even against the unfixed
+  // code.
+  it('awaits an in-flight render before resolving, so no write lands after stop() already returned (I1)', async () => {
+    const device = new FakeDevice()
+    const page = new ControlPage()
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+    await daemon.start()
+    device.reset()
+    page.lines = ['changed'] // dirties key 0 for the next render
+
+    const realSetKeyImage = device.setKeyImage.bind(device)
+    let release: (() => void) | undefined
+    device.setKeyImage = async (index, image) => {
+      await new Promise<void>((resolve) => { release = resolve })
+      await realSetKeyImage(index, image)
+    }
+
+    const rendering = daemon.renderOnce(2, 2000) // parks inside the held setKeyImage
+    await Promise.resolve()
+    await Promise.resolve()
+
+    let stopResolved = false
+    const stopping = daemon.stop().then(() => { stopResolved = true })
+    // A real macrotask boundary, not a fixed count of microtask ticks: by
+    // the time a `setTimeout(0)` fires, every microtask that does NOT
+    // depend on `release()` has already settled -- including however many
+    // ticks `stop()`'s own internal awaits take. If `stop()` still has not
+    // resolved at this point, it can only be because it is genuinely
+    // parked on the held render, not because the test simply did not wait
+    // long enough.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(stopResolved).toBe(false) // stop() is still waiting on the render
+
+    release?.()
+    await rendering
+    await stopping
+
+    expect(stopResolved).toBe(true)
+    expect(device.keyWrites.length).toBeGreaterThan(0) // the held write landed BEFORE stop() resolved
+  })
+
   it('a press arriving after stop() does not throw or write to the device at all', async () => {
     const device = new FakeDevice()
     const page = new ControlPage()
@@ -546,6 +935,34 @@ describe('Daemon.stop (M1)', () => {
 
     expect(page.presses).toEqual([]) // the plain key-press branch bailed too
     expect(device.keyWrites).toHaveLength(0)
+  })
+
+  // I4: `bin/deckd.ts`'s shutdown used to disconnect with the last frame
+  // still lit at full brightness. `shutdownBlank` is the best-effort privacy
+  // blank `shutdown()` now calls between `daemon.stop()` and
+  // `device.disconnect()` -- callable AFTER `stop()`, and it must still
+  // reach the device (which is still open at that point in the real
+  // sequence) even though the render loop itself has already stopped.
+  it('shutdownBlank blanks the deck and drops brightness even after stop() (I4)', async () => {
+    const { device, daemon } = build()
+    await daemon.start()
+    device.reset()
+
+    await daemon.stop()
+    await daemon.shutdownBlank()
+
+    expect(device.brightness).toBe(0)
+    const blank = renderKey({ kind: 'blank' })
+    for (let i = 0; i < 8; i++) expect(device.keyImages.get(i)?.equals(blank)).toBe(true)
+  })
+
+  it('shutdownBlank never throws even when the device is unreachable', async () => {
+    const { device, daemon } = build()
+    await daemon.start()
+    await daemon.stop()
+    await device.disconnect() // the device is already gone by the time shutdown blanks
+
+    await expect(daemon.shutdownBlank()).resolves.toBeUndefined()
   })
 })
 
