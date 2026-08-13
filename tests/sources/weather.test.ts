@@ -167,6 +167,87 @@ describe('parseForecast', () => {
     expect(days[1]!.high).toBe(90)
   })
 
+  // -------------------------------------------------------------------------
+  // day / night detail fields (task 34)
+  // -------------------------------------------------------------------------
+
+  it('builds day and night PeriodDetail objects from the same periods used for the summary fields', () => {
+    const periods = [
+      period({
+        name: 'Thursday',
+        isDaytime: true,
+        temperature: 95,
+        shortForecast: 'Showers And Thunderstorms',
+        detailedForecast: 'Showers and thunderstorms, mainly after 2pm.',
+        windSpeed: '8 mph',
+        windDirection: 'NE',
+        probabilityOfPrecipitation: { value: 40 },
+      }),
+      period({
+        name: 'Thursday Night',
+        isDaytime: false,
+        temperature: 77,
+        shortForecast: 'Clear',
+        detailedForecast: 'Clear skies overnight.',
+        windSpeed: '5 to 8 mph',
+        windDirection: 'SW',
+        probabilityOfPrecipitation: { value: 10 },
+      }),
+    ]
+    const { days } = parseForecast(forecastBody(periods), NOW)
+    const day = days[0]!
+
+    expect(day.day).toEqual({
+      emoji: '⛈',
+      temperature: 95,
+      precipPercent: 40,
+      shortForecast: 'Showers And Thunderstorms',
+      detailedForecast: 'Showers and thunderstorms, mainly after 2pm.',
+      windSpeed: '8 mph',
+      windDirection: 'NE',
+    })
+    expect(day.night).toEqual({
+      emoji: '☀️',
+      temperature: 77,
+      precipPercent: 10,
+      shortForecast: 'Clear',
+      detailedForecast: 'Clear skies overnight.',
+      windSpeed: '5 to 8 mph',
+      windDirection: 'SW',
+    })
+  })
+
+  it('gives the day half null when the forecast opens at night, but keeps the night half', () => {
+    const periods = [
+      period({ name: 'Tonight', isDaytime: false, temperature: 70, shortForecast: 'Clear' }),
+      period({ name: 'Thursday', isDaytime: true, temperature: 90 }),
+      period({ name: 'Thursday Night', isDaytime: false, temperature: 72 }),
+    ]
+    const { days } = parseForecast(forecastBody(periods), NOW)
+    expect(days[0]!.day).toBeNull()
+    expect(days[0]!.night).not.toBeNull()
+    expect(days[0]!.night!.temperature).toBe(70)
+  })
+
+  it('gives the night half null for a trailing day period with no following night', () => {
+    const periods = [
+      period({ name: 'Thursday', isDaytime: true, temperature: 90 }),
+    ]
+    const { days } = parseForecast(forecastBody(periods), NOW)
+    expect(days[0]!.day).not.toBeNull()
+    expect(days[0]!.night).toBeNull()
+  })
+
+  it('keeps a null precipPercent on a period detail, never 0, when the value is unknown', () => {
+    const periods = [
+      period({ probabilityOfPrecipitation: { value: null } }),
+      period({ name: 'Tonight', isDaytime: false, temperature: 77, probabilityOfPrecipitation: { value: null } }),
+    ]
+    const { days } = parseForecast(forecastBody(periods), NOW)
+    expect(days[0]!.day!.precipPercent).toBeNull()
+    expect(days[0]!.night!.precipPercent).toBeNull()
+  })
+
   it('gives precipPercent null, never 0, when the value is null', () => {
     const periods = [
       period({ probabilityOfPrecipitation: { value: null } }),

@@ -2,7 +2,7 @@ import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
-import type { Conditions, DayForecast, WeatherStatus } from '../sources/weather.js'
+import type { Conditions, DayForecast, PeriodDetail, WeatherStatus } from '../sources/weather.js'
 import { ZIP } from '../sources/weather.js'
 
 /** Measured limit for one strip line. See `render/canvas.ts`. */
@@ -34,6 +34,20 @@ const TEMP_SIZES = [16, 13, 11]
 const TEMP_Y = 54
 const PRECIP_SIZE = 20
 const PRECIP_Y = 74
+
+/**
+ * Candidate sizes for the detail view's variable-length text lines: the
+ * DAY/NIGHT wind reading and the DAY/NIGHT short-forecast text. Both can run
+ * well past the 81 px budget (a real `"5 to 9 mph S"` measures 92.7 px even
+ * at the smallest candidate, 11 px, and a real `shortForecast` like
+ * `"Slight Chance Showers And Thunderstorms then Partly Cloudy"` measures
+ * 384 px) — `renderKey` measures with the real canvas and, per its own
+ * `shrinkToFit` fallback, truncates with an ellipsis rather than clipping.
+ * This page never reasons about the width itself, per docs/LESSONS.md #17.
+ */
+const DETAIL_TEXT_SIZES = [13, 11]
+/** Fixed size for the detail view's BACK label, matching the stocks detail view. */
+const BACK_SIZE = 16
 
 /** Heat colour bands for the high temperature (or the low, when there is no
  * high). A null temperature — nothing to grade — stays neutral. */
@@ -109,6 +123,15 @@ function precipColor(pct: number | null): readonly [number, number, number] {
   return typeof pct === 'number' && pct >= PRECIP_HOT_THRESHOLD ? theme.blue : theme.textDim
 }
 
+/** `"8 mph"` and `"NE"` become `"8 mph NE"`. A missing direction keeps just
+ * the speed. A null period (that half of the day is unknown) becomes `--`,
+ * never a fabricated reading. */
+function formatWind(period: PeriodDetail | null): string {
+  if (!period) return '--'
+  const speed = period.windSpeed || '--'
+  return period.windDirection ? `${speed} ${period.windDirection}` : speed
+}
+
 /** `4:05 PM EDT`, in US Eastern time — the project's one timestamp
  * formatter, per `AGENTS.md`'s "Product conventions". Measured at 148.7 px
  * for `updated 4:05 PM EDT`, well inside the strip's 236 px usable width, so
@@ -121,10 +144,18 @@ function formatUpdated(epochSeconds: number): string {
  * Seven day tiles plus a conditions tile, for the National Weather Service
  * forecast at a fixed ZIP code. A key dims when the shared forecast is stale
  * or when no data has arrived yet for that slot, so a stale or missing
- * forecast never presents as current.
+ * forecast never presents as current. Pressing a day tile enters a detail
+ * mode for that one day, spread across all eight keys, with BACK on key 7 —
+ * the same mode-of-the-page pattern the stocks page uses for its own
+ * drill-down, per the task brief.
  */
 export class WeatherPage implements Page {
   readonly name = 'weather'
+
+  /** The day index (0 to 6) shown in detail mode, or null on the grid.
+   * `onLeave` always clears this, so the page reopens on the grid every
+   * time it becomes visible again. */
+  private selected: number | null = null
 
   constructor(private readonly source: WeatherReader) {}
 
@@ -133,6 +164,7 @@ export class WeatherPage implements Page {
   }
 
   onLeave(): void {
+    this.selected = null
     this.source.setVisible(false)
   }
 
@@ -141,12 +173,23 @@ export class WeatherPage implements Page {
     const status = this.source.getStatus()
     const stale = this.source.isStale()
     const absent = status !== 'ok' || days.length === 0
+    const dim = stale || absent
+
+    if (this.selected !== null) {
+      const day = days[this.selected]
+      if (day) return this.detailFrame(day, dim)
+      // The selected day vanished from the forecast — this should not
+      // happen, since a refresh only ever replaces the whole array, but a
+      // page must never throw, so fall back to the grid rather than render
+      // a detail view with nothing behind it.
+      this.selected = null
+    }
 
     const keys: KeySpec[] = []
     for (let i = 0; i < DAY_TILE_COUNT; i++) {
-      keys.push(this.dayKey(days[i], stale || absent))
+      keys.push(this.dayKey(days[i], dim))
     }
-    keys.push(this.conditionsKey(stale || absent))
+    keys.push(this.conditionsKey(dim))
 
     return {
       keys,
@@ -214,6 +257,150 @@ export class WeatherPage implements Page {
     return key
   }
 
+  /**
+   * The detail view for one day, spread across all eight keys:
+   *
+   * - Key 0: the same day tile shown on the grid — label, emoji, combined
+   *   high/low, combined rain chance — so the tile the user just pressed
+   *   stays recognisable inside the detail view.
+   * - Key 1: the DAY half alone (emoji, high only, day-only rain chance).
+   * - Key 2: the NIGHT half alone (emoji, low only, night-only rain chance).
+   * - Key 3: WIND, the day and night readings.
+   * - Key 4: the DAY half's short forecast text.
+   * - Key 5: the NIGHT half's short forecast text.
+   * - Key 6: RAIN, the day and night percentages side by side.
+   * - Key 7: BACK.
+   */
+  private detailFrame(day: DayForecast, dim: boolean): DeckFrame {
+    const keys: KeySpec[] = [
+      this.dayKey(day, dim),
+      this.periodKey('DAY', day.day, dim),
+      this.periodKey('NIGHT', day.night, dim),
+      this.windKey(day, dim),
+      this.textKey('DAY', day.day, dim),
+      this.textKey('NIGHT', day.night, dim),
+      this.rainKey(day, dim),
+      this.backKey(),
+    ]
+
+    return {
+      keys,
+      strip: this.detailStrip(day),
+      buttons: [theme.gray, theme.gray],
+    }
+  }
+
+  /**
+   * Keys 1 and 2: one half of the day alone, in the SAME four-band layout
+   * `dayKey` uses — label, emoji band, a single temperature, rain chance —
+   * just fed one period's fields instead of the combined pair. A missing
+   * half (see `PeriodDetail`'s doc comment) gets the same dashed placeholder
+   * `dayKey` uses for a day with no data at all, always dimmed, since there
+   * is nothing behind it to show.
+   */
+  private periodKey(label: string, period: PeriodDetail | null, dim: boolean): KeySpec {
+    if (!period) {
+      return {
+        kind: 'gauge',
+        lines: [label, '--', '--'],
+        lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
+        lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
+        align: 'center',
+        bg: DEFAULT_TINT,
+        dim: true,
+      }
+    }
+
+    const key: KeySpec = {
+      kind: 'gauge',
+      // formatTemps's high-only branch and its low-only branch both render a
+      // single value the same way, `${round}°`, so passing the one known
+      // reading as the "high" slot reuses that helper for either half
+      // without a second formatter.
+      lines: [label, formatTemps(period.temperature, null), formatPrecip(period.precipPercent)],
+      lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
+      lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
+      lineColors: [undefined, heatColor(period.temperature, null), precipColor(period.precipPercent)],
+      align: 'center',
+      emoji: period.emoji,
+      bg: conditionTint(period.emoji),
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Key 3: WIND, the day and night readings, each prefixed `D`/`N` since
+   * the tile carries one shared label for both halves. The two lines pass
+   * the SAME candidate array, so a long reading on one side does not render
+   * bigger than a short one on the other (the same grouped-sizing rule the
+   * stocks detail view's range tiles rely on). */
+  private windKey(day: DayForecast, dim: boolean): KeySpec {
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: ['WIND', `D ${formatWind(day.day)}`, `N ${formatWind(day.night)}`],
+      lineSizes: [DAY_LABEL_SIZE, DETAIL_TEXT_SIZES, DETAIL_TEXT_SIZES],
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Keys 4 and 5: one half's short forecast text, for example `Slight
+   * Chance Showers And Thunderstorms then Partly Cloudy`. Real strings run
+   * far past the usable width even at the smallest candidate size, so
+   * `renderKey` truncates with an ellipsis — measured, not guessed, per
+   * docs/LESSONS.md #17. A missing half shows `--`. */
+  private textKey(label: string, period: PeriodDetail | null, dim: boolean): KeySpec {
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: [label, period?.shortForecast || '--'],
+      lineSizes: [DAY_LABEL_SIZE, DETAIL_TEXT_SIZES],
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Key 6: RAIN, the day and night percentages side by side, each prefixed
+   * `D`/`N`. Bounded length (`D 100%` is the longest real value, `D --` the
+   * shortest), so — like the grid tile's own precip line — this stays a
+   * fixed size rather than a measured candidate array. */
+  private rainKey(day: DayForecast, dim: boolean): KeySpec {
+    const dayPct = day.day?.precipPercent ?? null
+    const nightPct = day.night?.precipPercent ?? null
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: ['RAIN', `D ${formatPrecip(dayPct)}`, `N ${formatPrecip(nightPct)}`],
+      lineSizes: [DAY_LABEL_SIZE, PRECIP_SIZE, PRECIP_SIZE],
+      lineColors: [undefined, precipColor(dayPct), precipColor(nightPct)],
+    }
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Key 7: BACK. A gray border and no fill colour, on purpose, so it never
+   * reads as one more data tile — the same look the stocks detail view
+   * uses for its own BACK key. Centred vertically as well as horizontally,
+   * since it carries no other line to share the tile with. */
+  private backKey(): KeySpec {
+    return {
+      kind: 'control',
+      lines: ['◀ BACK'],
+      lineSizes: [BACK_SIZE],
+      lineY: [40],
+      align: 'center',
+      border: theme.gray,
+    }
+  }
+
+  /** The detail view's strip shows the day's actual forecast paragraph
+   * instead of the grid's place-and-update-time summary: line 1 is the day
+   * half's `detailedForecast`, line 2 the night half's, each truncated to
+   * the strip's usable width. A missing half shows `--`. */
+  private detailStrip(day: DayForecast): StripSpec {
+    const dayText = day.day?.detailedForecast || '--'
+    const nightText = day.night?.detailedForecast || '--'
+    return { lines: [truncate(dayText, STRIP_CHARS), truncate(nightText, STRIP_CHARS)] }
+  }
+
   private strip(): StripSpec {
     const place = this.source.getPlace()
     const conditions = this.source.getConditions()
@@ -237,8 +424,25 @@ export class WeatherPage implements Page {
     return { lines: [truncate(line1, STRIP_CHARS), truncate(line2, STRIP_CHARS)] }
   }
 
-  onKeyPress(_index: number): PressOutcome {
-    // Read-only. No refresh-on-press. Every key, 0 to 7, ignores a press.
+  onKeyPress(index: number): PressOutcome {
+    if (this.selected === null) {
+      // Key 7 is the conditions tile, never a day — it has no drill-down.
+      if (index >= DAY_TILE_COUNT) return 'ignored'
+      // No forecast at all for this slot yet: nothing to show a detail view
+      // for. A partial forecast can leave a day tile empty before the first
+      // full refresh, and an empty key must not open detail for a day that
+      // does not exist.
+      if (!this.source.getDays()[index]) return 'ignored'
+      this.selected = index
+      return 'handled'
+    }
+
+    if (index === 7) {
+      this.selected = null
+      return 'handled'
+    }
+    // Keys 0 to 6 do nothing while a day is selected. Read-only: no
+    // refresh-on-press, no browser.
     return 'ignored'
   }
 }

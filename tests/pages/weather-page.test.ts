@@ -3,7 +3,7 @@ import { WeatherPage, conditionTint, heatColor } from '../../src/pages/weather-p
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
-import type { Conditions, DayForecast, WeatherStatus } from '../../src/sources/weather.js'
+import type { Conditions, DayForecast, PeriodDetail, WeatherStatus } from '../../src/sources/weather.js'
 
 const NOW = 1786549560
 
@@ -21,6 +21,19 @@ function near3(actual: readonly number[], expected: readonly number[], tol = 12)
  * one individually via `conditionTint`; this list just drives `it.each`. */
 const ALL_CONDITION_EMOJI = ['⛈', '🌨', '🌧', '🌫', '💨', '☁️', '⛅', '☀️']
 
+function periodDetail(over: Partial<PeriodDetail> = {}): PeriodDetail {
+  return {
+    emoji: '☀️',
+    temperature: 90,
+    precipPercent: 20,
+    shortForecast: 'Sunny',
+    detailedForecast: 'Sunny, with a high near 90.',
+    windSpeed: '8 mph',
+    windDirection: 'NE',
+    ...over,
+  }
+}
+
 function day(label: string, over: Partial<DayForecast> = {}): DayForecast {
   return {
     label,
@@ -29,6 +42,8 @@ function day(label: string, over: Partial<DayForecast> = {}): DayForecast {
     low: 70,
     precipPercent: 20,
     shortForecast: 'Sunny',
+    day: null,
+    night: null,
     ...over,
   }
 }
@@ -467,20 +482,334 @@ describe('WeatherPage strip', () => {
   })
 })
 
-describe('WeatherPage presses', () => {
-  it('ignores every key, 0 to 7 — read-only, no refresh-on-press', () => {
-    const { page } = build()
-    for (let i = 0; i <= 7; i++) {
-      expect(page.onKeyPress(i)).toBe('ignored')
-    }
-  })
-})
-
 describe('WeatherPage visibility', () => {
   it('tells the source when it becomes visible and when it leaves', () => {
     const { page, calls } = build()
     page.onEnter!()
     page.onLeave!()
     expect(calls).toEqual(['visible:true', 'visible:false'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Detail view (task 34): pressing a day tile drills into it, same pattern
+// as StocksPage — a mode of the page, BACK on key 7, onLeave resets to grid.
+// ---------------------------------------------------------------------------
+
+/** A day with both halves populated, real-shaped values for the detail view. */
+function fullDay(label: string, over: Partial<DayForecast> = {}): DayForecast {
+  return day(label, {
+    day: periodDetail({ emoji: '⛈', temperature: 95, precipPercent: 40, shortForecast: 'Showers And Thunderstorms', detailedForecast: 'Showers and storms after 2pm.', windSpeed: '8 mph', windDirection: 'NE' }),
+    night: periodDetail({ emoji: '☀️', temperature: 77, precipPercent: 10, shortForecast: 'Clear', detailedForecast: 'Clear skies overnight.', windSpeed: '5 to 8 mph', windDirection: 'SW' }),
+    ...over,
+  })
+}
+
+describe('WeatherPage presses report the real outcome, keys 0 to 7', () => {
+  it('reports handled for every day tile (0-6) on the grid, since every slot has a forecast', () => {
+    // A fresh page per key: pressing one key enters detail mode, which would
+    // change what every OTHER key reports — see the next test below.
+    for (let i = 0; i <= 6; i++) {
+      const { page } = build()
+      expect(page.onKeyPress(i)).toBe('handled')
+    }
+  })
+
+  it('reports ignored for key 7 on the grid — the conditions tile has no drill-down', () => {
+    const { page } = build()
+    expect(page.onKeyPress(7)).toBe('ignored')
+  })
+
+  it('reports ignored on the grid for a day tile with no forecast behind it yet', () => {
+    const { page } = build({ days: sevenDays().slice(0, 3) })
+    expect(page.onKeyPress(5)).toBe('ignored')
+  })
+
+  it('reports handled for BACK (key 7), and ignored for every other key, once a day is selected', () => {
+    const { page } = build()
+    expect(page.onKeyPress(2)).toBe('handled') // enters detail mode
+    for (let i = 0; i <= 6; i++) {
+      expect(page.onKeyPress(i)).toBe('ignored')
+    }
+    expect(page.onKeyPress(7)).toBe('handled') // BACK
+  })
+})
+
+describe('WeatherPage presses: entering and leaving detail mode', () => {
+  it('selecting a day tile with a forecast enters detail mode for that day', () => {
+    const { page } = build()
+    page.onKeyPress(2)
+    const key0 = page.render(NOW).keys[0]!
+    expect(key0.lines![0]).toBe(LABELS[2])
+  })
+
+  it('BACK (key 7) returns to the grid', () => {
+    const { page } = build()
+    page.onKeyPress(2)
+    page.onKeyPress(7)
+    const keys = page.render(NOW).keys
+    expect(keys).toHaveLength(8)
+    LABELS.forEach((label, i) => expect(keys[i]!.lines![0]).toBe(label))
+  })
+
+  it('does nothing when pressing a day tile with no forecast behind it at all', () => {
+    const { page } = build({ days: sevenDays().slice(0, 3) })
+    page.onKeyPress(5)
+    const keys = page.render(NOW).keys
+    // Still the grid, not detail.
+    expect(keys).toHaveLength(8)
+    expect(keys[5]!.lines).toEqual(['--', '--', '--'])
+  })
+
+  it('keys 0 to 6 do nothing while a day is selected', () => {
+    const { page } = build()
+    page.onKeyPress(1)
+    const before = page.render(NOW)
+    page.onKeyPress(3)
+    const after = page.render(NOW)
+    expect(after).toEqual(before)
+  })
+
+  it('leaving the page clears the selection, so it always reopens on the grid', () => {
+    const { page } = build()
+    page.onKeyPress(1)
+    page.onLeave!()
+    const keys = page.render(NOW).keys
+    LABELS.forEach((label, i) => expect(keys[i]!.lines![0]).toBe(label))
+  })
+
+  it('falls back to the grid, without throwing, if the selected day vanishes from a shorter forecast', () => {
+    const { page, f } = build()
+    page.onKeyPress(6) // selects the 7th day
+    f.days = sevenDays().slice(0, 3) // a later refresh shrinks the array
+    const keys = page.render(NOW).keys
+    expect(keys).toHaveLength(8)
+    expect(keys[0]!.lines![0]).toBe(LABELS[0])
+  })
+})
+
+describe('WeatherPage detail view layout', () => {
+  function detailKeys() {
+    const days = sevenDays()
+    days[2] = fullDay(LABELS[2]!, { high: 95, low: 77, precipPercent: 40, emoji: '⛈' })
+    const { page } = build({ days })
+    page.onKeyPress(2)
+    return page.render(NOW).keys
+  }
+
+  it('key 0 shows the same day tile as the grid: label, emoji, combined high/low, combined rain chance', () => {
+    const key = detailKeys()[0]!
+    expect(key.lines).toEqual([LABELS[2], '95°/77°', '40%'])
+    expect(key.emoji).toBe('⛈')
+  })
+
+  it('key 1 shows the DAY half alone: high only, day-only rain chance', () => {
+    const key = detailKeys()[1]!
+    expect(key.lines).toEqual(['DAY', '95°', '40%'])
+    expect(key.emoji).toBe('⛈')
+  })
+
+  it('key 2 shows the NIGHT half alone: low only, night-only rain chance', () => {
+    const key = detailKeys()[2]!
+    expect(key.lines).toEqual(['NIGHT', '77°', '10%'])
+    expect(key.emoji).toBe('☀️')
+  })
+
+  it('key 3 shows WIND, the day and night readings prefixed D/N', () => {
+    const key = detailKeys()[3]!
+    expect(key.lines).toEqual(['WIND', 'D 8 mph NE', 'N 5 to 8 mph SW'])
+  })
+
+  it('key 4 shows the DAY half short forecast text', () => {
+    const key = detailKeys()[4]!
+    expect(key.lines).toEqual(['DAY', 'Showers And Thunderstorms'])
+  })
+
+  it('key 5 shows the NIGHT half short forecast text', () => {
+    const key = detailKeys()[5]!
+    expect(key.lines).toEqual(['NIGHT', 'Clear'])
+  })
+
+  it('key 6 shows RAIN, the day and night percentages prefixed D/N', () => {
+    const key = detailKeys()[6]!
+    expect(key.lines).toEqual(['RAIN', 'D 40%', 'N 10%'])
+  })
+
+  it('key 7 shows BACK with a gray border', () => {
+    const key = detailKeys()[7]!
+    expect(key.lines!.join('')).toContain('BACK')
+    expect(key.border).toEqual(theme.gray)
+  })
+
+  it('groups the WIND day/night lines under one candidate array, so they size as a unit', () => {
+    const key = detailKeys()[3]!
+    expect(Array.isArray(key.lineSizes![1])).toBe(true)
+    expect(key.lineSizes![1]).toEqual(key.lineSizes![2])
+  })
+
+  it('shows -- for a missing day half, never a fabricated reading', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { day: null, night: periodDetail() })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    expect(keys[1]!.lines).toEqual(['DAY', '--', '--'])
+    expect(keys[1]!.dim).toBe(true)
+    expect(keys[3]!.lines![1]).toBe('D --')
+    expect(keys[4]!.lines![1]).toBe('--')
+    expect(keys[6]!.lines![1]).toBe('D --')
+  })
+
+  it('shows -- for a missing night half, never a fabricated reading', () => {
+    const days = sevenDays()
+    days[6] = day(LABELS[6]!, { day: periodDetail(), night: null })
+    const { page } = build({ days })
+    page.onKeyPress(6)
+    const keys = page.render(NOW).keys
+    expect(keys[2]!.lines).toEqual(['NIGHT', '--', '--'])
+    expect(keys[2]!.dim).toBe(true)
+    expect(keys[3]!.lines![2]).toBe('N --')
+    expect(keys[5]!.lines![1]).toBe('--')
+    expect(keys[6]!.lines![2]).toBe('N --')
+  })
+})
+
+describe('WeatherPage detail view staleness', () => {
+  // Both halves are populated with `fullDay`, so the data tiles' `dim`
+  // reflects only the page-wide staleness flag, not the "missing half"
+  // placeholder dimming `periodKey`/`textKey`/`windKey`/`rainKey` also carry
+  // (proven separately above) — otherwise a fresh render with the default
+  // null day/night halves would already read as dimmed for the wrong reason.
+  it('dims every detail-view data tile when the forecast is stale, but not BACK', () => {
+    const days = sevenDays()
+    days[0] = fullDay('NOW')
+    const { page } = build({ days, stale: true })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    for (const key of keys.slice(0, 7)) expect(key.dim).toBe(true)
+    expect(keys[7]!.dim).not.toBe(true)
+  })
+
+  it('does not dim a fresh detail view for a day with both halves known', () => {
+    const days = sevenDays()
+    days[0] = fullDay('NOW')
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    for (const key of keys.slice(0, 7)) expect(key.dim).not.toBe(true)
+  })
+})
+
+describe('WeatherPage detail view strip', () => {
+  it('shows the day half detailedForecast on line 1, truncated, and the night half on line 2', () => {
+    const days = sevenDays()
+    days[0] = fullDay('NOW', {
+      day: periodDetail({ detailedForecast: 'A slight chance of showers and thunderstorms before 9pm. Partly cloudy.' }),
+      night: periodDetail({ detailedForecast: 'Clear skies overnight, with a low around 77.' }),
+    })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const strip = page.render(NOW).strip
+    // truncate(s, 30) keeps the first 29 characters plus an ellipsis.
+    expect(strip.lines[0]).toBe('A slight chance of showers an…')
+    expect(strip.lines[0]!.length).toBe(30)
+    expect(strip.lines[1]).toBe('Clear skies overnight, with a…')
+  })
+
+  it('shows -- on a strip line for a missing half', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { day: null, night: periodDetail() })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const strip = page.render(NOW).strip
+    expect(strip.lines[0]).toBe('--')
+  })
+
+  it('never draws detail-strip text past the strip edge for the longest real detailedForecast text', () => {
+    // Measured live from api.weather.gov/gridpoints/OKX/33,37/forecast on
+    // 2026-08-13 (Brooklyn FL, this deck's fixed ZIP): the longest
+    // detailedForecast in that response, 290 characters.
+    const longest =
+      'A slight chance of showers and thunderstorms before 9pm. Partly cloudy. Low around 77, with temperatures rising to around 78 overnight. Heat index values as high as 103. Southwest wind around 7 mph. Chance of precipitation is 20%. New rainfall amounts less than a tenth of an inch possible.'
+    const days = sevenDays()
+    days[0] = fullDay('NOW', {
+      day: periodDetail({ detailedForecast: longest }),
+      night: periodDetail({ detailedForecast: longest }),
+    })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const buffer = renderStrip(page.render(NOW).strip)
+    for (let y = 0; y < STRIP_HEIGHT; y++) {
+      expect(probe(buffer, STRIP_WIDTH - 1, y, STRIP_WIDTH)).toEqual(theme.bg)
+    }
+  })
+})
+
+describe('WeatherPage detail view text fits the usable key width', () => {
+  // Same proof shape as tests/pages/stocks-page.test.ts's own "text fits the
+  // usable key width" block: `lineSizes` declares candidate sizes, and
+  // `renderKey` resolves and, if necessary, truncates them at draw time — so
+  // the proof has to render real pixels and probe them, not read the
+  // declared candidates as if they were already final.
+  const RIGHT_EDGE_X = 90 // BORDER(3) + PAD(6) + usable width(81)
+
+  // The emoji tiles (keys 0 to 2) carry their own condition tint as `bg`,
+  // not `theme.bg` — probing against the wrong background would flag every
+  // pixel of the tint itself as "ink". Callers pass the key's own `bg` when
+  // it has one; the plain info tiles (WIND, the text tiles, RAIN, BACK)
+  // carry no `bg` at all, so the default covers them.
+  function noInkAtOrPastRightEdge(buf: Buffer, bg: readonly number[] = theme.bg): boolean {
+    for (let y = 0; y < KEY_SIZE; y++) {
+      if (!near3(probe(buf, RIGHT_EDGE_X, y), bg)) return false
+    }
+    return true
+  }
+
+  it('keeps the WIND tile clear of the right margin for the longest real wind reading', () => {
+    // Measured live from the same forecast response: the longest real
+    // windSpeed value was "5 to 9 mph" (10 characters); paired with a
+    // 3-letter direction ("WNW"), the field's own documented range, that is
+    // longer still. `D 5 to 9 mph WNW` measures well past the 81 px budget
+    // even at the smallest candidate size, so this proves the renderer's
+    // truncation, not this page's guess.
+    const days = sevenDays()
+    days[0] = fullDay('NOW', {
+      day: periodDetail({ windSpeed: '5 to 9 mph', windDirection: 'WNW' }),
+      night: periodDetail({ windSpeed: '10 to 15 mph', windDirection: 'ENE' }),
+    })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const key = page.render(NOW).keys[3]!
+    expect(noInkAtOrPastRightEdge(renderKey(key))).toBe(true)
+  })
+
+  it('keeps the DAY/NIGHT text tiles clear of the right margin for the longest real shortForecast', () => {
+    // Measured live from the same forecast response: the longest real
+    // shortForecast was 58 characters.
+    const longest = 'Slight Chance Showers And Thunderstorms then Partly Cloudy'
+    const days = sevenDays()
+    days[0] = fullDay('NOW', {
+      day: periodDetail({ shortForecast: longest }),
+      night: periodDetail({ shortForecast: longest }),
+    })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const keys = page.render(NOW).keys
+    expect(noInkAtOrPastRightEdge(renderKey(keys[4]!))).toBe(true)
+    expect(noInkAtOrPastRightEdge(renderKey(keys[5]!))).toBe(true)
+  })
+
+  it('keeps every detail-view tile clear of the right margin across every day label', () => {
+    for (const label of LABELS) {
+      const days = sevenDays()
+      const idx = LABELS.indexOf(label)
+      days[idx] = fullDay(label)
+      const { page } = build({ days })
+      page.onKeyPress(idx)
+      const keys = page.render(NOW).keys
+      for (const key of keys) {
+        expect(noInkAtOrPastRightEdge(renderKey(key), key.bg)).toBe(true)
+      }
+    }
   })
 })

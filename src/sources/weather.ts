@@ -25,6 +25,39 @@ export interface DayForecast {
   /** Percent, 0 to 100, or null when unknown. */
   precipPercent: number | null
   shortForecast: string
+  /**
+   * The daytime half of this day, for the detail view. Null when this day
+   * tile has no day period — only tile 0 ("NOW") can be missing it, when the
+   * forecast opens at night.
+   */
+  day: PeriodDetail | null
+  /**
+   * The nighttime half of this day, for the detail view. Null when this day
+   * tile has no night period — only the LAST tile can be missing it, when
+   * the 14-period series runs out before a closing night.
+   */
+  night: PeriodDetail | null
+}
+
+/**
+ * One half (day or night) of a day tile, carrying the fields the detail
+ * view needs beyond what the grid tile's summary already has. Every field
+ * comes from the SAME period object the summary already reads — no second
+ * fetch, per the user's decision to use only data the source already gets.
+ */
+export interface PeriodDetail {
+  emoji: string
+  /** Degrees Fahrenheit, or null when unknown. */
+  temperature: number | null
+  /** Percent, 0 to 100, or null when unknown. Null must never render as 0%. */
+  precipPercent: number | null
+  shortForecast: string
+  /** A full paragraph. The detail view truncates it; it never fits whole. */
+  detailedForecast: string
+  /** For example `"8 mph"` or `"5 to 9 mph"` — a string, never a number. */
+  windSpeed: string
+  /** For example `"NE"`. Empty when unknown. */
+  windDirection: string
 }
 
 export interface Conditions {
@@ -134,6 +167,27 @@ function extractConditions(period: unknown): Conditions {
 }
 
 /**
+ * Builds the detail-view fields for one half (day or night) of a day tile,
+ * straight from the same period object `buildDay` already reads for the
+ * summary fields. Null in, null out: a day tile can be missing its day half
+ * (the forecast opens at night) or its night half (the periods run out),
+ * and the detail view must show that as unknown, never fabricate a period.
+ */
+function periodDetail(period: unknown | null): PeriodDetail | null {
+  if (period === null) return null
+  const shortForecast = strOf(period, 'shortForecast')
+  return {
+    emoji: weatherEmoji(shortForecast),
+    temperature: tempOf(period),
+    precipPercent: precipOf(period),
+    shortForecast,
+    detailedForecast: strOf(period, 'detailedForecast'),
+    windSpeed: strOf(period, 'windSpeed'),
+    windDirection: strOf(period, 'windDirection'),
+  }
+}
+
+/**
  * Builds one day tile from a day period, a night period, or both. Either may
  * be null: the first tile is `null` for the day half when the forecast opens
  * at night, and the last tile is `null` for the night half when the periods
@@ -149,7 +203,16 @@ function buildDay(label: string, day: unknown | null, night: unknown | null): Da
   )
   const anchor = day ?? night
   const shortForecast = strOf(anchor, 'shortForecast')
-  return { label, emoji: weatherEmoji(shortForecast), high, low, precipPercent, shortForecast }
+  return {
+    label,
+    emoji: weatherEmoji(shortForecast),
+    high,
+    low,
+    precipPercent,
+    shortForecast,
+    day: periodDetail(day),
+    night: periodDetail(night),
+  }
 }
 
 /**
