@@ -147,18 +147,39 @@ assignment prefix, `#` starting a comment, and tilde expansion.
 Measured locally on 2026-08-13:
 
 - `~/.codex/state_5.sqlite` contains the read-only `threads` index, including thread id,
-  title, cwd, model, rollout path, updated time, archive state, and token count.
+  title, cwd, model, rollout path, updated time, archive state, and token count. Exact
+  columns read: `threads.{id, rollout_path, updated_at_ms, title, cwd, model, tokens_used,
+  archived, thread_source, preview}`. `model` can be `NULL`. `updated_at_ms` is epoch
+  MILLISECONDS, unlike the accounting timestamps below.
 - User-owned tasks have `thread_source = 'user'`; internal approval-review work is stored
-  as `thread_source = 'subagent'` and must not appear as a user task tile.
-- Rollout JSONL emits `task_started` and `task_complete` lifecycle events.
-- Its repeated `token_count` events contain `total_token_usage`, account rate limits,
-  reset timestamps, and the plan type. On this account the visible limit is a 10,080
-  minute (seven-day) window.
-- A rollout can be many megabytes. The Codex source therefore establishes state once,
-  remembers its byte offset, and reads only appended bytes on later five-second polls.
+  as `thread_source = 'subagent'` and must not appear as a user task tile. A third value,
+  `realtime_voice`, also exists in the live index.
+- **`title` has no length limit.** `MAX(LENGTH(title))` in the live index measured
+  **42,081 characters** (that row is `thread_source = 'subagent'` and is correctly
+  filtered, but the same column serves user rows too). The query truncates it with
+  `substr(title, 1, 64)` rather than retaining or re-serialising the whole thing every poll.
+- Rollout JSONL emits `type: "event_msg"` envelopes; the field that matters is
+  `payload.type`, one of `"task_started"`, `"task_complete"`, or `"token_count"`.
+  `event.timestamp` is an ISO string.
+- Its repeated `token_count` events carry `payload.info.total_token_usage.total_tokens` and
+  `payload.rate_limits.{primary, secondary, plan_type}`, where each non-null limit is
+  `{used_percent, window_minutes, resets_at}` with `resets_at` in epoch SECONDS (not
+  milliseconds — the two accounting clocks in this schema do not agree with each other or
+  with `updated_at_ms` above). On this account: `plan_type = "team"`, `window_minutes =
+  10080` (seven days), and `secondary` is currently `null` — one window only.
+- A rollout can be many megabytes; the live index already references one at 2.7 MB. The
+  Codex source establishes its byte offset once per rollout and reads only appended bytes
+  on every poll AFTER that — but the very FIRST read of any rollout (a cold daemon start, or
+  a rollout newly entering the top ten) is itself bounded to a fixed trailing byte window
+  rather than the whole file, precisely because a multi-megabyte first read would block the
+  event loop for seconds on its own. Do not read the earlier wording ("establishes state
+  once, remembers its byte offset, and reads only appended bytes") as covering the cold
+  start — it does not; that gap was a Critical review finding.
 - These files are local implementation details rather than a public integration API.
   Schema or event changes must fail closed to an unavailable Codex page and must never
-  stop the daemon or the other pages.
+  stop the daemon or the other pages. A field that is absent or renamed must render as
+  unknown (`--`), never as a measured `0` — that failure mode reached shipped code once
+  already and is why this line is here.
 
 ---
 
