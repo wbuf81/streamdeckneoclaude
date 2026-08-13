@@ -38,11 +38,23 @@ if [ -n "$TMPIN" ]; then
     [ -z "$SESSION_TMP" ] || rm -f "$SESSION_TMP"
   }
   trap cleanup EXIT
+  # A bare `trap cleanup EXIT` does not fire on an uncaught SIGTERM in every
+  # shell, so a slow render that Claude Code times out and kills can leave
+  # the captured payload file behind in $TMPDIR. Trap the terminating
+  # signals too, so a killed render still cleans up after itself.
+  trap 'cleanup; exit 143' TERM INT HUP
   cat > "$TMPIN"
 fi
 
 if [ -n "$TMPIN" ] && command -v jq >/dev/null 2>&1; then
   mkdir -p "$STATE_DIR/sessions" 2>/dev/null || true
+  # `mkdir -p` only sets a mode on a directory it CREATES (Lesson 1). This
+  # runs on every render, so it is the one place a token-bearing directory
+  # can end up world-readable if it is ever recreated -- after a manual
+  # delete, or on a fresh machine where a render happens before the daemon
+  # ever starts. Force 0700 unconditionally; `chmod` fixes an
+  # already-existing looser directory, which `mkdir -p` cannot.
+  chmod 700 "$STATE_DIR" "$STATE_DIR/sessions" 2>/dev/null || true
   NOW=$(date +%s)
 
   # usage.json holds the newest rate limits. The gauge keys read it.
@@ -79,6 +91,13 @@ if [ -n "$TMPIN" ] && command -v jq >/dev/null 2>&1; then
       fi
     fi
   fi
+
+  # Nothing else ever expires a per-session file, so one accumulates per
+  # Claude Code session id forever, and UsageSource re-reads every file in
+  # this directory on every poll. Bound the growth: a session more than a
+  # week old is stale far past any use, so prune it. Error-tolerant, and
+  # bounded to this one directory.
+  find "$STATE_DIR/sessions" -maxdepth 1 -name '*.json' -mtime +7 -delete 2>/dev/null || true
 fi
 
 # Run the real statusline with the original stdin. Its output is the only

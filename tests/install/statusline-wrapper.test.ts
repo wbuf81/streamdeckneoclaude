@@ -160,8 +160,13 @@ describe('statusline-wrapper.sh', () => {
     })
     expect(existsSync(join(dir, 'usage.json'))).toBe(true)
     expect(existsSync(join(dir, 'evil.json'))).toBe(false)
-    expect(existsSync(join(dir, 'evil.json.tmp'))).toBe(false)
     expect(existsSync(join(dir, 'sessions', 'evil.json'))).toBe(false)
+    // Minor 8: a rejected session_id must not even leave a hidden mktemp
+    // artifact behind in the sessions directory. (The old assertion here
+    // checked for a literal `evil.json.tmp` name, which the current
+    // `mktemp`-based naming scheme -- `.evil.json.XXXXXX` -- never
+    // produces, so it always passed regardless of correctness.)
+    expect(readdirSync(join(dir, 'sessions')).filter((name) => name.startsWith('.'))).toEqual([])
   })
 
   it('keeps concurrent cache writes atomic and leaves no temporary files', async () => {
@@ -181,7 +186,13 @@ describe('statusline-wrapper.sh', () => {
       const session = JSON.parse(readFileSync(join(dir, 'sessions', `session-${i}.json`), 'utf8'))
       expect(session.model).toBe(`Model ${i}`)
     }
-    expect(readdirSync(dir).filter((name) => name.includes('.tmp'))).toEqual([])
+    // Minor 8: the temp names this script actually creates are
+    // `.usage.json.XXXXXX` and `.SID.json.XXXXXX` -- neither contains
+    // `.tmp`, so a `.includes('.tmp')` filter is empty no matter what the
+    // wrapper does. `.startsWith('.')` matches the real naming scheme, so
+    // this assertion can actually fail if a leftover temp file survives a
+    // concurrent run.
+    expect(readdirSync(dir).filter((name) => name.startsWith('.'))).toEqual([])
     expect(readdirSync(join(dir, 'sessions')).filter((name) => name.startsWith('.'))).toEqual([])
   })
 })
