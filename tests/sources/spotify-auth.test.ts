@@ -96,6 +96,24 @@ describe('parseTokenResponse', () => {
       .toThrow(/access token/i)
   })
 
+  // C1 regression test. A body carrying a rotated `refresh_token` but no
+  // usable `access_token` used to be serialised WHOLE into the thrown
+  // message, which reaches `spotify.ts`'s `log.once` and then `deckd.log`.
+  // Break the fix (put `JSON.stringify(body)` back into the message) and
+  // this fails.
+  it('never embeds the response body — including a refresh token — in the error message', () => {
+    const secret = 'AQD-SUPER-SECRET-REFRESH-TOKEN'
+    let caught: unknown
+    try {
+      parseTokenResponse({ refresh_token: secret, token_type: 'Bearer' }, 'rt', 0)
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(Error)
+    expect(String(caught)).not.toContain(secret)
+    expect(String(caught)).not.toContain('token_type')
+  })
+
   it('throws when an initial exchange has no refresh token to store', () => {
     expect(() => parseTokenResponse({ access_token: 'at' }, '', 0))
       .toThrow(/refresh token/i)
@@ -185,6 +203,28 @@ describe('token endpoint validation', () => {
       json: async () => { throw new Error('not json') },
     })))
     await expect(refreshTokens('cid', 'rt')).rejects.toThrow(/invalid JSON/i)
+  })
+
+  // I6 regression test. `res.json()`'s own `SyntaxError` embeds a fragment
+  // of the text it failed to parse. Break the fix (put `String(e)` back into
+  // the thrown message) and this fails, because the truncated body below
+  // starts with the secret.
+  it('never lets a real SyntaxError fragment leak a token into the invalid-JSON error', async () => {
+    const secret = 'AQD-SUPER-SECRET-REFRESH-TOKEN'
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => JSON.parse(`{"refresh_token":"${secret}`), // truncated: a real SyntaxError
+    })))
+    let caught: unknown
+    try {
+      await refreshTokens('cid', 'rt')
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(Error)
+    expect(String(caught)).toMatch(/invalid JSON/i)
+    expect(String(caught)).not.toContain(secret)
   })
 })
 

@@ -41,7 +41,15 @@ export function elapsedPercent(
   const remaining = resetsAt - now
   const elapsed = windowSeconds - remaining
   if (elapsed <= 0) return null
-  return (elapsed / windowSeconds) * 100
+  // M6, same family as I1's future-timestamp guard: when `resetsAt` is
+  // already in the past, `remaining` goes negative and `elapsed` overruns
+  // `windowSeconds`, so the raw ratio exceeds 100. An elapsed percentage
+  // past 100 is not a real reading of anything — the window has already
+  // ended — and left unclamped it made `computePace` report `slow`
+  // permanently, since `usedPct` (0 to 100) can never catch up to a
+  // three-digit `elapsedPct`. Clamp at the boundary the window itself
+  // defines.
+  return Math.min(100, (elapsed / windowSeconds) * 100)
 }
 
 /**

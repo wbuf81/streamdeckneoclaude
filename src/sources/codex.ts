@@ -633,6 +633,18 @@ export class CodexSource extends EventEmitter {
       const tasks: CodexTask[] = []
       let newestUsage: CodexUsage | null = null
       const seenRollouts = new Set<string>()
+      // I7 — this was the one read path in the file with no `log.once` at
+      // all: every sibling failure (state-absent, state-read, state-degraded,
+      // rollout-short-read) logs exactly once with a distinct key, but a
+      // rollout that fails to read or parse simply vanished, task and usage
+      // sample both, with nothing in `deckd.log` to say why. `this.sqlite`
+      // can still succeed on its own (`this.available` stays true), so the
+      // result was a healthy, fresh, EMPTY Codex page — indistinguishable
+      // from "no active tasks", per lesson 20's undiagnosable-degradation
+      // trap. Tracked across the whole batch, not per rollout, so one
+      // `log.once` / `clearOnce` pair covers every thread rather than growing
+      // an unbounded key per rollout (the M8 mistake).
+      let anyRolloutReadFailed = false
 
       for (const row of Array.isArray(rows) ? rows : []) {
         const rollout = str(row.rollout_path)
@@ -650,6 +662,11 @@ export class CodexSource extends EventEmitter {
           state = parseRolloutTail(complete, reset ? undefined : cursor?.state)
           this.cursors.set(rollout, { offset: read.consumedTo, remainder, state })
         } catch {
+          // Never the rollout path's own basename or any file content here
+          // (lesson 20): both are derived from the thread. A fixed,
+          // query-free description is all this needs — `describeExecFailure`
+          // and the `codex-state-read` catch below use the same pattern.
+          anyRolloutReadFailed = true
           continue
         }
         if (state.usage && (!newestUsage || usageOrderKey(state.usage) > usageOrderKey(newestUsage))) {
@@ -665,7 +682,15 @@ export class CodexSource extends EventEmitter {
         // `MAX_ACTIVE_TASK_AGE_SECONDS`.
         const updatedAtMs = finite(row.updated_at_ms)
         const updatedAt = updatedAtMs === null ? null : Math.floor(updatedAtMs / 1000)
-        if (updatedAt === null || this.now() - updatedAt > MAX_ACTIVE_TASK_AGE_SECONDS) continue
+        // I1: two-sided, via the same `isSampleTooOld` this file already
+        // uses for a usage sample's timestamp. A one-sided `this.now() -
+        // updatedAt > MAX_ACTIVE_TASK_AGE_SECONDS` reads a FUTURE
+        // `updated_at_ms` as fresh, because the subtraction goes negative —
+        // never greater than a positive backstop. A clock stepped backwards,
+        // or a skewed row, must fail this the same way a stale one does,
+        // not silently publish `RUNNING` forever. One decision (what counts
+        // as "too old to trust"), one function, used by both callers.
+        if (updatedAt === null || this.isSampleTooOld(updatedAt, MAX_ACTIVE_TASK_AGE_SECONDS)) continue
 
         tasks.push({
           threadId: str(row.id),
@@ -679,6 +704,15 @@ export class CodexSource extends EventEmitter {
 
       for (const rollout of this.cursors.keys()) {
         if (!seenRollouts.has(rollout)) this.cursors.delete(rollout)
+      }
+
+      if (anyRolloutReadFailed) {
+        log.once(
+          'codex-rollout-read',
+          'one or more Codex rollout files failed to read or parse; their task and usage data are skipped this poll',
+        )
+      } else {
+        log.clearOnce('codex-rollout-read')
       }
 
       this.available = true
@@ -695,6 +729,15 @@ export class CodexSource extends EventEmitter {
           'codex-state-degraded',
           `Codex task data is DEGRADED (immutable fallback) at ${this.database}`,
         )
+      } else if (anyRolloutReadFailed) {
+        // I7: at least one thread's task and usage sample could not be read
+        // this poll. The sqlite read itself succeeded, so `available` still
+        // reports true, but the snapshot may be missing data for a reason
+        // the page cannot see on its own — surface that as degraded
+        // (`isStale()` already folds `degraded` in) rather than publishing a
+        // snapshot that looks like a clean, current, and genuinely empty
+        // Codex.
+        this.degraded = true
       } else {
         this.degraded = false
         this.lastSuccessAt = this.now()

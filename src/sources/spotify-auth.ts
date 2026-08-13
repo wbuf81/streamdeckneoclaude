@@ -61,7 +61,15 @@ export function parseTokenResponse(
 ): Tokens {
   const accessToken = body.access_token
   if (typeof accessToken !== 'string' || !accessToken) {
-    throw new Error(`token response has no access token: ${JSON.stringify(body)}`)
+    // C1: never embed the response body (or any fragment of it) here. A
+    // token-endpoint body can carry a rotated `refresh_token` even when
+    // `access_token` is absent, and this error travels straight to
+    // `spotify.ts`'s `log.once`, which appends it to `deckd.log`. The
+    // invariant this closes: no function in the auth path may put a
+    // token-endpoint response body, or any substring of one, into a string a
+    // caller could log. A short, fixed description carries everything a
+    // reader needs to diagnose this.
+    throw new Error('Spotify token endpoint response has no usable access token')
   }
   const refresh = typeof body.refresh_token === 'string' ? body.refresh_token : previousRefresh
   if (!refresh) {
@@ -122,7 +130,14 @@ async function postForm(
   try {
     parsed = (await res.json()) as Record<string, unknown>
   } catch (e) {
-    throw new Error(`Spotify token endpoint returned invalid JSON: ${String(e)}`)
+    // I6: `res.json()`'s own `SyntaxError` message can embed a fragment of
+    // the body it failed to parse (undici's shape is `Unexpected token 'x',
+    // "...{"access_to"... is not valid JSON`) — and the body here is a token
+    // response. Same class C1 closes above and the same guard `codex.ts`
+    // already uses for its own `JSON.parse` failures: name the failure kind,
+    // never quote the error's own message.
+    const detail = e instanceof SyntaxError ? 'malformed JSON' : 'response body could not be read'
+    throw new Error(`Spotify token endpoint returned invalid JSON: ${detail}`)
   }
   if (res.ok === false) {
     const code = typeof parsed.error === 'string' ? `: ${parsed.error}` : ''

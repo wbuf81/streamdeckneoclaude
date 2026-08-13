@@ -6,11 +6,30 @@ import {
   UsageSource,
   computePace,
   parseUsage,
+  elapsedPercent,
   STALE_USAGE_SECONDS,
 } from '../../src/sources/usage.js'
 
 const FIVE_HOURS = 5 * 3600
 const NOW = 1786549560
+
+// M6, same family as I1: a `resetsAt` already in the past must not produce
+// an elapsed percentage past 100. Break the fix (drop the `Math.min(100,
+// ...)` clamp) and the first case here fails.
+describe('elapsedPercent', () => {
+  it('clamps to 100 when resetsAt is already in the past', () => {
+    const resetsAt = NOW - FIVE_HOURS
+    expect(elapsedPercent(resetsAt, FIVE_HOURS, NOW)).toBe(100)
+  })
+
+  it('reports exactly 100 right at the window boundary', () => {
+    expect(elapsedPercent(NOW, FIVE_HOURS, NOW)).toBe(100)
+  })
+
+  it('reports 50 at the midpoint of a fresh window', () => {
+    expect(elapsedPercent(NOW + FIVE_HOURS / 2, FIVE_HOURS, NOW)).toBe(50)
+  })
+})
 
 describe('computePace', () => {
   it('is fast when usage leads elapsed time', () => {
@@ -36,6 +55,16 @@ describe('computePace', () => {
 
   it('is even at the very start of a window', () => {
     expect(computePace(0, NOW + FIVE_HOURS, FIVE_HOURS, NOW)).toBe('even')
+  })
+
+  // M6 — before the clamp, a `resetsAt` well in the past drove `elapsedPct`
+  // past 100, so `usedPct` (capped at 100) could never catch up and this
+  // reported `slow` permanently, regardless of how current usage compared to
+  // the window. With the clamp, a fully-used window against a long-expired
+  // `resetsAt` is `even`, not `slow`.
+  it('does not report permanently slow once resetsAt is long past', () => {
+    const resetsAt = NOW - 10 * FIVE_HOURS
+    expect(computePace(100, resetsAt, FIVE_HOURS, NOW)).toBe('even')
   })
 })
 

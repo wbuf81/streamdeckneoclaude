@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { parsePlayer, pickArtUrl, SpotifySource } from '../../src/sources/spotify.js'
 import type { Tokens } from '../../src/sources/spotify-auth.js'
 import type { Image } from '@napi-rs/canvas'
-import { log } from '../../src/log.js'
+import { log, setDefaultSink } from '../../src/log.js'
 
 const PLAYER = {
   is_playing: true,
@@ -330,6 +330,76 @@ describe('SpotifySource', () => {
     expect(await src.pause()).toBe(false)
     // Exactly the poll plus the one failing control call: no refresh, no retry.
     expect(calls).toHaveLength(2)
+  })
+})
+
+// C1/I6: end-to-end proof that no log line written through the whole refresh
+// path can ever carry a token-like string, for every shape a broken token
+// endpoint can hand back. Each of these drives the SAME route C1 was found
+// on: a 401 forces `doRefresh` -> `performRefresh` -> `refreshTokens`
+// (spotify-auth.ts), whose failure lands in `spotify.ts`'s
+// `log.once('spotify-refresh-failed', ...)`. Break either fix (restore
+// `JSON.stringify(body)` at spotify-auth.ts's `parseTokenResponse`, or
+// `String(e)` at its `res.json()` catch) and one of these fails.
+describe('SpotifySource token refresh never leaks a secret to the log (C1/I6)', () => {
+  const SECRET = 'AQD-SUPER-SECRET-REFRESH-TOKEN'
+  let lines: string[]
+
+  beforeEach(() => {
+    lines = []
+    setDefaultSink((line) => { lines.push(line) })
+  })
+  afterEach(() => {
+    setDefaultSink(() => {})
+  })
+
+  it('does not leak a secret when the token endpoint returns garbage (no access_token)', async () => {
+    const { src } = build([
+      { status: 401 },
+      { status: 200, body: { refresh_token: SECRET, token_type: 'Bearer' } },
+    ])
+    await src.poll()
+    expect(src.getStatus()).toBe('unauthorized')
+    const logged = lines.join('\n')
+    expect(logged).toContain('spotify token refresh failed')
+    expect(logged).not.toContain(SECRET)
+  })
+
+  it('does not leak a secret when the token endpoint returns an error object', async () => {
+    const { src } = build([
+      { status: 401 },
+      { status: 400, body: { error: 'invalid_grant', refresh_token: SECRET } },
+    ])
+    await src.poll()
+    expect(src.getStatus()).toBe('unauthorized')
+    expect(lines.join('\n')).not.toContain(SECRET)
+  })
+
+  it('does not leak a secret when the token endpoint returns an HTML error page', async () => {
+    let call = 0
+    const fetchFn = vi.fn(async () => {
+      call++
+      if (call === 1) {
+        // The player poll's own 401.
+        return { ok: false, status: 401, headers: { get: () => null }, json: async () => ({}) }
+      }
+      // A captive portal or proxy error page: not JSON at all, and the
+      // truncated text below starts with the secret, so a leaked SyntaxError
+      // fragment would carry it.
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => JSON.parse(`<html>${SECRET}`),
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }
+    })
+    vi.stubGlobal('fetch', fetchFn)
+    const store = { load: () => tokens(), save: vi.fn(), clear: vi.fn() }
+    const src = new SpotifySource('cid', store as never, fetchFn as never, () => 1000)
+    await src.poll()
+    expect(src.getStatus()).toBe('unauthorized')
+    expect(lines.join('\n')).not.toContain(SECRET)
   })
 })
 

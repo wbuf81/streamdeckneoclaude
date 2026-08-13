@@ -320,7 +320,12 @@ export class SpotifySource extends EventEmitter {
       body = await res.json()
       log.clearOnce('spotify-player-json')
     } catch (e) {
-      log.once('spotify-player-json', `spotify player response is not valid JSON: ${String(e)}`)
+      // Same class as I6: a `SyntaxError` from `res.json()` can embed a
+      // fragment of the body it failed on. This body is player state, not a
+      // token, but the invariant is file-wide — no error built in this file
+      // may embed any part of a response body.
+      const detail = e instanceof SyntaxError ? 'malformed JSON' : 'response body could not be read'
+      log.once('spotify-player-json', `spotify player response is not valid JSON: ${detail}`)
       this.status = 'offline'
       return
     }

@@ -720,6 +720,36 @@ describe('CodexSource', () => {
     }
   })
 
+  // I1 — a `updated_at_ms` dated in the FUTURE (a stepped-back clock, a
+  // skewed row) must fail the age guard the same way a stale one does. A
+  // one-sided `this.now() - updatedAt > MAX_ACTIVE_TASK_AGE_SECONDS` reads
+  // this as fresh, because the subtraction goes negative. Break the fix
+  // (revert to the one-sided comparison) and this fails.
+  it('drops a task whose thread row is dated in the future, the same way it drops a stale one', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const now = 1_000_000
+    const ninetyDaysMs = 90 * 24 * 3600 * 1000
+    const futureUpdatedAtMs = now * 1000 + ninetyDaysMs
+    const sqlite = vi.fn(async () => ok(JSON.stringify([{
+      id: 'skewed', rollout_path: '/skewed.jsonl', updated_at_ms: futureUpdatedAtMs,
+      title: 'Skewed task', cwd: '/work/deckd', model: 'gpt-5.6-sol', tokens_used: 1,
+    }])))
+    const readTail = () => fixedRead(
+      `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } })}\n`,
+    )
+    const source = new CodexSource(database, sqlite, readTail, () => now)
+    try {
+      await source.refresh()
+      expect(source.isAvailable()).toBe(true)
+      expect(source.getSnapshot().tasks).toEqual([])
+    } finally {
+      await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('keeps a recently active task whose thread row is well within the age guard', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
     const database = join(dir, 'state.sqlite')
@@ -988,6 +1018,88 @@ describe('CodexSource', () => {
       expect(source.isStale()).toBe(true) // ...but it never satisfies a freshness check.
     } finally {
       await source.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // I7 — a rollout that fails to read or parse used to vanish silently: no
+  // log line anywhere, and the sqlite read itself still succeeds, so the
+  // snapshot published looked like a healthy, fresh, genuinely empty Codex —
+  // indistinguishable from "no active tasks". Break the fix (put `catch {
+  // continue }` back with nothing logged, and drop the `anyRolloutReadFailed`
+  // branch) and this fails on both the log line and the staleness signal.
+  it('logs once and surfaces degraded/stale, never a silent healthy-empty page, when a rollout fails to read', async () => {
+    log.clearOnce('codex-rollout-read')
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    const sqlite = vi.fn(async () => ok(JSON.stringify([{
+      id: 'broken', rollout_path: '/broken.jsonl', updated_at_ms: 500_000,
+      title: 'Broken rollout', cwd: '/work/deckd', model: 'gpt-5.6-sol', tokens_used: 1,
+    }])))
+    const readTail = () => { throw new Error('EACCES: permission denied') }
+    const source = new CodexSource(database, sqlite, readTail, () => 500)
+    try {
+      await source.refresh()
+      // The sqlite read itself succeeded — the source is still "available" —
+      // but must not look like a clean, current, empty page.
+      expect(source.isAvailable()).toBe(true)
+      expect(source.getSnapshot()).toEqual({ tasks: [], usage: null })
+      expect(source.isDegraded()).toBe(true)
+      expect(source.isStale()).toBe(true)
+
+      const rolloutLines = lines.filter((line) => line.includes('rollout file'))
+      expect(rolloutLines).toHaveLength(1)
+      // Lesson 20: never the rollout path's own basename, the title, or the
+      // cwd — all derived from or naming the thread.
+      expect(rolloutLines[0]).not.toContain('/broken.jsonl')
+      expect(rolloutLines[0]).not.toContain('Broken rollout')
+      expect(rolloutLines[0]).not.toContain('deckd')
+    } finally {
+      await source.stop()
+      setDefaultSink(() => {})
+      log.clearOnce('codex-rollout-read')
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('clears the rollout-read log key on recovery, so a later failure logs again', async () => {
+    log.clearOnce('codex-rollout-read')
+    const dir = mkdtempSync(join(tmpdir(), 'deckd-codex-'))
+    const database = join(dir, 'state.sqlite')
+    writeFileSync(database, '')
+    const lines: string[] = []
+    setDefaultSink((line) => { lines.push(line) })
+    const sqlite = vi.fn(async () => ok(JSON.stringify([{
+      id: 't1', rollout_path: '/t1.jsonl', updated_at_ms: 500_000,
+      title: 'T', cwd: '/work/deckd', model: 'gpt-5.6-sol', tokens_used: 1,
+    }])))
+    let fail = true
+    const readTail = () => {
+      if (fail) throw new Error('EACCES')
+      return fixedRead('')
+    }
+    const source = new CodexSource(database, sqlite, readTail, () => 500)
+    const rolloutLines = () => lines.filter((line) => line.includes('rollout file'))
+    try {
+      await source.refresh()
+      expect(rolloutLines()).toHaveLength(1)
+      expect(source.isDegraded()).toBe(true)
+
+      fail = false
+      await source.refresh() // recovers.
+      expect(source.isDegraded()).toBe(false)
+      expect(source.isStale()).toBe(false)
+
+      fail = true
+      await source.refresh() // fails again, after the recovery.
+      expect(rolloutLines()).toHaveLength(2) // the cleared once-key let this one log again.
+    } finally {
+      await source.stop()
+      setDefaultSink(() => {})
+      log.clearOnce('codex-rollout-read')
       rmSync(dir, { recursive: true, force: true })
     }
   })
