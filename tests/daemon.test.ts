@@ -179,6 +179,36 @@ describe('Daemon per-page render interval', () => {
     await daemon.stop()
   })
 
+  it('follows a page that changes its own tickMs without a page change', async () => {
+    // The Spotify page asks for a fast tick only while it animates its idle
+    // state. Reading `tickMs` solely on a page switch would freeze that
+    // animation until the user flipped pages and back — the same defect the
+    // user already reported once for the Spotify page not loading.
+    vi.useFakeTimers()
+    const device = new FakeDevice()
+    const page = new TickPage(undefined)
+    const manager = new PageManager()
+    manager.add(page)
+    const daemon = new Daemon(device, manager)
+
+    await daemon.start()
+    await vi.advanceTimersByTimeAsync(1000)
+
+    // The page now wants 100 ms, with no page change to announce it.
+    page.tickMs = 100
+    // The next tick at the OLD rate is what notices the change and re-arms, so
+    // give it that tick before measuring. Measuring across it would see the old
+    // slow rate and pass for the wrong reason.
+    await vi.advanceTimersByTimeAsync(1000)
+
+    page.renderCount = 0
+    await vi.advanceTimersByTimeAsync(1000)
+
+    // Now the timer runs at 100 ms, so this is near 10 rather than 1.
+    expect(page.renderCount).toBeGreaterThan(5)
+    await daemon.stop()
+  })
+
   it('does not raise the rate for a page with no tickMs', async () => {
     vi.useFakeTimers()
     const device = new FakeDevice()

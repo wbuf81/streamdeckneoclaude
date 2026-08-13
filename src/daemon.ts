@@ -24,6 +24,8 @@ export class Daemon {
   private lastStrip: string | null = null
   private lastButtons: (string | null)[] = [null, null]
   private timer: NodeJS.Timeout | null = null
+  /** The interval the live timer was armed at, so a tick can notice a change. */
+  private armedTickMs = 0
   private rendering = false
   /**
    * Set once by `stop()` and never cleared. `device.onPress`'s listener is
@@ -69,7 +71,19 @@ export class Daemon {
     if (this.stopped) return
     if (this.timer) clearInterval(this.timer)
     const tickMs = this.pages.current().tickMs ?? DEFAULT_TICK_MS
-    this.timer = setInterval(() => void this.renderOnce(this.now(), this.nowMs()), tickMs)
+    this.armedTickMs = tickMs
+    this.timer = setInterval(() => {
+      // A page may change its own rate WITHOUT a page change: the Spotify page
+      // asks for 100 ms while it animates its idle state and the default rate
+      // while a track is loaded. Reading `tickMs` only on a page switch would
+      // leave that animation frozen until the user flipped pages — the same
+      // "flip away and back to fix it" defect the user already reported once.
+      // So compare every tick and re-arm when the page has changed its mind.
+      if ((this.pages.current().tickMs ?? DEFAULT_TICK_MS) !== this.armedTickMs) {
+        this.armTimer()
+      }
+      void this.renderOnce(this.now(), this.nowMs())
+    }, tickMs)
   }
 
   private async handlePress(index: number): Promise<void> {
