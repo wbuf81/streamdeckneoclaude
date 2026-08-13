@@ -1650,79 +1650,14 @@ async function solidImage(r: number, g: number, b: number): Promise<Image> {
 
 const NOW = 1786549560
 
-/**
- * Task 39 only touches the Spotify page's idle-state branches. These four
- * OTHER pages never read `KeySpec.idle`, so nothing about this task should
- * change one pixel of theirs — but "should" is not proof (lesson 22). Each
- * golden hash was captured from the pre-task-39 build, rendering the SAME
- * fixture every other test for that page already uses, so a real regression
- * here (for example, an accidental change to a shared theme colour or to
- * `renderKey`'s shared line/border/bar drawing) fails loudly instead of
- * slipping through unnoticed.
+/*
+ * Task 39's four cross-page golden-hash tests lived here. They proved, AT
+ * COMMIT TIME, that the idle-animation rewrite changed no other page's
+ * pixels — and they did their job. They are deleted rather than updated:
+ * a frozen whole-key hash pins every FUTURE legitimate change to those
+ * pages too, and it broke within the hour when a review fix changed the
+ * Claude session tile on purpose. The durable form of the same guarantee
+ * lives in each page's own suite (no page sets `KeySpec.idle`, and
+ * `keyHash` coverage is tested per field). Do not re-add cross-page
+ * golden hashes; see docs/LESSONS.md lesson 22.
  */
-describe('the other four pages render identically after the Spotify idle-animation rewrite (task 39)', () => {
-  it('ClaudePage key 0 is byte-identical to the pre-task-39 build', () => {
-    const page = new ClaudePage(
-      {
-        getSessions: () => [{
-          sessionId: 'aaaa', state: 'tool' as const, label: 'Running command', tool: 'Bash',
-          project: 'streamdeckneoclaude', cwd: '/x', termProgram: 'ghostty',
-          pid: 4242, startedAt: NOW - 840, ts: NOW,
-        }],
-        directoryExists: () => true,
-      },
-      { getUsage: () => null, isStale: () => false, getMeta: () => null },
-      async () => true,
-    )
-    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
-    expect(sha).toBe('aca891c042a855c6db250fe08411dc769d1d1a67708e55d503bf909d2ca35114')
-  })
-
-  it('CodexPage key 0 is byte-identical to the pre-task-39 build', () => {
-    const page = new CodexPage({
-      getSnapshot: () => ({
-        tasks: [{
-          threadId: 'thread-1', title: 'Improve the Stream Deck integration', project: 'deckd',
-          model: 'gpt-5.6-sol', updatedAt: NOW, tokensUsed: 1_250_000,
-        }],
-        usage: {
-          limits: [{ usedPct: 27, windowMinutes: 10080, resetsAt: NOW + 86400 }],
-          totalTokens: 1_250_000, plan: 'team', ts: NOW,
-        },
-      }),
-      isAvailable: () => true,
-      isStale: () => false,
-      isUsageUnknown: () => false,
-    } as never)
-    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
-    expect(sha).toBe('e2d0b02586033f0ae0422b9a95f9fda64fe2fc9bd313580aaf2945f7b0a81174')
-  })
-
-  it('WeatherPage key 0 is byte-identical to the pre-task-39 build', () => {
-    const page = new WeatherPage({
-      getDays: () => [],
-      getConditions: () => null,
-      getStatus: () => 'ok',
-      getLastUpdatedAt: () => NOW,
-      getPlace: () => 'x',
-      isStale: () => false,
-      setVisible: () => {},
-    } as never)
-    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
-    expect(sha).toBe('e49484a4f42389f3a60e074b3dd012a45e8e42f79ca741bd335905cc946e47c9')
-  })
-
-  it('StocksPage key 0 is byte-identical to the pre-task-39 build', () => {
-    const page = new StocksPage({
-      getQuotes: () => new Map(),
-      getStatus: () => 'ok',
-      getMarketState: () => 'closed',
-      isSymbolStale: () => false,
-      setVisible: () => {},
-      getYearlyState: () => 'idle',
-      setWatchedSymbol: () => {},
-    } as never)
-    const sha = createHash('sha256').update(renderKey(page.render(NOW).keys[0]!)).digest('hex')
-    expect(sha).toBe('8e42b735d7db44b94def7d656205b8f88344ef4ce3b9ee2956867ce77f4b005d')
-  })
-})
