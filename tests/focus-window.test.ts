@@ -6,9 +6,8 @@ import {
   parseWindowTitles,
   pickWindowIndex,
   buildRaiseWindowScript,
-  findTerminalPid,
   focusWindow,
-  MAX_WALK,
+  MIN_CANDIDATE_LENGTH,
 } from '../src/focus-window.js'
 import { createLogger } from '../src/log.js'
 
@@ -64,31 +63,6 @@ describe('buildFocusScript', () => {
 
   it('refuses a name with a quote in it', () => {
     expect(() => buildFocusScript('bad"name')).toThrow(/name/i)
-  })
-})
-
-describe('findTerminalPid', () => {
-  it('returns the pid when it has no parent', () => {
-    expect(findTerminalPid(100, () => null)).toBe(100)
-  })
-
-  it('walks up to the top of the tree', () => {
-    // 100 -> 50 -> 1. The walk stops at 1, because 1 is launchd.
-    const parents = new Map([[100, 50], [50, 1]])
-    expect(findTerminalPid(100, (p) => parents.get(p) ?? null)).toBe(50)
-  })
-
-  it('stops at the depth cap on a cyclic tree', () => {
-    // A cycle must not loop for ever.
-    expect(findTerminalPid(2, () => 2)).toBe(2)
-  })
-
-  it('has a depth cap above 1', () => {
-    expect(MAX_WALK).toBeGreaterThan(1)
-  })
-
-  it('returns the pid unchanged when it is already 1', () => {
-    expect(findTerminalPid(1, () => null)).toBe(1)
   })
 })
 
@@ -193,6 +167,39 @@ describe('pickWindowIndex', () => {
     // an arbitrary window.
     const titles = ['Investigate flaky CI test on the reporting service']
     expect(pickWindowIndex(titles, ['streamdeckneoclaude', '/x/streamdeckneoclaude', 'streamdeckneoclaude'])).toBeNull()
+  })
+
+  // Regression coverage for B1: no minimum candidate length and no score
+  // threshold meant a one-character candidate, or the `—` sentinel
+  // `src/sources/claude.ts` substitutes for a missing `project`, could match
+  // an unrelated title and raise the WRONG window — worse than today's
+  // app-level fallback.
+
+  it('drops a one-character candidate before scoring, rather than letting it match inside an unrelated word', () => {
+    // Verified live before the fix: this returned 0 -- the "a" inside
+    // "flaky" matched.
+    const titles = ['Investigate flaky CI']
+    expect(pickWindowIndex(titles, ['a', '/x/a', 'proj'])).toBeNull()
+  })
+
+  it('drops the em-dash placeholder sentinel before scoring, rather than letting it match any title with an em dash', () => {
+    // Verified live before the fix: this returned 1 -- a window belonging to
+    // a completely different directory, because `—` is what
+    // `src/sources/claude.ts` substitutes for a missing `project` field, and
+    // Ghostty titles routinely contain an em dash.
+    const titles = ['nvim', '~/unrelated-dir — zsh']
+    expect(pickWindowIndex(titles, ['foo', '/Users/x/foo', '—'])).toBeNull()
+  })
+
+  it('exports the minimum candidate length so the threshold is not a magic number', () => {
+    expect(MIN_CANDIDATE_LENGTH).toBeGreaterThanOrEqual(3)
+  })
+
+  it('still matches normally when at least one candidate clears the minimum length', () => {
+    // The short basename ("w", from a session in ~/w) gives up its vote, but
+    // the project name is still a candidate and can still win.
+    const titles = ['~/other — zsh', 'Deploy the widget-project pipeline']
+    expect(pickWindowIndex(titles, ['w', '/Users/x/w', 'widget-project'])).toBe(1)
   })
 })
 
@@ -475,5 +482,57 @@ describe('focusWindow', () => {
     const ok = await focusWindow(1, 'some-new-term', '/x', 'proj', runner, logger)
     expect(ok).toBe(false)
     expect(calls).toEqual([])
+  })
+
+  // M3: `basename(cwd)` and `pickWindowIndex` sit between the two `try`
+  // blocks in `tryFocusWindow`. No live caller can pass a non-string `cwd` --
+  // `ClaudeSource` coerces it through `str()` first -- but `focusWindow`'s
+  // doc comment promises never to throw, and that promise was unproven for
+  // this stretch of code. A cast bypasses the type system the same way a
+  // future caller's bug could.
+  it('never throws even if cwd is not actually a string, despite the type signature', async () => {
+    const logger = createLogger(() => {})
+    const runner: Runner = async (_file, args) => {
+      if (scriptKind(args) === 'list') return { stdout: '~/other — zsh', stderr: '' }
+      return { stdout: '', stderr: '' }
+    }
+    const badCwd = undefined as unknown as string
+    await expect(
+      focusWindow(1, 'ghostty', badCwd, 'proj', runner, logger),
+    ).resolves.toBe(true) // degrades to the app-level activate fallback
+  })
+
+  // M4: `clearOnce('accessibility-<app>')` used to run only after a
+  // successful raise. If Accessibility is granted but no title matches, that
+  // path is never reached, so an earlier denial log stayed suppressed and a
+  // later, genuine denial would log nothing.
+  it('clears the earlier accessibility denial once listing succeeds, even if nothing then matches', async () => {
+    const written: string[] = []
+    const logger = createLogger((line) => written.push(line))
+    let denyList = true
+    const runner: Runner = async (_file, args) => {
+      const kind = scriptKind(args)
+      if (kind === 'list') {
+        if (denyList) throw new Error('not allowed assistive access. (-1728)')
+        // Accessibility is granted now, but nothing matches this session.
+        return { stdout: 'Investigate flaky CI test on the reporting service', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    }
+
+    // First press: denied. Logs once.
+    await focusWindow(1, 'ghostty', '/x/streamdeckneoclaude', 'streamdeckneoclaude', runner, logger)
+    expect(written.filter((l) => l.includes('-1728'))).toHaveLength(1)
+
+    // Accessibility is granted, but the title still does not match. The
+    // earlier denial key must clear here, not stay suppressed.
+    denyList = false
+    await focusWindow(1, 'ghostty', '/x/streamdeckneoclaude', 'streamdeckneoclaude', runner, logger)
+
+    // A later, genuine denial (e.g. permission revoked again) must log
+    // again, proving the key actually cleared.
+    denyList = true
+    await focusWindow(1, 'ghostty', '/x/streamdeckneoclaude', 'streamdeckneoclaude', runner, logger)
+    expect(written.filter((l) => l.includes('-1728'))).toHaveLength(2)
   })
 })

@@ -8,9 +8,6 @@ const run = promisify(execFile)
 /** The shape of `run`. A test injects a fake to avoid shelling out. */
 type Runner = (file: string, args: readonly string[]) => Promise<{ stdout: string; stderr: string }>
 
-/** Depth cap for the process walk. A broken tree must not loop. */
-export const MAX_WALK = 12
-
 const APPS: Record<string, string> = {
   ghostty: 'Ghostty',
   'iterm.app': 'iTerm2',
@@ -108,6 +105,34 @@ function normalizeTitle(title: string): string {
 }
 
 /**
+ * A candidate shorter than this cannot be trusted as a match signal — a one-
+ * or two-character candidate matches almost any title by luck. Verified live:
+ * `pickWindowIndex(['Investigate flaky CI'], ['a', '/x/a', 'proj'])` used to
+ * return `0` — the `a` inside "flaky" matched. A short cwd basename (a
+ * session in `~/w` or `~/ai`) hit the same bug. Dropping it below this length
+ * still leaves the full cwd path and the project name as candidates, so a
+ * short basename alone giving up its vote is not a regression.
+ */
+export const MIN_CANDIDATE_LENGTH = 3
+
+/**
+ * Sentinel values a source substitutes for a field it could not read.
+ * `src/sources/claude.ts` passes `—` for `project` when a session file omits
+ * it. A placeholder carries no real match signal and must never enter
+ * scoring — checked by value, not just by length, so it stays excluded even
+ * if `MIN_CANDIDATE_LENGTH` ever changes. Verified live:
+ * `pickWindowIndex(['nvim', '~/unrelated-dir — zsh'], ['foo', '/Users/x/foo', '—'])`
+ * used to return `1`, raising a window that belongs to a different directory.
+ */
+const PLACEHOLDER_CANDIDATES = new Set(['—'])
+
+/** A title must match at least this well before `pickWindowIndex` will raise
+ * it, rather than falling back to app-level `activate`. Named explicitly, so
+ * the rule is "requires a minimum score" rather than merely "score is not
+ * exactly zero". */
+const MIN_SCORE = 1
+
+/**
  * Scores each title against `candidates` — normally the session's cwd
  * basename, its full path, and its project name — and picks the single best
  * match. Measured live: a Claude Code session's Ghostty title is a task
@@ -117,16 +142,23 @@ function normalizeTitle(title: string): string {
  * candidates still lets a plain shell window win on its cwd, while giving a
  * Claude Code window a chance to win on its project name.
  *
+ * Candidates shorter than `MIN_CANDIDATE_LENGTH`, and any known placeholder
+ * sentinel, are dropped before scoring — neither carries a real match signal,
+ * and either one can turn an unrelated title into a false match.
+ *
  * Never guesses: this never returns "the closest of the bad options" or a
  * first-window default. It returns `null` — meaning "fall back to app-level
- * activate", today's behaviour — when: nothing scores above zero; the top
- * score is tied between two or more windows, which is ambiguous rather than
- * a real answer; or every positively-scoring title is unsafe (contains a
- * quote or backslash) and so can never be used in `buildRaiseWindowScript` —
- * an unsafe title is treated the same as no match at all, never escaped.
+ * activate", today's behaviour — when: nothing scores at or above
+ * `MIN_SCORE`; the top score is tied between two or more windows, which is
+ * ambiguous rather than a real answer; or every positively-scoring title is
+ * unsafe (contains a quote or backslash) and so can never be used in
+ * `buildRaiseWindowScript` — an unsafe title is treated the same as no match
+ * at all, never escaped.
  */
 export function pickWindowIndex(titles: string[], candidates: readonly string[]): number | null {
-  const wanted = candidates.map((c) => c.trim().toLowerCase()).filter((c) => c.length > 0)
+  const wanted = candidates
+    .map((c) => c.trim().toLowerCase())
+    .filter((c) => c.length >= MIN_CANDIDATE_LENGTH && !PLACEHOLDER_CANDIDATES.has(c))
   if (wanted.length === 0) return null
 
   let bestIndex: number | null = null
@@ -140,7 +172,7 @@ export function pickWindowIndex(titles: string[], candidates: readonly string[])
     // title matching both the cwd and the project outranks one matching
     // only the project — more agreement is a stronger signal.
     const score = wanted.reduce((acc, w) => acc + (title.includes(w) ? 1 : 0), 0)
-    if (score === 0) return
+    if (score < MIN_SCORE) return
     if (score > bestScore) {
       bestScore = score
       bestIndex = i
@@ -222,8 +254,24 @@ async function tryFocusWindow(
     return false
   }
 
+  // Listing just succeeded, so Accessibility is granted right now. Clear any
+  // earlier denial here, not only after a later successful raise below — a
+  // granted-but-no-match outcome (the very next block) must not leave a
+  // later, genuine denial suppressed forever.
+  logger.clearOnce(`accessibility-${app}`)
+
   const matchKey = `nomatch-${app}-${cwd}`
-  const index = pickWindowIndex(titles, [basename(cwd), cwd, project])
+  let index: number | null
+  try {
+    // `basename` throws on a non-string input, and `pickWindowIndex` is a
+    // plain function this code does not fully control the future shape of.
+    // `focusWindow` promises never to throw, so this stays inside its own
+    // try even though no live caller can reach a throwing input today —
+    // `ClaudeSource` always coerces `cwd` and `project` to strings first.
+    index = pickWindowIndex(titles, [basename(cwd), cwd, project])
+  } catch {
+    return false
+  }
   if (index === null) {
     // Named so this is diagnosable later: which titles existed, and what the
     // session wanted matched against them. A plain shell window usually
@@ -242,42 +290,10 @@ async function tryFocusWindow(
 
   try {
     await runner('/usr/bin/osascript', ['-e', buildRaiseWindowScript(app, title)])
-    // Listing worked, so Accessibility is granted; clear any earlier denial
-    // so a later, genuine denial logs again instead of staying suppressed.
-    logger.clearOnce(`accessibility-${app}`)
     logger.clearOnce(matchKey)
     return true
   } catch {
     return false
-  }
-}
-
-/**
- * Walks up the process tree from `pid`. It stops below `launchd`, which is pid
- * 1, and it stops at the depth cap.
- */
-export function findTerminalPid(
-  pid: number,
-  readParent: (pid: number) => number | null,
-): number {
-  let current = pid
-  for (let i = 0; i < MAX_WALK; i++) {
-    const parent = readParent(current)
-    if (parent === null || parent <= 1) return current
-    if (parent === current) return current
-    current = parent
-  }
-  return current
-}
-
-/** Reads a parent pid with `ps`. Returns null when the process is gone. */
-export async function readParentPid(pid: number): Promise<number | null> {
-  try {
-    const { stdout } = await run('/bin/ps', ['-o', 'ppid=', '-p', String(pid)])
-    const n = Number.parseInt(stdout.trim(), 10)
-    return Number.isFinite(n) ? n : null
-  } catch {
-    return null
   }
 }
 
