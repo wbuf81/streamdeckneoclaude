@@ -46,42 +46,56 @@ describe('getSpriteFrame and getSpriteFrameIndex', () => {
   })
 
   it('advances the frame index as nowMs advances', async () => {
-    writeState(root, 'walk', { frameCount: 4, delayMs: 10 })
+    // delayMs above MIN_DELAY_MS (M3 floors anything below it), so this
+    // tests genuine frame advancement, not the floor.
+    writeState(root, 'walk', { frameCount: 4, delayMs: 50 })
     await loadCrabFrames(root, ['walk'])
 
     expect(getSpriteFrameIndex('walk', 0)).toBe(0)
-    expect(getSpriteFrameIndex('walk', 10)).toBe(1)
-    expect(getSpriteFrameIndex('walk', 20)).toBe(2)
-    expect(getSpriteFrameIndex('walk', 25)).toBe(2)
+    expect(getSpriteFrameIndex('walk', 50)).toBe(1)
+    expect(getSpriteFrameIndex('walk', 100)).toBe(2)
+    expect(getSpriteFrameIndex('walk', 125)).toBe(2)
   })
 
   it('wraps at the frame count', async () => {
-    writeState(root, 'walk', { frameCount: 3, delayMs: 10 })
+    writeState(root, 'walk', { frameCount: 3, delayMs: 50 })
     await loadCrabFrames(root, ['walk'])
 
-    expect(getSpriteFrameIndex('walk', 30)).toBe(0)
-    expect(getSpriteFrameIndex('walk', 40)).toBe(1)
+    expect(getSpriteFrameIndex('walk', 150)).toBe(0)
+    expect(getSpriteFrameIndex('walk', 200)).toBe(1)
   })
 
   it('returns a different frame for two nowMs values one frame apart', async () => {
-    writeState(root, 'walk', { frameCount: 4, delayMs: 10 })
+    writeState(root, 'walk', { frameCount: 4, delayMs: 50 })
     await loadCrabFrames(root, ['walk'])
 
     const a = getSpriteFrame('walk', 0)
-    const b = getSpriteFrame('walk', 10)
+    const b = getSpriteFrame('walk', 50)
     expect(a).not.toBeNull()
     expect(b).not.toBeNull()
     expect(a).not.toBe(b)
   })
 
   it('returns the same frame for two nowMs values inside one frame duration', async () => {
-    writeState(root, 'walk', { frameCount: 4, delayMs: 10 })
+    writeState(root, 'walk', { frameCount: 4, delayMs: 50 })
     await loadCrabFrames(root, ['walk'])
 
-    const a = getSpriteFrame('walk', 12)
-    const b = getSpriteFrame('walk', 18)
+    const a = getSpriteFrame('walk', 60)
+    const b = getSpriteFrame('walk', 90)
     expect(a).not.toBeNull()
     expect(a).toBe(b)
+  })
+
+  it('floors a tiny positive delayMs to the minimum too (M3): the old guard only caught zero and negative', async () => {
+    writeState(root, 'tiny', { frameCount: 3, delayMs: 0.001 })
+    await loadCrabFrames(root, ['tiny'])
+
+    // With the floor applied, one period is MIN_DELAY_MS (40 ms) — before
+    // the fix, delayMs stayed at 0.001, so the SAME nowMs already read as
+    // frame `Math.floor(1 / 0.001) % 3` = 1000 % 3 = 1, not 0.
+    expect(getSpriteFrameIndex('tiny', 1)).toBe(0)
+    expect(getSpriteFrameIndex('tiny', MIN_DELAY_MS)).toBe(1)
+    expect(getSpriteFrameIndex('tiny', MIN_DELAY_MS * 2)).toBe(2)
   })
 
   it('floors a delayMs of zero to the minimum, instead of dividing by zero', async () => {

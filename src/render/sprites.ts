@@ -80,7 +80,12 @@ async function loadStateFrames(assetsRoot: string, state: string): Promise<void>
   }
 
   const rawDelay = typeof meta.delayMs === 'number' ? meta.delayMs : 0
-  const delayMs = rawDelay > 0 ? rawDelay : MIN_DELAY_MS
+  // `Math.max`, not `rawDelay > 0 ? rawDelay : MIN_DELAY_MS` (M3): the old
+  // guard only caught zero and negative values, so a tiny positive
+  // `delayMs` (for example 0.001) passed through unfloored, contradicting
+  // this module's own doc comment above ("floored here, once, at load
+  // time"). `Math.max` floors every case in one comparison.
+  const delayMs = Math.max(MIN_DELAY_MS, rawDelay)
 
   const frames: Image[] = []
   for (let i = 0; i < frameCount; i++) {

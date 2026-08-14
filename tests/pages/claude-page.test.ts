@@ -873,11 +873,14 @@ describe('crabFrame', () => {
   })
 
   it('emits a different frame for two nowMs values one frame apart', async () => {
-    writeCrabState(root, 'thinking', { frameCount: 4, delayMs: 10 })
+    // delayMs above sprites.ts's MIN_DELAY_MS (40, a Minor fix elsewhere in
+    // this pass floors anything below it) — 10 would now floor to 40 and no
+    // longer land on two distinct frames at nowMs 0 and 10.
+    writeCrabState(root, 'thinking', { frameCount: 4, delayMs: 50 })
     await loadCrabFrames(root, ['thinking'])
 
     const a = crabFrame('thinking', 0)
-    const b = crabFrame('thinking', 10)
+    const b = crabFrame('thinking', 50)
     expect(a).not.toBeNull()
     expect(b).not.toBeNull()
     expect(a!.image).not.toBe(b!.image)
@@ -918,12 +921,13 @@ describe('ClaudePage renders the crab through the page, not just the helper', ()
   })
 
   it('advances key 3\'s image as nowMs advances, one render call apart', async () => {
-    writeCrabState(root, 'tool', { frameCount: 4, delayMs: 10 })
+    // delayMs above sprites.ts's MIN_DELAY_MS — see the same note above.
+    writeCrabState(root, 'tool', { frameCount: 4, delayMs: 50 })
     await loadCrabFrames(root, ['tool'])
 
     const { page } = build({ sessions: [session({ state: 'tool' })] })
     const first = page.render(NOW, 0).keys[3]!
-    const second = page.render(NOW, 10).keys[3]!
+    const second = page.render(NOW, 50).keys[3]!
     expect(first.image).not.toBe(second.image)
     expect(first.imageKey).not.toBe(second.imageKey)
   })
