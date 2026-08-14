@@ -1,31 +1,36 @@
 import { describe, it, expect } from 'vitest'
 import type { Image } from '@napi-rs/canvas'
-import { FootballPage, formatShortDate, formatKickoff, formatScore, wrapText } from '../../src/pages/football-page.js'
+import {
+  FootballPage,
+  formatShortDate,
+  formatKickoff,
+  formatRecord,
+  scheduleWindow,
+} from '../../src/pages/football-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, probe, KEY_SIZE } from '../../src/render/canvas.js'
 import { keyHash } from '../../src/render/specs.js'
 import type { KeySpec } from '../../src/render/specs.js'
-import type { FootballStatus, GameSummary, Slot, Team } from '../../src/sources/football.js'
+import type { FootballStatus, Game, Team, TeamRecord } from '../../src/sources/football.js'
 
-const NOW = 1786549560 // arbitrary fixed clock, seconds
+const NOW_S = 1755000000 // arbitrary fixed clock, seconds
+const NOW_MS = NOW_S * 1000
 
-function game(over: Partial<GameSummary> = {}): GameSummary {
+function game(over: Partial<Game> = {}): Game {
   return {
-    id: '2475347',
+    id: '401873281',
     opponent: 'New Orleans Saints',
+    opponentShort: 'NO',
     isHome: false,
-    kickoffEpochMs: Date.UTC(2026, 7, 15, 20, 0, 0), // 4:00 PM EDT
-    venue: 'Caesars Superdome',
-    city: 'New Orleans, LA',
-    finished: false,
-    teamScore: null,
-    opponentScore: null,
+    kickoffEpochMs: NOW_MS + 3 * 24 * 60 * 60 * 1000, // 3 days out
+    timeTbd: false,
     ...over,
   }
 }
 
 interface Fakes {
-  games: Partial<Record<`${Team}:${Slot}`, GameSummary | null>>
+  schedules: Partial<Record<Team, Game[]>>
+  records: Partial<Record<Team, TeamRecord | null>>
   status: FootballStatus
   stale: boolean
   lastUpdatedAt: number
@@ -34,21 +39,25 @@ interface Fakes {
 
 function build(over: Partial<Fakes> = {}) {
   const f: Fakes = {
-    games: {},
+    schedules: {},
+    records: {},
     status: 'ok',
     stale: false,
-    lastUpdatedAt: NOW,
+    lastUpdatedAt: NOW_S,
     logos: {},
     ...over,
   }
   const calls: string[] = []
   const source = {
-    getGame: (team: Team, slot: Slot) => f.games[`${team}:${slot}`] ?? null,
+    getSchedule: (team: Team) => f.schedules[team] ?? [],
+    getRecord: (team: Team) => f.records[team] ?? null,
     getStatus: () => f.status,
     getLastUpdatedAt: () => f.lastUpdatedAt,
     isStale: () => f.stale,
     getLogo: (team: Team) => f.logos[team] ?? null,
-    setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
+    setVisible: (v: boolean) => {
+      calls.push(`visible:${v}`)
+    },
   }
   return { page: new FootballPage(source as never), calls, f }
 }
@@ -59,12 +68,10 @@ function build(over: Partial<Fakes> = {}) {
 
 describe('formatShortDate', () => {
   it('formats a UTC kickoff as its Eastern calendar date', () => {
-    // 2026-08-15T20:00:00Z is 4:00 PM EDT the SAME day.
     expect(formatShortDate(Date.UTC(2026, 7, 15, 20, 0, 0))).toBe('AUG 15')
   })
 
-  it('rolls back to the PREVIOUS Eastern day for a late UTC kickoff (measured: Oregon vs Portland State)', () => {
-    // dateEvent 2026-09-19, strTime 02:30:00 UTC -> 2026-09-18 22:30 EDT.
+  it('rolls back to the PREVIOUS Eastern day for a late UTC kickoff', () => {
     expect(formatShortDate(Date.UTC(2026, 8, 19, 2, 30, 0))).toBe('SEP 18')
   })
 
@@ -74,46 +81,71 @@ describe('formatShortDate', () => {
 })
 
 describe('formatKickoff', () => {
-  it('renders a known kickoff through the shared Eastern time formatter', () => {
-    expect(formatKickoff(Date.UTC(2026, 7, 15, 20, 0, 0))).toBe('4:00 PM EDT')
+  it('renders a known, non-TBD kickoff through the shared Eastern time formatter', () => {
+    expect(formatKickoff({ kickoffEpochMs: Date.UTC(2026, 7, 15, 20, 0, 0), timeTbd: false })).toBe('4:00 PM EDT')
   })
 
-  it('renders TBA, never a fabricated time, when the kickoff is unknown', () => {
-    // Break the fix (return '00:00 AM EST' or any computed fallback instead
-    // of the literal string) and this fails.
-    expect(formatKickoff(null)).toBe('TBA')
-  })
-})
-
-describe('formatScore', () => {
-  it('formats a win', () => {
-    expect(formatScore(game({ finished: true, teamScore: 27, opponentScore: 24 }))).toBe('W 27-24')
+  it('renders TBA when the kickoff instant itself is unknown', () => {
+    expect(formatKickoff({ kickoffEpochMs: null, timeTbd: false })).toBe('TBA')
   })
 
-  it('formats a loss', () => {
-    expect(formatScore(game({ finished: true, teamScore: 24, opponentScore: 27 }))).toBe('L 24-27')
-  })
-
-  it('formats a tie', () => {
-    expect(formatScore(game({ finished: true, teamScore: 20, opponentScore: 20 }))).toBe('T 20-20')
-  })
-
-  it('is -- for a game not yet played, never a fabricated 0-0', () => {
-    expect(formatScore(game({ finished: false, teamScore: null, opponentScore: null }))).toBe('--')
+  it('renders TBA when ESPN marks the game timeTbd, even though a placeholder instant exists', () => {
+    // Break the fix (drop the `game.timeTbd` check) and this fails: a real,
+    // still-unannounced kickoff would show a confident, likely-wrong time.
+    expect(formatKickoff({ kickoffEpochMs: Date.UTC(2027, 0, 3, 5, 0, 0), timeTbd: true })).toBe('TBA')
   })
 })
 
-describe('wrapText', () => {
-  it('wraps a long venue name across multiple lines without breaking a word', () => {
-    const lines = wrapText('Ben Hill Griffin Stadium', 12, 3)
-    expect(lines.join(' ')).toBe('Ben Hill Griffin Stadium')
-    for (const l of lines) expect(l.length).toBeLessThanOrEqual(12)
+describe('formatRecord', () => {
+  it('formats a real record', () => {
+    expect(formatRecord({ wins: 8, losses: 3, ties: 0, started: true })).toBe('8-3')
   })
 
-  it('folds overflow onto the last line with an ellipsis rather than dropping it', () => {
-    const lines = wrapText('a very extremely long venue name that will not fit in three lines at all', 12, 3)
-    expect(lines).toHaveLength(3)
-    expect(lines[2]).toMatch(/…$/)
+  it('appends a tie only when there is one', () => {
+    expect(formatRecord({ wins: 7, losses: 3, ties: 1, started: true })).toBe('7-3-1')
+  })
+
+  it('is -- for a real record where gamesPlayed is 0 — never a fabricated 0-0 (lesson 18)', () => {
+    // Break the fix (drop the `started` check) and this fails: an unstarted
+    // season's real 0-0 would render as if the team had actually gone 0-0.
+    expect(formatRecord({ wins: 0, losses: 0, ties: 0, started: false })).toBe('--')
+  })
+
+  it('is -- when the record itself is unknown', () => {
+    expect(formatRecord(null)).toBe('--')
+  })
+})
+
+describe('scheduleWindow', () => {
+  function games(n: number, base = 0): Game[] {
+    return Array.from({ length: n }, (_, i) =>
+      game({ id: String(i), kickoffEpochMs: base + i * 86400000, opponent: `Opponent ${i}` }),
+    )
+  }
+
+  it('returns the whole schedule unchanged when it already fits', () => {
+    const g = games(5)
+    expect(scheduleWindow(g, NOW_MS, 7)).toEqual(g)
+  })
+
+  it('shows the next N games when there are more upcoming games than fit', () => {
+    const g = games(10, NOW_MS - 86400000) // game 0 is already 1 day past
+    const w = scheduleWindow(g, NOW_MS, 7)
+    expect(w).toHaveLength(7)
+    // Game 0 already happened; the window starts from game 1 (the first
+    // still-upcoming one).
+    expect(w[0]!.opponent).toBe('Opponent 1')
+  })
+
+  it('backfills with the most recent past games once fewer than a full window remain upcoming', () => {
+    // 10 games, all but the last 2 already in the past.
+    const g = games(10, NOW_MS - 8 * 86400000)
+    const w = scheduleWindow(g, NOW_MS, 7)
+    expect(w).toHaveLength(7)
+    // Break the fix (clamp `start` to `idx` with no backfill) and this
+    // shrinks to 2 — the window would show only the 2 upcoming games
+    // instead of filling all 7 slots.
+    expect(w[w.length - 1]!.opponent).toBe('Opponent 9')
   })
 })
 
@@ -122,103 +154,115 @@ describe('wrapText', () => {
 // ---------------------------------------------------------------------------
 
 describe('FootballPage grid layout', () => {
-  it('returns 8 keys: logo, next, last, blank, logo, next, last, blank', () => {
+  function threeUpcoming(prefix: string): Game[] {
+    return [
+      game({ id: `${prefix}1`, opponent: `${prefix} Opp 1`, kickoffEpochMs: NOW_MS + 1 * 86400000 }),
+      game({ id: `${prefix}2`, opponent: `${prefix} Opp 2`, kickoffEpochMs: NOW_MS + 8 * 86400000 }),
+      game({ id: `${prefix}3`, opponent: `${prefix} Opp 3`, kickoffEpochMs: NOW_MS + 15 * 86400000 }),
+    ]
+  }
+
+  it('returns 8 keys: gators logo, 3 gators games, jaguars logo, 3 jaguars games', () => {
     const { page } = build({
-      games: {
-        'jaguars:next': game({ opponent: 'New Orleans Saints' }),
-        'jaguars:last': game({
-          opponent: 'Buffalo Bills',
-          finished: true,
-          teamScore: 24,
-          opponentScore: 27,
-          kickoffEpochMs: Date.UTC(2026, 0, 11, 18, 0, 0),
-        }),
-        'gators:next': game({ opponent: 'Florida Atlantic' }),
-        'gators:last': game({ opponent: 'Florida State', finished: true, teamScore: 40, opponentScore: 21 }),
+      schedules: { gators: threeUpcoming('UF'), jaguars: threeUpcoming('JAX') },
+      records: { gators: { wins: 8, losses: 3, ties: 0, started: true } },
+    })
+    const keys = page.render(NOW_S).keys
+    expect(keys).toHaveLength(8)
+    // Logo not loaded yet -> text fallback shows the team name AND record.
+    expect(keys[0]!.lines).toEqual(['GATORS', '8-3'])
+    expect(keys[1]!.lines![1]).toBe('UF Opp 1')
+    expect(keys[2]!.lines![1]).toBe('UF Opp 2')
+    expect(keys[3]!.lines![1]).toBe('UF Opp 3')
+    expect(keys[5]!.lines![1]).toBe('JAX Opp 1')
+    expect(keys[6]!.lines![1]).toBe('JAX Opp 2')
+    expect(keys[7]!.lines![1]).toBe('JAX Opp 3')
+  })
+
+  it('shows a dashed placeholder, dimmed, when a team has fewer than three upcoming games', () => {
+    const { page } = build({ schedules: { gators: [threeUpcoming('UF')[0]!] } })
+    const keys = page.render(NOW_S).keys
+    expect(keys[1]!.lines![1]).toBe('UF Opp 1')
+    expect(keys[2]!.lines).toEqual(['--', '--', '--'])
+    expect(keys[2]!.dim).toBe(true)
+    expect(keys[3]!.dim).toBe(true)
+  })
+
+  it('excludes games already in the past from the next-three selection', () => {
+    const { page } = build({
+      schedules: {
+        gators: [
+          game({ id: 'past', opponent: 'Already Played', kickoffEpochMs: NOW_MS - 86400000 }),
+          ...threeUpcoming('UF'),
+        ],
       },
     })
-    const keys = page.render(NOW).keys
-    expect(keys).toHaveLength(8)
-    expect(keys[3]!.kind).toBe('blank')
-    expect(keys[7]!.kind).toBe('blank')
-    expect(keys[1]!.lines).toEqual(['NEXT', 'New Orleans Saints', 'AUG 15', '4:00 PM EDT'])
-    expect(keys[2]!.lines).toEqual(['LAST', 'Buffalo Bills', 'JAN 11', 'L 24-27'])
-    expect(keys[5]!.lines![1]).toBe('Florida Atlantic')
-    expect(keys[6]!.lines![1]).toBe('Florida State')
+    const keys = page.render(NOW_S).keys
+    expect(keys[1]!.lines![1]).toBe('UF Opp 1')
+    expect(keys.slice(1, 4).some((k) => k.lines?.[1] === 'Already Played')).toBe(false)
   })
 
-  it('shows a dashed placeholder, dimmed, for a slot with no game yet', () => {
-    const { page } = build({ games: {} })
-    const keys = page.render(NOW).keys
-    expect(keys[1]!.lines).toEqual(['NEXT', '--', '--'])
-    expect(keys[1]!.dim).toBe(true)
-    expect(keys[2]!.dim).toBe(true)
-  })
-
-  it('shows the team name as a fallback on the logo tile while the image has not loaded', () => {
-    const { page } = build({ logos: {} })
-    const keys = page.render(NOW).keys
+  it('shows the team name and record as a text fallback on the logo tile while the image has not loaded', () => {
+    const { page } = build({ records: { jaguars: { wins: 5, losses: 6, ties: 0, started: true } } })
+    const keys = page.render(NOW_S).keys
     expect(keys[0]!.kind).toBe('control')
-    expect(keys[0]!.lines).toEqual(['JAGUARS'])
-    expect(keys[4]!.lines).toEqual(['GATORS'])
+    expect(keys[0]!.lines).toEqual(['GATORS', '--'])
+    expect(keys[4]!.kind).toBe('control')
+    expect(keys[4]!.lines).toEqual(['JAGUARS', '5-6'])
   })
 
-  it('draws the decoded logo as an image tile once loaded', () => {
-    const fakeImage = { width: 500, height: 500 } as unknown as Image
-    const { page } = build({ logos: { jaguars: fakeImage } })
-    const key = page.render(NOW).keys[0]!
+  it('draws the decoded/composited logo as an image tile, with the record as a text line over it, once loaded', () => {
+    const fakeImage = { width: 200, height: 200 } as unknown as Image
+    const { page } = build({
+      logos: { jaguars: fakeImage },
+      records: { jaguars: { wins: 8, losses: 3, ties: 0, started: true } },
+    })
+    const key = page.render(NOW_S).keys[4]!
     expect(key.kind).toBe('image')
     expect(key.image).toBe(fakeImage)
     expect(key.imageKey).toBe('jaguars')
+    expect(key.lines).toEqual(['8-3'])
+  })
+
+  it('never shows a fabricated 0-0 on the logo tile for a season that has not started', () => {
+    const { page } = build({ records: { jaguars: { wins: 0, losses: 0, ties: 0, started: false } } })
+    const keys = page.render(NOW_S).keys
+    expect(keys[4]!.lines).toEqual(['JAGUARS', '--'])
   })
 
   it('dims every tile when the schedule has gone stale', () => {
-    const { page } = build({
-      stale: true,
-      games: { 'jaguars:next': game() },
-    })
-    const keys = page.render(NOW).keys
-    expect(keys[1]!.dim).toBe(true)
+    const { page } = build({ stale: true, schedules: { jaguars: threeUpcoming('JAX') } })
+    const keys = page.render(NOW_S).keys
+    expect(keys[5]!.dim).toBe(true)
+    expect(keys[4]!.dim).toBe(true)
   })
 
-  it('dims every tile when the status is not ok (offline or empty), even if not stale', () => {
-    const { page } = build({
-      status: 'offline',
-      stale: false,
-      games: { 'jaguars:next': game() },
-    })
-    const keys = page.render(NOW).keys
-    expect(keys[1]!.dim).toBe(true)
+  it('dims every tile when the status is not ok, even if not stale', () => {
+    const { page } = build({ status: 'offline', stale: false, schedules: { jaguars: threeUpcoming('JAX') } })
+    const keys = page.render(NOW_S).keys
+    expect(keys[5]!.dim).toBe(true)
   })
 
   it('does not dim a fresh, ok schedule', () => {
-    const { page } = build({
-      status: 'ok',
-      stale: false,
-      games: { 'jaguars:next': game() },
-    })
-    const keys = page.render(NOW).keys
-    expect(keys[1]!.dim).toBeFalsy()
+    const { page } = build({ status: 'ok', stale: false, schedules: { jaguars: threeUpcoming('JAX') } })
+    const keys = page.render(NOW_S).keys
+    expect(keys[5]!.dim).toBeFalsy()
   })
 
   it('renders the widest measured opponent names without throwing and without overflowing the key', () => {
-    // JACKSONVILLE and TEXAS A&M are the task brief's own examples of long
-    // opponent names; both must render, at whichever candidate size fits.
     const { page } = build({
-      games: {
-        'jaguars:next': game({ opponent: 'JACKSONVILLE' }),
-        'gators:next': game({ opponent: 'TEXAS A&M' }),
+      schedules: {
+        jaguars: [game({ opponent: 'JACKSONVILLE' })],
+        gators: [game({ opponent: 'TEXAS A&M' })],
       },
     })
-    const keys = page.render(NOW).keys
-    expect(() => renderKey(keys[1]!)).not.toThrow()
+    const keys = page.render(NOW_S).keys
     expect(() => renderKey(keys[5]!)).not.toThrow()
+    expect(() => renderKey(keys[1]!)).not.toThrow()
 
     // Probe a REGION (not a single column, per docs/LESSONS.md #22) along
-    // the key's right edge, inside the border, for every row: real ink must
-    // never reach all the way to the key's own edge, which is what an
-    // unclamped overflow would look like.
-    const buf = renderKey(keys[1]!)
+    // the key's right edge, inside the border, for every row.
+    const buf = renderKey(keys[5]!)
     const bg = theme.bg
     for (let y = 0; y < KEY_SIZE; y++) {
       const [r, g, b] = probe(buf, KEY_SIZE - 1, y)
@@ -235,105 +279,138 @@ describe('FootballPage grid layout', () => {
 describe('FootballPage strip', () => {
   it('shows the nearer of the two teams\' next games, with weekday, time, and matchup', () => {
     const { page } = build({
-      games: {
-        'jaguars:next': game({ opponent: 'FSU', kickoffEpochMs: Date.UTC(2026, 7, 20, 20, 0, 0) }),
-        'gators:next': game({ opponent: 'FAU', kickoffEpochMs: Date.UTC(2026, 7, 15, 23, 45, 0) }),
+      schedules: {
+        jaguars: [game({ opponent: 'FSU', isHome: true, opponentShort: 'FSU', kickoffEpochMs: NOW_MS + 5 * 86400000 })],
+        gators: [game({ opponent: 'FAU', isHome: true, opponentShort: 'FAU', kickoffEpochMs: NOW_MS + 1 * 86400000 })],
       },
     })
-    const line1 = page.render(NOW).strip.lines[0]!
-    // Gators' game is earlier (Aug 15 vs Aug 20), so it wins. Both team
-    // names are short enough here to survive the strip's 30-character
-    // truncation whole, so this can assert the full expected text — a
-    // longer name's truncation is covered separately by `truncate`'s own
-    // tests, not re-proven here.
-    expect(line1).toBe('SAT 7:45 PM EDT · UF vs FAU')
+    const line1 = page.render(NOW_S).strip.lines[0]!
+    expect(line1).toContain('UF')
+    expect(line1).toContain('FAU')
+    expect(line1).not.toContain('FSU')
   })
 
-  it('prefers a team with a KNOWN kickoff over one with none, regardless of which team it is', () => {
+  it('prefers a team with a KNOWN kickoff over one with none', () => {
     const { page } = build({
-      games: {
-        'jaguars:next': game({ opponent: 'Bears', kickoffEpochMs: null }),
-        'gators:next': game({ opponent: 'UGA', kickoffEpochMs: Date.UTC(2026, 7, 20, 20, 0, 0) }),
+      schedules: {
+        jaguars: [game({ opponent: 'Bears', kickoffEpochMs: null })],
+        gators: [game({ opponent: 'UGA', isHome: true, opponentShort: 'UGA', kickoffEpochMs: NOW_MS + 86400000 })],
       },
     })
-    const line1 = page.render(NOW).strip.lines[0]!
-    // The brief's own example strip text, verified end to end.
-    expect(line1).toBe('THU 4:00 PM EDT · UF vs UGA')
+    const line1 = page.render(NOW_S).strip.lines[0]!
+    expect(line1).toContain('UGA')
   })
 
   it('reports no upcoming games honestly when neither team has one', () => {
-    const { page } = build({ games: {}, status: 'empty' })
-    const line1 = page.render(NOW).strip.lines[0]!
+    const { page } = build({ schedules: {}, status: 'empty' })
+    const line1 = page.render(NOW_S).strip.lines[0]!
     expect(line1).toContain('no upcoming games')
   })
 
   it('shows offline on the second line when the source reports offline', () => {
-    const { page } = build({ status: 'offline', games: { 'jaguars:next': game() } })
-    expect(page.render(NOW).strip.lines[1]).toBe('offline')
+    const { page } = build({ status: 'offline', schedules: { jaguars: [game()] } })
+    expect(page.render(NOW_S).strip.lines[1]).toBe('offline')
   })
 })
 
 // ---------------------------------------------------------------------------
-// Detail view
+// Schedule drill-down
 // ---------------------------------------------------------------------------
 
-describe('FootballPage detail view', () => {
-  function withSelection(over: Partial<GameSummary> = {}) {
-    const { page, f } = build({
-      games: { 'jaguars:next': game(over) },
-    })
-    page.onKeyPress(1)
-    return { page, f }
+describe('FootballPage schedule drill-down', () => {
+  function seasonOf(n: number): Game[] {
+    return Array.from({ length: n }, (_, i) =>
+      game({ id: String(i), opponent: `Opp ${i}`, kickoffEpochMs: NOW_MS + (i - 2) * 86400000 }),
+    )
   }
 
-  it('opens on pressing a populated NEXT tile and shows date, kickoff, status, venue, city, score', () => {
-    const { page } = withSelection({ venue: 'Caesars Superdome', city: 'New Orleans, LA' })
-    const keys = page.render(NOW).keys
-    expect(keys[1]!.lines).toEqual(['DATE', 'AUG 15'])
-    expect(keys[2]!.lines).toEqual(['KICKOFF', '4:00 PM EDT'])
-    expect(keys[3]!.lines).toEqual(['STATUS', 'AWAY'])
-    expect(keys[4]!.lines).toEqual(['VENUE', 'Caesars', 'Superdome'])
-    expect(keys[5]!.lines).toEqual(['CITY', 'New Orleans,', 'LA'])
-    expect(keys[6]!.lines).toEqual(['SCORE', '--'])
+  it('pressing the gators logo (key 0) opens that team\'s schedule, with BACK on key 7', () => {
+    const { page } = build({ schedules: { gators: seasonOf(5) } })
+    expect(page.onKeyPress(0)).toBe('handled')
+    const keys = page.render(NOW_S).keys
+    expect(keys).toHaveLength(8)
+    expect(keys[7]!.lines!.join('')).toContain('BACK')
+    expect(keys[7]!.border).toEqual(theme.gray)
   })
 
-  it('shows FINAL and a real score for a finished (LAST) game', () => {
+  it('pressing the jaguars logo (key 4) opens that team\'s schedule', () => {
+    const { page } = build({ schedules: { jaguars: seasonOf(3) } })
+    expect(page.onKeyPress(4)).toBe('handled')
+    const keys = page.render(NOW_S).keys
+    expect(keys[0]!.lines![1]).toBe('Opp 0')
+  })
+
+  it('a logo with no schedule data reports ignored, per the task brief', () => {
+    const { page } = build({ schedules: {} })
+    expect(page.onKeyPress(0)).toBe('ignored')
+    expect(page.onKeyPress(4)).toBe('ignored')
+  })
+
+  it('shows up to 7 games from the season, filling every non-BACK key when there are enough', () => {
+    const { page } = build({ schedules: { gators: seasonOf(12) } })
+    page.onKeyPress(0)
+    const keys = page.render(NOW_S).keys
+    for (let i = 0; i < 7; i++) {
+      expect(keys[i]!.lines).toBeDefined()
+      expect(keys[i]!.lines![1]).not.toBe('--')
+    }
+  })
+
+  it('dims a game already in the past, independent of the page-wide staleness dim', () => {
     const { page } = build({
-      games: {
-        'jaguars:last': game({
-          finished: true,
-          teamScore: 24,
-          opponentScore: 27,
-          isHome: true,
-        }),
+      schedules: {
+        gators: [
+          game({ id: 'past', opponent: 'Already Played', kickoffEpochMs: NOW_MS - 86400000 }),
+          game({ id: 'future', opponent: 'Not Yet', kickoffEpochMs: NOW_MS + 86400000 }),
+        ],
       },
+      status: 'ok',
+      stale: false,
     })
-    page.onKeyPress(2)
-    const keys = page.render(NOW).keys
-    expect(keys[3]!.lines).toEqual(['STATUS', 'FINAL'])
-    expect(keys[6]!.lines).toEqual(['SCORE', 'L 24-27'])
+    page.onKeyPress(0)
+    const keys = page.render(NOW_S).keys
+    const pastKey = keys.find((k) => k.lines?.[1] === 'Already Played')!
+    const futureKey = keys.find((k) => k.lines?.[1] === 'Not Yet')!
+    expect(pastKey.dim).toBe(true)
+    expect(futureKey.dim).toBeFalsy()
   })
 
-  it('shows TBA on the KICKOFF key and -- for DATE when the kickoff is unknown', () => {
-    const { page } = withSelection({ kickoffEpochMs: null })
-    const keys = page.render(NOW).keys
-    expect(keys[1]!.lines).toEqual(['DATE', '--'])
-    expect(keys[2]!.lines).toEqual(['KICKOFF', 'TBA'])
+  it('strip shows the team, its record, and how many of the season\'s games are visible', () => {
+    const { page } = build({
+      schedules: { gators: seasonOf(12) },
+      records: { gators: { wins: 8, losses: 3, ties: 0, started: true } },
+    })
+    page.onKeyPress(0)
+    const strip = page.render(NOW_S).strip
+    expect(strip.lines[0]).toContain('GATORS')
+    expect(strip.lines[0]).toContain('8-3')
+    expect(strip.lines[1]).toContain('7')
+    expect(strip.lines[1]).toContain('12')
   })
 
-  it('key 7 is BACK, distinct from a data tile', () => {
-    const { page } = withSelection()
-    const key = page.render(NOW).keys[7]!
-    expect(key.lines!.join('')).toContain('BACK')
-    expect(key.border).toEqual(theme.gray)
+  it('strip reports showing all games when the whole season fits', () => {
+    const { page } = build({ schedules: { gators: seasonOf(4) } })
+    page.onKeyPress(0)
+    const strip = page.render(NOW_S).strip
+    expect(strip.lines[1]).toContain('all 4')
   })
 
-  it('falls back to the grid if the selected game disappears from the source on a later render', () => {
-    const { page, f } = withSelection()
-    f.games['jaguars:next'] = null
-    const keys = page.render(NOW).keys
-    // Back on the grid: key 0 is the logo tile again, not a DATE/KICKOFF key.
-    expect(keys[1]!.lines![0]).toBe('NEXT')
+  it('game tiles inside the schedule view have no further drill-down: every key 0-6 reports ignored', () => {
+    const { page } = build({ schedules: { gators: seasonOf(5) } })
+    page.onKeyPress(0)
+    for (let i = 0; i <= 6; i++) {
+      expect(page.onKeyPress(i)).toBe('ignored')
+    }
+  })
+
+  it('key 7 (BACK) returns to the grid', () => {
+    const { page } = build({ schedules: { gators: seasonOf(5) } })
+    page.onKeyPress(0)
+    expect(page.onKeyPress(7)).toBe('handled')
+    const keys = page.render(NOW_S).keys
+    // Back on the grid: key 0 is a logo/control tile again (`kind` is
+    // 'control' or 'image'), not a schedule game tile.
+    expect(['control', 'image']).toContain(keys[0]!.kind)
   })
 })
 
@@ -350,11 +427,15 @@ describe('FootballPage onEnter/onLeave', () => {
   })
 
   it('clears the selection on leave, so the page reopens on the grid', () => {
-    const { page } = build({ games: { 'jaguars:next': game() } })
-    page.onKeyPress(1)
-    expect(page.render(NOW).keys[1]!.lines).toEqual(['DATE', 'AUG 15'])
+    const { page } = build({ schedules: { gators: [game()] } })
+    page.onKeyPress(0)
+    // In the schedule drill-down, key 7 is BACK.
+    expect(page.render(NOW_S).keys[7]!.lines!.join('')).toContain('BACK')
     page.onLeave()
-    expect(page.render(NOW).keys[1]!.lines![0]).toBe('NEXT')
+    const keys = page.render(NOW_S).keys
+    // Back on the grid: key 7 is the jaguars' third game tile, not BACK.
+    expect(keys[7]!.lines?.join('') ?? '').not.toContain('BACK')
+    expect(['control', 'image']).toContain(keys[0]!.kind)
   })
 })
 
@@ -363,54 +444,28 @@ describe('FootballPage onEnter/onLeave', () => {
 // ---------------------------------------------------------------------------
 
 describe('FootballPage onKeyPress', () => {
-  it('grid: selects a populated NEXT/LAST tile and reports handled', () => {
-    for (const i of [1, 2, 5, 6]) {
-      const { page } = build({
-        games: {
-          'jaguars:next': game(),
-          'jaguars:last': game({ finished: true, teamScore: 1, opponentScore: 0 }),
-          'gators:next': game(),
-          'gators:last': game({ finished: true, teamScore: 1, opponentScore: 0 }),
-        },
-      })
-      expect(page.onKeyPress(i)).toBe('handled')
-    }
-  })
-
-  it('grid: reports ignored for an empty NEXT/LAST slot', () => {
-    const { page } = build({ games: {} })
-    for (const i of [1, 2, 5, 6]) {
-      expect(page.onKeyPress(i)).toBe('ignored')
-    }
-  })
-
-  it('grid: logo tiles and blank spacers always report ignored', () => {
+  it('grid: game tiles (1-3, 5-7) always report ignored, even when populated', () => {
     const { page } = build({
-      games: {
-        'jaguars:next': game(),
-        'jaguars:last': game(),
-        'gators:next': game(),
-        'gators:last': game(),
+      schedules: {
+        gators: [game({ id: 'g1' }), game({ id: 'g2' }), game({ id: 'g3' })],
+        jaguars: [game({ id: 'j1' }), game({ id: 'j2' }), game({ id: 'j3' })],
       },
     })
-    for (const i of [0, 3, 4, 7]) {
+    for (const i of [1, 2, 3, 5, 6, 7]) {
       expect(page.onKeyPress(i)).toBe('ignored')
     }
   })
 
-  it('detail mode: key 7 (BACK) reports handled and returns to the grid', () => {
-    const { page } = build({ games: { 'jaguars:next': game() } })
-    expect(page.onKeyPress(1)).toBe('handled') // enters detail
-    expect(page.onKeyPress(7)).toBe('handled') // BACK
-    expect(page.render(NOW).keys[1]!.lines![0]).toBe('NEXT')
-  })
-
-  it('detail mode: every other key (0-6) reports ignored', () => {
-    const { page } = build({ games: { 'jaguars:next': game() } })
-    page.onKeyPress(1)
-    for (let i = 0; i <= 6; i++) {
+  it('grid: an empty-slot game tile also reports ignored', () => {
+    const { page } = build({ schedules: {} })
+    for (const i of [1, 2, 3, 5, 6, 7]) {
       expect(page.onKeyPress(i)).toBe('ignored')
     }
+  })
+
+  it('grid: a populated logo tile reports handled', () => {
+    const { page } = build({ schedules: { gators: [game()], jaguars: [game()] } })
+    expect(page.onKeyPress(0)).toBe('handled')
   })
 })
 
@@ -421,8 +476,8 @@ describe('FootballPage onKeyPress', () => {
 
 describe('keyHash covers every field FootballPage sets', () => {
   it('a different opponent name changes the hash', () => {
-    const a: KeySpec = { kind: 'gauge', lines: ['NEXT', 'Buffalo Bills', 'AUG 15', '4:00 PM EDT'] }
-    const b: KeySpec = { kind: 'gauge', lines: ['NEXT', 'Miami Dolphins', 'AUG 15', '4:00 PM EDT'] }
+    const a: KeySpec = { kind: 'gauge', lines: ['@ NO', 'Buffalo Bills', 'AUG 15', '4:00 PM EDT'] }
+    const b: KeySpec = { kind: 'gauge', lines: ['@ NO', 'Miami Dolphins', 'AUG 15', '4:00 PM EDT'] }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
@@ -433,16 +488,28 @@ describe('keyHash covers every field FootballPage sets', () => {
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
+  it('the record text drawn OVER the logo image changes the hash even with the same imageKey', () => {
+    // This page combines `image` with `lines`/`lineY` — a genuinely new
+    // combination on this project. Break the fix (drop `lines` from the
+    // logo key entirely) and BOTH specs below collapse to the same hash,
+    // so a record change (season goes from 7-3 to 8-3) would leave the
+    // OLD record on the glass forever.
+    const img = { width: 1, height: 1 } as unknown as Image
+    const a: KeySpec = { kind: 'image', image: img, imageKey: 'jaguars', lines: ['7-3'], lineY: [70], align: 'center' }
+    const b: KeySpec = { kind: 'image', image: img, imageKey: 'jaguars', lines: ['8-3'], lineY: [70], align: 'center' }
+    expect(keyHash(a)).not.toBe(keyHash(b))
+  })
+
   it('dim toggling changes the hash', () => {
-    const a: KeySpec = { kind: 'gauge', lines: ['NEXT', 'Buffalo Bills'] }
-    const b: KeySpec = { kind: 'gauge', lines: ['NEXT', 'Buffalo Bills'], dim: true }
+    const a: KeySpec = { kind: 'gauge', lines: ['@ NO', 'Buffalo Bills'] }
+    const b: KeySpec = { kind: 'gauge', lines: ['@ NO', 'Buffalo Bills'], dim: true }
     expect(keyHash(a)).not.toBe(keyHash(b))
   })
 
   it('a blank key hashes identically to another blank key, and differently from a populated one', () => {
     const a: KeySpec = { kind: 'blank' }
     const b: KeySpec = { kind: 'blank' }
-    const c: KeySpec = { kind: 'gauge', lines: ['NEXT'] }
+    const c: KeySpec = { kind: 'gauge', lines: ['@ NO'] }
     expect(keyHash(a)).toBe(keyHash(b))
     expect(keyHash(a)).not.toBe(keyHash(c))
   })

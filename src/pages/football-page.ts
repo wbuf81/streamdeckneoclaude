@@ -3,108 +3,72 @@ import type { DeckFrame, KeySpec, StripSpec } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
-import type { FootballStatus, GameSummary, Slot, Team } from '../sources/football.js'
+import type { FootballStatus, Game, Team, TeamRecord } from '../sources/football.js'
+import { LOGO_ART_FRACTION } from '../sources/football.js'
 
 /** Measured limit for one strip line. See `render/canvas.ts`. */
 const STRIP_CHARS = 30
-/** Fixed size for the "NEXT"/"LAST" header line — matches the precedent
- * `weather-page.ts`'s `DAY_LABEL_SIZE` sets for a short, always-safe label
- * (measured well under the 81 px usable width at every real value here). */
+/** Fixed size for a short, always-safe header line (home/away plus a short
+ * opponent code, e.g. `@ NO`, `vs GA`). Matches `weather-page.ts`'s own
+ * `DAY_LABEL_SIZE` precedent for a short label that never needs measuring. */
 const HEADER_SIZE = 12
-/** Candidate sizes for the opponent name, largest first. Measured
- * (`@napi-rs/canvas`, Menlo, see the task 40 report): `JACKSONVILLE` (12
- * characters) is 93.9 px at 13 px — over the 81 px budget — but 79.5 px at
- * 11 px, just inside it; `TEXAS A&M` fits at both. The renderer measures and
- * picks the size that actually fits, per docs/LESSONS.md #17 — this page
- * never reasons about the width itself. */
+/** Candidate sizes for the opponent's full name. Measured (`@napi-rs/canvas`,
+ * Menlo, docs/VERIFIED-FACTS.md's advance table): a 12-character name like
+ * `JACKSONVILLE` clears 81 px only at 11 px (79.4 px) or smaller; `TEXAS A&M`
+ * and `South Carolina` both need the renderer's own measure-and-shrink path
+ * too. The renderer picks the size that actually fits, per
+ * docs/LESSONS.md #17 — this page never reasons about the width itself. */
 const OPPONENT_SIZES = [13, 11]
 /** Fixed size for the short date line (`AUG 15`) — always exactly 6
- * characters, measured 47.0 px at 13 px, well inside the 81 px budget at
- * every real month/day combination. */
+ * characters, measured 47.0 px at 13 px, well inside the 81 px budget. */
 const DATE_SIZE = 13
-/** Candidate sizes for the kickoff time line. Measured: `12:00 PM EDT` (the
- * widest realistic reading, a mid-day kickoff) is 79.5 px at 11 px but 93.9
- * px at 13 px — over budget — so 11 px is what the renderer actually picks
- * every time; the candidate array is still declared, not assumed, per
- * docs/LESSONS.md #17. */
+/** Candidate sizes for the kickoff time line. `12:00 PM EDT` (the widest
+ * realistic reading) is 79.5 px at 11 px but 93.9 px at 13 px — over budget
+ * — so 11 px is what the renderer actually picks every time; still declared
+ * as a candidate array, not assumed, per docs/LESSONS.md #17. */
 const TIME_SIZES = [13, 11]
-/** Candidate sizes for the score line (`W 24-27`, `L 100-99`). Measured safe
- * even at 16 px (77.1 px for a 3-digit score), so this stays a size larger
- * than the text-only lines above. */
-const SCORE_SIZES = [16, 13, 11]
-/** Fixed size for a short, bounded status word (`HOME`, `AWAY`, `FINAL`). */
-const STATUS_SIZE = 20
+/** Candidate sizes for the season record line (`8-3`, `12-1-1`). Even the
+ * widest realistic case, a six-character record with a tie (`16-0-1`,
+ * college football's longest possible regular season), is 72.2 px at 20 px
+ * — inside the 81 px budget with room to spare. */
+const RECORD_SIZES = [20, 16, 13]
 const BACK_SIZE = 16
-/** Character budget for one wrapped venue/city line, sized to the smallest
- * `OPPONENT_SIZES` candidate (11 px): 81 px / 6.62 px per character
- * (docs/VERIFIED-FACTS.md's advance table) = 12.24, so 12 characters stays
- * inside the budget with room to spare — the same number weather-page.ts's
- * `TEXT_WRAP_CHARS` uses for the identical reason. */
-const WRAP_CHARS = 12
-const WRAP_LINES = 3
+
+/**
+ * The logo tile's record line sits inside the plain background band
+ * `compositeLogo` (in `sources/football.ts`) reserves at the bottom of the
+ * image — this page never draws its own background box (it cannot; it owns
+ * no canvas code), so the two files share this one fraction. `RECORD_Y` is
+ * the top edge of the text, chosen to sit roughly centred within that band:
+ * band starts at `96 * LOGO_ART_FRACTION` (~61 px) and runs to 96, so 70
+ * leaves comfortable clearance above and below a 20 px line.
+ */
+const RECORD_BAND_TOP = Math.round(96 * LOGO_ART_FRACTION)
+const RECORD_Y = RECORD_BAND_TOP + 8
 
 const TEAM_LABELS: Readonly<Record<Team, string>> = { jaguars: 'JAGUARS', gators: 'GATORS' }
-/** Short strip abbreviations. `UF` matches the task brief's own example
- * strip text (`"UF vs UGA"`); `JAX` is the Jaguars' own standard abbreviation. */
+/** Short strip abbreviations, matching the task brief's own example strip
+ * text (`"UF vs UGA"`). */
 const TEAM_SHORT: Readonly<Record<Team, string>> = { jaguars: 'JAX', gators: 'UF' }
 
-const TEAMS: readonly Team[] = ['jaguars', 'gators']
+/** How many upcoming games each grid tile group shows. */
+const NEXT_COUNT = 3
+/** How many games the full-schedule drill-down shows at once (keys 0-6;
+ * key 7 is BACK). Chosen — see `scheduleWindow` — over round-button paging:
+ * this project leaves the round buttons unbound on every existing page
+ * (`claude-page.ts`'s own note: "always ignored — nothing is bound to
+ * them"), and the closest precedent for "more items than tiles"
+ * (`claude-page.ts`/`codex-page.ts`'s own session/task overflow) is a
+ * relevant WINDOW plus a "+N more" count, not pagination controls. */
+const SCHEDULE_WINDOW = 7
 
 interface Selection {
   team: Team
-  slot: Slot
 }
 
-/**
- * Greedily wraps `text` into up to `maxLines` lines of at most `maxChars`
- * characters, breaking only between words. Text left over once every line is
- * full is folded onto the last line and cut with an ellipsis via `truncate`
- * — the same shape `weather-page.ts`'s own `wrapText` uses, kept as a
- * separate local copy rather than a shared import: each page owns its own
- * text-shaping helpers in this project (see `stocks-page.ts` and
- * `weather-page.ts`, neither of which imports the other's).
- */
-export function wrapText(text: string, maxChars: number, maxLines: number): string[] {
-  if (maxLines <= 0 || maxChars <= 0) return []
-  const words = text.split(/\s+/).filter(Boolean)
-  if (words.length === 0) return []
-
-  const lines: string[] = []
-  let current = ''
-  for (const word of words) {
-    const candidate = current ? `${current} ${word}` : word
-    if (candidate.length <= maxChars) {
-      current = candidate
-    } else {
-      if (current) lines.push(current)
-      current = word
-    }
-  }
-  if (current) lines.push(current)
-
-  if (lines.length <= maxLines) return lines
-
-  const kept = lines.slice(0, maxLines - 1)
-  const rest = lines.slice(maxLines - 1).join(' ')
-  kept.push(truncate(rest, maxChars))
-  return kept
-}
-
-/**
- * `AUG 15`, in US Eastern time — derived from the SAME epoch
- * `formatKickoff` reads, never from the source's raw (UTC-calendar)
- * `dateEvent`. A late-kickoff West Coast game can fall on the previous
- * Eastern calendar day (measured: `Oregon vs Portland State`, UTC date
- * 2026-09-19, converts to 2026-09-18 evening Eastern) — mixing a UTC date
- * with an Eastern time would be exactly the "wrong-timezone kickoff" the
- * task brief calls worse than no kickoff. `--` when the kickoff itself is
- * unknown, since there is then no single instant to derive a date from.
- *
- * This is a calendar DATE, not a wall-clock TIME, so it does not go through
- * `formatEasternTime` (AGENTS.md's shared formatter is for times); it uses
- * `Intl.DateTimeFormat` directly, the same primitive `text.ts`'s own
- * `easternZoneAbbr` is built on.
- */
+/** `AUG 15`, in US Eastern time — derived from the SAME epoch `formatKickoff`
+ * reads, never from a raw UTC calendar string. `--` when the kickoff instant
+ * itself is unknown. */
 export function formatShortDate(kickoffEpochMs: number | null): string {
   if (kickoffEpochMs === null) return '--'
   try {
@@ -120,8 +84,7 @@ export function formatShortDate(kickoffEpochMs: number | null): string {
   }
 }
 
-/** `SAT`, the Eastern weekday for the strip's matchup line. `''` when the
- * kickoff is unknown. */
+/** `SAT`, the Eastern weekday. `''` when the kickoff is unknown. */
 function shortWeekday(kickoffEpochMs: number | null): string {
   if (kickoffEpochMs === null) return ''
   try {
@@ -133,27 +96,59 @@ function shortWeekday(kickoffEpochMs: number | null): string {
   }
 }
 
-/** `4:00 PM EDT`, through the ONE shared time formatter (AGENTS.md's
- * "Product conventions"). `TBA` — never a fabricated time — when the source
- * has no usable kickoff instant, per docs/LESSONS.md #18 and the task
- * brief's own instruction. */
-export function formatKickoff(kickoffEpochMs: number | null): string {
-  if (kickoffEpochMs === null) return 'TBA'
-  return formatEasternTime(kickoffEpochMs)
+/**
+ * `4:00 PM EDT`, through the ONE shared time formatter. `TBA` — never a
+ * fabricated time — when the kickoff instant itself is unknown, OR when
+ * `game.timeTbd` is true: ESPN's own `timeValid` flag, measured live to be
+ * `false` on real, still-scheduled games well before the two-week mark, not
+ * only on placeholder far-future rows (docs/VERIFIED-FACTS.md). The DATE
+ * line still shows the scheduled week; only the exact clock time is
+ * withheld here.
+ */
+export function formatKickoff(game: Pick<Game, 'kickoffEpochMs' | 'timeTbd'>): string {
+  if (game.kickoffEpochMs === null || game.timeTbd) return 'TBA'
+  return formatEasternTime(game.kickoffEpochMs)
 }
 
-/** `W 24-27`, `L 100-99`, `T 20-20`. `--` when the game has not finished, or
- * a score is somehow still missing despite `finished` being true (never a
- * fabricated `0-0`). */
-export function formatScore(game: GameSummary): string {
-  if (!game.finished || game.teamScore === null || game.opponentScore === null) return '--'
-  const letter = game.teamScore > game.opponentScore ? 'W' : game.teamScore < game.opponentScore ? 'L' : 'T'
-  return `${letter} ${game.teamScore}-${game.opponentScore}`
+/** `8-3`, `12-1-1` (a tie only appears when there is one). `--` for an
+ * explicit unknown record — never a fabricated `0-0` for a season that has
+ * not started (docs/LESSONS.md #18). */
+export function formatRecord(record: TeamRecord | null): string {
+  if (!record || !record.started) return '--'
+  return record.ties > 0 ? `${record.wins}-${record.losses}-${record.ties}` : `${record.wins}-${record.losses}`
+}
+
+/** `@ NO`, `vs GA`. Falls back to just `@`/`vs` (still correct and still
+ * informative about home/away) when `opponentShort` could not be extracted. */
+function homeAwayHeader(game: Pick<Game, 'isHome' | 'opponentShort'>): string {
+  const prefix = game.isHome ? 'vs' : '@'
+  return game.opponentShort ? `${prefix} ${game.opponentShort}` : prefix
+}
+
+/** The games with a known future (or unknown-but-not-past) kickoff, ascending
+ * — `schedule` is already sorted ascending by the source's own contract. */
+function upcoming(schedule: Game[], nowMs: number): Game[] {
+  return schedule.filter((g) => g.kickoffEpochMs !== null && g.kickoffEpochMs >= nowMs)
+}
+
+/**
+ * The "most relevant window" of up to `SCHEDULE_WINDOW` games for the full-
+ * schedule drill-down: as many of the NEXT games as fit, backfilled with the
+ * most recent past games once fewer than a full window of upcoming games
+ * remain (late in a season). `schedule` must already be sorted ascending.
+ */
+export function scheduleWindow(schedule: Game[], nowMs: number, size: number = SCHEDULE_WINDOW): Game[] {
+  if (schedule.length <= size) return schedule.slice()
+  let idx = schedule.findIndex((g) => g.kickoffEpochMs === null || g.kickoffEpochMs >= nowMs)
+  if (idx === -1) idx = schedule.length
+  const start = Math.max(0, Math.min(idx, schedule.length - size))
+  return schedule.slice(start, start + size)
 }
 
 /** The part of `FootballSource` this page needs. */
 export interface FootballReader {
-  getGame(team: Team, slot: Slot): GameSummary | null
+  getSchedule(team: Team): Game[]
+  getRecord(team: Team): TeamRecord | null
   getStatus(): FootballStatus
   getLastUpdatedAt(): number
   isStale(): boolean
@@ -162,25 +157,25 @@ export interface FootballReader {
 }
 
 /**
- * The Jacksonville Jaguars' and Florida Gators' schedules: a logo tile and a
- * NEXT/LAST game tile per team. Measured 2026-08-14 (task 40 report):
- * TheSportsDB's free tier returns exactly one future and one past event per
- * team, not "next three" — showing three would mean fabricating two of
- * them, so this page shows the one real game in each direction instead.
- * Pressing a NEXT or LAST tile opens a detail view for that one game (date,
- * kickoff, venue, city, result), with BACK on key 7 — the same
- * mode-of-the-page pattern the stocks and weather pages use for their own
- * drill-downs. A key dims when the shared schedule is stale or absent, so a
- * stale or missing schedule never presents as current.
+ * The Florida Gators' and Jacksonville Jaguars' schedules. Keys 0 and 4 are
+ * the logo tiles, each carrying the team's season (regular-season) record
+ * beneath the crest, in the plain band `compositeLogo` reserves there. Keys
+ * 1-3 show the Gators' next three games; keys 5-7 the Jaguars' next three.
+ * Pressing a logo tile opens that team's full schedule as a mode of the
+ * page — the same mode-of-the-page pattern `stocks-page.ts` and
+ * `weather-page.ts` use for their own drill-downs — with `◀ BACK` on key 7.
+ * Game tiles themselves have no further drill-down: the task brief only
+ * describes the logo as an interactive control, so a press on a game tile
+ * reports `ignored`, truthfully, in both modes.
  */
 export class FootballPage implements Page {
   readonly name = 'football'
 
-  /** The selected team/slot, or null on the grid. `onLeave` always clears
-   * this, so the page reopens on the grid every time it becomes visible
-   * again — matching `WeatherPage`/`StocksPage`. Unlike those pages, there
-   * is no array-position risk here (docs/LESSONS.md #19): a team and a slot
-   * are both fixed identities, never a position in a rebuilt array. */
+  /** The team whose schedule is open, or null on the grid. `onLeave` always
+   * clears this, so the page reopens on the grid every time it becomes
+   * visible again — matching `WeatherPage`/`StocksPage`. A team name is a
+   * fixed identity, never a rebuilt array's position (docs/LESSONS.md #19),
+   * so there is no stale-selection risk here. */
   private selected: Selection | null = null
 
   constructor(private readonly source: FootballReader) {}
@@ -194,134 +189,113 @@ export class FootballPage implements Page {
     this.source.setVisible(false)
   }
 
-  /** The selected game, or null when nothing is selected OR the selected
-   * slot has gone missing (data lost on a later refresh) — either way there
-   * is nothing to show a detail view for, so `render` falls back to the
-   * grid. Computed fresh every call rather than cached, so `render` never
-   * mutates `this.selected` (a page must not mutate its own state inside
-   * `render`) — `onKeyPress` calls this too, so the two stay consistent. */
-  private activeGame(): GameSummary | null {
-    if (!this.selected) return null
-    return this.source.getGame(this.selected.team, this.selected.slot)
-  }
-
-  render(_now: number): DeckFrame {
+  /** `now` is unix seconds (matching every existing page); `nowMs`, when the
+   * daemon supplies it, is the millisecond clock this page actually needs to
+   * compare against `kickoffEpochMs` — defaulting to `now * 1000` keeps this
+   * correct for any caller (including tests) that only passes `now`. */
+  render(now: number, nowMs?: number): DeckFrame {
+    const clockMs = nowMs ?? now * 1000
     const status = this.source.getStatus()
     const stale = this.source.isStale()
     const dim = stale || status !== 'ok'
 
-    const game = this.activeGame()
-    if (game && this.selected) return this.detailFrame(this.selected.team, game, dim)
+    if (this.selected) return this.scheduleFrame(this.selected.team, clockMs, dim)
 
     const keys: KeySpec[] = [
-      this.logoKey('jaguars', dim),
-      this.gameKey('jaguars', 'next', dim),
-      this.gameKey('jaguars', 'last', dim),
-      { kind: 'blank' },
       this.logoKey('gators', dim),
-      this.gameKey('gators', 'next', dim),
-      this.gameKey('gators', 'last', dim),
-      { kind: 'blank' },
+      ...this.nextThreeKeys('gators', clockMs, dim),
+      this.logoKey('jaguars', dim),
+      ...this.nextThreeKeys('jaguars', clockMs, dim),
     ]
 
-    return { keys, strip: this.strip(), buttons: [theme.gray, theme.gray] }
+    return { keys, strip: this.strip(clockMs), buttons: [theme.gray, theme.gray] }
   }
 
-  /** Keys 0 and 4: a team's logo once decoded, or its name while the image
-   * is still downloading — the same fallback-then-image shape
-   * `spotify-page.ts` uses for album art. */
+  /** Keys 0 and 4: the team's composited logo (crest plus a reserved plain
+   * band) with the season record drawn in that band, once the logo has
+   * decoded — or a text-only fallback (team name AND record, so the record
+   * is not lost just because the crest is still downloading) meanwhile. */
   private logoKey(team: Team, dim: boolean): KeySpec {
     const logo = this.source.getLogo(team)
+    const recordText = formatRecord(this.source.getRecord(team))
     if (logo) {
-      return { kind: 'image', image: logo, imageKey: team, dim }
+      return {
+        kind: 'image',
+        image: logo,
+        imageKey: team,
+        lines: [recordText],
+        lineSizes: [RECORD_SIZES],
+        lineY: [RECORD_Y],
+        align: 'center',
+        dim,
+      }
     }
-    // Matches `spotify-page.ts`'s own art-not-ready fallback: `dim` follows
-    // the page's OWN freshness signal, not a hard-coded true — a logo still
-    // downloading on an otherwise-fresh page is not "stale data".
-    return { kind: 'control', lines: [TEAM_LABELS[team]], align: 'center', dim }
+    return {
+      kind: 'control',
+      lines: [TEAM_LABELS[team], recordText],
+      lineSizes: [HEADER_SIZE, RECORD_SIZES],
+      align: 'center',
+      dim,
+    }
   }
 
-  /** Keys 1, 2, 5 and 6: one NEXT or LAST game tile. Empty (no game known
-   * for this slot yet) draws the same dashed placeholder shape the weather
-   * page uses for a missing day, rather than a bare, left-hugging fallback. */
-  private gameKey(team: Team, slot: Slot, dim: boolean): KeySpec {
-    const game = this.source.getGame(team, slot)
-    const header = slot === 'next' ? 'NEXT' : 'LAST'
+  /** Keys 1-3 / 5-7: this team's next three games in chronological order. A
+   * missing slot (fewer than three upcoming games left, or no data yet)
+   * draws a dashed placeholder rather than a bare, left-hugging fallback. */
+  private nextThreeKeys(team: Team, nowMs: number, dim: boolean): KeySpec[] {
+    const next = upcoming(this.source.getSchedule(team), nowMs).slice(0, NEXT_COUNT)
+    const keys: KeySpec[] = []
+    for (let i = 0; i < NEXT_COUNT; i++) {
+      keys.push(this.gameKey(next[i], dim))
+    }
+    return keys
+  }
+
+  /** One game tile: home/away plus short opponent code, full opponent name,
+   * date, kickoff or TBA. Used identically on the grid and inside the
+   * schedule drill-down (`pastDim` additionally dims an already-played
+   * game inside the drill-down, independent of the page-wide staleness dim). */
+  private gameKey(game: Game | undefined, dim: boolean, pastDim = false): KeySpec {
     if (!game) {
       return {
         kind: 'gauge',
-        lines: [header, '--', '--'],
+        lines: ['--', '--', '--'],
         lineSizes: [HEADER_SIZE, OPPONENT_SIZES, DATE_SIZE],
-        align: 'center',
         dim: true,
       }
     }
-
-    const lastLine = slot === 'next' ? formatKickoff(game.kickoffEpochMs) : formatScore(game)
     const key: KeySpec = {
       kind: 'gauge',
-      lines: [header, game.opponent || '--', formatShortDate(game.kickoffEpochMs), lastLine],
-      lineSizes: [HEADER_SIZE, OPPONENT_SIZES, DATE_SIZE, slot === 'next' ? TIME_SIZES : SCORE_SIZES],
+      lines: [homeAwayHeader(game), game.opponent || '--', formatShortDate(game.kickoffEpochMs), formatKickoff(game)],
+      lineSizes: [HEADER_SIZE, OPPONENT_SIZES, DATE_SIZE, TIME_SIZES],
     }
-    if (dim) key.dim = true
+    if (dim || pastDim) key.dim = true
     return key
   }
 
   /**
-   * The detail view for one game, spread across all eight keys:
-   *
-   * - Key 0: the same tile shown on the grid, so the tile the user just
-   *   pressed stays recognisable inside the detail view.
-   * - Key 1: DATE.
-   * - Key 2: KICKOFF (or `TBA`).
-   * - Key 3: HOME/AWAY, or FINAL once the game has been played.
-   * - Key 4: VENUE, wrapped.
-   * - Key 5: CITY, wrapped.
-   * - Key 6: SCORE (`--` for a game not yet played).
-   * - Key 7: BACK.
+   * The full-schedule drill-down for one team, spread across keys 0-6 (a
+   * "most relevant window" of up to `SCHEDULE_WINDOW` games — see
+   * `scheduleWindow`), with `◀ BACK` on key 7. Deliberately does NOT
+   * reserve a key for the team's logo (unlike the stocks/weather detail
+   * views, which keep the pressed tile visible) — the whole point of this
+   * mode is showing as much of the schedule as possible, per the user's own
+   * request ("shows all the games"); team identity and record move to the
+   * strip instead, costing no key.
    */
-  private detailFrame(team: Team, game: GameSummary, dim: boolean): DeckFrame {
-    const slot = this.selected!.slot
-    const keys: KeySpec[] = [
-      this.gameKey(team, slot, dim),
-      this.labelKey('DATE', formatShortDate(game.kickoffEpochMs), DATE_SIZE, dim),
-      this.labelKey('KICKOFF', formatKickoff(game.kickoffEpochMs), TIME_SIZES, dim),
-      this.labelKey('STATUS', game.finished ? 'FINAL' : game.isHome ? 'HOME' : 'AWAY', STATUS_SIZE, dim),
-      this.wrappedKey('VENUE', game.venue, dim),
-      this.wrappedKey('CITY', game.city, dim),
-      this.labelKey('SCORE', formatScore(game), SCORE_SIZES, dim),
-      this.backKey(),
-    ]
-    return { keys, strip: this.detailStrip(team, game), buttons: [theme.gray, theme.gray] }
-  }
+  private scheduleFrame(team: Team, nowMs: number, dim: boolean): DeckFrame {
+    const schedule = this.source.getSchedule(team)
+    const window = scheduleWindow(schedule, nowMs)
 
-  /** A simple header-plus-value tile, used for the detail view's fixed-fact
-   * keys. `valueSize` is either a fixed size (bounded text) or a candidate
-   * array (variable-length text) — the renderer resolves either, per
-   * `KeySpec.lineSizes`'s own doc comment. */
-  private labelKey(label: string, value: string, valueSize: number | number[], dim: boolean): KeySpec {
-    const key: KeySpec = {
-      kind: 'gauge',
-      lines: [label, value || '--'],
-      lineSizes: [HEADER_SIZE, valueSize],
+    const keys: KeySpec[] = []
+    for (let i = 0; i < SCHEDULE_WINDOW; i++) {
+      const game = window[i]
+      const isPast = game !== undefined && game.kickoffEpochMs !== null && game.kickoffEpochMs < nowMs
+      keys.push(this.gameKey(game, dim, isPast))
     }
-    if (dim) key.dim = true
-    return key
-  }
+    keys.push(this.backKey())
 
-  /** The VENUE and CITY detail keys: a header plus up to `WRAP_LINES` of
-   * wrapped text, so a venue name too long for one line (`Ben Hill Griffin
-   * Stadium`, measured well past the 81 px budget at every candidate size)
-   * still shows most of itself instead of one truncated fragment. */
-  private wrappedKey(label: string, text: string, dim: boolean): KeySpec {
-    const wrapped = wrapText(text || '--', WRAP_CHARS, WRAP_LINES)
-    const key: KeySpec = {
-      kind: 'gauge',
-      lines: [label, ...wrapped],
-      lineSizes: [HEADER_SIZE, ...wrapped.map(() => OPPONENT_SIZES)],
-    }
-    if (dim) key.dim = true
-    return key
+    return { keys, strip: this.scheduleStrip(team, schedule, window), buttons: [theme.gray, theme.gray] }
   }
 
   /** Key 7: BACK. A gray border and no fill colour, so it never reads as one
@@ -337,20 +311,18 @@ export class FootballPage implements Page {
     }
   }
 
-  /** The nearer of the two teams' NEXT games — the one with the smaller
-   * known kickoff. A team with no known kickoff never wins this comparison
-   * over one that has one; two unknown kickoffs fall back to `jaguars`
-   * arbitrarily (both equally unknown, so there is no wrong answer). */
-  private nearestNext(): { team: Team; game: GameSummary } | null {
-    let best: { team: Team; game: GameSummary } | null = null
-    for (const team of TEAMS) {
-      const game = this.source.getGame(team, 'next')
+  /** The nearer of the two teams' next games — the one with the smaller
+   * known kickoff. A team with no known-kickoff game never wins this
+   * comparison over one that has one. */
+  private nearestNext(nowMs: number): { team: Team; game: Game } | null {
+    let best: { team: Team; game: Game } | null = null
+    for (const team of ['jaguars', 'gators'] as const) {
+      const game = upcoming(this.source.getSchedule(team), nowMs)[0]
       if (!game) continue
-      if (!best) {
-        best = { team, game }
+      if (!best || game.kickoffEpochMs === null) {
+        if (!best) best = { team, game }
         continue
       }
-      if (game.kickoffEpochMs === null) continue
       if (best.game.kickoffEpochMs === null || game.kickoffEpochMs < best.game.kickoffEpochMs) {
         best = { team, game }
       }
@@ -358,18 +330,22 @@ export class FootballPage implements Page {
     return best
   }
 
-  private strip(): StripSpec {
+  private strip(nowMs: number): StripSpec {
     const status = this.source.getStatus()
-    const nearest = this.nearestNext()
+    const nearest = this.nearestNext(nowMs)
 
     let line1: string
     if (!nearest) {
       line1 = status === 'empty' ? 'football: no upcoming games yet' : 'football: no upcoming games'
     } else {
       const weekday = shortWeekday(nearest.game.kickoffEpochMs)
-      const time = formatKickoff(nearest.game.kickoffEpochMs)
+      const time = formatKickoff(nearest.game)
       const when = weekday ? `${weekday} ${time}` : time
-      line1 = `${when} · ${TEAM_SHORT[nearest.team]} vs ${nearest.game.opponent}`
+      const prefix = nearest.game.isHome ? 'vs' : '@'
+      // Team's own short code plus the FULL opponent name (never both the
+      // short AND the full opponent name — that duplicated the same team
+      // twice and pushed real matchups past the 30-character strip budget).
+      line1 = `${when} · ${TEAM_SHORT[nearest.team]} ${prefix} ${nearest.game.opponent}`
     }
 
     const updatedAt = this.source.getLastUpdatedAt()
@@ -379,9 +355,14 @@ export class FootballPage implements Page {
     return { lines: [truncate(line1, STRIP_CHARS), truncate(line2, STRIP_CHARS)] }
   }
 
-  private detailStrip(team: Team, game: GameSummary): StripSpec {
-    const line1 = truncate(`${TEAM_LABELS[team]} vs ${game.opponent || '--'}`, STRIP_CHARS)
-    const line2 = truncate(`${game.venue || '--'} · ${game.city || '--'}`, STRIP_CHARS)
+  private scheduleStrip(team: Team, fullSchedule: Game[], window: Game[]): StripSpec {
+    const record = formatRecord(this.source.getRecord(team))
+    const line1 = truncate(`${TEAM_LABELS[team]} SCHEDULE · ${record}`, STRIP_CHARS)
+    const hidden = fullSchedule.length - window.length
+    const line2 = truncate(
+      hidden > 0 ? `showing ${window.length} of ${fullSchedule.length} · ${hidden} more` : `showing all ${fullSchedule.length} games`,
+      STRIP_CHARS,
+    )
     const status = this.source.getStatus()
     const updatedAt = this.source.getLastUpdatedAt()
     const right =
@@ -390,35 +371,30 @@ export class FootballPage implements Page {
   }
 
   onKeyPress(index: number): PressOutcome {
-    const game = this.activeGame()
-    if (game && this.selected) {
+    if (this.selected) {
       if (index === 7) {
         this.selected = null
         return 'handled'
       }
-      // Keys 0 to 6 do nothing while a game is selected. Read-only: no
-      // refresh-on-press, no browser.
+      // Keys 0-6 (game tiles) carry no drill-down of their own. Read-only:
+      // no refresh-on-press, no network I/O from a key press at all (the
+      // "do not fire 32 requests on a page press" rule the task brief
+      // states plainly — this page's onKeyPress never calls the source's
+      // fetch-driving methods, only its pure readers).
       return 'ignored'
     }
 
-    // Grid mode. Logo tiles (0, 4) and the two blank spacers (3, 7) carry no
-    // action, per the task brief: "logo tiles and empty slots report
-    // ignored."
-    const target = GRID_TARGETS[index]
-    if (!target) return 'ignored'
-    const [team, slot] = target
-    if (!this.source.getGame(team, slot)) return 'ignored'
-    this.selected = { team, slot }
+    // Grid mode. Only the two logo tiles (0, 4) are interactive.
+    let team: Team | null = null
+    if (index === 0) team = 'gators'
+    else if (index === 4) team = 'jaguars'
+    if (!team) return 'ignored'
+
+    // A logo with no schedule data at all has nothing to drill into — per
+    // the task brief, this reports `ignored`, truthfully, rather than
+    // opening an empty schedule view.
+    if (this.source.getSchedule(team).length === 0) return 'ignored'
+    this.selected = { team }
     return 'handled'
   }
-}
-
-/** Maps a grid key index to the team/slot it selects, or `undefined` for a
- * logo tile or blank spacer. A plain lookup table, checked once here, rather
- * than a chain of `if (index === ...)` branches repeated at each call site. */
-const GRID_TARGETS: Readonly<Record<number, readonly [Team, Slot] | undefined>> = {
-  1: ['jaguars', 'next'],
-  2: ['jaguars', 'last'],
-  5: ['gators', 'next'],
-  6: ['gators', 'last'],
 }

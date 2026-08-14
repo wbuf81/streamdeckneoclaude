@@ -484,6 +484,138 @@ exact assumption rather than treated as a mystery.
 
 ---
 
+## Football (task 42, measured 2026-08-14)
+
+The task 40/41 version of this page used TheSportsDB's free tier, which
+returns exactly one event per team per call — it cannot show "next three
+games." Re-measured live for the rebuild:
+
+- **`site.api.espn.com` is still Akamai-blocked**: HTTP 403, confirmed again
+  with Node's own `fetch`, not just `curl`. Per lesson 10, this host is
+  never retried.
+- **A different ESPN host, `sports.core.api.espn.com`, is OPEN** and serves
+  a team's full season, not one game:
+  - `.../nfl/seasons/2026/teams/30/events?limit=50` → `count: 20`, 20 `$ref`
+    items (Jaguars: 3 preseason + 17 regular season).
+  - `.../college-football/seasons/2026/teams/57/events?limit=50` →
+    `count: 12`, 12 items (Gators: no preseason games in this list at all).
+  - Team ids on this host are ESPN's own and differ from the old TheSportsDB
+    ids: **Jaguars = `30`** (league `nfl`), **Gators = `57`** (league
+    `college-football`).
+  - Each `$ref` must be followed individually — the list gives no inline
+    date, name, or score. Following one event ref returns `name`
+    (`"Jacksonville Jaguars at New Orleans Saints"`), `shortName`
+    (`"JAX @ NO"`), `date` (`"2026-08-15T20:00Z"`), `timeValid` (boolean),
+    and `competitions[0].competitors[]` with `id`/`homeAway`/`order` —
+    but competitors' own `score`, `record`, and `status` are ALL further
+    `$ref` links, not inlined. This page never follows those: no score is
+    shown anywhere in the rebuilt page, by design (see below).
+
+### Opponent name and home/away — no extra request needed
+
+`name` is **always** `"Away Team at Home Team"`, verified on **32 of 32**
+real events across both teams' full seasons, including neutral-site games
+(the Florida-Georgia game's `name` still says "Florida Gators at Georgia
+Bulldogs" even though `shortName` switches to `"FLA VS UGA"` and
+`competitions[0].neutralSite` is `true`). Splitting on the literal `" at "`
+gives the opponent's full name with **zero extra requests per game**.
+
+Home/away itself comes ONLY from `competitors[].homeAway`, matched against
+the known team id — never from the `name`/`shortName` string order. Proven
+necessary by the Florida-Georgia game itself: Georgia (id `61`) is marked
+`homeAway: "home"` there despite the fixed neutral venue (playoff-seeding
+convention), so guessing "away team is whichever comes first in the string"
+would have been right by luck on 31 of the 32 events and silently wrong on
+this one.
+
+`shortName` gives the same pair as an abbreviation (`"JAX"`/`"NO"`,
+`"FLA"`/`"UGA"`), split on `" @ "` for a normal game or `" VS "` for a
+neutral-site one (both measured live).
+
+### TBD kickoffs — ARE distinguishable on this host
+
+`timeValid` is a real, per-event boolean. Measured live across the full
+Gators season: `false` on 7 of 12 games (everything more than roughly two
+weeks out), `true` on the 5 closer in — this is a common, ongoing state
+throughout a season, not a rare edge case confined to the far future. The
+NFL's own Week 18 games (`timeValid: false`) additionally still carry a
+placeholder, non-midnight UTC time (`05:00Z`), so the OLD ambiguity
+(TheSportsDB's `00:00:00` that could be a real prime-time kickoff or a
+placeholder) does not apply here: this source treats `timeValid !== true`
+as TBD for the kickoff TIME only, while still trusting `date`'s calendar
+day for the DATE line.
+
+### Season record — a dedicated endpoint, not a self-tally
+
+`.../<league>/seasons/2026/types/<N>/teams/<id>/record` returns several
+named records; `items` with `name: "overall"` carries a flat `stats` array
+including real numeric `wins`, `losses`, `ties`, and `gamesPlayed` — this
+is ESPN's own authoritative tally, never computed by walking events.
+
+Season-type numbering, measured identical on BOTH leagues: `types/1` =
+Preseason, `types/2` = Regular Season, `types/3` = Postseason, `types/4` =
+Off Season. The record shown on the logo tile reads `types/2` (regular
+season) only — a preseason record folded into "the record for the year"
+would misrepresent it. Measured live on 2026-08-14 (preseason under way,
+regular season not started): `types/2`'s `gamesPlayed` is `0` for the
+Jaguars, so the real, authoritative record IS `0-0` — but the page renders
+this as an explicit unknown (`--`), never the literal `0-0`, per the task
+brief's own instruction and lesson 18: a `gamesPlayed: 0` record is real
+data saying "nothing has happened yet," and showing `0-0` on a tile reads
+as "the team already went 0-0," which is false.
+
+### N+1 cost and fetch strategy — measured
+
+Following every event ref for a full combined season (20 NFL + 12 college
+= 32 refs) at concurrency 10 completed in **0.58 s**, all 200s (`curl` via
+`xargs -P 10`, measured 2026-08-14). Three sequential (unbatched) refs took
+0.33 s. Based on this, `FootballSource` follows event refs at a concurrency
+cap of **6 per team** (so up to 12 combined, both teams refreshing in
+parallel) — comfortably under the measured-safe ceiling while keeping this
+source well clear of a 32-request burst. This only ever runs from the
+periodic 6-hour poll or the initial visible-refresh; `FootballPage`'s
+`onKeyPress` performs no network I/O at all, so pressing a logo tile to
+open the full schedule reads from the cache already populated by that
+periodic refresh, never triggering a fresh 32-request burst on a key press.
+
+The season's current year (`2026`) is hardcoded, matching this project's
+existing convention for the team ids — `sports.core.api.espn.com/v2/
+sports/football/leagues/<league>` DOES carry the live season year inline
+(`season.year`), which would let this self-correct automatically, but that
+is one more request per league per poll for a value that changes once a
+year. Bump `SEASON_YEAR` in `src/sources/football.ts` when the 2027 season
+starts.
+
+### Logo art leaves too little clean margin for a record line — composited instead
+
+Measured by drawing each REAL fetched crest full-bleed onto a 96×96 key
+(the exact way `render/canvas.ts`'s `drawCroppedImage` draws it) and
+scanning upward from the bottom row for the first pixel that differs from
+the plain background by more than a small tolerance:
+
+| Logo | Clean margin at the bottom |
+| --- | --- |
+| Jaguars (`jax.png`) | 15 px |
+| Gators (`57.png`, NCAA) | 20 px |
+
+15-20 px is too thin, and inconsistent between the two crests, to trust for
+a legible record line drawn directly over the raw image — and `render/
+canvas.ts`'s `drawCroppedImage` always draws to the FULL 96×96 destination
+regardless of any source crop, so there is no renderer-level way to shrink
+the image into part of the key (this task owns neither `render/canvas.ts`
+nor `render/specs.ts`, so that could not be changed). `FootballSource`
+instead composites the raw logo onto an offscreen canvas once, off the
+render path: the crest is scaled to fit the top `LOGO_ART_FRACTION` (0.64)
+of the frame, and the remaining bottom band is filled with the exact key
+background colour (`theme.bg`), more than double the tighter of the two
+measured margins. The result is re-encoded to PNG and re-decoded as a real
+`Image` (`@napi-rs/canvas`'s `createCanvas`/`toBuffer`/`loadImage` round
+trip, confirmed working locally) so `KeySpec.image` still holds an ordinary
+decoded image — `FootballPage` then draws the record as a normal text line
+at a fixed `lineY` inside that reserved band.
+
+---
+
 ## macOS specifics
 
 - **Per-window focus needs Accessibility permission**, which is NOT granted.
