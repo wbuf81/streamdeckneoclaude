@@ -529,11 +529,18 @@ const RAIN_FONT_SIZE = 12
  * text font, covers all of these.
  */
 const RAIN_CHARSET = ['0', '1', '$', '%', '#', '@', '&', '+', '=', '-', '/', '\\', '<', '>', '*']
-/** How long one column takes to fall the full height of the key, before its
- * per-column random variation and its own per-column offset. Slow and
- * ambient, never a fast scroll. */
-const RAIN_SPEED_BASE_MS = 3800
-const RAIN_SPEED_VARIANCE_MS = 2600
+/** How long one column takes to fall its FULL travel (see `rainColumnSpan`:
+ * the trail's length above the top, the key, and the trail's length below
+ * the bottom), before its per-column random variation and its own
+ * per-column offset. Slow and ambient, never a fast scroll.
+ *
+ * These were 3800/2600 when the travel was 174 px; the user's smoothness fix
+ * grew the travel to 252 px, and both constants were scaled by the same
+ * 252/174 so the on-glass velocity in px/ms is unchanged — only the loop got
+ * longer. Do not "restore" the shorter numbers without also restoring the
+ * shorter travel, or the rain visibly speeds up. */
+const RAIN_SPEED_BASE_MS = 5500
+const RAIN_SPEED_VARIANCE_MS = 3800
 
 /**
  * Glyph rain. Per-key variant (each key owns its own independent columns,
@@ -541,15 +548,42 @@ const RAIN_SPEED_VARIANCE_MS = 2600
  * cyan and near-white rather than the Matrix's green, sparse enough to read
  * as atmosphere behind the deck rather than dense noise.
  */
+/**
+ * The glyph-centre positions of one rain column at one instant: `head` is
+ * the lead glyph's y, `tail` is the last trail glyph's y (always above the
+ * head). Exported so a test can prove the loop geometry rather than trust
+ * this comment.
+ *
+ * The head starts one full trail-length ABOVE the top (so the column slides
+ * in) and travels to one full trail-length BELOW the bottom before it loops
+ * (so the column slides out, tail last). At the wrap instant every glyph is
+ * therefore off-key, and the loop is invisible.
+ *
+ * The first shipped version's travel stopped at `KEY_SIZE`: the head
+ * touched the bottom edge and wrapped while five of the six trail glyphs
+ * were still mid-key, so the whole strand vanished in one frame. Its
+ * comment CLAIMED the trail exited first — the code did half of what the
+ * comment said. The user saw it on the glass within minutes: "as soon as
+ * one strand touches the bottom ... the whole strand vanishes". This
+ * function exists so the claim is now tested, not narrated.
+ */
+export function rainColumnSpan(
+  keyIndex: number, col: number, nowMs: number,
+): { head: number; tail: number } {
+  const seed = keyIndex * 97 + col * 13
+  const speed = RAIN_SPEED_BASE_MS + pseudoRandom(seed) * RAIN_SPEED_VARIANCE_MS
+  const phase = pseudoRandom(seed + 1) * speed
+  const t = ((nowMs + phase) % speed) / speed
+  const travel = KEY_SIZE + 2 * RAIN_TRAIL * RAIN_CHAR_H
+  const head = -RAIN_TRAIL * RAIN_CHAR_H + t * travel
+  return { head, tail: head - (RAIN_TRAIL - 1) * RAIN_CHAR_H }
+}
+
 function drawIdleRain(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
   const keyIndex = idle.row * 2 + idle.col
   const x0 = BORDER + PAD
   const x1 = KEY_SIZE - PAD
   const colSpacing = (x1 - x0) / RAIN_COLS
-  // The full distance a drop travels before it loops, including its own
-  // trail length, so the whole trail exits the bottom before a new drop
-  // starts at the top — otherwise the loop point would visibly pop.
-  const travel = KEY_SIZE + RAIN_TRAIL * RAIN_CHAR_H
 
   ctx.font = `${RAIN_FONT_SIZE}px ${FONT}`
   ctx.textAlign = 'center'
@@ -557,10 +591,7 @@ function drawIdleRain(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
 
   for (let c = 0; c < RAIN_COLS; c++) {
     const seed = keyIndex * 97 + c * 13
-    const speed = RAIN_SPEED_BASE_MS + pseudoRandom(seed) * RAIN_SPEED_VARIANCE_MS
-    const phase = pseudoRandom(seed + 1) * speed
-    const t = ((idle.nowMs + phase) % speed) / speed
-    const headY = -RAIN_TRAIL * RAIN_CHAR_H + t * travel
+    const headY = rainColumnSpan(keyIndex, c, idle.nowMs).head
     const x = x0 + c * colSpacing + colSpacing / 2
 
     for (let i = 0; i < RAIN_TRAIL; i++) {

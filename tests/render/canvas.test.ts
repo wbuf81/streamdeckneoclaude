@@ -9,6 +9,7 @@ import {
   renderKey,
   renderStrip,
   probe,
+  rainColumnSpan,
   KEY_SIZE,
   STRIP_WIDTH,
   STRIP_HEIGHT,
@@ -1457,6 +1458,40 @@ describe('renderKey idle animations (the Spotify cyberpunk idle screens, task 39
       })
       expect(anyLeft).toBe(true)
       expect(anyRight).toBe(true)
+    })
+
+    it('every strand slides fully off the bottom before it loops — the wrap is never visible', () => {
+      // The user's report from the glass: "as soon as one strand touches the
+      // bottom ... the whole strand vanishes". The first shipped travel
+      // stopped the head AT the bottom edge, wrapping while five of six
+      // trail glyphs were still mid-key. The property that forbids it: at
+      // any instant where a column's head position jumps backwards (a
+      // wrap), the strand's TAIL at the previous instant must already be
+      // below the key. Scanned at 20 ms — under 1 px of motion per step at
+      // the slowest period — across every key and column for a full worst-
+      // case cycle. Break the fix (travel back to KEY_SIZE + one trail
+      // length) and this fails on every column.
+      const STEP_MS = 20
+      const SCAN_MS = 12_000 // longest period is < 9.3 s; cover one full loop
+      for (let keyIndex = 0; keyIndex < 4; keyIndex++) {
+        for (let col = 0; col < 6; col++) {
+          let prev = rainColumnSpan(keyIndex, col, 0)
+          let sawWrap = false
+          for (let nowMs = STEP_MS; nowMs <= SCAN_MS; nowMs += STEP_MS) {
+            const cur = rainColumnSpan(keyIndex, col, nowMs)
+            if (cur.head < prev.head) {
+              sawWrap = true
+              // At the moment before the wrap, the whole strand — tail
+              // included — must sit below the key's bottom edge.
+              expect(prev.tail).toBeGreaterThan(KEY_SIZE)
+            }
+            prev = cur
+          }
+          // The scan must actually witness a wrap, or the assertion above
+          // proved nothing for this column (lesson 22).
+          expect(sawWrap).toBe(true)
+        }
+      }
     })
   })
 
