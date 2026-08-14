@@ -1,6 +1,6 @@
 # Project state — handoff
 
-Last updated 2026-08-13. **Read `docs/VERIFIED-FACTS.md` and `docs/LESSONS.md` before
+Last updated 2026-08-14. **Read `docs/VERIFIED-FACTS.md` and `docs/LESSONS.md` before
 writing any code.** They hold measurements and recurring bug classes that cost real fix
 rounds to learn.
 
@@ -15,7 +15,7 @@ round buttons (8 = previous, 9 = next, wrapping both ways).
 | --- | --- | --- |
 | **Claude** | 3 session keys + dedicated animated crab + 4 usage gauges; press focuses that terminal | live |
 | **Codex** | 3 active task keys + identity/count + account limit, plan, tokens, and reset gauges | live |
-| **Spotify** | album art spanning keys 0,1,4,5; play/pause 2; volume 3; previous 6; next 7 | live |
+| **Spotify** | album art spanning keys 0,1,4,5; colour-emoji transport (play/pause 2, volume 3 with a thump while playing, previous 6, next 7); glyph-rain cyberpunk idle animation when nothing plays | live |
 | **Stocks** | 8 tickers with price, daily change, sparkline, red/green. Press a ticker for a detail view across all 8 keys, BACK on key 7 | live |
 | **Weather** | 7 day tiles with colour emoji + temps + rain chance, wind tile | live |
 
@@ -134,7 +134,13 @@ but **that directory is git-ignored**, so this file is the durable record.
 | — | **review round 2**: four scoped reviewers over `3b5fb67..HEAD` | complete, **1 Critical + 17 Important** found |
 | — | all four review-2 fix batches | complete |
 | — | Codex sqlite degraded fallback (`e0ce088`) | complete |
-| 37 | Spotify control keys: emoji set, thumping volume | in progress |
+| 37 | Spotify control keys: one glyph render path (text set) | complete, superseded by 38 |
+| 38 | Spotify control keys: colour-emoji set + volume thump | complete, user's pick, live |
+| — | **review round 3**: four scoped reviewers over `a825bee..HEAD` | complete, **4 Critical + 8 Important** |
+| — | all four review-3 fix batches | complete |
+| 39 | cyberpunk idle animation, three variants, `rain` shipped | complete, user's pick, live |
+| — | **end-to-end pass**: five whole-file scopes, whole product | complete, **5 Critical + 27 Important** |
+| — | all five e2e fix batches | complete, deployed |
 
 Briefs and reports for tasks 9–24 are in
 `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-deck-part2/`. **Git-ignored** — copy
@@ -217,13 +223,13 @@ What to look at, and what is expected:
 
 Record the outcomes here. Anything wrong becomes the next task.
 
-#### P0 — two stray files need the user's go-ahead to delete
+#### DONE — the two stray probe files are deleted
 
-`~/.local/state/deckd/sessions/baseline-probe.json` and `deckd-install-probe.json` hold the
-installer's **fabricated** payload, and the usage source reads that directory, so they can
-still feed the gauges invented numbers. `install()` now cleans them up, but running install
-against live config is not something to do casually. The repair is a two-file delete and needs
-one word from the user. **Nothing else under `~` may be deleted.**
+The user said "remove those files" on 2026-08-13 and both fabricated probe files were
+deleted from `~/.local/state/deckd/sessions/`. Only the real session file remains; the
+token files were untouched. The installed wrapper was also refreshed the same day with
+`deckd refresh-wrapper` (sha now matches source, state dir 0700, live statusline verified
+writing through it within 20 seconds).
 
 #### DONE — review round 2, and what it taught
 
@@ -246,11 +252,43 @@ Four defects came from instructions written by the controller, not from implemen
 three flash-timing bugs. **A review checks the code; nothing checks the brief.** Read a fix
 brief as sceptically as the code it targets.
 
-#### P0 — unreviewed again
+#### DONE — review round 3, and the whole-system end-to-end pass
 
-Everything after `a825bee` — the review-2 fixes themselves, the flash ring, the Codex degraded
-fallback, and the Spotify control keys — has not been reviewed. Given the rate above, assume
-defects are present.
+**Round 3** (four scoped reviewers over `a825bee..HEAD`) found **4 Critical and 8 Important**,
+all fixed: the em-dash window matcher, `deckd auth` hang, the ms-clock rewind, the 0644 token
+window, and more. Its distillations became `docs/LESSONS.md` **21 and 22**.
+
+**The end-to-end pass** (2026-08-13, five whole-file scopes: infra seams, the seven sources as
+a family, four pages as products, install/CLI, then render+Spotify last after the animation
+landed) found **5 Critical and 27 Important**, all fixed the same day:
+
+- Boot with the deck unplugged crash-looped under launchd forever; lock→unplug→unlock froze
+  the deck permanently. Both closed by a class invariant: no device call or page hook on a
+  startup/reconnect/unlock path may abort the remaining bookkeeping.
+- The Spotify refresh token could reach `deckd.log` in plaintext if the token endpoint ever
+  returned an error body. **Never fired on this machine** (log grepped, zero occurrences).
+  Response bodies are now banned from error messages as a class.
+- The Claude page presented an ended 5-hour window as live `87%` — the exact defect the Codex
+  page was already cured of. Now `--`/`ELAPSED`, dimmed.
+- A non-finite `nowMs` reaching the `grid` idle variant's `ctx.arc` **aborted the process in
+  Rust (SIGABRT), uncatchable from JS**. Dormant only because the shipped variant is `rain`.
+  Fixed with a boundary sanitiser in `renderKey`/`renderStrip`: every numeric spec field is
+  coerced finite before any draw call. The renderer can no longer kill the process on any
+  input.
+- Install posted its **first Critical-free round in four**: both structural walls (uninstall
+  never deletes the backup; one shared `detectWrap`) held under deliberate attack.
+
+The dominant pattern across the day: **fixes that never propagated to their siblings** — one
+page cured while the other kept the hole, install cured while uninstall kept the race, one
+source guarded while four lacked copy-on-read. The binding process response is the "Fix briefs
+and review loops" section of `AGENTS.md`. Cumulative day total: roughly **12 Critical and 70
+Important**, every one behind a green suite at the time it was found.
+
+Current baseline after all fixes: **34 test files, 1312 tests**, typecheck (tests included)
+clean, deployed and running.
+
+**Still unreviewed:** only the e2e fix batches themselves (`464489d..` onward). Every earlier
+line of the product has now had fresh whole-file review within one day.
 
 #### P1 — Add `deckd status` and `deckd doctor`
 
