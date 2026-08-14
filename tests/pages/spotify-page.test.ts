@@ -385,6 +385,102 @@ describe('SpotifyPage tickMs', () => {
   })
 })
 
+describe('SpotifyPage staleness (I3): one predicate for the whole page, including the album-art keys', () => {
+  // Before this fix, `dead` (the transport keys' dim check) omitted
+  // `'offline'`, the strip used a SEPARATE `status === 'offline'` check of
+  // its own, and the four album-art keys never dimmed at all, in any state
+  // — the exact disagreement I3 reports.
+  it('dims the four album-art keys, not just the transport controls, when the device is gone with a stale but present state', () => {
+    const { page } = build(player({ isPlaying: true }), 'no-device', FAKE_ART)
+    const keys = page.render(NOW).keys
+    for (const i of [0, 1, 4, 5]) {
+      expect(keys[i]!.kind).toBe('image')
+      expect(keys[i]!.dim).toBe(true)
+    }
+    for (const i of [2, 3, 6, 7]) {
+      expect(keys[i]!.dim).toBe(true)
+    }
+  })
+
+  it('dims the strip AND the four album-art keys when offline — the strip alone used to be the only thing that dimmed', () => {
+    const { page } = build(player({ isPlaying: true }), 'offline', FAKE_ART)
+    const frame = page.render(NOW)
+    for (const i of [0, 1, 4, 5]) {
+      expect(frame.keys[i]!.dim).toBe(true)
+    }
+    for (const i of [2, 3, 6, 7]) {
+      expect(frame.keys[i]!.dim).toBe(true)
+    }
+    expect(frame.strip.dim).toBe(true)
+  })
+
+  it('does not dim the idle-animation art keys just because nothing is loaded — an idle scene is not stale data', () => {
+    const { page } = build(null, 'ok')
+    const keys = page.render(NOW).keys
+    for (const i of [0, 1, 4, 5]) {
+      expect(keys[i]!.dim).toBeFalsy()
+    }
+  })
+
+  it('does not thump the volume key while offline, even if the stale state still says isPlaying', () => {
+    const { page } = build(player({ isPlaying: true }), 'offline', FAKE_ART)
+    expect(page.render(NOW).keys[3]!.glyphPulse).toBeUndefined()
+  })
+
+  it('freezes the interpolated position while offline, instead of tracking the wall clock forward for up to 5 minutes behind dim art', () => {
+    const calls: number[] = []
+    const source = {
+      interpolate: (now: number) => {
+        calls.push(now)
+        return player({ isPlaying: true })
+      },
+      getStatus: () => 'offline' as SpotifyStatus,
+      getArt: () => FAKE_ART,
+      play: async () => true,
+      pause: async () => true,
+      next: async () => true,
+      previous: async () => true,
+      setVolume: async () => true,
+      setVisible: () => {},
+    }
+    const page = new SpotifyPage(source as never)
+    page.render(1000)
+    page.render(1010)
+    page.render(1020)
+    // Every render while offline reuses the FIRST `now` this page observed
+    // the drop at (1000) — it does not keep handing `interpolate` the
+    // advancing wall clock.
+    expect(calls).toEqual([1000, 1000, 1000])
+  })
+
+  it('re-anchors the freeze the next time the device goes offline, rather than reusing a stale anchor from a previous drop', () => {
+    const calls: number[] = []
+    let status: SpotifyStatus = 'offline'
+    const source = {
+      interpolate: (now: number) => {
+        calls.push(now)
+        return player({ isPlaying: true })
+      },
+      getStatus: () => status,
+      getArt: () => FAKE_ART,
+      play: async () => true,
+      pause: async () => true,
+      next: async () => true,
+      previous: async () => true,
+      setVolume: async () => true,
+      setVisible: () => {},
+    }
+    const page = new SpotifyPage(source as never)
+    page.render(1000) // offline: anchors at 1000
+    status = 'ok'
+    page.render(2000) // recovered: uses the real clock again
+    status = 'offline'
+    page.render(3000) // offline again: re-anchors at 3000, not the old 1000
+    page.render(3010)
+    expect(calls).toEqual([1000, 2000, 3000, 3000])
+  })
+})
+
 describe('SpotifyPage strip', () => {
   it('shows the title on line 1 and the artist on line 2', () => {
     const { page } = build(player())
@@ -523,16 +619,27 @@ describe('SpotifyPage presses', () => {
     expect(calls).toContain('volume:65')
   })
 
-  it('assumes 50 percent when the volume is unknown, before raising it', async () => {
+  it('M4: ignores the volume press when the volume is unknown, instead of assuming 50 percent', async () => {
+    // Lesson 18: a missing value is UNKNOWN, not a measured 50%. The old
+    // behaviour showed "—" on the key's caption but silently asserted a real
+    // number on a press — 'ignored' still gives visible feedback (the red
+    // ring), so the press is never mistaken for one the deck never received.
     const { page, calls } = build(player({ volumePercent: null }))
-    await page.onKeyPress(3)
-    expect(calls).toContain('volume:60')
+    const outcome = await page.onKeyPress(3)
+    expect(outcome).toBe('ignored')
+    expect(calls).toEqual([])
   })
 
-  it('wraps volume from the top back to zero', async () => {
+  it('M4: clamps the volume at 100 instead of wrapping to zero', async () => {
     const { page, calls } = build(player({ volumePercent: 100 }))
     await page.onKeyPress(3)
-    expect(calls).toContain('volume:0')
+    expect(calls).toContain('volume:100')
+  })
+
+  it('M4: reaches exactly 100 from 95, instead of jumping past it to zero', async () => {
+    const { page, calls } = build(player({ volumePercent: 95 }))
+    await page.onKeyPress(3)
+    expect(calls).toContain('volume:100')
   })
 
   it('does not read the wall clock while handling a press', async () => {

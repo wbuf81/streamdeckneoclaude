@@ -136,6 +136,14 @@ export class SpotifyPage implements Page {
   constructor(private readonly source: PlayerReader) {}
 
   /**
+   * The `now` (seconds) this page last handed to `interpolate` while
+   * `status` was `'offline'` — see `render`'s freeze below (I3). `null`
+   * whenever `status` is anything else, so the very next `offline` render
+   * re-anchors instead of reusing a value from a PREVIOUS offline spell.
+   */
+  private offlineAnchorNow: number | null = null
+
+  /**
    * Raises the render rate while the idle animation is showing, OR while a
    * track is playing (task 38's volume-key "thump" — see `glyphPulse` on
    * key 3 below). A loaded but PAUSED track is the one case left at the
@@ -185,39 +193,59 @@ export class SpotifyPage implements Page {
   }
 
   render(now: number, nowMs: number = now * 1000): DeckFrame {
-    const state = this.source.interpolate(now)
     const status = this.source.getStatus()
-    const dead = status === 'no-device' || status === 'unauthorized' || !state
+    // I3: while `status` is `'offline'`, freeze the clock `interpolate` sees
+    // at the value it had the FIRST render this page observed the drop —
+    // otherwise `interpolate` keeps extrapolating the position forward for
+    // up to `INTERPOLATE_MAX_POLL_AGE_SECONDS` (5 minutes,
+    // `sources/spotify.ts`), so the progress bar and the clock kept creeping
+    // ahead behind art the page was not yet marking as stale. Any other
+    // status clears the anchor, so the NEXT time this page goes offline it
+    // re-anchors instead of reusing a stale one from a previous drop.
+    if (status === 'offline') {
+      this.offlineAnchorNow ??= now
+    } else {
+      this.offlineAnchorNow = null
+    }
+    const effectiveNow = status === 'offline' ? this.offlineAnchorNow! : now
+    const state = this.source.interpolate(effectiveNow)
+    // I3: ONE staleness predicate, used for every element on this page —
+    // the control glyphs, the strip, AND the four album-art keys, which
+    // previously carried no staleness signal at all. Before this fix, a
+    // failed transport command (`status: 'no-device'`, `state` left in
+    // place until the next poll) dimmed the transport glyphs but left the
+    // art keys bright, and `'offline'` dimmed only the strip — two
+    // different, disagreeing checks. `stale` folds `'offline'` in exactly
+    // like `'no-device'` and `'unauthorized'` always were.
+    const stale = isStale(status, state)
     const art = state ? this.source.getArt(state.trackId, state.artUrl) : null
 
     return {
       keys: [
-        this.primaryArtKey(state, status, art, CROP_TOP_LEFT, nowMs),
-        this.spanArtKey(state, status, art, CROP_TOP_RIGHT, nowMs, 1, 0),
-        { kind: 'control', glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH, glyphFont: 'emoji', dim: dead },
+        this.primaryArtKey(state, status, art, stale, CROP_TOP_LEFT, nowMs),
+        this.spanArtKey(state, status, art, stale, CROP_TOP_RIGHT, nowMs, 1, 0),
+        { kind: 'control', glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH, glyphFont: 'emoji', dim: stale },
         {
           kind: 'control',
           glyph: VOLUME_UP_GLYPH,
           glyphFont: 'emoji',
           glyphCaption: volumeLabel(state),
           // The "thump" — only while a track is actually PLAYING AND the
-          // device is not dead. Per M5: `state?.isPlaying` alone survived a
-          // failed transport command (the source sets `status: 'no-device'`
-          // on a 403/404 but leaves `state` in place until the next poll),
-          // so this page kept animating a device it was simultaneously
-          // reporting as gone. A thumping speaker beside a paused track, or
-          // a dimmed dead one, would be decoration with no meaning; static
-          // here matches static everywhere else on a paused, idle, or dead
-          // page.
-          glyphPulse: state?.isPlaying && !dead ? { phase: volumePulsePhase(nowMs) } : undefined,
-          dim: dead,
+          // page is not otherwise marking this data stale (no device, no
+          // authorization, or an offline connection: per M5, `isPlaying`
+          // alone survived a failed transport command, and per I3 it also
+          // used to survive `'offline'`). A thumping speaker beside a
+          // paused, dead, or disconnected track would be decoration with no
+          // meaning; static here matches static everywhere else on the page.
+          glyphPulse: state?.isPlaying && !stale ? { phase: volumePulsePhase(nowMs) } : undefined,
+          dim: stale,
         },
-        this.spanArtKey(state, status, art, CROP_BOTTOM_LEFT, nowMs, 0, 1),
-        this.spanArtKey(state, status, art, CROP_BOTTOM_RIGHT, nowMs, 1, 1),
-        { kind: 'control', glyph: PREVIOUS_GLYPH, glyphFont: 'emoji', dim: dead },
-        { kind: 'control', glyph: NEXT_GLYPH, glyphFont: 'emoji', dim: dead },
+        this.spanArtKey(state, status, art, stale, CROP_BOTTOM_LEFT, nowMs, 0, 1),
+        this.spanArtKey(state, status, art, stale, CROP_BOTTOM_RIGHT, nowMs, 1, 1),
+        { kind: 'control', glyph: PREVIOUS_GLYPH, glyphFont: 'emoji', dim: stale },
+        { kind: 'control', glyph: NEXT_GLYPH, glyphFont: 'emoji', dim: stale },
       ],
-      strip: this.strip(state, status, nowMs),
+      strip: this.strip(state, status, stale, nowMs),
       buttons: [theme.gray, theme.gray],
     }
   }
@@ -234,6 +262,7 @@ export class SpotifyPage implements Page {
     state: PlayerState | null,
     status: SpotifyStatus,
     art: Image | null,
+    stale: boolean,
     crop: ImageCrop,
     nowMs: number,
   ): KeySpec {
@@ -244,13 +273,18 @@ export class SpotifyPage implements Page {
       return { kind: 'control', idle: idleSpec(nowMs, 0, 0) }
     }
     if (art) {
-      return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop }
+      // I3: dims like every other element on the page when `stale` — an art
+      // key used to be the one thing on this screen with no staleness
+      // signal at all, so a dead device or a dropped connection still
+      // showed a bright cover behind dim transport glyphs.
+      return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop, dim: stale }
     }
     // The art downloads in the background. Show the album name meanwhile.
     return {
       kind: 'control',
       lines: ['NOW', truncate(state.album, ALBUM_FALLBACK_CHARS)],
       align: 'center',
+      dim: stale,
     }
   }
 
@@ -265,6 +299,7 @@ export class SpotifyPage implements Page {
     state: PlayerState | null,
     status: SpotifyStatus,
     art: Image | null,
+    stale: boolean,
     crop: ImageCrop,
     nowMs: number,
     col: 0 | 1,
@@ -273,10 +308,10 @@ export class SpotifyPage implements Page {
     if (status === 'unauthorized') return blankKey()
     if (!state) return { kind: 'control', idle: idleSpec(nowMs, col, row) }
     if (!art) return blankKey()
-    return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop }
+    return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop, dim: stale }
   }
 
-  private strip(state: PlayerState | null, status: SpotifyStatus, nowMs: number): StripSpec {
+  private strip(state: PlayerState | null, status: SpotifyStatus, stale: boolean, nowMs: number): StripSpec {
     if (status === 'unauthorized') {
       return { lines: ['spotify not connected', 'run: deckd auth spotify'], dim: true }
     }
@@ -294,7 +329,10 @@ export class SpotifyPage implements Page {
       lines: [truncate(state.title, TITLE_CHARS), truncate(state.artist, ARTIST_CHARS)],
       right: `${formatClock(state.positionMs / 1000)} / ${formatClock(state.durationMs / 1000)}`,
       bar: { value: fraction, color: theme.green },
-      dim: status === 'offline',
+      // I3: the SAME `stale` predicate the keys use, not a separate
+      // `status === 'offline'` check — that check alone left the strip
+      // bright on `'no-device'` while the transport glyphs already dimmed.
+      dim: stale,
     }
   }
 
@@ -302,7 +340,6 @@ export class SpotifyPage implements Page {
     // Press handling needs playback flags and volume, not the interpolated
     // position. A fixed clock keeps the page pure and deterministic.
     const state = this.source.interpolate(0)
-    const volume = state?.volumePercent ?? 50
 
     switch (index) {
       case 2: {
@@ -310,7 +347,20 @@ export class SpotifyPage implements Page {
         return ok ? 'handled' : 'failed'
       }
       case 3: {
-        const ok = await this.source.setVolume(volume + VOLUME_STEP > 100 ? 0 : volume + VOLUME_STEP)
+        // M4: an unknown volume (lesson 18 — absent is UNKNOWN, not a
+        // measured 50%) used to fall back to an assumed 50 and step from
+        // there, so the caption showed "—" while the press asserted a real
+        // number nobody measured. With no baseline to step from, this press
+        // does nothing rather than guess one — the daemon still gives
+        // visible feedback (the red ring for `'ignored'`), so silence is
+        // never mistaken for a press the deck never received.
+        if (state?.volumePercent == null) return 'ignored'
+        // `Math.min(100, ...)`, not `> 100 ? 0 : ...`: the old wrap-to-zero
+        // meant a volume already at or near 100 could never land exactly on
+        // 100, and one more press from there muted the device outright.
+        // Clamping means the last few presses before the ceiling simply stop
+        // climbing, which is what "raise the volume" should do at the top.
+        const ok = await this.source.setVolume(Math.min(100, state.volumePercent + VOLUME_STEP))
         return ok ? 'handled' : 'failed'
       }
       case 6: {
@@ -329,6 +379,24 @@ export class SpotifyPage implements Page {
         return 'ignored'
     }
   }
+}
+
+/**
+ * The ONE staleness predicate for this whole page (I3). Every element that
+ * dims — the four transport keys, the strip, and the four album-art keys —
+ * reads this same function, so they can no longer disagree the way `dead`
+ * (which omitted `'offline'`) and the strip's own `status === 'offline'`
+ * check used to.
+ *
+ * `!state` counts as stale too: nothing is loaded, so there is nothing valid
+ * for a transport press to act on — matching the original `dead` formula's
+ * treatment of that case. The four idle-animation art keys never reach this
+ * predicate for their OWN dimming (an idle scene is not "stale data", it is
+ * "no data"), but the control glyphs still need it while idle, exactly as
+ * before.
+ */
+function isStale(status: SpotifyStatus, state: PlayerState | null): boolean {
+  return status === 'no-device' || status === 'unauthorized' || status === 'offline' || !state
 }
 
 function volumeLabel(state: PlayerState | null): string {
