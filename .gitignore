@@ -12,6 +12,12 @@ spotify.json
 .vscode/
 .idea/
 
+# C1's child-process probe test (tests/render/canvas.test.ts) writes its
+# esbuild-bundled scratch files here, inside the project so Node's ESM
+# resolver finds node_modules — cleaned up in the test's own `finally`, this
+# is only a backstop against a run that dies before cleanup.
+.c1-probe-*/
+
 # SDD scratch: ledger, briefs, review packages. Not part of the project.
 .superpowers/
 

@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { createHash } from 'node:crypto'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import * as esbuild from 'esbuild'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
 import {
   renderKey,
@@ -13,14 +17,6 @@ import {
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
 import type { KeySpec } from '../../src/render/specs.js'
-// Read-only, for the cross-page regression test at the bottom of this file:
-// task 39 only owns the Spotify page's idle animation, and these four pages
-// must render byte-identically to before that work — see
-// "the other four pages" describe block.
-import { ClaudePage } from '../../src/pages/claude-page.js'
-import { CodexPage } from '../../src/pages/codex-page.js'
-import { WeatherPage } from '../../src/pages/weather-page.js'
-import { StocksPage } from '../../src/pages/stocks-page.js'
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -1402,13 +1398,23 @@ describe('renderKey idle animations (the Spotify cyberpunk idle screens, task 39
       }
     })
 
-    it('renders visibly different pixels for all four quadrants at the same clock', () => {
-      const bufs = IDLE_QUADRANTS.map(({ col, row }) =>
-        renderKey({ kind: 'control', idle: { variant, nowMs: 1500, col, row } }),
-      )
-      for (let i = 0; i < bufs.length; i++) {
-        for (let j = i + 1; j < bufs.length; j++) {
-          expect(bufs[i]!.equals(bufs[j]!)).toBe(false)
+    // I1: the old glitch scanline phase came from a weak sine-based hash
+    // whose nearby integer seeds could (and, for two of the four keys, did)
+    // return nearly identical outputs — the four quadrants were
+    // byte-identical at 46 of 60 sampled clocks, and a test that only
+    // checked one hard-coded clock (1500) could not see it, since 1500
+    // happened to be one of the 14 lucky ones (lesson 22). Sweeping many
+    // clocks here is what would have caught it, and is what proves the fix.
+    it('renders visibly different pixels for all four quadrants across many clocks', () => {
+      const clocks = Array.from({ length: 60 }, (_, i) => i * 100)
+      for (const nowMs of clocks) {
+        const bufs = IDLE_QUADRANTS.map(({ col, row }) =>
+          renderKey({ kind: 'control', idle: { variant, nowMs, col, row } }),
+        )
+        for (let i = 0; i < bufs.length; i++) {
+          for (let j = i + 1; j < bufs.length; j++) {
+            expect(bufs[i]!.equals(bufs[j]!)).toBe(false)
+          }
         }
       }
     })
@@ -1472,18 +1478,24 @@ describe('renderKey idle animations (the Spotify cyberpunk idle screens, task 39
       }
     })
 
-    it('breathes slowly rather than flickering: brightness cannot swing across most of its range in one small time step', () => {
-      // A strobe is a FAST swing, not a big one — the text is meant to
-      // breathe all the way from dim to bright, just slowly. So this
-      // measures brightness (total channel deviation from the background,
-      // over the whole text region — not a pixel count, which cannot tell a
-      // dim frame from a bright one once any ink is present at all) at
-      // 150 ms steps across several seconds, well clear of the one brief
-      // glitch dropout near nowMs 0, and requires that no two adjacent
-      // samples swing by more than 40% of the full range seen. A period as
-      // slow as the real one stays under about 17%; cutting the period down
-      // to something that would actually read as flicker pushes this ratio
-      // toward 100% and fails here.
+    it('breathes slowly rather than flickering: brightness cannot swing across most of its range on more than a handful of small time steps', () => {
+      // A strobe is a FAST, REPEATED swing, not one big one — the text is
+      // meant to breathe all the way from dim to bright, just slowly, with
+      // one brief (90 ms), INTENTIONAL sharp dropout timed to its own
+      // glitch band each cycle (documented at `GLITCH_TEXT_DROPOUT_MS`). So
+      // this measures brightness (total channel deviation from the
+      // background, over the whole text region — not a pixel count, which
+      // cannot tell a dim frame from a bright one once any ink is present at
+      // all) at 150 ms steps across FOUR full band periods (not a
+      // hand-picked window chosen to dodge the one dropout at whatever
+      // clock it happens to land on for THIS key — lesson 22 — since M7's
+      // fix moved that clock off a fixed epoch boundary) and requires that
+      // no more than a handful of adjacent-sample steps swing by 40% of the
+      // full range: at most one or two per band period, from the dropout's
+      // own brief in/out edges. A period as slow as the real BREATHING one
+      // produces a handful of such steps across the whole sweep; cutting
+      // the breathing period down to something that would actually read as
+      // flicker produces one on nearly EVERY step instead.
       const totalDeviation = (buf: Buffer): number => {
         let sum = 0
         for (let y = 40; y < 56; y++) {
@@ -1495,16 +1507,241 @@ describe('renderKey idle animations (the Spotify cyberpunk idle screens, task 39
         return sum
       }
       const stepMs = 150
+      const glitchBandPeriodMs = 5200 // matches canvas.ts's GLITCH_BAND_PERIOD_MS, not exported
+      const bandPeriods = 4
       const samples: number[] = []
-      for (let nowMs = 300; nowMs < 4300; nowMs += stepMs) {
+      for (let nowMs = 0; nowMs < glitchBandPeriodMs * bandPeriods; nowMs += stepMs) {
         samples.push(totalDeviation(renderKey({ kind: 'control', idle: { variant: 'glitch', nowMs, col: 0, row: 0 } })))
       }
       const range = Math.max(...samples) - Math.min(...samples)
       expect(range).toBeGreaterThan(0) // the property only means something if brightness moves at all
-      let maxStep = 0
-      for (let i = 1; i < samples.length; i++) maxStep = Math.max(maxStep, Math.abs(samples[i]! - samples[i - 1]!))
-      expect(maxStep / range).toBeLessThan(0.4)
+      let bigSteps = 0
+      for (let i = 1; i < samples.length; i++) {
+        const step = Math.abs(samples[i]! - samples[i - 1]!)
+        if (step / range >= 0.4) bigSteps++
+      }
+      // Measured (post-fix): 3 big steps across 4 band periods (~139
+      // samples) — the dropout's own edges. A generous multiple of that,
+      // still far short of "nearly every step," which is what an actual
+      // fast-flicker regression would produce.
+      expect(bigSteps).toBeLessThanOrEqual(8)
     })
+  })
+
+  // I2: at the Spotify page's real idle tick (100 ms), keys 1, 4 and 5 held
+  // byte-identical pixels for up to 8 consecutive frames — 800 ms — because
+  // the scanline position only advanced past a rounding boundary once every
+  // ~860 ms, even though `idle.nowMs` (correctly) changed `keyHash` on every
+  // tick. That is wasted key-writes for content that had not visibly
+  // changed. Key 0 (the OFFLINE-text quadrant) already escaped this via its
+  // own continuous breathing, so it is excluded here — its own "breathes
+  // slowly" behaviour is covered above instead.
+  describe('glitch scanline animation cost (I2)', () => {
+    it('does not hold identical pixels for more than a couple of consecutive 100ms ticks, on any of the three non-text quadrants', () => {
+      const tickMs = 100
+      const durationMs = 12_000
+      for (const { col, row } of [
+        { col: 1 as const, row: 0 as const },
+        { col: 0 as const, row: 1 as const },
+        { col: 1 as const, row: 1 as const },
+      ]) {
+        let prev: Buffer | null = null
+        let run = 0
+        let maxRun = 0
+        for (let nowMs = 0; nowMs < durationMs; nowMs += tickMs) {
+          const buf = renderKey({ kind: 'control', idle: { variant: 'glitch', nowMs, col, row } })
+          if (prev && buf.equals(prev)) {
+            run++
+            maxRun = Math.max(maxRun, run)
+          } else {
+            run = 0
+          }
+          prev = buf
+        }
+        // Measured pre-fix: up to 8. Post-fix, sub-pixel scanline motion
+        // changes something on every tick, so this should never run long.
+        expect(maxRun).toBeLessThanOrEqual(1)
+      }
+    })
+  })
+})
+
+/**
+ * C1: `drawIdleGrid`'s sun, drawn with `ctx.arc`, is the only `arc`/`ellipse`
+ * call anywhere in `src/` (`grep -rn '\.arc(\|arcTo\|ellipse(' src/`).
+ * `@napi-rs/canvas`'s `ctx.arc` PANICS in Rust — an uncatchable `SIGABRT`,
+ * not a `throw` — when handed a non-finite argument, which a non-finite
+ * `idle.nowMs` produces (`sunY` becomes `NaN`). A `try`/`catch` around the
+ * render loop cannot see a Rust panic, so a genuinely aborting test would
+ * kill the vitest worker outright, not just fail one assertion — the exact
+ * hazard this suite exists to catch. So this proves the fix from the
+ * OUTSIDE, in an isolated child process, checking the exit code rather than
+ * calling `renderKey` with a hostile spec in-process.
+ *
+ * Pre-fix, this same probe (run manually during development, not committed
+ * here — a test that captures the crash would itself abort the suite)
+ * measured `status: null, signal: 'SIGABRT'` for `nowMs: NaN`, and a clean
+ * exit for a finite clock — matching the review's own measurement exactly.
+ * `sanitizeKeySpec` (the boundary guard) plus the belt-and-braces
+ * `Number.isFinite` check at the `arc` call itself are what make the
+ * post-fix assertion below true.
+ */
+describe('C1: drawIdleGrid does not abort the process on a non-finite clock', () => {
+  /**
+   * Bundles `src/render/canvas.ts` (and its two local dependencies) into one
+   * self-contained ESM file with `esbuild` — a real dependency of `vitest`
+   * itself, so this needs no prior `npm run build` and no `dist/` output to
+   * exist. `@napi-rs/canvas` stays external (a real, already-installed
+   * node_module) rather than bundled. The temp files live under a directory
+   * INSIDE the project root (not the system tmpdir) so plain Node's ESM
+   * resolver walks up and finds `node_modules` normally.
+   */
+  function renderHostileGridInChildProcess(nowMsLiteral: string): {
+    status: number | null
+    signal: NodeJS.Signals | null
+  } {
+    const result = esbuild.buildSync({
+      entryPoints: [join(process.cwd(), 'src/render/canvas.ts')],
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      write: false,
+      external: ['@napi-rs/canvas'],
+    })
+    const bundled = result.outputFiles[0]!.text
+    const dir = mkdtempSync(join(process.cwd(), '.c1-probe-'))
+    try {
+      const bundleFile = join(dir, 'canvas.bundle.mjs')
+      writeFileSync(bundleFile, bundled)
+      const probeFile = join(dir, 'probe.mjs')
+      writeFileSync(
+        probeFile,
+        [
+          `import { renderKey } from ${JSON.stringify(bundleFile)}`,
+          `const buf = renderKey({ kind: 'control', idle: { variant: 'grid', nowMs: ${nowMsLiteral}, col: 0, row: 0 } })`,
+          `if (buf.length !== 96 * 96 * 4) throw new Error('unexpected buffer length: ' + buf.length)`,
+        ].join('\n'),
+      )
+      const r = spawnSync(process.execPath, [probeFile], { encoding: 'utf8' })
+      return { status: r.status, signal: r.signal }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  it.each(['NaN', 'Infinity', '-Infinity'])(
+    'renders a full key buffer, in a real child process, for grid idle.nowMs = %s',
+    (nowMsLiteral) => {
+      const { status, signal } = renderHostileGridInChildProcess(nowMsLiteral)
+      expect(signal).toBeNull()
+      expect(status).toBe(0)
+    },
+  )
+
+  it('still renders a real clock correctly through the same child-process path', () => {
+    const { status, signal } = renderHostileGridInChildProcess('1786549560000')
+    expect(signal).toBeNull()
+    expect(status).toBe(0)
+  })
+})
+
+/**
+ * I4 (folded into C1's boundary sweep): every other hostile numeric field
+ * throws a plain, catchable JS error rather than aborting the process, so
+ * these run in-process directly. Before `sanitizeKeySpec`, `lineSizes` and
+ * `glyphPulse.phase` reached a font string built from their own value and
+ * threw `is not valid font style`; a spark with >=125,000 points threw
+ * `Maximum call stack size exceeded` from `Math.min(...values)`'s argument
+ * spread.
+ */
+describe('C1/I4: hostile numeric specs never throw, across every numeric field and all three idle variants', () => {
+  const HOSTILE = [NaN, Infinity, -Infinity]
+
+  // `'grid'` is deliberately excluded from this in-process loop: it is the
+  // one variant whose `ctx.arc` call is uniquely fatal (not merely
+  // throwing) on a non-finite `nowMs`, and the describe block above already
+  // covers exactly that combination through the isolated child-process
+  // probe. Testing it here too, in-process, would mean a FUTURE regression
+  // in `sanitizeKeySpec` aborts this whole file's vitest worker instead of
+  // failing one test — confirmed by deliberately breaking both the
+  // sanitizer and the belt-and-braces `arc` guard during development: with
+  // `'grid'` in this loop, that break took down all 153 tests in this file,
+  // not just this one. `'rain'` and `'glitch'` never call `arc` at all, so
+  // they carry no such risk and are safe to test directly.
+  it.each(HOSTILE)('idle.nowMs = %s renders for rain and glitch, in-process', (nowMs) => {
+    for (const variant of ['rain', 'glitch'] as const) {
+      expect(() => renderKey({ kind: 'control', idle: { variant, nowMs, col: 0, row: 0 } })).not.toThrow()
+    }
+  })
+
+  it.each(HOSTILE)('idle.col / idle.row = %s render without throwing', (n) => {
+    expect(() =>
+      renderKey({ kind: 'control', idle: { variant: 'grid', nowMs: 0, col: n as never, row: n as never } }),
+    ).not.toThrow()
+  })
+
+  it.each(HOSTILE)('lineSizes = %s (plain number) renders without throwing', (size) => {
+    expect(() => renderKey({ kind: 'gauge', lines: ['A'], lineSizes: [size] })).not.toThrow()
+  })
+
+  it.each(HOSTILE)('lineSizes = [[%s]] (candidate array) renders without throwing', (size) => {
+    expect(() => renderKey({ kind: 'gauge', lines: ['A'], lineSizes: [[size]] })).not.toThrow()
+  })
+
+  it.each(HOSTILE)('lineY = %s renders without throwing', (y) => {
+    expect(() => renderKey({ kind: 'gauge', lines: ['A'], lineY: [y] })).not.toThrow()
+  })
+
+  it.each(HOSTILE)('glyphPulse.phase = %s renders without throwing', (phase) => {
+    expect(() =>
+      renderKey({ kind: 'control', glyph: '🔊', glyphFont: 'emoji', glyphPulse: { phase } }),
+    ).not.toThrow()
+  })
+
+  it.each(HOSTILE)('bar.value = %s renders without throwing (already clamp01-guarded)', (value) => {
+    expect(() => renderKey({ kind: 'gauge', bar: { value, color: theme.green } })).not.toThrow()
+    expect(() => renderStrip({ lines: ['a'], bar: { value, color: theme.green } })).not.toThrow()
+  })
+
+  it.each(HOSTILE)('imageCrop with %s in every field renders without throwing', async (n) => {
+    const img = await solidImage(10, 20, 30)
+    expect(() =>
+      renderKey({ kind: 'image', image: img, imageCrop: { sx: n, sy: n, sw: n, sh: n } }),
+    ).not.toThrow()
+  })
+
+  it.each(HOSTILE)('spark.values containing %s renders without throwing', (v) => {
+    expect(() =>
+      renderKey({ kind: 'gauge', spark: { values: [1, v, 5, v, 9], color: theme.green } }),
+    ).not.toThrow()
+  })
+
+  it('a spark with 200,000 points renders without throwing (the Math.min/max spread limit)', () => {
+    const values = Array.from({ length: 200_000 }, (_, i) => i % 100)
+    expect(() => renderKey({ kind: 'gauge', spark: { values, color: theme.green } })).not.toThrow()
+  })
+
+  it('one key with every hostile numeric field set at once still renders a full buffer', () => {
+    // `idle.variant` is `'rain'` here, deliberately, not `'grid'`: this test
+    // runs IN-PROCESS (lesson from developing C1's fix — see the describe
+    // block above), and `grid` combined with a non-finite `nowMs` is the one
+    // combination that must only ever be exercised through the isolated
+    // child-process probe, because it stays reachable to the fatal `ctx.arc`
+    // panic if `sanitizeKeySpec` ever regresses. `rain` never calls `arc`, so
+    // it safely covers every OTHER hostile field at once without that risk.
+    const buf = renderKey({
+      kind: 'control',
+      lines: ['A', 'B'],
+      lineSizes: [NaN, [Infinity, -Infinity]],
+      lineY: [NaN, Infinity],
+      bar: { value: NaN, color: theme.green },
+      glyph: '🔊',
+      glyphFont: 'emoji',
+      glyphPulse: { phase: Infinity },
+      spark: { values: [1, NaN, Infinity, -Infinity, 9], color: theme.green },
+      idle: { variant: 'rain', nowMs: NaN, col: Infinity as never, row: -Infinity as never },
+    } as unknown as KeySpec)
+    expect(buf.length).toBe(KEY_SIZE * KEY_SIZE * 4)
   })
 })
 
@@ -1647,8 +1884,6 @@ async function solidImage(r: number, g: number, b: number): Promise<Image> {
   ctx.fillRect(0, 0, 96, 96)
   return loadImage(c.toBuffer('image/jpeg'))
 }
-
-const NOW = 1786549560
 
 /*
  * Task 39's four cross-page golden-hash tests lived here. They proved, AT

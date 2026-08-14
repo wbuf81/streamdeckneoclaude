@@ -194,6 +194,80 @@ function clamp01(n: number): number {
   return Math.min(1, Math.max(0, n))
 }
 
+/** Returns `n` when it is a finite number, otherwise `fallback`. `NaN` and
+ * `+/-Infinity` are both valid `number`s at the type level, so this is a
+ * runtime check, not something the type system can rule out for us. */
+function finiteOr(n: number, fallback: number): number {
+  return Number.isFinite(n) ? n : fallback
+}
+
+/**
+ * The one boundary a hostile `KeySpec` passes through before any drawing
+ * primitive sees it (C1 in `.superpowers/sdd/2026-08-12-streamdeck-neo-claude-
+ * deck-part2/e2e-render.md`). Coerces every numeric field to a finite value,
+ * so a spec built from bad upstream data — or a deliberately hostile one —
+ * degrades to a plain, safely-rendered key instead of reaching a drawing
+ * primitive with `NaN`/`Infinity`.
+ *
+ * This matters most for `idle.nowMs`: `@napi-rs/canvas`'s `ctx.arc` (the
+ * `grid` variant's sun) panics in Rust on a non-finite argument and aborts
+ * the whole process — not a catchable `throw`, so the render loop's own
+ * `try`/`catch` cannot stop it. `lineSizes` and `glyphPulse.phase` reach a
+ * font string built from their own value (`` `${size}px ...` ``), and
+ * `NaN`/`Infinity` there throws `is not valid font style`.
+ *
+ * One choke point, not a guard at each call site (lesson 21 in
+ * docs/LESSONS.md): a future numeric field is safe only if it is added here
+ * too. `bar.value` and `imageCrop` already had their own narrower `clamp01`
+ * guard before this function existed; that guard stays as a second belt —
+ * this function is the one that covers everything else, including the
+ * fields `clamp01` never touched.
+ */
+function sanitizeKeySpec(spec: KeySpec): KeySpec {
+  const out: KeySpec = { ...spec }
+
+  if (out.lineSizes) {
+    out.lineSizes = out.lineSizes.map((entry) =>
+      Array.isArray(entry) ? entry.map((n) => finiteOr(n, 11)) : finiteOr(entry, 11),
+    )
+  }
+  if (out.lineY) {
+    out.lineY = out.lineY.map((n) => finiteOr(n, 0))
+  }
+  if (out.bar) {
+    out.bar = { ...out.bar, value: finiteOr(out.bar.value, 0) }
+  }
+  if (out.glyphPulse) {
+    out.glyphPulse = { phase: finiteOr(out.glyphPulse.phase, 0) }
+  }
+  if (out.imageCrop) {
+    out.imageCrop = {
+      sx: finiteOr(out.imageCrop.sx, 0),
+      sy: finiteOr(out.imageCrop.sy, 0),
+      sw: finiteOr(out.imageCrop.sw, 0),
+      sh: finiteOr(out.imageCrop.sh, 0),
+    }
+  }
+  if (out.spark) {
+    out.spark = { ...out.spark, values: out.spark.values.map((v) => finiteOr(v, 0)) }
+  }
+  if (out.idle) {
+    out.idle = {
+      ...out.idle,
+      nowMs: finiteOr(out.idle.nowMs, 0),
+      col: finiteOr(out.idle.col, 0) === 1 ? 1 : 0,
+      row: finiteOr(out.idle.row, 0) === 1 ? 1 : 0,
+    }
+  }
+  return out
+}
+
+/** Same boundary as `sanitizeKeySpec`, for `renderStrip`'s own numeric field. */
+function sanitizeStripSpec(spec: StripSpec): StripSpec {
+  if (!spec.bar) return spec
+  return { ...spec, bar: { ...spec.bar, value: finiteOr(spec.bar.value, 0) } }
+}
+
 /**
  * Deterministic pseudo-random value in [0, 1) from an integer seed. No
  * internal state and never `Math.random()` — the same seed always returns
@@ -271,8 +345,17 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
   const sliceStart = index * width
   const sliceEnd = sliceStart + width
 
-  const min = Math.min(...values)
-  const max = Math.max(...values)
+  // A loop, not `Math.min(...values)`/`Math.max(...values)`: argument spread
+  // has an engine call-stack limit (measured: throws past ~125,000 points,
+  // I4) and `sanitizeKeySpec` already guarantees every entry here is finite,
+  // so no `NaN`-poisoning behaviour needs preserving.
+  let min = values[0]!
+  let max = values[0]!
+  for (let i = 1; i < values.length; i++) {
+    const v = values[i]!
+    if (v < min) min = v
+    if (v > max) max = v
+  }
   const range = max - min
 
   ctx.fillStyle = css(color, dim)
@@ -380,8 +463,18 @@ function drawIdleGrid(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
 
   ctx.fillStyle = css(theme.neonMagenta, dim)
   ctx.beginPath()
-  ctx.arc(cx, sunY, GRID_SUN_RADIUS, 0, Math.PI * 2)
-  ctx.fill()
+  // Belt-and-braces (see `sanitizeKeySpec`, the boundary guard that already
+  // makes `idle.nowMs` finite before this function ever runs): `ctx.arc` is
+  // the one drawing primitive in this file that does not merely misrender on
+  // a non-finite argument — `@napi-rs/canvas` panics in Rust and aborts the
+  // whole process (C1), a failure no `try`/`catch` around the render loop
+  // can see. Checked again here, at the call site, rather than trusted from
+  // upstream — this is the one place in the file where that trust must be
+  // verified, not assumed.
+  if (Number.isFinite(cx) && Number.isFinite(sunY)) {
+    ctx.arc(cx, sunY, GRID_SUN_RADIUS, 0, Math.PI * 2)
+    ctx.fill()
+  }
 
   // Slats are background-coloured, so they read as gaps regardless of `dim`
   // — the background itself is what shows through, never a separate colour
@@ -501,6 +594,30 @@ const GLITCH_TEXT_SIZE = 14
  * than as two unrelated animations. */
 const GLITCH_TEXT_BREATHE_MS = 3200
 const GLITCH_TEXT_DROPOUT_MS = 90
+/**
+ * Guaranteed minimum gap, in px, between any two quadrants' scanline phase —
+ * the I1 fix. The old scheme picked each key's phase from `pseudoRandom`
+ * alone, a weak sine-based hash whose nearby integer seeds can return nearly
+ * identical outputs by chance: keys 1 and 5 landed 0.12 px apart, and
+ * `Math.round` collapsed that gap to zero at 46 of 60 sampled clocks — the
+ * four quadrants were byte-identical most of the time, contradicting this
+ * file's own stated invariant. A quarter of the scanline spacing, spread
+ * DETERMINISTICALLY across the four `keyIndex` values (0, 1.5, 3, 4.5 px),
+ * guarantees every pair is at least this far apart before any jitter is
+ * added — no amount of hash bad luck can close that gap the way it did
+ * before, because the guarantee no longer depends on the hash at all.
+ */
+const GLITCH_QUADRANT_PHASE_SPREAD = GLITCH_SCANLINE_SPACING / 4
+/**
+ * Small per-key jitter layered on top of the guaranteed spread above, so the
+ * four quadrants still look organically offset rather than mechanically
+ * even. Bounded well under the guaranteed spread (at most a fifth of it on
+ * either side of a key's own base phase) so jitter alone can never pull two
+ * adjacent keys' phases back down into the old bug's territory — the worst
+ * case (adjacent keys, jitter pulling them toward each other) still leaves a
+ * 1.1 px gap, measured, comfortably far from the 0.12 px that caused I1.
+ */
+const GLITCH_QUADRANT_PHASE_JITTER = 0.4
 
 /**
  * Glitch scanline. Per-key variant: scanlines and the occasional slip band
@@ -511,18 +628,47 @@ const GLITCH_TEXT_DROPOUT_MS = 90
  */
 function drawIdleGlitch(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
   const keyIndex = idle.row * 2 + idle.col
-  const seed = keyIndex * 211
+  // Offset away from 0 (M7): `pseudoRandom(0)` is exactly 0, which locked key
+  // 0's slip band below to nowMs epoch boundaries instead of a phase of its
+  // own, the same weak-hash-at-small-seeds failure mode as I1. `+ 1000`
+  // keeps every key's seed, including key 0's, away from that degenerate
+  // point.
+  const seed = keyIndex * 211 + 1000
 
   // Each key's scanlines start from their own offset, so two quadrants with
   // no glitch band active at a given instant still never render identically
   // — the four keys of the block should always be tellable apart, the same
   // invariant `imageCrop` and `pulse.phase` had to protect in earlier tasks.
-  const scanPhase = pseudoRandom(seed + 500) * GLITCH_SCANLINE_SPACING
+  // See `GLITCH_QUADRANT_PHASE_SPREAD`'s comment for why this is a
+  // guaranteed-by-construction spread rather than a hash-derived one.
+  const scanPhase =
+    keyIndex * GLITCH_QUADRANT_PHASE_SPREAD +
+    (pseudoRandom(seed + 500) - 0.5) * GLITCH_QUADRANT_PHASE_JITTER
+  const rawOffset = scanPhase + (idle.nowMs / GLITCH_SCROLL_PERIOD_MS) * GLITCH_SCANLINE_SPACING
+  // Normalised into [0, GLITCH_SCANLINE_SPACING) explicitly — JS `%` keeps
+  // the sign of its left operand, so a negative `rawOffset` (reachable from
+  // a hostile negative `nowMs`, which `sanitizeKeySpec` allows through
+  // unchanged since a negative finite clock is not itself unsafe) would
+  // otherwise leave `scrollOffset` negative too.
   const scrollOffset =
-    (scanPhase + ((idle.nowMs / GLITCH_SCROLL_PERIOD_MS) * GLITCH_SCANLINE_SPACING)) % GLITCH_SCANLINE_SPACING
+    ((rawOffset % GLITCH_SCANLINE_SPACING) + GLITCH_SCANLINE_SPACING) % GLITCH_SCANLINE_SPACING
+  // I2: scanline positions used to jump in whole-pixel steps only once every
+  // ~860 ms, so three of the four quadrants held byte-identical pixels for
+  // up to 8 consecutive 100 ms ticks even though `idle.nowMs` (correctly)
+  // changed `keyHash` on every one of them — wasted key-writes for content
+  // that had not visibly changed. The top-left key (`col` 0, `row` 0)
+  // already "escapes" this: its OFFLINE text's breathing alpha changes every
+  // tick regardless. So only the OTHER three keys need the fix — a
+  // fractional, unrounded `y` lets `fillRect` anti-alias across the row
+  // boundary, so their pixels now actually change on every tick, matching
+  // what the hash already claims. Key 0 keeps the rounded, discrete-jump
+  // rendering: it does not need the fix, and giving it continuous scanline
+  // motion too would add sub-pixel noise inside the exact region the text's
+  // OWN slow-breathe animation is measured over, for no benefit.
+  const isTextKey = idle.col === 0 && idle.row === 0
   for (let y = -GLITCH_SCANLINE_SPACING; y < KEY_SIZE + GLITCH_SCANLINE_SPACING; y += GLITCH_SCANLINE_SPACING) {
-    const yy = Math.round(y + scrollOffset)
-    if (yy < 0 || yy >= KEY_SIZE) continue
+    const yy = isTextKey ? Math.round(y + scrollOffset) : y + scrollOffset
+    if (isTextKey ? yy < 0 || yy >= KEY_SIZE : yy < -1 || yy > KEY_SIZE) continue
     ctx.fillStyle = cssAlpha(theme.cyan, 0.18, dim)
     ctx.fillRect(0, yy, KEY_SIZE, 1)
   }
@@ -769,7 +915,8 @@ function toRgba(ctx: SKRSContext2D, w: number, h: number): Buffer {
 }
 
 /** Renders one 96 by 96 key. The result is a raw RGBA buffer. */
-export function renderKey(spec: KeySpec): Buffer {
+export function renderKey(rawSpec: KeySpec): Buffer {
+  const spec = sanitizeKeySpec(rawSpec)
   const canvas = createCanvas(KEY_SIZE, KEY_SIZE)
   const ctx = canvas.getContext('2d')
   const dim = spec.dim === true
@@ -909,7 +1056,8 @@ export function renderKey(spec: KeySpec): Buffer {
 }
 
 /** Renders the 248 by 58 info strip as one image. The result is a raw RGBA buffer. */
-export function renderStrip(spec: StripSpec): Buffer {
+export function renderStrip(rawSpec: StripSpec): Buffer {
+  const spec = sanitizeStripSpec(rawSpec)
   const canvas = createCanvas(STRIP_WIDTH, STRIP_HEIGHT)
   const ctx = canvas.getContext('2d')
   const dim = spec.dim === true

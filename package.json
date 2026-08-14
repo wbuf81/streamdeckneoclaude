@@ -26,6 +26,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/omggif": "^1.0.5",
+    "esbuild": "^0.21.5",
     "omggif": "^1.0.10",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
