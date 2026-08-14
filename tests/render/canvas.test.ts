@@ -107,6 +107,27 @@ describe('renderKey', () => {
     near(probe(buf, 48, 48), [255, 0, 0], 20)
   })
 
+  it('dims an image key, so album art darkens with the text beside it', async () => {
+    // The image path was the ONE drawing path that ignored `dim`: a decoded
+    // bitmap ignores `fillStyle` exactly like a colour emoji does (lesson
+    // 15), so it needs `globalAlpha`. Spotify's album art therefore stayed
+    // at full brightness while its own key's text and border dimmed, for as
+    // long as that page has shipped. Found by a reviewer working on an
+    // unrelated page. Break the fix (drop the `globalAlpha` lines) and the
+    // two probes below come back equal.
+    const solid = await solidImage(200, 200, 200)
+    const bright = renderKey({ kind: 'image', image: solid, imageKey: 'x' })
+    const dimmed = renderKey({ kind: 'image', image: solid, imageKey: 'x', dim: true })
+
+    const [br, bg, bb] = probe(bright, 48, 48)
+    const [dr, dg, db] = probe(dimmed, 48, 48)
+    expect(br + bg + bb).toBeGreaterThan(dr + dg + db)
+    // And it must dim by the same fraction the text does, not some other
+    // amount — a mismatch would read as two unrelated brightnesses on one key.
+    expect(dr).toBeLessThan(br)
+    expect(dr).toBeGreaterThan(0)
+  })
+
   it('draws the glyph in its default colour when no glyphColor is set', () => {
     const buf = renderKey({ kind: 'control', glyph: '♡' })
     // Just proving it renders without throwing and paints something.

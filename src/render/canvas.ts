@@ -958,7 +958,19 @@ export function renderKey(rawSpec: KeySpec): Buffer {
   if (spec.image) {
     // The producer already decoded this. With no crop, it scales to the key,
     // edge to edge, exactly as before `imageCrop` existed.
+    //
+    // A decoded bitmap ignores `fillStyle`, exactly like a colour emoji does
+    // (lesson 15), so `dim` has to act through `globalAlpha` here. Without
+    // this the image path was the ONE drawing path that silently ignored
+    // `dim`: Spotify's album art stayed at full brightness while the same
+    // key's text and border dimmed, for as long as that page has shipped.
+    // Found by the football page's reviewer, in code it did not own.
+    // `DIM_FACTOR` is the same fraction `css` applies to a colour, so a
+    // dimmed image and the dimmed text beside it darken by equal amounts.
+    const prevAlpha = ctx.globalAlpha
+    if (dim) ctx.globalAlpha = prevAlpha * DIM_FACTOR
     drawCroppedImage(ctx, spec.image, spec.imageCrop)
+    ctx.globalAlpha = prevAlpha
   }
 
   if (spec.border) {

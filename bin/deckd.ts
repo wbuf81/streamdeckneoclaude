@@ -8,12 +8,16 @@ import { CodexPage } from '../src/pages/codex-page.js'
 import { SpotifyPage } from '../src/pages/spotify-page.js'
 import { StocksPage } from '../src/pages/stocks-page.js'
 import { WeatherPage } from '../src/pages/weather-page.js'
+import { FootballPage } from '../src/pages/football-page.js'
+import { SystemPage } from '../src/pages/system-page.js'
 import { ClaudeSource } from '../src/sources/claude.js'
 import { CodexSource } from '../src/sources/codex.js'
 import { UsageSource } from '../src/sources/usage.js'
 import { SpotifySource } from '../src/sources/spotify.js'
 import { StockSource } from '../src/sources/stocks.js'
 import { WeatherSource } from '../src/sources/weather.js'
+import { FootballSource } from '../src/sources/football.js'
+import { SystemSource } from '../src/sources/system.js'
 import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
@@ -64,12 +68,16 @@ async function start(): Promise<void> {
   const spotify = new SpotifySource(clientId)
   const stocks = new StockSource()
   const weather = new WeatherSource()
+  const football = new FootballSource()
+  const system = new SystemSource()
   await claude.start()
   await usage.start()
   await codex.start()
   await spotify.start()
   await stocks.start()
   await weather.start()
+  await football.start()
+  await system.start()
 
   const device = new Device()
   const pages = new PageManager()
@@ -78,8 +86,10 @@ async function start(): Promise<void> {
   pages.add(new SpotifyPage(spotify))
   pages.add(new StocksPage(stocks))
   pages.add(new WeatherPage(weather))
+  pages.add(new FootballPage(football))
+  pages.add(new SystemPage(system))
 
-  // Only now, with all five pages present, may a saved page be restored.
+  // Only now, with all seven pages present, may a saved page be restored.
   // `PageManager.setIndex` silently ignores an index outside the current
   // page count, so restoring before every page exists would strand the deck
   // on an earlier page with no error and no log line.
@@ -105,6 +115,8 @@ async function start(): Promise<void> {
   spotify.on('change', onChange)
   stocks.on('change', onChange)
   weather.on('change', onChange)
+  football.on('change', onChange)
+  system.on('change', onChange)
 
   const shutdown = async () => {
     log.info('deckd stopping')
@@ -124,6 +136,8 @@ async function start(): Promise<void> {
     await spotify.stop()
     await stocks.stop()
     await weather.stop()
+    await football.stop()
+    await system.stop()
     await device.disconnect()
     process.exit(0)
   }
