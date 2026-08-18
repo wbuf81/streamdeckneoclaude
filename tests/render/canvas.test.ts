@@ -17,6 +17,7 @@ import {
   FX_STORM_STRIKE_DURATION_MS,
   fxWindStreakSpan,
   tapeLoopWidthPx,
+  fxDriftParticleSpan,
   FX_MAX_ALPHA,
   FX_INTENSITY_MIN,
   FX_SNOW_R,
@@ -2065,7 +2066,7 @@ async function solidImage(r: number, g: number, b: number): Promise<Image> {
 describe('fx layer', () => {
   const BG: Rgb = [18, 28, 44]
   const ALL_VARIANTS: readonly FxVariant[] = [
-    'rain', 'snow', 'storm', 'fog', 'wind', 'sun', 'cloud',
+    'rain', 'snow', 'storm', 'fog', 'wind', 'sun', 'cloud', 'drift',
   ]
 
   /**
@@ -2186,7 +2187,7 @@ describe('fx layer', () => {
   // rather than failing one test — the same split `C1/I4` already uses for the
   // `grid` idle variant.
   const IN_PROCESS_SAFE_VARIANTS: readonly FxVariant[] = [
-    'rain', 'storm', 'fog', 'wind', 'sun',
+    'rain', 'storm', 'fog', 'wind', 'sun', 'drift',
   ]
 
   it.each(IN_PROCESS_SAFE_VARIANTS)('survives a non-finite fx without throwing, for %s', (variant) => {
@@ -2677,6 +2678,162 @@ describe('strip ticker tape', () => {
         }
       }
     }
+  })
+})
+
+describe('fx drift variant (task 43)', () => {
+  const BG: Rgb = [14, 22, 18]
+
+  function driftKey(direction: 'up' | 'down', nowMs = 900, intensity = 1, seed = 2): KeySpec {
+    return { kind: 'gauge', bg: BG, fx: { variant: 'drift', nowMs, intensity, seed, direction } }
+  }
+
+  function inkCount(buf: Buffer): number {
+    let n = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(buf, x, y), BG, 1)) n++
+      }
+    }
+    return n
+  }
+
+  it('renders up and down differently', () => {
+    expect(renderKey(driftKey('up')).equals(renderKey(driftKey('down')))).toBe(false)
+  })
+
+  it('leads green rising and red sinking', () => {
+    // Measures the INK's contribution, not raw channel totals. The first version
+    // summed whole-key channels against a green-tinted background, so the
+    // background's own g > r decided the result for BOTH directions and the test
+    // could not fail. Subtracting the background is what makes this about the
+    // particles.
+    const inkChannels = (direction: 'up' | 'down') => {
+      const buf = renderKey(driftKey(direction))
+      let r = 0
+      let g = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          const p = probe(buf, x, y)
+          r += p[0]! - BG[0]
+          g += p[1]! - BG[1]
+        }
+      }
+      return { r, g }
+    }
+    const up = inkChannels('up')
+    const down = inkChannels('down')
+    expect(up.g).toBeGreaterThan(up.r)
+    expect(down.r).toBeGreaterThan(down.g)
+  })
+
+  it('defaults a missing or bogus direction to rising, rather than falling through', () => {
+    const noDirection = renderKey({ kind: 'gauge', bg: BG, fx: { variant: 'drift', nowMs: 900, intensity: 1, seed: 2 } })
+    const rising = renderKey(driftKey('up'))
+    expect(noDirection.equals(rising)).toBe(true)
+    const bogus = renderKey({
+      kind: 'gauge', bg: BG,
+      fx: { variant: 'drift', nowMs: 900, intensity: 1, seed: 2, direction: 'sideways' as never },
+    })
+    expect(bogus.equals(rising)).toBe(true)
+  })
+
+  /**
+   * Sampled every MILLISECOND, not every 15.
+   *
+   * The loop's phase is `(nowMs + offset) % period / period`, so it lies in
+   * [0, 1) and never reaches 1 exactly — the trailing tip therefore approaches
+   * the far edge without passing it. A 15 ms grid over a ~1470 ms period never
+   * landed close enough to the wrap and reported broken geometry that was
+   * actually correct. At 1 ms the extremes are reached to two decimal places:
+   * measured on 2026-08-18, a rising trail spans 0.00 to 113.99 and a sinking
+   * trail spans -17.99 to 96.00, against a 96 px key.
+   *
+   * `EDGE_TOLERANCE` is the same kind of 1 px allowance the rain proof uses, and
+   * for the same reason.
+   */
+  const EDGE_TOLERANCE = 0.5
+  const FINE_SAMPLES = 6000
+
+  it('slides a rising particle fully in from below and out past the top', () => {
+    const spans = Array.from({ length: FINE_SAMPLES }, (_, ms) => fxDriftParticleSpan(2, 0, ms, 1, 'up'))
+    // Rising: the lead is the SMALLER y, and the trail sits below it.
+    for (const sp of spans) expect(sp.trail).toBeGreaterThan(sp.lead)
+    // Enters fully from below the key, and leaves fully above it.
+    expect(spans.some((sp) => sp.lead >= KEY_SIZE)).toBe(true)
+    expect(spans.some((sp) => sp.trail <= EDGE_TOLERANCE)).toBe(true)
+  })
+
+  it('slides a sinking particle fully in from above and out past the bottom', () => {
+    const spans = Array.from({ length: FINE_SAMPLES }, (_, ms) => fxDriftParticleSpan(2, 0, ms, 1, 'down'))
+    for (const sp of spans) expect(sp.lead).toBeGreaterThan(sp.trail)
+    expect(spans.some((sp) => sp.trail >= KEY_SIZE - EDGE_TOLERANCE)).toBe(true)
+    expect(spans.some((sp) => sp.lead <= EDGE_TOLERANCE)).toBe(true)
+  })
+
+  it('tapers each particle, so a STILL frame shows which way it travels', () => {
+    // The whole point of the variant: a symmetrical mark would animate correctly
+    // and still say nothing in one frame, and one frame is what a glance is.
+    //
+    // Probes an INDIVIDUAL particle's own column, using the x the span function
+    // returns, and compares its leading end against its trailing end. An earlier
+    // version compared the key's top half against its bottom half — but the up
+    // and down geometry alone produces that asymmetry, so it passed with the
+    // taper removed entirely. Found by breaking the fix.
+    /** Matches `FX_DRIFT_MAX_PARTICLES` in the renderer; only used to bound the
+     * scan, so a mismatch costs nothing but a shorter sweep. */
+    const FX_DRIFT_TEST_PARTICLES = 20
+    const ink = (buf: Buffer, x: number, y: number): number => {
+      if (x < 0 || x >= KEY_SIZE || y < 0 || y >= KEY_SIZE) return 0
+      const p = probe(buf, x, y)
+      return Math.abs(p[0]! - BG[0]) + Math.abs(p[1]! - BG[1]) + Math.abs(p[2]! - BG[2])
+    }
+
+    for (const direction of ['up', 'down'] as const) {
+      const nowMs = 900
+      const seed = 7
+      const buf = renderKey(driftKey(direction, nowMs, 1, seed))
+      // Find a particle sitting well inside the key, so both of its ends are
+      // actually on screen and measurable.
+      // AGGREGATED across every measurable particle, not asserted per particle.
+      // At 22 px long with twenty of them on a 96 px key, particles overlap, so a
+      // single particle's trailing probe can pick up a neighbour's bright lead —
+      // measured, one such collision made a correct taper look reversed. Summing
+      // averages the overlaps out while still failing decisively if the taper is
+      // removed or reversed.
+      let measured = 0
+      let leadTotal = 0
+      let trailTotal = 0
+      for (let i = 0; i < FX_DRIFT_TEST_PARTICLES; i++) {
+        const sp = fxDriftParticleSpan(seed, i, nowMs, 1, direction)
+        const lo = Math.min(sp.lead, sp.trail)
+        const hi = Math.max(sp.lead, sp.trail)
+        if (lo < 6 || hi > KEY_SIZE - 6) continue
+        const col = Math.round(sp.x)
+        // Three pixels inside each end, summed across the stroke's width.
+        const at = (y: number) => ink(buf, col - 1, y) + ink(buf, col, y) + ink(buf, col + 1, y)
+        leadTotal += at(Math.round(sp.lead + (direction === 'up' ? 3 : -3)))
+        trailTotal += at(Math.round(sp.trail + (direction === 'up' ? -3 : 3)))
+        measured++
+      }
+      // Guards against a vacuous pass: some particle must have been measurable.
+      expect(measured, `${direction} had no fully on-screen particle`).toBeGreaterThan(0)
+      expect(leadTotal, `${direction} leading ends`).toBeGreaterThan(trailTotal * 1.3)
+    }
+  })
+
+  it('drifts faster and denser at a higher intensity', () => {
+    // Density: more particles means more ink.
+    expect(inkCount(renderKey(driftKey('up', 900, 1)))).toBeGreaterThan(
+      inkCount(renderKey(driftKey('up', 900, 0.3))),
+    )
+    // Speed: one particle covers more ground per unit time.
+    const travelled = (intensity: number) => {
+      const a = fxDriftParticleSpan(2, 0, 0, intensity, 'up').lead
+      const b = fxDriftParticleSpan(2, 0, 200, intensity, 'up').lead
+      return Math.abs(a - b)
+    }
+    expect(travelled(1)).toBeGreaterThan(travelled(0.3))
   })
 })
 

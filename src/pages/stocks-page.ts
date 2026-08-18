@@ -1,4 +1,4 @@
-import type { DeckFrame, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
+import type { DeckFrame, FxSpec, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
@@ -199,14 +199,78 @@ export function blendToward(target: Rgb, fraction: number): Rgb {
  * "it did not move" — but neither is a direction, and inventing a colour for
  * either would be a fabricated reading.
  */
+/**
+ * How big a move is, on a 0-to-1 absolute scale saturating at
+ * `HEAT_SATURATION_PCT`.
+ *
+ * ONE function, read by both the heat wash and the directional drift. Two
+ * functions grading the same number would eventually disagree, and then a tile's
+ * colour and its motion would tell different stories about the same stock
+ * (lesson 21: one decision, one function).
+ */
+export function moveMagnitude(changePercent: number | null): number {
+  if (typeof changePercent !== 'number' || !Number.isFinite(changePercent)) return 0
+  return Math.min(1, Math.abs(changePercent) / HEAT_SATURATION_PCT)
+}
+
 export function heatWash(
   changePercent: number | null, marketState: MarketState,
 ): Rgb | undefined {
   const trend = trendOf(changePercent)
   if (trend === 'unknown' || trend === 'flat') return undefined
-  const magnitude = Math.min(1, Math.abs(changePercent as number) / HEAT_SATURATION_PCT)
-  const scaled = HEAT_FLOOR + (1 - HEAT_FLOOR) * magnitude
+  const scaled = HEAT_FLOOR + (1 - HEAT_FLOOR) * moveMagnitude(changePercent)
   return blendToward(trendColor(trend), scaled * HEAT_MAX_BLEND * MOOD_BY_STATE[marketState])
+}
+
+/**
+ * How lively the drift is by market state. Distinct from `MOOD_BY_STATE`, which
+ * scales a COLOUR: a closed market gets no drift at all rather than faint drift,
+ * because showing flow when nothing is trading would be a claim the data does
+ * not support. `unknown` shares that, while the strip keeps saying MARKET
+ * UNKNOWN.
+ */
+const DRIFT_BY_STATE: Record<MarketState, number> = {
+  open: 1,
+  pre: 0.6,
+  post: 0.6,
+  closed: 0,
+  unknown: 0,
+}
+
+/** The floor for a drift that runs at all, so a small real move still shows a
+ * trickle rather than a single lonely particle. */
+const DRIFT_INTENSITY_MIN = 0.3
+
+/**
+ * The drifting-particle effect for one ticker tile, or undefined when the tile
+ * must stay still.
+ *
+ * Drift is DECORATION: it carries nothing the still tile does not already say,
+ * so unlike the ticker tape it stops whenever the data is not live. That split
+ * is deliberate — see the two design notes in docs/superpowers/specs/.
+ */
+export function driftFx(
+  changePercent: number | null,
+  marketState: MarketState,
+  stale: boolean,
+  nowMs: number,
+  seed: number,
+): FxSpec | undefined {
+  if (stale) return undefined
+  const liveliness = DRIFT_BY_STATE[marketState]
+  if (liveliness === 0) return undefined
+  const trend = trendOf(changePercent)
+  if (trend === 'unknown' || trend === 'flat') return undefined
+  const magnitude = moveMagnitude(changePercent)
+  const intensity =
+    (DRIFT_INTENSITY_MIN + (1 - DRIFT_INTENSITY_MIN) * magnitude) * liveliness
+  return {
+    variant: 'drift',
+    nowMs,
+    intensity,
+    seed,
+    direction: trend === 'up' ? 'up' : 'down',
+  }
 }
 
 /**
@@ -397,7 +461,11 @@ export class StocksPage implements Page {
     if (quote) return this.detailFrame(this.selected!, quote, now)
 
     const marketState = this.source.getMarketState()
-    const keys = SYMBOLS.map((symbol) => this.tickerKey(quotes.get(symbol), symbol, marketState))
+    const keys = SYMBOLS.map((symbol, i) =>
+      // `i` is the seed: each tile drifts on its own phase, so eight tiles moving
+      // the same way still read as eight tiles rather than one sheet.
+      this.tickerKey(quotes.get(symbol), symbol, marketState, ms, i),
+    )
     // Both buttons take ONE colour. They are page navigation, so two different
     // colours would read as two different controls; one board-level signal is
     // what this surface can honestly carry.
@@ -411,6 +479,7 @@ export class StocksPage implements Page {
 
   private tickerKey(
     quote: Quote | undefined, symbol: string, marketState: MarketState,
+    nowMs: number, seed: number,
   ): KeySpec {
     const trend = trendOf(quote?.changePercent ?? null)
     const unknown = !quote || quote.price === null
@@ -429,6 +498,11 @@ export class StocksPage implements Page {
     // line use, so the three cannot disagree about direction.
     const wash = heatWash(quote?.changePercent ?? null, marketState)
     if (wash) key.bg = wash
+
+    // And the drift reads the same direction and the same magnitude function, so
+    // the tile's colour and its motion always tell one story.
+    const drift = driftFx(quote?.changePercent ?? null, marketState, stale || unknown, nowMs, seed)
+    if (drift) key.fx = drift
 
     const spark = downsample(quote?.spark ?? [], SPARK_BUCKETS)
     if (spark.length >= 2) {

@@ -56,7 +56,7 @@ export interface IdleSpec {
  * so the forecast reads across the room before the digits do. A later
  * standalone animation page reuses the same layer.
  */
-export type FxVariant = 'rain' | 'snow' | 'storm' | 'fog' | 'wind' | 'sun' | 'cloud'
+export type FxVariant = 'rain' | 'snow' | 'storm' | 'fog' | 'wind' | 'sun' | 'cloud' | 'drift'
 
 export interface FxSpec {
   variant: FxVariant
@@ -74,6 +74,18 @@ export interface FxSpec {
    * seven separate tiles; the key index is enough to break it.
    */
   seed: number
+  /**
+   * Which way the `drift` variant travels. Ignored by every other variant.
+   *
+   * The renderer picks the colour from this — green rising, red sinking —
+   * exactly as every other variant hardcodes its own palette (rain is blue,
+   * snow is white, sun is amber). There is deliberately no `color` field:
+   * nothing needs one yet.
+   *
+   * Absent defaults to `'up'`, and `sanitizeKeySpec` coerces any other value to
+   * one of the two, the same way it already coerces `IdleSpec.col` and `row`.
+   */
+  direction?: 'up' | 'down'
 }
 
 export interface SparkSpec {

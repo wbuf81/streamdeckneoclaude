@@ -428,6 +428,19 @@ one of everything.**
 
 ### New invariants added by task 43 (stocks board and ticker tape)
 
+- Drift particles must stay LARGE enough to register on a tile that already
+  carries a wash, a sparkline and three text lines. Measured: 9 px streaks touch
+  2.7 percent of the key and are invisible; 22 px streaks touch 8.8 percent and
+  read. Do not shrink them back for tidiness.
+- **Drift stops for a closed or unknown market, and for a stale symbol.** It is
+  decoration — it says nothing the still tile does not — so it follows the
+  weather rule, NOT the ticker tape's exception. A closed market has no flow.
+- The heat wash and the drift read ONE `moveMagnitude`. Two graders would
+  eventually disagree, and then a tile's colour and its motion would describe
+  different stocks.
+- The ticker tile's five trend-coloured layers have an asserted brightness
+  ladder: wash < drift particles < sparkline and text. If it ever cannot be met,
+  change the drift colour, never `FX_MAX_ALPHA`.
 - The heat scale is **absolute**, saturating at 3 percent. Do not make it
   relative to the board's biggest mover: that always looks contrasty but paints
   a 0.3 percent nudge as brightly as a 5 percent crash.

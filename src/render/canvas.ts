@@ -271,6 +271,9 @@ function sanitizeKeySpec(spec: KeySpec): KeySpec {
       nowMs: finiteOr(out.fx.nowMs, 0),
       intensity: clamp01(finiteOr(out.fx.intensity, 0)),
       seed: finiteOr(out.fx.seed, 0),
+      // Coerced to one of the two values, so a bogus string cannot reach the
+      // drawing code and silently pick a direction by falling through.
+      direction: out.fx.direction === 'down' ? 'down' : 'up',
     }
   }
   return out
@@ -869,6 +872,9 @@ function drawFx(ctx: SKRSContext2D, fx: FxSpec, dim: boolean): void {
     case 'cloud':
       drawFxCloud(layer, fx, intensity)
       break
+    case 'drift':
+      drawFxDrift(layer, fx, intensity)
+      break
   }
 
   const prev = ctx.globalAlpha
@@ -1326,6 +1332,105 @@ function drawFxCloud(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
       ctx.arc(ox, y, r, 0, Math.PI * 2)
       ctx.fill()
     }
+  }
+}
+
+/**
+ * Particle geometry, sized from a measurement rather than a guess.
+ *
+ * The first attempt used 18 particles, 9 px long and 1.6 px wide, with the taper
+ * fading across the WHOLE length. Rendered against a real tile that touched only
+ * **2.7 percent** of the key at a peak luminance delta of 67 out of 765 — which
+ * is to say invisible, especially with the sparkline and three text lines already
+ * occupying the tile. Nothing about it was wrong; it was simply too small to see.
+ *
+ * These are longer, wider, and hold full brightness over the leading half rather
+ * than fading the whole way, which raises the average alpha as well as the area.
+ */
+const FX_DRIFT_MAX_PARTICLES = 20
+const FX_DRIFT_LEN = 22
+const FX_DRIFT_WIDTH = 2.4
+/** Where the taper starts, as a fraction from the trailing end. Everything from
+ * here to the lead is at full brightness, so the streak reads as a solid spark
+ * with a fading tail rather than as a uniform smear. */
+const FX_DRIFT_TAPER_START = 0.45
+const FX_DRIFT_SWAY_PX = 4
+const FX_DRIFT_SWAY_PERIOD_MS = 2600
+/** Slowest and fastest a particle travels one full loop, in milliseconds. A
+ * bigger move drifts faster, so magnitude reads as urgency. */
+const FX_DRIFT_PERIOD_SLOW_MS = 4200
+const FX_DRIFT_PERIOD_FAST_MS = 1500
+
+/**
+ * One drift particle's vertical extent at one instant. `lead` is the end the
+ * particle is travelling toward, `trail` the end behind it — so for `'up'` the
+ * lead is the SMALLER y, and for `'down'` the larger.
+ *
+ * Exported so a test proves the loop geometry rather than trusting this comment,
+ * the same way `fxRainDropSpan` and `fxWindStreakSpan` are. The particle enters
+ * one full length beyond one edge and leaves one full length beyond the other,
+ * so nothing is ever visible at the wrap instant.
+ */
+export function fxDriftParticleSpan(
+  seed: number, index: number, nowMs: number, intensity: number, direction: 'up' | 'down',
+): { lead: number; trail: number; x: number } {
+  const s = seed * 811 + index * 43
+  const span = FX_DRIFT_PERIOD_SLOW_MS - FX_DRIFT_PERIOD_FAST_MS
+  const period =
+    FX_DRIFT_PERIOD_SLOW_MS - span * clamp01(intensity) + pseudoRandom(s) * 900
+  const phase = pseudoRandom(s + 1) * period
+  const t = ((nowMs + phase) % period) / period
+  const travel = KEY_SIZE + 2 * FX_DRIFT_LEN
+  // `x` is returned as well as the vertical span, so a test can probe the exact
+  // column a particle occupies and compare its leading end against its trailing
+  // one. Without it, a taper test can only measure whole-key asymmetry — which
+  // the up and down GEOMETRY produces on its own, so such a test passes even
+  // with the taper removed entirely. Found by breaking the fix.
+  const sway =
+    FX_DRIFT_SWAY_PX *
+    Math.sin((nowMs / FX_DRIFT_SWAY_PERIOD_MS) * 2 * Math.PI + pseudoRandom(s + 3) * 2 * Math.PI)
+  const x = pseudoRandom(s + 2) * KEY_SIZE + sway
+  if (direction === 'up') {
+    // Rising: the lead end starts one length BELOW the key and climbs past the
+    // top.
+    const lead = KEY_SIZE + FX_DRIFT_LEN - t * travel
+    return { lead, trail: lead + FX_DRIFT_LEN, x }
+  }
+  const lead = -FX_DRIFT_LEN + t * travel
+  return { lead, trail: lead - FX_DRIFT_LEN, x }
+}
+
+/**
+ * Sparks drifting in the direction a stock moved: rising green on a gainer,
+ * sinking red on a loser (task 43).
+ *
+ * Each particle is a TAPERED streak, bright at the leading end and fading
+ * behind. A symmetrical dot cannot say which way it is going, so a still frame
+ * would lose the one thing this variant exists to show.
+ */
+function drawFxDrift(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  const direction = fx.direction === 'down' ? 'down' : 'up'
+  const color = direction === 'up' ? theme.green : theme.red
+  const count = Math.max(3, Math.round(intensity * FX_DRIFT_MAX_PARTICLES))
+  ctx.lineWidth = FX_DRIFT_WIDTH
+  ctx.lineCap = 'round'
+
+  for (let i = 0; i < count; i++) {
+    const s = fx.seed * 811 + i * 43
+    // Position AND span from one function, so what a test probes is exactly what
+    // this loop draws.
+    const { lead, trail, x } = fxDriftParticleSpan(fx.seed, i, fx.nowMs, intensity, direction)
+    // Bright at the lead, transparent at the trail: the taper IS the direction.
+    const peak = 0.8 + 0.2 * pseudoRandom(s + 4)
+    const grad = ctx.createLinearGradient(x, trail, x, lead)
+    grad.addColorStop(0, fxCss(color, 0))
+    grad.addColorStop(FX_DRIFT_TAPER_START, fxCss(color, peak))
+    grad.addColorStop(1, fxCss(color, peak))
+    ctx.strokeStyle = grad
+    ctx.beginPath()
+    ctx.moveTo(x, trail)
+    ctx.lineTo(x, lead)
+    ctx.stroke()
   }
 }
 

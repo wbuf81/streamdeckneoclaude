@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { StocksPage, heatWash, breadthColor, breadth, tapeOffsetPx, tapeSegments } from '../../src/pages/stocks-page.js'
+import { StocksPage, heatWash, breadthColor, breadth, tapeOffsetPx, tapeSegments, driftFx, moveMagnitude } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { SYMBOLS, YEARLY_REFRESH_SECONDS } from '../../src/sources/stocks.js'
@@ -7,6 +7,15 @@ import type { Quote, MarketState, StockStatus, YearlyState } from '../../src/sou
 import type { Page } from '../../src/pages/types.js'
 
 const NOW = 1786549560
+
+/** Allows a small difference, because canvas anti-aliases edges. Matches the
+ * helper the weather and canvas suites use. */
+function near3(actual: readonly number[], expected: readonly number[], tol = 12): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(actual[i]! - expected[i]!) > tol) return false
+  }
+  return true
+}
 
 function quote(symbol: string, over: Partial<Quote> = {}): Quote {
   return {
@@ -1408,5 +1417,181 @@ describe('StocksPage tickMs: fast only while the tape scrolls (task 43)', () => 
     expect((page as Page).tickMs).toBeUndefined()
     page.onKeyPress(7) // BACK
     expect((page as Page).tickMs).toBeDefined()
+  })
+})
+
+describe('StocksPage directional drift (task 43)', () => {
+  const MS = NOW * 1000
+
+  function tileFor(changePercent: number | null, over: Parameters<typeof build>[0] = {}) {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, {
+      changePercent,
+      spark: Array.from({ length: 24 }, (_, i) => 100 + (changePercent ?? 0) * (i / 23)),
+    }))
+    const { page } = build({ quotes, marketState: 'open', ...over })
+    return page.render(NOW, MS).keys[0]!
+  }
+
+  it('drifts up on a gainer and down on a loser', () => {
+    expect(tileFor(2).fx!.direction).toBe('up')
+    expect(tileFor(-2).fx!.direction).toBe('down')
+    expect(tileFor(2).fx!.variant).toBe('drift')
+  })
+
+  it('reads the SAME direction the wash, border and change line read', () => {
+    const key = tileFor(-2)
+    expect(key.fx!.direction).toBe('down')
+    expect(key.border).toEqual(theme.red)
+    // The wash leans red too, so colour and motion tell one story.
+    expect(key.bg![0]).toBeGreaterThan(key.bg![1])
+  })
+
+  it('grades intensity from the same magnitude function the wash uses', () => {
+    // ONE function for both. Two would eventually disagree, and then a tile's
+    // colour and its motion would describe different stocks.
+    expect(moveMagnitude(3)).toBe(1)
+    expect(moveMagnitude(1.5)).toBeCloseTo(0.5, 5)
+    expect(moveMagnitude(null)).toBe(0)
+    expect(tileFor(3).fx!.intensity).toBeGreaterThan(tileFor(0.5).fx!.intensity)
+  })
+
+  /** Every symbol MOVING, alternating direction. `allQuotes()` on its own is
+   * deliberately flat, which correctly produces no drift at all — so a drift test
+   * built on it would assert against undefined. */
+  const movingQuotes = () => allQuotes((_s, i) => ({ changePercent: i % 2 === 0 ? 1.5 : -1.5 }))
+
+  it('gives each tile its own seed, so eight tiles are not one sheet', () => {
+    const { page } = build({ quotes: movingQuotes(), marketState: 'open' })
+    const keys = page.render(NOW, MS).keys.slice(0, 8)
+    for (const key of keys) expect(key.fx).toBeDefined()
+    expect(new Set(keys.map((k) => k.fx!.seed)).size).toBe(8)
+  })
+
+  it('advances with the injected clock', () => {
+    const { page } = build({ quotes: movingQuotes(), marketState: 'open' })
+    const a = page.render(NOW, 1000).keys[0]!.fx!.nowMs
+    const b = page.render(NOW, 2000).keys[0]!.fx!.nowMs
+    expect(b).toBeGreaterThan(a)
+  })
+
+  it('does not drift a flat or unknown move, since there is no direction', () => {
+    expect(tileFor(0).fx).toBeUndefined()
+    expect(tileFor(null).fx).toBeUndefined()
+  })
+
+  it('does not drift a stale tile', () => {
+    expect(tileFor(2, { staleSymbols: new Set([SYMBOLS[0]!]) }).fx).toBeUndefined()
+  })
+
+  it('stops entirely when the market is closed or unknown, unlike the ticker tape', () => {
+    // Drift is DECORATION: it says nothing the still tile does not. A closed
+    // market has no flow, so showing flow would claim something the data does not
+    // support. The tape keeps moving in the same states, because its motion
+    // carries content — that split is deliberate.
+    expect(tileFor(2, { marketState: 'closed' }).fx).toBeUndefined()
+    expect(tileFor(2, { marketState: 'unknown' }).fx).toBeUndefined()
+    expect(driftFx(2, 'closed', false, 0, 0)).toBeUndefined()
+    expect(driftFx(2, 'unknown', false, 0, 0)).toBeUndefined()
+  })
+
+  it('drifts more slowly before and after the bell than during it', () => {
+    const open = driftFx(3, 'open', false, 0, 0)!
+    const pre = driftFx(3, 'pre', false, 0, 0)!
+    const post = driftFx(3, 'post', false, 0, 0)!
+    expect(open.intensity).toBeGreaterThan(pre.intensity)
+    expect(open.intensity).toBeGreaterThan(post.intensity)
+    expect(pre.intensity).toBe(post.intensity)
+  })
+
+  it('keeps a small real move drifting, rather than showing one lonely particle', () => {
+    const tiny = driftFx(0.05, 'open', false, 0, 0)!
+    expect(tiny.intensity).toBeGreaterThan(0.2)
+  })
+
+  it('leaves the detail view still, matching where the wash lives', () => {
+    const { page } = build({ quotes: allQuotes(), marketState: 'open' })
+    page.onKeyPress(0)
+    const keys = page.render(NOW, MS).keys
+    expect(keys.every((k) => k.fx === undefined)).toBe(true)
+  })
+})
+
+describe('StocksPage tile contrast ladder (task 43)', () => {
+  const MS = NOW * 1000
+  const lum = (p: readonly number[]) => p[0]! + p[1]! + p[2]!
+
+  /**
+   * The real risk this whole block exists for: a ticker tile now carries FIVE
+   * trend-coloured elements — the heat wash, the drifting particles, the
+   * sparkline, the change text and the border. Same-hue layers turn to mush, so
+   * the ordering is asserted rather than hoped for:
+   *
+   *   heat wash  <  drift particles  <  sparkline / text
+   */
+  function layers(changePercent: number) {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, {
+      changePercent,
+      spark: Array.from({ length: 24 }, (_, i) => 100 + changePercent * (i / 23)),
+    }))
+    const { page } = build({ quotes, marketState: 'open' })
+    const key = page.render(NOW, MS).keys[0]!
+    expect(key.bg).toBeDefined()
+    expect(key.fx).toBeDefined()
+    // Wash alone: no particles, no content.
+    const washOnly = renderKey({ kind: 'gauge', bg: key.bg })
+    // Wash plus particles, no content.
+    const withDrift = renderKey({ kind: 'gauge', bg: key.bg, fx: key.fx })
+    // The real, complete tile.
+    const full = renderKey(key)
+    return { key, washOnly, withDrift, full }
+  }
+
+  it('keeps the particles brighter than the wash behind them', () => {
+    for (const pct of [3, -3, 1, -1]) {
+      const { key, withDrift } = layers(pct)
+      let brightestParticle = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          brightestParticle = Math.max(brightestParticle, lum(probe(withDrift, x, y)))
+        }
+      }
+      expect(brightestParticle, `${pct}%`).toBeGreaterThan(lum(key.bg!) * 1.4)
+    }
+  })
+
+  it('keeps the sparkline and text brighter than the particles', () => {
+    for (const pct of [3, -3]) {
+      const { withDrift, full } = layers(pct)
+      let brightestDrift = 0
+      let brightestFull = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          brightestDrift = Math.max(brightestDrift, lum(probe(withDrift, x, y)))
+          brightestFull = Math.max(brightestFull, lum(probe(full, x, y)))
+        }
+      }
+      expect(brightestFull, `${pct}%`).toBeGreaterThan(brightestDrift * 1.3)
+    }
+  })
+
+  it('keeps the tile text legible over the wash AND the drift together', () => {
+    // The same proof the weather tiles get, applied to the busiest possible
+    // stocks tile: strongest move, drift running, sparkline drawn.
+    for (const pct of [12, -12]) {
+      const { withDrift, full } = layers(pct)
+      let brightestBackground = 0
+      let brightestContent = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          const under = probe(withDrift, x, y)
+          const over = probe(full, x, y)
+          brightestBackground = Math.max(brightestBackground, lum(under))
+          if (!near3(over, under, 1)) brightestContent = Math.max(brightestContent, lum(over))
+        }
+      }
+      expect(brightestContent, `${pct}%`).toBeGreaterThan(brightestBackground * 1.5)
+    }
   })
 })

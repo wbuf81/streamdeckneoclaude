@@ -736,6 +736,39 @@ layer entirely.
 
 ---
 
+## The directional drift particles (task 43)
+
+Measured on 2026-08-18, against a real ticker tile carrying a heat wash, a
+sparkline, three text lines and a border.
+
+An effect layer has to be **big** to register on a tile that is already full.
+The first attempt used 20 particles 9 px long and 1.6 px wide, with the taper
+fading across the whole length:
+
+| Geometry | Key area touched | Peak luminance delta |
+| --- | --- | --- |
+| 9 px long, 1.6 px wide, full-length fade | **2.7%** | 67 of 765 |
+| 22 px long, 2.4 px wide, fade over the trailing 45% | **8.8%** | 73 of 765 |
+
+Nothing about the first version was wrong. It was simply too small to see, and
+only a render showed that — the tests all passed. About 8 to 9 percent coverage
+is what reads as motion behind existing content.
+
+Holding full brightness over the leading half, instead of fading the whole way,
+raises the average alpha as well as the area. That matters more than the peak,
+which barely moved.
+
+### Overlapping particles confound a per-particle probe
+
+At 22 px long with twenty of them on a 96 px key, particles overlap. A test that
+probed ONE particle's leading end against its own trailing end therefore picked
+up a neighbour's bright lead and reported a correct taper as reversed. Aggregate
+the leading and trailing ends across every measurable particle instead; the
+overlaps average out and the test still fails decisively when the taper is
+removed or reversed.
+
+---
+
 ## The strip ticker tape (task 43)
 
 Measured on 2026-08-18.

@@ -202,6 +202,55 @@ async function main(): Promise<void> {
   const tapePath = outPath.replace(/\.png$/, '-tape.png')
   await writeFile(tapePath, tapeSheet.toBuffer('image/png'))
   process.stdout.write(`wrote ${tapePath}\n`)
+
+  // A third sheet for the directional drift: the live board at several instants,
+  // so the rising and sinking motion can be judged side by side, plus the flat
+  // board and a closed market — the two cases drift is least flattering to.
+  const DRIFT_INSTANTS = [0, 250, 500, 750, 1000, 1250]
+  const rows: readonly { label: string; changes: readonly number[]; state: MarketState }[] = [
+    { label: 'LIVE open', changes: LIVE, state: 'open' },
+    { label: 'FLAT open', changes: FLAT, state: 'open' },
+    { label: 'LIVE closed', changes: LIVE, state: 'closed' },
+  ]
+  const dLabelW = 92
+  const dRowH = KEY_SIZE + 20
+  const dW = M * 2 + dLabelW + DRIFT_INSTANTS.length * (KEY_SIZE + GAP)
+  const dH = 30 + rows.length * 2 * dRowH + M
+  const dSheet = createCanvas(dW, dH)
+  const dctx = dSheet.getContext('2d')
+  dctx.fillStyle = 'rgb(24, 24, 28)'
+  dctx.fillRect(0, 0, dW, dH)
+  dctx.textBaseline = 'top'
+  dctx.fillStyle = `rgb(${theme.text.join(',')})`
+  dctx.font = '14px Menlo'
+  dctx.fillText('Directional drift — rising on gainers, sinking on losers', M, 8)
+
+  let dy = 30
+  for (const row of rows) {
+    const page = pageFor(row.changes, row.state)
+    // Two representative tiles per row: the strongest riser and the strongest
+    // faller, so the two directions sit next to each other.
+    const sorted = row.changes.map((c, i) => ({ c, i })).sort((a, b) => b.c - a.c)
+    const picks = [sorted[0]!, sorted[sorted.length - 1]!]
+    for (const pick of picks) {
+      dctx.fillStyle = `rgb(${theme.textDim.join(',')})`
+      dctx.font = '10px Menlo'
+      dctx.fillText(`${row.label}`, M, dy + 4)
+      dctx.fillText(`${pick.c > 0 ? '+' : ''}${pick.c.toFixed(2)}%`, M, dy + 18)
+      DRIFT_INSTANTS.forEach((ms, col) => {
+        const frame = page.render(Math.floor(ms / 1000), ms)
+        const key = frame.keys[pick.i]!
+        dctx.drawImage(
+          rgbaToCanvas(renderKey(key), KEY_SIZE, KEY_SIZE),
+          M + dLabelW + col * (KEY_SIZE + GAP), dy,
+        )
+      })
+      dy += dRowH
+    }
+  }
+  const driftPath = outPath.replace(/\.png$/, '-drift.png')
+  await writeFile(driftPath, dSheet.toBuffer('image/png'))
+  process.stdout.write(`wrote ${driftPath}\n`)
 }
 
 await main()
