@@ -426,6 +426,33 @@ survived a green suite and a preview the user approved, and all four were found
 by simulating the user's actual week. **Preview the real data distribution, not
 one of everything.**
 
+### New invariants added by task 43 (stocks board and ticker tape)
+
+- The heat scale is **absolute**, saturating at 3 percent. Do not make it
+  relative to the board's biggest mover: that always looks contrasty but paints
+  a 0.3 percent nudge as brightly as a 5 percent crash.
+- `HEAT_FLOOR` stays low. At 0.22 a 0.05 percent nudge drew 23 percent of the
+  full wash, and a flat day was indistinguishable from a real mixed day.
+- The breadth lights and the strip's up/down text read **one** `breadth` call.
+- `StripSpec.tape` is opt-in; absent, `renderStrip` is byte-identical.
+- The tape draws inside a **clip rectangle**. That is what makes escaping its
+  band impossible rather than merely unlikely. Do not replace it with bounds
+  arithmetic.
+- The renderer owns the tape's wrap, because it owns the font metrics. A page
+  passes an unbounded `offsetPx` and never measures anything.
+- **The tape does NOT freeze for stale data**, unlike the weather effects and the
+  heat wash. The strip shows about 30 of its ~145 characters, so stopping it
+  would make seven of the eight symbols unreachable — the motion carries the
+  content. Staleness shows in each segment's colour and in line 1's timestamp.
+  This exception is deliberate; do not "fix" it for consistency.
+- `tests/pages/tick-rate.test.ts` has now been caught twice holding an assertion
+  that stayed green after the page outgrew it, because its fake reader supplied
+  the very state that disables the animation (no days for weather, no quotes for
+  stocks). When a page there gains a conditional rate, move its case to that
+  page's own suite where the fakes carry real data.
+
+---
+
 ### New invariants added by task 42 (weather ambient effects)
 
 - `KeySpec.fx` is **opt-in per key**. Absent, the render path is byte-identical

@@ -1,5 +1,5 @@
 import { createCanvas, type Canvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
-import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, IdleSpec, FxSpec } from './specs.js'
+import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, IdleSpec, FxSpec, TapeSpec, TapeSegment } from './specs.js'
 import { theme } from './theme.js'
 
 export const KEY_SIZE = 96
@@ -276,10 +276,17 @@ function sanitizeKeySpec(spec: KeySpec): KeySpec {
   return out
 }
 
-/** Same boundary as `sanitizeKeySpec`, for `renderStrip`'s own numeric field. */
+/** Same boundary as `sanitizeKeySpec`, for `renderStrip`'s own numeric fields. */
 function sanitizeStripSpec(spec: StripSpec): StripSpec {
-  if (!spec.bar) return spec
-  return { ...spec, bar: { ...spec.bar, value: finiteOr(spec.bar.value, 0) } }
+  const out: StripSpec = { ...spec }
+  if (out.bar) out.bar = { ...out.bar, value: finiteOr(out.bar.value, 0) }
+  if (out.tape) {
+    // A non-finite offset reaches `fillText`'s x and the clip rectangle. Neither
+    // is survivable, and the render loop's own try/catch cannot help with the
+    // ones that panic in Rust.
+    out.tape = { ...out.tape, offsetPx: finiteOr(out.tape.offsetPx, 0) }
+  }
+  return out
 }
 
 /**
@@ -1679,6 +1686,100 @@ export function renderKey(rawSpec: KeySpec): Buffer {
 }
 
 /** Renders the 248 by 58 info strip as one image. The result is a raw RGBA buffer. */
+/** The separator drawn between tape segments, and the band the tape occupies. */
+const TAPE_SEPARATOR = '  ·  '
+
+/**
+ * The tape's full loop width in pixels — every segment plus its trailing
+ * separator, measured in the real font.
+ *
+ * Exported because only this file can measure it, and two callers need to:
+ *
+ * - a test, to assert the wrap at the EXACT loop boundary. `measureText`
+ *   returns fractional pixels, so no integer offset lands on the boundary and a
+ *   test scanning integers can never prove the wrap.
+ * - a page, if it ever wants to know how long its tape takes to pass.
+ *
+ * Returns 0 for a tape with nothing to draw.
+ */
+export function tapeLoopWidthPx(segments: readonly TapeSegment[]): number {
+  const runs = segments.filter((seg) => seg.text.length > 0)
+  if (runs.length === 0) return 0
+  const canvas = createCanvas(STRIP_WIDTH, STRIP_HEIGHT)
+  const ctx = canvas.getContext('2d')
+  ctx.font = `13px ${FONT}`
+  return runs.reduce((total, seg) => total + ctx.measureText(seg.text + TAPE_SEPARATOR).width, 0)
+}
+const TAPE_BAND_TOP = STRIP_LINE_2_Y - 3
+const TAPE_BAND_HEIGHT = 20
+
+/**
+ * Draws a scrolling tape across line 2's band.
+ *
+ * Everything happens inside a clip rectangle. That is what makes it impossible
+ * for the tape to reach line 1, the bar, or the strip's edges, rather than
+ * relying on the arithmetic below staying correct forever (lesson 21: prefer
+ * impossible to unreachable).
+ *
+ * The renderer owns the wrap because it owns the font metrics. It measures the
+ * real tape width, reduces `offsetPx` modulo that width, and then draws as many
+ * copies as the clip needs — so a tape NARROWER than the strip still fills it,
+ * and the seam is never visible at any offset.
+ */
+function drawTape(ctx: SKRSContext2D, tape: TapeSpec, dim: boolean, rightWidth: number): void {
+  const segments = tape.segments.filter((seg) => seg.text.length > 0)
+  if (segments.length === 0) return
+
+  ctx.font = `13px ${FONT}`
+
+  // Each segment plus the separator that follows it, so the loop is seamless.
+  const runs = segments.map((seg) => ({
+    text: seg.text + TAPE_SEPARATOR,
+    color: seg.color,
+  }))
+  const widths = runs.map((run) => ctx.measureText(run.text).width)
+  const totalWidth = widths.reduce((a, b) => a + b, 0)
+  if (totalWidth <= 0) return
+
+  // The clip: line 2's band, minus `right`'s gutter when there is one.
+  const clipWidth =
+    rightWidth > 0
+      ? Math.max(0, STRIP_WIDTH - rightWidth - STRIP_RIGHT_GAP - PAD)
+      : STRIP_WIDTH
+  if (clipWidth <= 0) return
+
+  ctx.save()
+  try {
+    ctx.beginPath()
+    ctx.rect(0, TAPE_BAND_TOP, clipWidth, TAPE_BAND_HEIGHT)
+    ctx.clip()
+
+    // A positive offset scrolls the tape leftward, so the text moves the way a
+    // real ticker does: newest content entering from the right.
+    const wrapped = ((tape.offsetPx % totalWidth) + totalWidth) % totalWidth
+    // Enough copies to cover the clip from the wrap point, plus one so the
+    // trailing copy always reaches the right edge.
+    const copies = Math.ceil(clipWidth / totalWidth) + 1
+
+    for (let copy = 0; copy < copies; copy++) {
+      let x = -wrapped + copy * totalWidth
+      for (let i = 0; i < runs.length; i++) {
+        const run = runs[i]!
+        const width = widths[i]!
+        // Skip runs entirely off the clip, so a long tape costs no more than a
+        // short one.
+        if (x + width >= 0 && x <= clipWidth) {
+          ctx.fillStyle = css(run.color ?? theme.text, dim)
+          ctx.fillText(run.text, x, STRIP_LINE_2_Y)
+        }
+        x += width
+      }
+    }
+  } finally {
+    ctx.restore()
+  }
+}
+
 export function renderStrip(rawSpec: StripSpec): Buffer {
   const spec = sanitizeStripSpec(rawSpec)
   const canvas = createCanvas(STRIP_WIDTH, STRIP_HEIGHT)
@@ -1715,7 +1816,9 @@ export function renderStrip(rawSpec: StripSpec): Buffer {
   }
 
   let y = 4
-  const lines = spec.lines.slice(0, 2)
+  // A tape OWNS line 2's band, so line 2's own text is not drawn. Line 1 still
+  // is, which is what lets a page keep a fixed title above a moving tape.
+  const lines = spec.lines.slice(0, spec.tape ? 1 : 2)
   for (let i = 0; i < lines.length; i++) {
     ctx.font = `13px ${FONT}`
     const maxWidth =
@@ -1737,6 +1840,10 @@ export function renderStrip(rawSpec: StripSpec): Buffer {
     ctx.font = `13px ${FONT}`
     ctx.fillText(right, STRIP_WIDTH - PAD, STRIP_LINE_2_Y)
     ctx.textAlign = 'left'
+  }
+
+  if (spec.tape) {
+    drawTape(ctx, spec.tape, dim, rightWidth)
   }
 
   if (spec.bar) {

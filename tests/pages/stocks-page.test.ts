@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { StocksPage, heatWash, breadthColor, breadth } from '../../src/pages/stocks-page.js'
+import { StocksPage, heatWash, breadthColor, breadth, tapeOffsetPx, tapeSegments } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { SYMBOLS, YEARLY_REFRESH_SECONDS } from '../../src/sources/stocks.js'
 import type { Quote, MarketState, StockStatus, YearlyState } from '../../src/sources/stocks.js'
+import type { Page } from '../../src/pages/types.js'
 
 const NOW = 1786549560
 
@@ -255,9 +256,18 @@ describe('StocksPage strip', () => {
     // ownership) keeps every line off the true margin regardless of what
     // this page hands it. This probes the whole margin band, not one
     // column, as the strongest proof available from this page's surface.
+    //
+    // Scoped to LINE 1's band (rows 0 to 15). Task 43's ticker tape owns line 2
+    // and runs edge to edge ON PURPOSE — reaching the margin is what a tape
+    // does — so probing the full strip height would now fail for the right
+    // reason and the wrong cause. The property this test has always protected
+    // is that line 1's market label and timestamp never overflow, and that is
+    // exactly what it still probes, across the whole margin band rather than
+    // one column.
+    const LINE_1_BAND_END_Y = 16
     const { page } = build({ quotes: allQuotes(), marketState: 'closed' })
     const buffer = renderStrip(page.render(NOW).strip)
-    for (let y = 0; y < STRIP_HEIGHT; y++) {
+    for (let y = 0; y < LINE_1_BAND_END_Y; y++) {
       for (let x = STRIP_WIDTH - 6; x < STRIP_WIDTH; x++) {
         expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
       }
@@ -1255,5 +1265,148 @@ describe('StocksPage detail view text fits the usable key width', () => {
         expect(noInkAtOrPastRightEdge(renderKey(key))).toBe(true)
       }
     }
+  })
+})
+
+describe('StocksPage ticker tape (task 43)', () => {
+  const MS = NOW * 1000
+
+  it('puts a tape on the grid strip, one segment per priced symbol', () => {
+    const { page } = build({ quotes: allQuotes() })
+    const tape = page.render(NOW, MS).strip.tape
+    expect(tape).toBeDefined()
+    expect(tape!.segments).toHaveLength(SYMBOLS.length)
+  })
+
+  it('writes each segment as symbol, price and change', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { price: 92.3, changePercent: -1.1 }))
+    const { page } = build({ quotes })
+    const first = page.render(NOW, MS).strip.tape!.segments[0]!
+    expect(first.text).toContain(SYMBOLS[0]!)
+    expect(first.text).toContain('92.30')
+    expect(first.text).toContain('1.10%')
+    expect(first.text).toContain('▼')
+  })
+
+  it('colours a segment by its own direction, matching the tile', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: 2 }))
+    quotes.set(SYMBOLS[1]!, quote(SYMBOLS[1]!, { changePercent: -2 }))
+    const { page } = build({ quotes })
+    const frame = page.render(NOW, MS)
+    const segs = frame.strip.tape!.segments
+    expect(segs[0]!.color).toEqual(theme.green)
+    expect(segs[1]!.color).toEqual(theme.red)
+    // The SAME direction the tile's border shows, so the tape and the grid
+    // cannot disagree.
+    expect(frame.keys[0]!.border).toEqual(theme.green)
+    expect(frame.keys[1]!.border).toEqual(theme.red)
+  })
+
+  it('dims only a stale symbol\'s own segment, not the whole tape', () => {
+    const { page } = build({ quotes: allQuotes(), staleSymbols: new Set([SYMBOLS[2]!]) })
+    const segs = page.render(NOW, MS).strip.tape!.segments
+    expect(segs[2]!.color).toEqual(theme.textDim)
+    expect(segs[0]!.color).not.toEqual(theme.textDim)
+  })
+
+  it('keeps scrolling for stale data, unlike the heat wash and the weather effects', () => {
+    // Deliberate exception, and the reason it is tested. The strip shows about 30
+    // of the tape's ~145 characters, so a frozen tape makes seven of the eight
+    // symbols unreachable — the motion carries the CONTENT here, not liveliness.
+    const { page } = build({
+      quotes: allQuotes(),
+      staleSymbols: new Set(SYMBOLS),
+      marketState: 'closed',
+    })
+    const a = page.render(NOW, MS).strip.tape!.offsetPx
+    const b = page.render(NOW, MS + 500).strip.tape!.offsetPx
+    expect(b).toBeGreaterThan(a)
+  })
+
+  it('advances the offset with the injected clock, never the wall clock', () => {
+    const { page } = build({ quotes: allQuotes() })
+    expect(page.render(NOW, 0).strip.tape!.offsetPx).toBe(0)
+    expect(page.render(NOW, 1000).strip.tape!.offsetPx)
+      .toBe(page.render(NOW, 0).strip.tape!.offsetPx + tapeOffsetPx(1000))
+    // Absent nowMs, the seconds clock still yields a usable millisecond value.
+    expect(page.render(NOW).strip.tape!.offsetPx).toBe(tapeOffsetPx(NOW * 1000))
+  })
+
+  it('scrolls at a steady, finite rate', () => {
+    expect(tapeOffsetPx(1000)).toBeGreaterThan(0)
+    expect(tapeOffsetPx(2000)).toBe(tapeOffsetPx(1000) * 2)
+    expect(tapeOffsetPx(Number.NaN)).toBe(0)
+    expect(tapeOffsetPx(Number.POSITIVE_INFINITY)).toBe(0)
+  })
+
+  it('shows no tape, and keeps the static line 2, when the source is offline', () => {
+    const { page } = build({ quotes: allQuotes(), status: 'offline' })
+    const strip = page.render(NOW, MS).strip
+    expect(strip.tape).toBeUndefined()
+    expect(strip.lines[1]).toBe('offline')
+  })
+
+  it('shows no tape when no quote has arrived yet', () => {
+    const { page } = build({ quotes: new Map() })
+    expect(page.render(NOW, MS).strip.tape).toBeUndefined()
+  })
+
+  it('skips a symbol with no usable price rather than writing a blank segment', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[3]!, quote(SYMBOLS[3]!, { price: null }))
+    const { page } = build({ quotes })
+    const segs = page.render(NOW, MS).strip.tape!.segments
+    expect(segs).toHaveLength(SYMBOLS.length - 1)
+    expect(segs.every((seg) => seg.text.includes(SYMBOLS[3]!))).toBe(false)
+  })
+
+  it('shows no tape in the detail view, which has its own strip', () => {
+    const { page } = build({ quotes: allQuotes() })
+    page.onKeyPress(0)
+    expect(page.render(NOW, MS).strip.tape).toBeUndefined()
+  })
+
+  it('builds segments from the real symbol order', () => {
+    const segs = tapeSegments(allQuotes(), () => false)
+    SYMBOLS.forEach((sym, i) => expect(segs[i]!.text.startsWith(sym)).toBe(true))
+  })
+})
+
+describe('StocksPage tickMs: fast only while the tape scrolls (task 43)', () => {
+  it('raises the rate while a tape is showing', () => {
+    const { page } = build({ quotes: allQuotes() })
+    expect((page as Page).tickMs).toBeDefined()
+    expect((page as Page).tickMs!).toBeLessThan(1000)
+  })
+
+  it('keeps the default rate when no quote has arrived', () => {
+    // NOTE the trap this avoids: the old tick-rate assertion for this page used a
+    // fake reader with NO quotes, which is exactly the no-tape case — so it would
+    // have stayed green against a page that always raised its rate. The weather
+    // change walked into that same trap once already.
+    const { page } = build({ quotes: new Map() })
+    expect((page as Page).tickMs).toBeUndefined()
+  })
+
+  it('keeps the default rate when offline', () => {
+    const { page } = build({ quotes: allQuotes(), status: 'offline' })
+    expect((page as Page).tickMs).toBeUndefined()
+  })
+
+  it('keeps the default rate in the detail view', () => {
+    const { page } = build({ quotes: allQuotes() })
+    page.onKeyPress(0)
+    expect((page as Page).tickMs).toBeUndefined()
+  })
+
+  it('re-reads the source every time rather than fixing the rate at construction', () => {
+    const { page } = build({ quotes: allQuotes() })
+    expect((page as Page).tickMs).toBeDefined()
+    page.onKeyPress(0)
+    expect((page as Page).tickMs).toBeUndefined()
+    page.onKeyPress(7) // BACK
+    expect((page as Page).tickMs).toBeDefined()
   })
 })

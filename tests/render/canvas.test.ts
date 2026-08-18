@@ -16,6 +16,7 @@ import {
   fxStormStrikePeriodMs,
   FX_STORM_STRIKE_DURATION_MS,
   fxWindStreakSpan,
+  tapeLoopWidthPx,
   FX_MAX_ALPHA,
   FX_INTENSITY_MIN,
   FX_SNOW_R,
@@ -26,7 +27,7 @@ import {
   FLASH_RING_THICKNESS,
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
-import type { FxVariant, KeySpec, Rgb } from '../../src/render/specs.js'
+import type { FxVariant, KeySpec, Rgb, StripSpec } from '../../src/render/specs.js'
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -2462,6 +2463,220 @@ describe('fx layer', () => {
     }
     // Guards against a vacuous pass: there must BE text pixels to compare.
     expect(textPixels).toBeGreaterThan(100)
+  })
+})
+
+/**
+ * The scrolling ticker tape (task 43). Its motion carries CONTENT, not just
+ * liveliness: the strip shows about 30 of the tape's ~145 characters, so the
+ * properties that matter are containment (it must never escape its band), a
+ * seamless wrap (no gap at any offset), and real motion.
+ */
+describe('strip ticker tape', () => {
+  const SEGMENTS = [
+    { text: 'TSLA 92.30 ▼1.10%', color: theme.red },
+    { text: 'MSFT 101.33 ▲0.19%', color: theme.green },
+    { text: 'NVDA 82.57 ▼2.49%', color: theme.red },
+  ]
+
+  function tapeStrip(offsetPx: number, over: Partial<StripSpec> = {}): Buffer {
+    return renderStrip({
+      lines: ['MARKET OPEN · 11:46 AM EDT', 'unused when a tape is set'],
+      tape: { segments: SEGMENTS, offsetPx },
+      ...over,
+    })
+  }
+
+  /** Any pixel differing from the strip background, within a row band. */
+  function inkInBand(buf: Buffer, y0: number, y1: number): boolean {
+    for (let y = y0; y < y1; y++) {
+      for (let x = 0; x < STRIP_WIDTH; x++) {
+        if (!near3(probe(buf, x, y, STRIP_WIDTH), theme.bg)) return true
+      }
+    }
+    return false
+  }
+
+  it('renders byte-identical output when no tape is set', () => {
+    const a = renderStrip({ lines: ['one', 'two'] })
+    const b = renderStrip({ lines: ['one', 'two'] })
+    expect(a.equals(b)).toBe(true)
+  })
+
+  it('paints the tape while still drawing line 1', () => {
+    const withTape = tapeStrip(0)
+    const withoutTape = renderStrip({ lines: ['MARKET OPEN · 11:46 AM EDT'] })
+    // Line 1's band is identical either way: the tape does not disturb it.
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < STRIP_WIDTH; x++) {
+        expect(near3(probe(withTape, x, y, STRIP_WIDTH), probe(withoutTape, x, y, STRIP_WIDTH), 1)).toBe(true)
+      }
+    }
+    // And the tape's own band carries ink that the tape-less strip does not.
+    expect(inkInBand(withTape, 20, 38)).toBe(true)
+    expect(inkInBand(withoutTape, 20, 38)).toBe(false)
+  })
+
+  it('ignores line 2 entirely when a tape owns the band', () => {
+    // Asserts INDEPENDENCE: with a tape set, the output must be identical whether
+    // or not a line 2 was supplied. The first version of this test compared a
+    // taped strip against an untaped one and asserted they differed — which is
+    // true no matter what, because the tape adds ink. It could not fail, and
+    // breaking the fix proved it: line 2 drawn UNDER the tape passed cleanly.
+    const withLine2 = renderStrip({
+      lines: ['title', 'WWWWWWWWWWWWWWWWWWWWWWWWWWWW'],
+      tape: { segments: SEGMENTS, offsetPx: 0 },
+    })
+    const withoutLine2 = renderStrip({
+      lines: ['title'],
+      tape: { segments: SEGMENTS, offsetPx: 0 },
+    })
+    expect(withLine2.equals(withoutLine2)).toBe(true)
+  })
+
+  it('never paints outside its own band, at any offset across a full loop', () => {
+    // The clip is what makes this impossible rather than merely unlikely. Probed
+    // across a whole loop and well past it, including negative offsets.
+    for (const offset of [-5000, -1, 0, 37, 250, 900, 1131, 5000, 99999]) {
+      const buf = tapeStrip(offset)
+      // The bar's band (y 44 onward) must stay clear.
+      expect(inkInBand(buf, 40, STRIP_HEIGHT), `offset ${offset} leaked below`).toBe(false)
+      // And the very top rows, above line 1's own text.
+      expect(inkInBand(buf, 0, 3), `offset ${offset} leaked above`).toBe(false)
+    }
+  })
+
+  it('leaves no gap at any offset — the wrap seam is invisible', () => {
+    // A tape with a visible seam would show a run of pure background sweeping
+    // across the band. This walks a whole loop in small steps and requires the
+    // tape's ink to reach both edges of the band every time.
+    const reaches = (buf: Buffer, x0: number, x1: number): boolean => {
+      for (let y = 18; y < 38; y++) {
+        for (let x = x0; x < x1; x++) {
+          if (!near3(probe(buf, x, y, STRIP_WIDTH), theme.bg)) return true
+        }
+      }
+      return false
+    }
+    for (let offset = 0; offset < 1400; offset += 17) {
+      const buf = tapeStrip(offset)
+      expect(reaches(buf, 0, 24), `offset ${offset} left a gap at the left edge`).toBe(true)
+      expect(reaches(buf, STRIP_WIDTH - 24, STRIP_WIDTH), `offset ${offset} left a gap at the right edge`).toBe(true)
+    }
+  })
+
+  it('fills the whole band even when the tape is NARROWER than the strip', () => {
+    // One short segment cannot cover 248 px on its own, so the renderer has to
+    // repeat it. Without that, a short tape would leave permanent background.
+    const buf = renderStrip({
+      lines: ['t'],
+      tape: { segments: [{ text: 'A', color: theme.green }], offsetPx: 0 },
+    })
+    let inkColumns = 0
+    for (let x = 0; x < STRIP_WIDTH; x++) {
+      let hit = false
+      for (let y = 18; y < 38 && !hit; y++) {
+        if (!near3(probe(buf, x, y, STRIP_WIDTH), theme.bg)) hit = true
+      }
+      if (hit) inkColumns++
+    }
+    // Repeated across the strip, not clustered at the left.
+    expect(inkColumns).toBeGreaterThan(20)
+    let rightmost = 0
+    for (let x = 0; x < STRIP_WIDTH; x++) {
+      for (let y = 18; y < 38; y++) {
+        if (!near3(probe(buf, x, y, STRIP_WIDTH), theme.bg)) rightmost = Math.max(rightmost, x)
+      }
+    }
+    expect(rightmost).toBeGreaterThan(STRIP_WIDTH - 30)
+  })
+
+  it('moves with the offset, and renders identically for the same offset', () => {
+    expect(tapeStrip(0).equals(tapeStrip(0))).toBe(true)
+    expect(tapeStrip(0).equals(tapeStrip(9))).toBe(false)
+  })
+
+  it('wraps: one full loop on renders identically to the start', () => {
+    // The loop width comes FROM the renderer, never from a character count, so
+    // this keeps testing the wrap even if the separator or the font changes.
+    //
+    // It must be the exact fractional width. `measureText` returns fractional
+    // pixels, so no INTEGER offset ever lands on the loop boundary — an earlier
+    // version of this test scanned integers for a byte-identical frame and found
+    // none, because sub-pixel text positioning shifts the anti-aliasing. The
+    // wrap was correct; the assertion was too strong.
+    const loopWidth = tapeLoopWidthPx(SEGMENTS)
+    expect(loopWidth).toBeGreaterThan(0)
+    const base = tapeStrip(0)
+    expect(tapeStrip(loopWidth).equals(base)).toBe(true)
+    expect(tapeStrip(loopWidth * 2).equals(base)).toBe(true)
+    expect(tapeStrip(-loopWidth).equals(base)).toBe(true)
+    // And a partial offset is genuinely different, so this is not vacuous.
+    expect(tapeStrip(loopWidth / 2).equals(base)).toBe(false)
+  })
+
+  it('measures a loop width that matches the real segment content', () => {
+    expect(tapeLoopWidthPx([])).toBe(0)
+    expect(tapeLoopWidthPx([{ text: '' }])).toBe(0)
+    const one = tapeLoopWidthPx([SEGMENTS[0]!])
+    const three = tapeLoopWidthPx(SEGMENTS)
+    expect(three).toBeGreaterThan(one)
+  })
+
+  it('carries each segment\'s own colour to the glass', () => {
+    // An all-red tape and an all-green tape must differ; per-segment colour is
+    // the whole point, since a monochrome tape loses the direction.
+    const red = renderStrip({ lines: ['t'], tape: { segments: [{ text: 'AAA', color: theme.red }], offsetPx: 0 } })
+    const green = renderStrip({ lines: ['t'], tape: { segments: [{ text: 'AAA', color: theme.green }], offsetPx: 0 } })
+    expect(red.equals(green)).toBe(false)
+  })
+
+  it('survives an empty segment list, and segments with empty text', () => {
+    const empty = renderStrip({ lines: ['t'], tape: { segments: [], offsetPx: 50 } })
+    expect(empty.length).toBe(STRIP_WIDTH * STRIP_HEIGHT * 4)
+    const blanks = renderStrip({ lines: ['t'], tape: { segments: [{ text: '' }, { text: '' }], offsetPx: 50 } })
+    expect(blanks.length).toBe(STRIP_WIDTH * STRIP_HEIGHT * 4)
+  })
+
+  it('degrades a non-finite offset to a plain tape, rather than a blank band', () => {
+    // Asserting only "a buffer came back" could not fail: a NaN offset reaches
+    // `fillText`'s x, which draws NOTHING and throws nothing, so the strip came
+    // back full-size and blank either way. Breaking the sanitizer proved it.
+    //
+    // The property that actually matters is the one `sanitizeStripSpec` provides:
+    // a hostile number degrades to a plain, safely-rendered tape — identical to
+    // offset 0 — instead of silently erasing the whole band.
+    const good = renderStrip({ lines: ['t'], tape: { segments: SEGMENTS, offsetPx: 0 } })
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const buf = renderStrip({ lines: ['t'], tape: { segments: SEGMENTS, offsetPx: bad } })
+      expect(buf.length).toBe(STRIP_WIDTH * STRIP_HEIGHT * 4)
+      expect(buf.equals(good), `offset ${String(bad)}`).toBe(true)
+    }
+  })
+
+  it('keeps clear of a right-aligned field instead of painting over it', () => {
+    // With `right` set, the clip excludes its gutter, so the two coexist. The
+    // right-hand margin must therefore be free of tape ink.
+    const buf = renderStrip({
+      lines: ['title', 'ignored'],
+      right: '120:00 / 120:00',
+      tape: { segments: SEGMENTS, offsetPx: 0 },
+    })
+    const withoutTape = renderStrip({
+      lines: ['title', ''],
+      right: '120:00 / 120:00',
+    })
+    // The right field itself renders identically with and without the tape.
+    for (let y = 18; y < 38; y++) {
+      for (let x = STRIP_WIDTH - 120; x < STRIP_WIDTH; x++) {
+        const a = probe(buf, x, y, STRIP_WIDTH)
+        const b = probe(withoutTape, x, y, STRIP_WIDTH)
+        if (!near3(a, b, 1)) {
+          // Any difference must be LEFT of the right field's own gutter.
+          expect(x).toBeLessThan(STRIP_WIDTH - 117)
+        }
+      }
+    }
   })
 })
 

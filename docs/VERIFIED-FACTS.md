@@ -736,6 +736,28 @@ layer entirely.
 
 ---
 
+## The strip ticker tape (task 43)
+
+Measured on 2026-08-18.
+
+- The eight `SYMBOL price ▲change%` segments plus separators measure **1448 px**
+  at 13 px Menlo. A character count had suggested about 1130 — reason from the
+  measurement, never the estimate.
+- At 32 px per second that loop took **45 seconds** to pass, so waiting for one
+  particular ticker meant most of a minute. 60 px per second gives about 24
+  seconds, at 2.4 px per frame on a 40 ms tick. The strip's measured 1218
+  writes per second makes 25 frames per second free.
+- `measureText` returns FRACTIONAL pixel widths, so no integer offset ever lands
+  on the tape's loop boundary. A test that scanned integer offsets for a
+  byte-identical frame found none and wrongly reported a broken wrap. Use
+  `tapeLoopWidthPx` — the exact fractional width — to assert the wrap.
+- A `NaN` offset reaching `fillText`'s x coordinate draws **nothing** and throws
+  nothing. So a strip renders full-size and blank, and a test asserting only
+  "a buffer came back" cannot detect a missing sanitizer. Assert that a hostile
+  offset degrades to the offset-0 frame instead.
+
+---
+
 ## macOS specifics
 
 - **Per-window focus needs Accessibility permission**, which is NOT granted.

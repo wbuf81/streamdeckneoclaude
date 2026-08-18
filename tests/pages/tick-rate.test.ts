@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
-import { StocksPage } from '../../src/pages/stocks-page.js'
+import { CodexPage } from '../../src/pages/codex-page.js'
+import { FootballPage } from '../../src/pages/football-page.js'
+import { SystemPage } from '../../src/pages/system-page.js'
 import { WeatherPage } from '../../src/pages/weather-page.js'
 import type { PlayerReader } from '../../src/pages/spotify-page.js'
-import type { StockReader } from '../../src/pages/stocks-page.js'
+import type { CodexReader } from '../../src/pages/codex-page.js'
+import type { FootballReader } from '../../src/pages/football-page.js'
+import type { SystemReader } from '../../src/pages/system-page.js'
 import type { WeatherReader } from '../../src/pages/weather-page.js'
 import type { DayForecast } from '../../src/sources/weather.js'
 import type { Page } from '../../src/pages/types.js'
@@ -37,23 +41,57 @@ import type { Page } from '../../src/pages/types.js'
  * `tickMs` property matter here, not the rendered content.
  */
 describe('pages that must keep the default 1000 ms render interval', () => {
-  it('StocksPage declares no tickMs', () => {
+  /*
+   * StocksPage USED to be asserted here. Task 43 gave it a scrolling ticker tape,
+   * so it now raises its rate while the tape moves — and the old assertion would
+   * have STAYED GREEN against that change, because its fake reader returned an
+   * empty quote map, which is exactly the no-tape case. A passing test that no
+   * longer covers the shipped behaviour is lesson 22's shape, and this is the
+   * second time this file has hit it (WeatherPage was the first, in task 42).
+   *
+   * Its replacement lives beside the tape's own tests in
+   * `tests/pages/stocks-page.test.ts`, where the fakes carry real quotes.
+   *
+   * So this block now covers the three pages that genuinely have nothing to
+   * animate. That keeps the invariant it was written for — a page must not raise
+   * its render rate for no benefit — rather than deleting it along with the page
+   * that outgrew it.
+   */
+
+  it('CodexPage declares no tickMs', () => {
     const fake = {
-      getQuotes: () => new Map(),
+      getTasks: () => [],
       getStatus: () => 'ok',
-      getMarketState: () => 'closed',
-      isSymbolStale: () => false,
+      getUsage: () => null,
+      isStale: () => false,
       setVisible: () => {},
-    } as unknown as StockReader
-    // Typed as `Page`, not the concrete class (I8): `StocksPage` correctly
-    // never declares `tickMs` at all, since it is optional on `Page` and
-    // this page has no reason to animate — but that means the CONCRETE
-    // class type has no such member for `tsc` to see, even though reading
-    // it through the interface (exactly how the daemon does) is fine.
-    const page: Page = new StocksPage(fake)
+    } as unknown as CodexReader
+    const page: Page = new CodexPage(fake)
     expect(page.tickMs).toBeUndefined()
   })
 
+  it('FootballPage declares no tickMs', () => {
+    const fake = {
+      getSchedule: () => [],
+      getStatus: () => 'ok',
+      getRecord: () => null,
+      isStale: () => false,
+      setVisible: () => {},
+    } as unknown as FootballReader
+    const page: Page = new FootballPage(fake)
+    expect(page.tickMs).toBeUndefined()
+  })
+
+  it('SystemPage declares no tickMs', () => {
+    const fake = {
+      getStats: () => null,
+      getStatus: () => 'ok',
+      isStale: () => false,
+      setVisible: () => {},
+    } as unknown as SystemReader
+    const page: Page = new SystemPage(fake)
+    expect(page.tickMs).toBeUndefined()
+  })
 })
 
 /**

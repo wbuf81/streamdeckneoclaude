@@ -279,6 +279,45 @@ export interface StripSpec {
   /** Right-aligned text on line 2, for example `2:14 / 4:32`. */
   right?: string
   dim?: boolean
+  /**
+   * A tape scrolling horizontally across LINE 2's band. When set, line 2's own
+   * text is not drawn; `lines[0]` still draws normally, so a page can keep a
+   * fixed title above a moving tape.
+   *
+   * Opt-in: absent, `renderStrip` is byte-identical to before this field
+   * existed, exactly as `KeySpec.fx` is. That is what keeps every other page's
+   * strip proof valid.
+   *
+   * The tape draws inside a clip rectangle, so it CANNOT paint over line 1, over
+   * the bar, or outside the strip — and when `right` is also set the clip
+   * excludes its gutter, so the two coexist instead of one overwriting the
+   * other.
+   *
+   * `offsetPx` changes every frame, so a strip carrying a tape rewrites every
+   * frame by design. `stripHash` covers this field and must keep covering it.
+   */
+  tape?: TapeSpec
+}
+
+/**
+ * One coloured run of text inside a scrolling tape. Task 43's stocks ticker.
+ */
+export interface TapeSegment {
+  text: string
+  /** Absent takes the strip's default text colour. */
+  color?: Rgb
+}
+
+export interface TapeSpec {
+  segments: readonly TapeSegment[]
+  /**
+   * How far the tape has scrolled, in pixels, increasing without bound.
+   *
+   * The RENDERER wraps this, because only the renderer can measure the tape's
+   * real width in the real font — so a page can scroll a tape without ever
+   * touching font metrics, which it is not allowed to do anyway (lesson 17).
+   */
+  offsetPx: number
 }
 
 export interface DeckFrame {

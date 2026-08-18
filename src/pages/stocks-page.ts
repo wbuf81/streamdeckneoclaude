@@ -1,4 +1,4 @@
-import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
+import type { DeckFrame, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
@@ -89,6 +89,32 @@ function trendArrow(trend: Trend): string {
  * most of the range and still leaves headroom above it.
  */
 const HEAT_SATURATION_PCT = 3
+
+/**
+ * How fast the ticker tape crawls, in pixels per second, and how often the page
+ * renders while it does.
+ *
+ * The strip was measured at 1218 writes per second (docs/VERIFIED-FACTS.md), so
+ * it is nowhere near the constraint; 50 ms is 20 strip writes per second.
+ *
+ * Both were tuned against a rendered preview, not guessed.
+ *
+ * The real loop measures 1448 px at 13 px Menlo — more than the 1130 px first
+ * estimated, because eight `SYMBOL price ▲change%` segments plus separators run
+ * wider than a character count suggests (lesson 17 again: measure, do not
+ * reason). At the first speed, 32 px per second, the whole board took **45
+ * seconds** to pass, so waiting for one particular ticker meant most of a
+ * minute. 60 px per second brings that to about 24 seconds.
+ *
+ * The tick then has to keep the motion smooth at that speed: 60 px per second at
+ * 40 ms is 2.4 px per frame. The strip was measured at 1218 writes per second,
+ * so 25 frames per second costs nothing.
+ *
+ * If the tape ever needs to be faster still, the PRICE comes out of each segment
+ * before the speed goes up again — an unreadable tape is worse than a slow one.
+ */
+const TAPE_PX_PER_SEC = 60
+const TAPE_TICK_MS = 40
 
 /**
  * The smallest share of the wash any real, non-zero move gets, so a small move
@@ -284,6 +310,45 @@ export interface StockReader {
 }
 
 /**
+ * How far the tape has scrolled at `nowMs`. Pure, and exported so a test can
+ * prove the motion without rasterising anything.
+ *
+ * It grows without bound on purpose. The RENDERER wraps it, because only the
+ * renderer can measure the tape's real width in the real font — a page is not
+ * allowed to reason about pixel widths (lesson 17).
+ */
+export function tapeOffsetPx(nowMs: number, pxPerSec: number = TAPE_PX_PER_SEC): number {
+  if (!Number.isFinite(nowMs)) return 0
+  return (nowMs / 1000) * pxPerSec
+}
+
+/**
+ * One tape segment per symbol: `SYMBOL price ▲change%`, coloured by the SAME
+ * `trendOf` call the tile's border, its change line and its heat wash use — so
+ * all four agree about direction.
+ *
+ * A per-symbol stale quote takes the dim colour for its own segment only. One
+ * lagging ticker never dims the whole tape, matching how the tiles behave.
+ */
+export function tapeSegments(
+  quotes: Map<string, Quote>,
+  isStale: (symbol: string) => boolean,
+): TapeSegment[] {
+  const segments: TapeSegment[] = []
+  for (const symbol of SYMBOLS) {
+    const quote = quotes.get(symbol)
+    if (!quote || quote.price === null) continue
+    const trend = trendOf(quote.changePercent)
+    const text = `${symbol} ${formatPrice(quote.price)} ${formatChange(quote.changePercent, trend)}`
+    segments.push({
+      text,
+      color: isStale(symbol) ? theme.textDim : trendColor(trend),
+    })
+  }
+  return segments
+}
+
+/**
  * One ticker per key, eight keys, eight symbols, no empty key and no
  * overflow. Pressing a ticker enters a detail mode for that one symbol,
  * spread across all eight keys, with BACK on key 7. A key dims when ITS OWN
@@ -322,8 +387,11 @@ export class StocksPage implements Page {
     return quotes.get(this.selected) ?? null
   }
 
-  render(now: number): DeckFrame {
+  render(now: number, nowMs?: number): DeckFrame {
     const quotes = this.source.getQuotes()
+    // A page never reads the wall clock. The daemon injects both, and the
+    // seconds value is the documented fallback for the millisecond one.
+    const ms = nowMs ?? now * 1000
 
     const quote = this.activeQuote(quotes)
     if (quote) return this.detailFrame(this.selected!, quote, now)
@@ -336,7 +404,7 @@ export class StocksPage implements Page {
     const board = breadthColor(quotes.values(), marketState, this.source.getStatus())
     return {
       keys,
-      strip: this.strip(quotes),
+      strip: this.strip(quotes, ms),
       buttons: [board, board],
     }
   }
@@ -608,7 +676,36 @@ export class StocksPage implements Page {
     return { lines: [line1, line2], right }
   }
 
-  private strip(quotes: Map<string, Quote>): StripSpec {
+  /**
+   * Whether the grid strip would carry a scrolling tape right now. Read by both
+   * `strip` and `tickMs`, so the declared render rate can never disagree with
+   * whether anything is actually moving (lesson 21: one decision, one function).
+   */
+  private hasTape(quotes: Map<string, Quote>): boolean {
+    if (this.source.getStatus() === 'offline') return false
+    // A tape needs at least one real, priced quote. An empty board keeps its
+    // static line 2, so an offline or not-yet-loaded deck still says so.
+    return tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym)).length > 0
+  }
+
+  /**
+   * A fast tick ONLY while the tape is scrolling.
+   *
+   * Unlike the weather effects and the heat wash, this motion does not stop for
+   * stale data: the strip shows about 30 of the tape's ~145 characters, so
+   * freezing it would make seven of the eight symbols unreachable. The movement
+   * carries the content, not just liveliness. Staleness is expressed in each
+   * segment's colour and in line 1's timestamp instead. See the design note in
+   * docs/superpowers/specs/2026-08-18-stocks-ticker-tape-design.md.
+   */
+  get tickMs(): number | undefined {
+    // A detail view has no tape, so it keeps the default rate.
+    const quotes = this.source.getQuotes()
+    if (this.activeQuote(quotes) !== null) return undefined
+    return this.hasTape(quotes) ? TAPE_TICK_MS : undefined
+  }
+
+  private strip(quotes: Map<string, Quote>, nowMs: number): StripSpec {
     const status = this.source.getStatus()
     const marketState = this.source.getMarketState()
     const line1 = truncate(`${STATE_LABELS[marketState]} · ${formatAsOfOrUnknown(latestAsOf(quotes))}`, STRIP_CHARS)
@@ -623,7 +720,18 @@ export class StocksPage implements Page {
       line2 = `${up} up · ${down} down`
     }
 
-    return { lines: [line1, truncate(line2, STRIP_CHARS)] }
+    const spec: StripSpec = { lines: [line1, truncate(line2, STRIP_CHARS)] }
+
+    // The tape OWNS line 2's band when it is present, so `line2` above becomes
+    // the fallback the offline and not-yet-loaded cases keep.
+    if (this.hasTape(quotes)) {
+      spec.tape = {
+        segments: tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym)),
+        offsetPx: tapeOffsetPx(nowMs),
+      }
+    }
+
+    return spec
   }
 
   onKeyPress(index: number): PressOutcome {

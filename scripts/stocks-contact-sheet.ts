@@ -23,7 +23,7 @@ import { writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createCanvas, type Canvas } from '@napi-rs/canvas'
-import { renderKey, renderStrip, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../src/render/canvas.js'
+import { renderKey, renderStrip, tapeLoopWidthPx, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../src/render/canvas.js'
 import { theme } from '../src/render/theme.js'
 import { StocksPage, type StockReader } from '../src/pages/stocks-page.js'
 import { SYMBOLS } from '../src/sources/stocks.js'
@@ -50,6 +50,10 @@ const LIVE: readonly number[] = [-1.10, 0.19, -2.49, 2.33, -1.80, -1.22, -3.47, 
 const FLAT: readonly number[] = [0.12, -0.08, 0.31, -0.22, 0.04, -0.35, 0.19, -0.14]
 
 const STATES: readonly MarketState[] = ['open', 'pre', 'post', 'closed', 'unknown']
+
+/** Mirrors `TAPE_PX_PER_SEC` in the page. Kept local because that constant is a
+ * page-internal tuning value, and this preview only needs it to label seconds. */
+const TAPE_PX_PER_SEC_PREVIEW = 60
 
 function rgbaToCanvas(buf: Buffer, w: number, h: number): Canvas {
   const canvas = createCanvas(w, h)
@@ -162,6 +166,42 @@ async function main(): Promise<void> {
 
   await writeFile(outPath, sheet.toBuffer('image/png'))
   process.stdout.write(`wrote ${outPath}\n`)
+
+  // A second sheet for the ticker tape: the same strip at points across one full
+  // loop, so the scroll speed and the wrap seam can both be judged. The loop
+  // width comes from the renderer, never from a character count.
+  const tapePage = pageFor(LIVE, 'open')
+  const probeStrip = tapePage.render(1786549560, 0).strip
+  const loopPx = tapeLoopWidthPx(probeStrip.tape?.segments ?? [])
+  const loopSeconds = loopPx / TAPE_PX_PER_SEC_PREVIEW
+  const SAMPLES = 10
+  const tapeH = 26 + SAMPLES * (STRIP_HEIGHT + 16) + 20
+  const tapeSheet = createCanvas(STRIP_WIDTH + M * 2 + 120, tapeH)
+  const tctx = tapeSheet.getContext('2d')
+  tctx.fillStyle = 'rgb(24, 24, 28)'
+  tctx.fillRect(0, 0, tapeSheet.width, tapeH)
+  tctx.textBaseline = 'top'
+  tctx.fillStyle = `rgb(${theme.text.join(',')})`
+  tctx.font = '13px Menlo'
+  tctx.fillText(
+    `Ticker tape — ${Math.round(loopPx)} px loop, ${loopSeconds.toFixed(1)} s to pass`,
+    M, 8,
+  )
+  for (let i = 0; i < SAMPLES; i++) {
+    const seconds = (loopSeconds * i) / SAMPLES
+    const y = 26 + i * (STRIP_HEIGHT + 16)
+    const frame = tapePage.render(1786549560, seconds * 1000)
+    tctx.drawImage(
+      rgbaToCanvas(renderStrip(frame.strip), STRIP_WIDTH, STRIP_HEIGHT),
+      M, y,
+    )
+    tctx.fillStyle = `rgb(${theme.textDim.join(',')})`
+    tctx.font = '10px Menlo'
+    tctx.fillText(`t+${seconds.toFixed(1)}s`, M + STRIP_WIDTH + 8, y + STRIP_HEIGHT / 2)
+  }
+  const tapePath = outPath.replace(/\.png$/, '-tape.png')
+  await writeFile(tapePath, tapeSheet.toBuffer('image/png'))
+  process.stdout.write(`wrote ${tapePath}\n`)
 }
 
 await main()
