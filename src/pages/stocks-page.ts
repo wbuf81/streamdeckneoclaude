@@ -75,6 +75,135 @@ function trendArrow(trend: Trend): string {
   return ''
 }
 
+/**
+ * The move size at which a tile's heat wash reaches full strength, in percent.
+ *
+ * The scale is ABSOLUTE, deliberately, not normalised against the board's
+ * biggest mover. A relative scale would always look contrasty, but it would
+ * paint a 0.3 percent nudge exactly as brightly as a 5 percent crash — and this
+ * page never misrepresents its data. A flat day is allowed to look calm,
+ * because it IS calm.
+ *
+ * Measured live on 2026-08-18: the eight real symbols spanned -3.47 to +2.33
+ * percent, with two of them inside ±0.2. So 3 percent puts a real board across
+ * most of the range and still leaves headroom above it.
+ */
+const HEAT_SATURATION_PCT = 3
+
+/**
+ * The smallest share of the wash any real, non-zero move gets, so a small move
+ * is a faint hint rather than rounding away to nothing.
+ *
+ * Kept LOW on purpose. At the first value, 0.22, a 0.05 percent nudge — no real
+ * movement at all — already drew 23 percent of the full wash, and a rendered
+ * flat day (every symbol inside ±0.35 percent) was almost indistinguishable
+ * from a real mixed day. That directly contradicted this feature's own design
+ * decision to keep the scale absolute and let a calm day look calm.
+ *
+ * Measured on 2026-08-18: at 0.22 the strength ratio between a 0.12 percent
+ * nudge and a saturating 3 percent move was only 4.0x. At this value it is
+ * about 10x, so a real mover stands out and a quiet day stays quiet.
+ */
+const HEAT_FLOOR = 0.06
+
+/**
+ * The largest share of the trend colour a wash may ever blend in. The key's
+ * white text has to stay crisp on top of it, which is the same constraint the
+ * weather page's condition tints live under — see `conditionTint` there, where
+ * every value is hand-picked dark. Here the values are computed, so the ceiling
+ * has to be explicit and tested.
+ */
+const HEAT_MAX_BLEND = 0.3
+
+/**
+ * How strongly the board presents, by market state. One multiplier, applied to
+ * both the heat wash and the breadth buttons, so the whole page shares one mood.
+ *
+ * `unknown` shares `closed`'s multiplier but NOT its meaning. We do not know the
+ * market is live, so it must not LOOK live — but claiming it is closed would be
+ * a lie, and `STATE_LABELS` already refuses to (lesson 18: an absent signal is
+ * unknown, not a fact). The strip is what states it, in words.
+ */
+const MOOD_BY_STATE: Record<MarketState, number> = {
+  open: 1,
+  pre: 0.55,
+  post: 0.55,
+  closed: 0.3,
+  unknown: 0.3,
+}
+
+/** How many symbols are up and how many are down.
+ *
+ * ONE function, read by both the strip's "5 up · 3 down" text and the round
+ * buttons' colour. Two callers counting this separately would eventually
+ * disagree, and then the lights would contradict the words on the same frame
+ * (lesson 21: one decision, one function).
+ */
+export function breadth(quotes: Iterable<Quote>): { up: number; down: number } {
+  let up = 0
+  let down = 0
+  for (const q of quotes) {
+    const trend = trendOf(q.changePercent)
+    if (trend === 'up') up++
+    else if (trend === 'down') down++
+  }
+  return { up, down }
+}
+
+/**
+ * Blends the plain key background toward `target` by `fraction`, capped at
+ * `HEAT_MAX_BLEND`. Exported so a test can prove the cap and the contrast
+ * without going through a whole rendered frame.
+ */
+export function blendToward(target: Rgb, fraction: number): Rgb {
+  const f = Math.max(0, Math.min(HEAT_MAX_BLEND, fraction))
+  return [
+    Math.round(theme.bg[0] + (target[0] - theme.bg[0]) * f),
+    Math.round(theme.bg[1] + (target[1] - theme.bg[1]) * f),
+    Math.round(theme.bg[2] + (target[2] - theme.bg[2]) * f),
+  ]
+}
+
+/**
+ * The background wash for one ticker tile, or undefined for a tile that must
+ * keep the plain background.
+ *
+ * An unknown change (null, or non-finite) and a real flat 0.00 percent both get
+ * undefined. Those two cases mean different things — "we do not know" against
+ * "it did not move" — but neither is a direction, and inventing a colour for
+ * either would be a fabricated reading.
+ */
+export function heatWash(
+  changePercent: number | null, marketState: MarketState,
+): Rgb | undefined {
+  const trend = trendOf(changePercent)
+  if (trend === 'unknown' || trend === 'flat') return undefined
+  const magnitude = Math.min(1, Math.abs(changePercent as number) / HEAT_SATURATION_PCT)
+  const scaled = HEAT_FLOOR + (1 - HEAT_FLOOR) * magnitude
+  return blendToward(trendColor(trend), scaled * HEAT_MAX_BLEND * MOOD_BY_STATE[marketState])
+}
+
+/**
+ * The colour both round buttons take on the grid. Grey whenever nothing was
+ * counted or the source is offline — never a colour the data does not support.
+ */
+export function breadthColor(
+  quotes: Iterable<Quote>, marketState: MarketState, status: StockStatus,
+): Rgb {
+  if (status === 'offline') return theme.gray
+  const { up, down } = breadth(quotes)
+  if (up === 0 && down === 0) return theme.gray
+  const target = up > down ? theme.green : down > up ? theme.red : theme.amber
+  // The same mood multiplier the wash uses, so a closed market's lights are as
+  // quiet as its tiles.
+  const mood = MOOD_BY_STATE[marketState]
+  return [
+    Math.round(target[0] * mood),
+    Math.round(target[1] * mood),
+    Math.round(target[2] * mood),
+  ]
+}
+
 /** `123.5` becomes `123.50`. Never NaN, because it checks finiteness first. */
 function formatPrice(price: number | null): string {
   return typeof price === 'number' && Number.isFinite(price) ? price.toFixed(2) : '--'
@@ -199,15 +328,22 @@ export class StocksPage implements Page {
     const quote = this.activeQuote(quotes)
     if (quote) return this.detailFrame(this.selected!, quote, now)
 
-    const keys = SYMBOLS.map((symbol) => this.tickerKey(quotes.get(symbol), symbol))
+    const marketState = this.source.getMarketState()
+    const keys = SYMBOLS.map((symbol) => this.tickerKey(quotes.get(symbol), symbol, marketState))
+    // Both buttons take ONE colour. They are page navigation, so two different
+    // colours would read as two different controls; one board-level signal is
+    // what this surface can honestly carry.
+    const board = breadthColor(quotes.values(), marketState, this.source.getStatus())
     return {
       keys,
       strip: this.strip(quotes),
-      buttons: [theme.gray, theme.gray],
+      buttons: [board, board],
     }
   }
 
-  private tickerKey(quote: Quote | undefined, symbol: string): KeySpec {
+  private tickerKey(
+    quote: Quote | undefined, symbol: string, marketState: MarketState,
+  ): KeySpec {
     const trend = trendOf(quote?.changePercent ?? null)
     const unknown = !quote || quote.price === null
     const stale = this.source.isSymbolStale(symbol)
@@ -220,6 +356,11 @@ export class StocksPage implements Page {
       lineColors: [undefined, undefined, trendColor(trend)],
       border: trendColor(trend),
     }
+
+    // The wash comes from the SAME `trendOf` result the border and the change
+    // line use, so the three cannot disagree about direction.
+    const wash = heatWash(quote?.changePercent ?? null, marketState)
+    if (wash) key.bg = wash
 
     const spark = downsample(quote?.spark ?? [], SPARK_BUCKETS)
     if (spark.length >= 2) {
@@ -258,10 +399,19 @@ export class StocksPage implements Page {
       this.backKey(),
     ]
 
+    // The whole frame is about ONE symbol, so the buttons carry that symbol's
+    // trend rather than the board's breadth.
+    const mood = MOOD_BY_STATE[this.source.getMarketState()]
+    const lights: Rgb = [
+      Math.round(border[0] * mood),
+      Math.round(border[1] * mood),
+      Math.round(border[2] * mood),
+    ]
+
     return {
       keys,
       strip: this.detailStrip(quote),
-      buttons: [theme.gray, theme.gray],
+      buttons: [lights, lights],
     }
   }
 
@@ -467,13 +617,9 @@ export class StocksPage implements Page {
     if (status === 'offline') {
       line2 = 'offline'
     } else {
-      let up = 0
-      let down = 0
-      for (const q of quotes.values()) {
-        const trend = trendOf(q.changePercent)
-        if (trend === 'up') up++
-        else if (trend === 'down') down++
-      }
+      // The SAME count the round buttons' colour reads, so the lights and these
+      // words can never contradict each other on one frame.
+      const { up, down } = breadth(quotes.values())
       line2 = `${up} up · ${down} down`
     }
 

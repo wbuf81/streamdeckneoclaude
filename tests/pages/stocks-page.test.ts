@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { createHash } from 'node:crypto'
-import { StocksPage } from '../../src/pages/stocks-page.js'
+import { StocksPage, heatWash, breadthColor, breadth } from '../../src/pages/stocks-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { SYMBOLS, YEARLY_REFRESH_SECONDS } from '../../src/sources/stocks.js'
@@ -875,21 +874,258 @@ describe('StocksPage detail view layout', () => {
   })
 })
 
-describe('StocksPage grid rendering, before and after the 52-week detail chart change', () => {
-  // Task 33 adds a 52-week chart to the DETAIL view only. The grid keeps its
-  // intraday sparkline untouched. This hash was captured from `renderKey`
-  // against this exact grid key BEFORE task 33 touched any source file, and
-  // must still match after — proof, not assertion, that the grid path was
-  // never edited.
-  it('renders the grid ticker key byte-identically to the pre-task-33 snapshot', () => {
+/*
+ * RETIRED, deliberately: a golden sha256 of the grid ticker key, captured before
+ * task 33 to prove that task 33 — which added the detail view's 52-week chart —
+ * had not touched the grid path.
+ *
+ * Task 33 landed. AGENTS.md's own rule is that "a point-in-time proof (a golden
+ * hash pinning another page's bytes) retires when its change lands. Do not leave
+ * it to fire on the next legitimate change." It was left, and it fired on the
+ * next legitimate change: task 43's heat wash, which sets `bg` on this very key
+ * ON PURPOSE.
+ *
+ * Re-baselining the hash would have been the wrong fix. It would preserve a test
+ * that pins bytes for a reason that no longer exists, and it would fire again on
+ * the next legitimate change too. The grid tile's REAL properties are covered by
+ * the sixteen tests in the rendering block above — key count and order, price
+ * format, the up, down, flat and unknown colours and arrows, the price line
+ * never being coloured, four dimming cases, and four sparkline cases — plus the
+ * heat-wash block below. None of that coverage came from the hash.
+ */
+
+describe('StocksPage heat wash (task 43)', () => {
+  it('washes an up quote green and a down quote red', () => {
     const quotes = allQuotes()
-    quotes.set(SYMBOLS[0]!, tslaLikeQuote())
-    const { page } = build({ quotes })
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: 2.5 }))
+    quotes.set(SYMBOLS[1]!, quote(SYMBOLS[1]!, { changePercent: -2.5 }))
+    const { page } = build({ quotes, marketState: 'open' })
+    const keys = page.render(NOW).keys
+    const up = keys[0]!.bg!
+    const down = keys[1]!.bg!
+    expect(up[1]).toBeGreaterThan(up[0]) // green channel leads
+    expect(down[0]).toBeGreaterThan(down[1]) // red channel leads
+  })
+
+  it('grows the wash with the size of the move, and saturates at every market state', () => {
+    // EVERY state, not just `open`. Probing `open` alone could not fail: the
+    // final clamp inside `blendToward` independently pins the open-market value
+    // at the cap, so removing the magnitude clamp left that one case unchanged.
+    // At a quieter state the mood multiplier keeps the value BELOW that clamp,
+    // and an extreme move really does glow brighter — which is the bug. Found by
+    // breaking the fix and watching this test pass.
+    for (const state of ['open', 'pre', 'post', 'closed', 'unknown'] as const) {
+      const distance = (pct: number): number => {
+        const wash = heatWash(pct, state)
+        if (!wash) return 0
+        return Math.abs(wash[0] - theme.bg[0]) + Math.abs(wash[1] - theme.bg[1]) + Math.abs(wash[2] - theme.bg[2])
+      }
+      expect(distance(0.5), state).toBeGreaterThan(0)
+      expect(distance(1.5), state).toBeGreaterThan(distance(0.5))
+      expect(distance(3), state).toBeGreaterThan(distance(1.5))
+      // Saturated: a 3 percent move and a 12 percent move look identical, so an
+      // extreme day cannot wash the text out.
+      expect(distance(12), state).toBe(distance(3))
+      expect(distance(40), state).toBe(distance(3))
+    }
+  })
+
+  it('keeps a near-flat nudge far fainter than a real mover', () => {
+    // The point of an absolute scale. At the first floor value (0.22) this ratio
+    // was only 4.0x, and a rendered flat day looked like a real mixed day —
+    // exactly the dishonesty the absolute scale exists to avoid. Measured after
+    // the fix: about 10x.
+    const strength = (pct: number): number => {
+      const wash = heatWash(pct, 'open')
+      if (!wash) return 0
+      return Math.abs(wash[0] - theme.bg[0]) + Math.abs(wash[1] - theme.bg[1]) + Math.abs(wash[2] - theme.bg[2])
+    }
+    expect(strength(3) / strength(0.12)).toBeGreaterThan(6)
+    // And a nudge is still VISIBLE — the floor exists so a real small move does
+    // not round away to nothing.
+    expect(strength(0.12)).toBeGreaterThan(0)
+  })
+
+  it('keeps the sparkline clearly brighter than the wash behind it, in both directions', () => {
+    // The spark and the wash share a hue by design, so the bars have to win on
+    // luminance or the tile's only chart becomes mush. Measured on 2026-08-18:
+    // the worst real case, a -3.47 percent day, gave 2.76x.
+    const lum = (p: readonly number[]) => p[0]! + p[1]! + p[2]!
+    for (const pct of [-3.47, 3.47, -12, 12]) {
+      const quotes = allQuotes()
+      quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, {
+        changePercent: pct,
+        spark: Array.from({ length: 24 }, (_, i) => 100 - pct * (1 - i / 23)),
+      }))
+      const { page } = build({ quotes, marketState: 'open' })
+      const key = page.render(NOW).keys[0]!
+      expect(key.spark).toBeDefined()
+      const buf = renderKey(key)
+      let brightest = 0
+      for (let y = 50; y < 92; y++) {
+        for (let x = 10; x < 88; x++) brightest = Math.max(brightest, lum(probe(buf, x, y)))
+      }
+      expect(brightest / lum(key.bg!), `${pct}%`).toBeGreaterThan(2.4)
+    }
+  })
+
+  it('treats the two no-direction cases as no wash, rather than inventing a colour', () => {
+    // An unknown change and a real flat 0.00 percent mean DIFFERENT things —
+    // "we do not know" against "it did not move" — but neither is a direction.
+    expect(heatWash(null, 'open')).toBeUndefined()
+    expect(heatWash(Number.NaN, 'open')).toBeUndefined()
+    expect(heatWash(0, 'open')).toBeUndefined()
+  })
+
+  it('leaves a tile with no quote at all unwashed', () => {
+    const { page } = build({ quotes: new Map() })
+    expect(page.render(NOW).keys[0]!.bg).toBeUndefined()
+  })
+
+  it('keeps every wash dark enough for white text, at the strongest move and every state', () => {
+    // The wash is COMPUTED, unlike the weather page's hand-picked tints, so the
+    // ceiling has to be proven rather than eyeballed. Probes the real rendered
+    // key, not just the colour: the text has to win on the glass.
+    const lum = (c: readonly number[]) => c[0]! + c[1]! + c[2]!
+    for (const state of ['open', 'pre', 'post', 'closed', 'unknown'] as const) {
+      for (const pct of [3, -3, 12, -12]) {
+        const wash = heatWash(pct, state)!
+        expect(wash).toBeDefined()
+        // Text renders at 235 per channel. A wash must stay far below it.
+        expect(lum(wash)).toBeLessThan(lum(theme.text) * 0.45)
+      }
+    }
+  })
+
+  it('renders the wash with the tile text still clearly brighter than it', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: -12 }))
+    const { page } = build({ quotes, marketState: 'open' })
     const key = page.render(NOW).keys[0]!
     const buf = renderKey(key)
-    expect(createHash('sha256').update(buf).digest('hex')).toBe(
-      'fec8075230a539849e863956e7e9d6768962ff59d78b3b49a35be3d837df7bac',
-    )
+    const lum = (p: readonly number[]) => p[0]! + p[1]! + p[2]!
+    let brightest = 0
+    let washLum = lum(key.bg!)
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) brightest = Math.max(brightest, lum(probe(buf, x, y)))
+    }
+    expect(brightest).toBeGreaterThan(washLum * 2)
+  })
+
+  it('still dims a stale tile, on top of its wash', () => {
+    const quotes = allQuotes()
+    quotes.set(SYMBOLS[0]!, quote(SYMBOLS[0]!, { changePercent: 2.5 }))
+    const { page } = build({ quotes, staleSymbols: new Set([SYMBOLS[0]!]) })
+    const key = page.render(NOW).keys[0]!
+    expect(key.bg).toBeDefined()
+    expect(key.dim).toBe(true)
+  })
+})
+
+describe('StocksPage market-state mood (task 43)', () => {
+  const strength = (state: MarketState): number => {
+    const wash = heatWash(3, state)!
+    return Math.abs(wash[0] - theme.bg[0]) + Math.abs(wash[1] - theme.bg[1]) + Math.abs(wash[2] - theme.bg[2])
+  }
+
+  it('makes an open market strictly the strongest', () => {
+    expect(strength('open')).toBeGreaterThan(strength('pre'))
+    expect(strength('open')).toBeGreaterThan(strength('post'))
+    expect(strength('open')).toBeGreaterThan(strength('closed'))
+    expect(strength('open')).toBeGreaterThan(strength('unknown'))
+  })
+
+  it('puts pre and post between open and closed', () => {
+    expect(strength('pre')).toBeGreaterThan(strength('closed'))
+    expect(strength('post')).toBeGreaterThan(strength('closed'))
+  })
+
+  it('keeps unknown as quiet as closed, WITHOUT claiming the market is closed', () => {
+    // Sharing a multiplier is a display choice. Sharing the label would be a
+    // lie, and lesson 18 is exactly about that distinction.
+    expect(strength('unknown')).toBe(strength('closed'))
+    const { page } = build({ marketState: 'unknown' })
+    expect(page.render(NOW).strip.lines[0]).toContain('UNKNOWN')
+    expect(page.render(NOW).strip.lines[0]).not.toContain('CLOSED')
+  })
+})
+
+describe('StocksPage breadth on the round buttons (task 43)', () => {
+  function bothButtons(over: Parameters<typeof build>[0] = {}) {
+    const { page } = build(over)
+    const frame = page.render(NOW)
+    return { frame, left: frame.buttons[0], right: frame.buttons[1] }
+  }
+
+  it('gives both buttons one identical colour, since they are page navigation', () => {
+    const { left, right } = bothButtons()
+    expect(left).toEqual(right)
+  })
+
+  it('leads green when more symbols are up than down', () => {
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym, i) => quotes.set(sym, quote(sym, { changePercent: i < 6 ? 1 : -1 })))
+    const { left } = bothButtons({ quotes, marketState: 'open' })
+    expect(left[1]).toBeGreaterThan(left[0])
+  })
+
+  it('leads red when more symbols are down than up', () => {
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym, i) => quotes.set(sym, quote(sym, { changePercent: i < 6 ? -1 : 1 })))
+    const { left } = bothButtons({ quotes, marketState: 'open' })
+    expect(left[0]).toBeGreaterThan(left[1])
+  })
+
+  it('goes amber on an even split', () => {
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym, i) => quotes.set(sym, quote(sym, { changePercent: i < 4 ? 1 : -1 })))
+    const { left } = bothButtons({ quotes, marketState: 'open' })
+    expect(left).toEqual(breadthColor(quotes.values(), 'open', 'ok'))
+    expect(left[0]).toBeGreaterThan(0)
+    expect(left[1]).toBeGreaterThan(0)
+  })
+
+  it('stays grey when the source is offline, whatever the quotes say', () => {
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym) => quotes.set(sym, quote(sym, { changePercent: 5 })))
+    const { left } = bothButtons({ quotes, status: 'offline' })
+    expect(left).toEqual(theme.gray)
+  })
+
+  it('stays grey when nothing could be counted', () => {
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym) => quotes.set(sym, quote(sym, { changePercent: null })))
+    const { left } = bothButtons({ quotes, marketState: 'open' })
+    expect(left).toEqual(theme.gray)
+  })
+
+  it('agrees with the strip\'s own up/down text, always', () => {
+    // The lights and the words come from ONE count. This proves they cannot
+    // contradict each other on the same frame.
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym, i) => quotes.set(sym, quote(sym, { changePercent: i < 5 ? 1.2 : -0.8 })))
+    const { frame, left } = bothButtons({ quotes, marketState: 'open' })
+    expect(frame.strip.lines[1]).toBe('5 up · 3 down')
+    expect(left[1]).toBeGreaterThan(left[0]) // green, matching "5 up"
+  })
+
+  it('quietens the lights when the market is closed', () => {
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym) => quotes.set(sym, quote(sym, { changePercent: 1 })))
+    const open = breadthColor(quotes.values(), 'open', 'ok')
+    const closed = breadthColor(quotes.values(), 'closed', 'ok')
+    expect(closed[1]).toBeLessThan(open[1])
+  })
+
+  it('carries the SELECTED symbol\'s trend in the detail view, not the board\'s breadth', () => {
+    // Six symbols up, but the one opened is down: the buttons must follow the
+    // symbol on screen, since the whole frame is about that symbol.
+    const quotes = new Map<string, Quote>()
+    SYMBOLS.forEach((sym, i) => quotes.set(sym, quote(sym, { changePercent: i === 0 ? -2 : 2 })))
+    const { page } = build({ quotes, marketState: 'open' })
+    page.onKeyPress(0)
+    const buttons = page.render(NOW).buttons
+    expect(buttons[0][0]).toBeGreaterThan(buttons[0][1]) // red, the open symbol
   })
 })
 
