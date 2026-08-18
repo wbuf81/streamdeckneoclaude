@@ -407,6 +407,25 @@ into this file before it is cleaned.
   brief's own suggested 34 px at y 34 overlapped the label, found by pixel probe. Tests assert
   the gaps are background, so drift fails the suite instead of reaching the glass.
 
+### Verified live on 2026-08-18 — task 42, weather ambient effects
+
+**User-confirmed on the real deck**, in two rounds:
+
+1. First deployment: "i like it" — the effects read correctly and the numbers
+   stayed legible. But the user reported the case that mattered: their real
+   forecast was thunderstorms and rain every day, so the variety was invisible
+   and the tiles all looked alike.
+2. That report drove the storm rework (real bolts, a strike period that cannot
+   alias with the render tick, storm rain distinct from plain rain, intensity
+   driving more than the drop count). Second deployment: "looks awesome, this is
+   exactly what i wanted."
+
+The lesson worth keeping: a contact sheet built from ONE tile per condition
+hides every defect that only shows up when the real data repeats. Four defects
+survived a green suite and a preview the user approved, and all four were found
+by simulating the user's actual week. **Preview the real data distribution, not
+one of everything.**
+
 ### New invariants added by task 42 (weather ambient effects)
 
 - `KeySpec.fx` is **opt-in per key**. Absent, the render path is byte-identical
