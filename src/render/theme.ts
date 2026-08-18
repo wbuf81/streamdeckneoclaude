@@ -39,6 +39,24 @@ export const theme = {
   neonMagenta: [255, 45, 175] as Rgb,
 } as const
 
+/**
+ * Mixes `from` toward `to` by `fraction`, clamped to 0 to 1.
+ *
+ * ONE implementation, shared by every page that tints a key from data — the
+ * stocks heat wash and the football record wash both call it. A second copy is
+ * exactly the family drift this project calls its dominant defect pattern
+ * (docs/LESSONS.md #21's sibling sweep), and colour arithmetic duplicated across
+ * pages would eventually disagree about what "half way to green" means.
+ */
+export function blend(from: Rgb, to: Rgb, fraction: number): Rgb {
+  const f = Math.max(0, Math.min(1, Number.isFinite(fraction) ? fraction : 0))
+  return [
+    Math.round(from[0] + (to[0] - from[0]) * f),
+    Math.round(from[1] + (to[1] - from[1]) * f),
+    Math.round(from[2] + (to[2] - from[2]) * f),
+  ]
+}
+
 /** Every value the `state` field can hold, plus the fallback. */
 export type SessionStateName =
   | 'idle'

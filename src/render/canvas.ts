@@ -1917,6 +1917,23 @@ const TAPE_SEPARATOR = '  ·  '
  *
  * Returns 0 for a tape with nothing to draw.
  */
+/**
+ * How far a tape has scrolled at `nowMs`, given its speed in pixels per second.
+ *
+ * Pure, and generic: the SPEED is each page's own decision, while the wrap is the
+ * renderer's, because only the renderer can measure the tape's real width. Lives
+ * here rather than on a page because two pages now scroll tapes — the stocks
+ * ticker and the football schedule — and one page importing another's helper is
+ * coupling neither of them wants.
+ *
+ * It grows without bound on purpose; `drawTape` reduces it modulo the real loop
+ * width.
+ */
+export function tapeOffsetPx(nowMs: number, pxPerSec: number): number {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(pxPerSec)) return 0
+  return (nowMs / 1000) * pxPerSec
+}
+
 export function tapeLoopWidthPx(segments: readonly TapeSegment[]): number {
   const runs = segments.filter((seg) => seg.text.length > 0)
   if (runs.length === 0) return 0

@@ -1,5 +1,6 @@
 import type { DeckFrame, FxSpec, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
-import { theme } from '../render/theme.js'
+import { theme, blend } from '../render/theme.js'
+import { tapeOffsetPx as sharedTapeOffsetPx } from '../render/canvas.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
 import type { MarketState, Quote, StockStatus, YearlyState } from '../sources/stocks.js'
@@ -203,12 +204,11 @@ export function breadth(quotes: Iterable<Quote>): { up: number; down: number } {
  * without going through a whole rendered frame.
  */
 export function blendToward(target: Rgb, fraction: number): Rgb {
-  const f = Math.max(0, Math.min(HEAT_MAX_BLEND, fraction))
-  return [
-    Math.round(theme.bg[0] + (target[0] - theme.bg[0]) * f),
-    Math.round(theme.bg[1] + (target[1] - theme.bg[1]) * f),
-    Math.round(theme.bg[2] + (target[2] - theme.bg[2]) * f),
-  ]
+  // The blend arithmetic itself lives in `render/theme.ts`, shared with the
+  // football page's record wash — two copies would eventually disagree about
+  // what "half way to green" means. This function keeps the stocks-specific
+  // part: the cap, and blending from the key background.
+  return blend(theme.bg, target, Math.min(HEAT_MAX_BLEND, fraction))
 }
 
 /**
@@ -395,16 +395,14 @@ export interface StockReader {
 }
 
 /**
- * How far the tape has scrolled at `nowMs`. Pure, and exported so a test can
- * prove the motion without rasterising anything.
+ * How far this page's tape has scrolled at `nowMs`.
  *
- * It grows without bound on purpose. The RENDERER wraps it, because only the
- * renderer can measure the tape's real width in the real font — a page is not
- * allowed to reason about pixel widths (lesson 17).
+ * The arithmetic lives in `render/canvas.ts`, shared with the football page's
+ * schedule tape; this wrapper binds it to THIS page's speed, which is a page
+ * decision. Exported so a test can prove the motion without rasterising.
  */
 export function tapeOffsetPx(nowMs: number, pxPerSec: number = TAPE_PX_PER_SEC): number {
-  if (!Number.isFinite(nowMs)) return 0
-  return (nowMs / 1000) * pxPerSec
+  return sharedTapeOffsetPx(nowMs, pxPerSec)
 }
 
 /**

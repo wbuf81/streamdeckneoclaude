@@ -909,6 +909,45 @@ torn scene.
 
 ---
 
+## Football: what ESPN sends inline, and what costs a request
+
+Probed live on 2026-08-18, on the same keyless event endpoint the source already
+uses.
+
+| Data | Where | Cost |
+| --- | --- | --- |
+| `homeAway` | inline on each competitor | free |
+| **`winner: true \| false`** | **inline on each competitor** | **free** |
+| A competitor's score | a `$ref` under the competitor | 1 request each, so 2 per game |
+| Game clock and state | a `$ref` under the competition | 1 request per game |
+
+The status ref returns `{ clock, displayClock, period, type: { state:
+'pre'|'in'|'post', completed, shortDetail } }` — so `state: 'in'` plus
+`displayClock` and `period` is everything a live scoreboard needs. The score ref
+returns `{ value: 24.0, displayValue: '24', winner: true }`.
+
+`parseEvent` read only `homeAway` and threw the `winner` flag away. Task 45 reads
+it, which gives per-game win/loss at zero request cost.
+
+**A loss is only knowable from the OPPONENT's flag.** My own side's
+`winner: false` is also what an undecided game looks like, so both competitors
+have to be read. And when neither flag is set the game is either unplayed or a
+TIE — the inline data cannot tell those apart, so both render as no result rather
+than as a guess.
+
+### A game must not vanish at kickoff
+
+`upcoming()` originally dropped a game the instant its kickoff passed, so the grid
+showed dashed placeholders during the game itself — the moment it is the most
+interesting thing on the deck. It now keeps a game for a game-length window
+(4 hours) after kickoff. Found by rendering the kickoff-passed case and looking at
+it; every test passed either way.
+
+That window is also what makes `kickoffWarmth`'s post-kickoff branch reachable
+from the grid at all. Before the fix it was dead code that looked like a feature.
+
+---
+
 ## macOS specifics
 
 - **Per-window focus needs Accessibility permission**, which is NOT granted.

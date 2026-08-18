@@ -1,10 +1,11 @@
 import type { Image } from '@napi-rs/canvas'
-import type { DeckFrame, KeySpec, StripSpec } from '../render/specs.js'
-import { theme } from '../render/theme.js'
+import type { DeckFrame, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
+import { theme, blend } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
-import type { FootballStatus, Game, Team, TeamRecord } from '../sources/football.js'
+import type { FootballStatus, Game, GameResult, Team, TeamRecord } from '../sources/football.js'
 import { LOGO_ART_FRACTION } from '../sources/football.js'
+import { tapeOffsetPx } from '../render/canvas.js'
 
 /** Measured limit for one strip line. See `render/canvas.ts`. */
 const STRIP_CHARS = 30
@@ -125,10 +126,29 @@ function homeAwayHeader(game: Pick<Game, 'isHome' | 'opponentShort'>): string {
   return game.opponentShort ? `${prefix} ${game.opponentShort}` : prefix
 }
 
-/** The games with a known future (or unknown-but-not-past) kickoff, ascending
- * — `schedule` is already sorted ascending by the source's own contract. */
+/**
+ * The games with a KNOWN future kickoff, ascending — `schedule` is already sorted
+ * ascending by the source's own contract.
+ *
+ * A game stays for `WARMTH_GAME_WINDOW_MS` AFTER its kickoff, so a game in
+ * progress remains on the grid. Without that window it vanished the instant
+ * kickoff passed — leaving dashed placeholders at exactly the moment the game was
+ * the most interesting thing on the deck, and making `kickoffWarmth`'s
+ * post-kickoff branch unreachable from the grid. Found by rendering the
+ * kickoff-passed case and looking at it.
+ *
+ * A TBD kickoff (`kickoffEpochMs === null`) is excluded. The previous version of
+ * this comment claimed "or unknown-but-not-past", which the filter below has
+ * never done — that describes `scheduleWindow`, which DOES include nulls because
+ * a drill-down showing the whole season should not hide a game just because its
+ * time is unannounced. The grid's next-three tiles and the strip's tape both read
+ * this function, so they agree with each other; only the drill-down differs, and
+ * deliberately.
+ */
 function upcoming(schedule: Game[], nowMs: number): Game[] {
-  return schedule.filter((g) => g.kickoffEpochMs !== null && g.kickoffEpochMs >= nowMs)
+  return schedule.filter(
+    (g) => g.kickoffEpochMs !== null && g.kickoffEpochMs >= nowMs - WARMTH_GAME_WINDOW_MS,
+  )
 }
 
 /**
@@ -146,6 +166,93 @@ export function scheduleWindow(schedule: Game[], nowMs: number, size: number = S
 }
 
 /** The part of `FootballSource` this page needs. */
+/**
+ * How far above or below .500 a record has to be before its wash is at full
+ * strength. A 6-0 start and a 12-0 season should both read as "emphatically
+ * winning" rather than the second looking twice as green.
+ */
+const RECORD_SATURATION_GAMES = 4
+/** The most of the trend colour a record wash may blend in. Kept low for the
+ * same reason the weather tints and the stocks wash are: the tile's white record
+ * text has to stay crisp on top of it. */
+const RECORD_MAX_BLEND = 0.3
+
+/**
+ * How long before kickoff a tile starts to warm, and how long after kickoff it
+ * stays hot.
+ *
+ * The tail matters: a game that has just started must not go instantly cold, or
+ * the tile would look like the least interesting one on the deck at exactly the
+ * moment it is the most interesting. A game-length window keeps it hot.
+ */
+const WARMTH_LEAD_MS = 7 * 24 * 60 * 60 * 1000
+const WARMTH_GAME_WINDOW_MS = 4 * 60 * 60 * 1000
+/** The most of the team colour a countdown wash may blend in. */
+const WARMTH_MAX_BLEND = 0.34
+
+/** How many games the strip's ticker tape lists, across both teams combined.
+ * Bounded so the loop stays short enough to actually watch. */
+const TAPE_GAME_COUNT = 6
+/** How fast the schedule tape crawls, in pixels per second, and how often the
+ * page renders while it does. Matches the stocks ticker, which was tuned against
+ * a rendered preview: 60 px per second at a 40 ms tick is 2.4 px per frame. */
+const TAPE_PX_PER_SEC = 60
+const TAPE_TICK_MS = 40
+
+/**
+ * The record tile's wash: green above .500, red below, nothing at .500 or for an
+ * unknown record.
+ *
+ * An absent record draws NO wash rather than a neutral-looking one — the tile
+ * already shows `--` for the text, and a coloured background would suggest a
+ * reading that does not exist.
+ */
+export function recordWash(record: TeamRecord | null): Rgb | undefined {
+  if (!record) return undefined
+  const margin = record.wins - record.losses
+  if (margin === 0) return undefined
+  const magnitude = Math.min(1, Math.abs(margin) / RECORD_SATURATION_GAMES)
+  const target = margin > 0 ? theme.green : theme.red
+  return blend(theme.bg, target, magnitude * RECORD_MAX_BLEND)
+}
+
+/**
+ * How hot an upcoming game's tile is, 0 to 1.
+ *
+ * Ramps from nothing a week out to full at kickoff, then HOLDS full through a
+ * game-length window before dropping away. A TBD kickoff yields 0: an unknown
+ * time is not a countdown, and warming a tile for a game that might be days away
+ * would be inventing information (lesson 18).
+ */
+export function kickoffWarmth(kickoffEpochMs: number | null, nowMs: number): number {
+  if (kickoffEpochMs === null || !Number.isFinite(kickoffEpochMs)) return 0
+  if (!Number.isFinite(nowMs)) return 0
+  const untilKickoff = kickoffEpochMs - nowMs
+  // After kickoff: hot for the length of a game, then cold.
+  if (untilKickoff <= 0) {
+    return -untilKickoff <= WARMTH_GAME_WINDOW_MS ? 1 : 0
+  }
+  if (untilKickoff >= WARMTH_LEAD_MS) return 0
+  return 1 - untilKickoff / WARMTH_LEAD_MS
+}
+
+/** The countdown wash for one upcoming tile, or undefined when it is cold. */
+export function warmthWash(warmth: number, accent: Rgb): Rgb | undefined {
+  if (warmth <= 0) return undefined
+  return blend(theme.bg, accent, warmth * WARMTH_MAX_BLEND)
+}
+
+/**
+ * The wash for a game whose result is known: green for a win, red for a loss.
+ *
+ * `null` — not played, or a tie the inline flags cannot distinguish — gets no
+ * wash, so an undecided game never looks like a lost one.
+ */
+export function resultWash(result: GameResult): Rgb | undefined {
+  if (result === null) return undefined
+  return blend(theme.bg, result === 'win' ? theme.green : theme.red, RECORD_MAX_BLEND)
+}
+
 export interface FootballReader {
   getSchedule(team: Team): Game[]
   getRecord(team: Team): TeamRecord | null
@@ -153,6 +260,9 @@ export interface FootballReader {
   getLastUpdatedAt(): number
   isStale(): boolean
   getLogo(team: Team): Image | null
+  /** The team's accent colour, taken from its crest, or null when it has none.
+   * Computed once when the logo is decoded — never on the render path. */
+  getTeamColor(team: Team): Rgb | null
   setVisible(visible: boolean): void
 }
 
@@ -169,6 +279,18 @@ export interface FootballReader {
  * reports `ignored`, truthfully, in both modes.
  */
 export class FootballPage implements Page {
+  /**
+   * The clock the most recent `render` was given, so `tickMs` can answer without
+   * reading the wall clock — which a page may never do.
+   *
+   * `null` before the first render, and `tickMs` then returns the safe default.
+   * Treating an unset clock as 0 would put every future game "upcoming" relative
+   * to the epoch and report a tape that has not been drawn yet — an answer derived
+   * from a clock nobody supplied. The daemon re-reads `tickMs` every tick and
+   * re-arms when it changes, so the real rate arrives one tick later at worst.
+   */
+  private lastRenderMs: number | null = null
+
   readonly name = 'football'
 
   /** The team whose schedule is open, or null on the grid. `onLeave` always
@@ -193,33 +315,83 @@ export class FootballPage implements Page {
    * daemon supplies it, is the millisecond clock this page actually needs to
    * compare against `kickoffEpochMs` — defaulting to `now * 1000` keeps this
    * correct for any caller (including tests) that only passes `now`. */
+  /**
+   * A fast tick only while the schedule tape is actually scrolling.
+   *
+   * Like the stocks ticker, the tape's motion carries CONTENT — the strip shows a
+   * fraction of it at once — so it keeps moving even for stale data, and staleness
+   * shows through dimming instead. But when there is nothing upcoming there is no
+   * tape, and the page has nothing else that moves.
+   *
+   * Reads the same `tapeSegments` the strip reads, so the declared rate cannot
+   * disagree with whether anything is animating (lesson 21).
+   */
+  get tickMs(): number | undefined {
+    // A drill-down carries no tape.
+    if (this.selected) return undefined
+    const nowMs = this.nowMsForTick()
+    if (nowMs === null) return undefined
+    const gators = this.source.getTeamColor('gators') ?? theme.gray
+    const jaguars = this.source.getTeamColor('jaguars') ?? theme.gray
+    const hasTape = this.tapeSegments(nowMs, gators, jaguars).length > 0
+    return hasTape ? TAPE_TICK_MS : undefined
+  }
+
+  /**
+   * The clock `tickMs` uses to decide whether a tape exists.
+   *
+   * `tickMs` is a property, so it gets no injected clock — but the answer only
+   * depends on WHETHER any game is upcoming, which changes on the scale of days.
+   * The last clock `render` was given is therefore both available and precise
+   * enough, and it keeps this getter from reading the wall clock, which a page may
+   * never do.
+   */
+  private nowMsForTick(): number | null {
+    return this.lastRenderMs
+  }
+
   render(now: number, nowMs?: number): DeckFrame {
     const clockMs = nowMs ?? now * 1000
+    this.lastRenderMs = clockMs
     const status = this.source.getStatus()
     const stale = this.source.isStale()
     const dim = stale || status !== 'ok'
 
     if (this.selected) return this.scheduleFrame(this.selected.team, clockMs, dim)
 
+    // Each team's own colour, taken from its crest. Falls back to the theme when a
+    // crest has no usable accent — never a fabricated hue.
+    const gatorsColor = this.source.getTeamColor('gators') ?? theme.gray
+    const jaguarsColor = this.source.getTeamColor('jaguars') ?? theme.gray
+
     const keys: KeySpec[] = [
-      this.logoKey('gators', dim),
-      ...this.nextThreeKeys('gators', clockMs, dim),
-      this.logoKey('jaguars', dim),
-      ...this.nextThreeKeys('jaguars', clockMs, dim),
+      this.logoKey('gators', dim, gatorsColor),
+      ...this.nextThreeKeys('gators', clockMs, dim, gatorsColor),
+      this.logoKey('jaguars', dim, jaguarsColor),
+      ...this.nextThreeKeys('jaguars', clockMs, dim, jaguarsColor),
     ]
 
-    return { keys, strip: this.strip(clockMs), buttons: [theme.gray, theme.gray] }
+    // The ONE page where the two round buttons should differ. Every other page
+    // shows a single board-level signal, so two colours would read as two
+    // unrelated controls — but here the deck genuinely splits by row, Gators on
+    // top and Jaguars beneath, so each light names its own row.
+    return {
+      keys,
+      strip: this.strip(clockMs, gatorsColor, jaguarsColor),
+      buttons: [gatorsColor, jaguarsColor],
+    }
   }
 
   /** Keys 0 and 4: the team's composited logo (crest plus a reserved plain
    * band) with the season record drawn in that band, once the logo has
    * decoded — or a text-only fallback (team name AND record, so the record
    * is not lost just because the crest is still downloading) meanwhile. */
-  private logoKey(team: Team, dim: boolean): KeySpec {
+  private logoKey(team: Team, dim: boolean, accent: Rgb): KeySpec {
     const logo = this.source.getLogo(team)
-    const recordText = formatRecord(this.source.getRecord(team))
+    const record = this.source.getRecord(team)
+    const recordText = formatRecord(record)
     if (logo) {
-      return {
+      const key: KeySpec = {
         kind: 'image',
         image: logo,
         imageKey: team,
@@ -227,8 +399,15 @@ export class FootballPage implements Page {
         lineSizes: [RECORD_SIZES],
         lineY: [RECORD_Y],
         align: 'center',
+        border: accent,
         dim,
       }
+      // The record's own wash, behind the composited crest's reserved band. The
+      // crest itself covers the upper part of the key, so this reads as a tint
+      // under the record line rather than as a coloured logo.
+      const wash = recordWash(record)
+      if (wash) key.bg = wash
+      return key
     }
     return {
       kind: 'control',
@@ -242,11 +421,20 @@ export class FootballPage implements Page {
   /** Keys 1-3 / 5-7: this team's next three games in chronological order. A
    * missing slot (fewer than three upcoming games left, or no data yet)
    * draws a dashed placeholder rather than a bare, left-hugging fallback. */
-  private nextThreeKeys(team: Team, nowMs: number, dim: boolean): KeySpec[] {
+  private nextThreeKeys(team: Team, nowMs: number, dim: boolean, accent: Rgb): KeySpec[] {
     const next = upcoming(this.source.getSchedule(team), nowMs).slice(0, NEXT_COUNT)
     const keys: KeySpec[] = []
     for (let i = 0; i < NEXT_COUNT; i++) {
-      keys.push(this.gameKey(next[i], dim))
+      const game = next[i]
+      const key = this.gameKey(game, dim)
+      key.border = accent
+      // Warms as kickoff approaches, so the imminent game is the brightest thing
+      // on the row without needing to read a date.
+      if (game) {
+        const wash = warmthWash(kickoffWarmth(game.kickoffEpochMs, nowMs), accent)
+        if (wash) key.bg = wash
+      }
+      keys.push(key)
     }
     return keys
   }
@@ -291,7 +479,15 @@ export class FootballPage implements Page {
     for (let i = 0; i < SCHEDULE_WINDOW; i++) {
       const game = window[i]
       const isPast = game !== undefined && game.kickoffEpochMs !== null && game.kickoffEpochMs < nowMs
-      keys.push(this.gameKey(game, dim, isPast))
+      const key = this.gameKey(game, dim, isPast)
+      // Green for a win, red for a loss, nothing for a game that is undecided or
+      // a tie — so the whole season's shape reads down the deck at a glance. The
+      // result costs no extra request: ESPN sends it inline on every event.
+      if (game) {
+        const wash = resultWash(game.result)
+        if (wash) key.bg = wash
+      }
+      keys.push(key)
     }
     keys.push(this.backKey())
 
@@ -330,7 +526,7 @@ export class FootballPage implements Page {
     return best
   }
 
-  private strip(nowMs: number): StripSpec {
+  private strip(nowMs: number, gatorsColor: Rgb, jaguarsColor: Rgb): StripSpec {
     const status = this.source.getStatus()
     const nearest = this.nearestNext(nowMs)
 
@@ -352,7 +548,45 @@ export class FootballPage implements Page {
     const line2 =
       status === 'offline' ? 'offline' : updatedAt > 0 ? `updated ${formatEasternTime(updatedAt * 1000)}` : 'updated --'
 
-    return { lines: [truncate(line1, STRIP_CHARS), truncate(line2, STRIP_CHARS)] }
+    const spec: StripSpec = { lines: [truncate(line1, STRIP_CHARS), truncate(line2, STRIP_CHARS)] }
+
+    // The season crawling across line 2's band, both teams in date order, each
+    // segment in its own team's colour. Line 1 keeps the nearest game, so the
+    // most useful fact is still readable without waiting for the tape.
+    const segments = this.tapeSegments(nowMs, gatorsColor, jaguarsColor)
+    if (segments.length > 0) {
+      spec.tape = { segments, offsetPx: tapeOffsetPx(nowMs, TAPE_PX_PER_SEC) }
+    }
+
+    return spec
+  }
+
+  /**
+   * The next several games across BOTH teams, in date order, one tape segment
+   * each. Bounded by `TAPE_GAME_COUNT` so the loop stays short enough to watch.
+   *
+   * A game with no known kickoff still appears — it is real, upcoming
+   * information — but sorts last, since it cannot be placed on the timeline.
+   */
+  private tapeSegments(nowMs: number, gatorsColor: Rgb, jaguarsColor: Rgb): TapeSegment[] {
+    const entries: { game: Game; team: Team }[] = []
+    for (const team of ['gators', 'jaguars'] as const) {
+      for (const game of upcoming(this.source.getSchedule(team), nowMs)) {
+        entries.push({ game, team })
+      }
+    }
+    entries.sort((a, b) => {
+      const ak = a.game.kickoffEpochMs
+      const bk = b.game.kickoffEpochMs
+      if (ak === null && bk === null) return 0
+      if (ak === null) return 1
+      if (bk === null) return -1
+      return ak - bk
+    })
+    return entries.slice(0, TAPE_GAME_COUNT).map(({ game, team }) => ({
+      text: `${TEAM_SHORT[team]} ${formatShortDate(game.kickoffEpochMs)} ${game.isHome ? 'vs' : '@'} ${game.opponentShort || game.opponent}`,
+      color: team === 'gators' ? gatorsColor : jaguarsColor,
+    }))
   }
 
   private scheduleStrip(team: Team, fullSchedule: Game[], window: Game[]): StripSpec {

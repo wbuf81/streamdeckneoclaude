@@ -2,6 +2,8 @@ import { EventEmitter } from 'node:events'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
 import { log } from '../log.js'
 import { theme } from '../render/theme.js'
+import { dominantColor } from '../render/canvas.js'
+import type { Rgb } from '../render/specs.js'
 
 /**
  * Data source note, measured 2026-08-14 (see docs/VERIFIED-FACTS.md, task 42).
@@ -124,7 +126,24 @@ export interface Game {
    * (docs/VERIFIED-FACTS.md's prior note on `00:00:00`), and this host can.
    */
   timeTbd: boolean
+  /**
+   * How this game ended for THIS team, or null.
+   *
+   * Read from `competitors[].winner`, which ESPN sends INLINE on every event —
+   * measured 2026-08-18. The scores and the game clock are `$ref` links needing
+   * their own fetches, but the result costs nothing, and this parser used to
+   * throw it away.
+   *
+   * `null` covers two different things the inline flags cannot tell apart: a game
+   * not yet played, and a genuine TIE (where neither competitor is the winner).
+   * Rendering a tie as "no result" is the honest reading — the season tie count
+   * is still available on `TeamRecord` — and it is never rendered as a loss.
+   */
+  result: GameResult
 }
+
+/** How a game ended for the team being asked about. See `Game.result`. */
+export type GameResult = 'win' | 'loss' | null
 
 export interface TeamRecord {
   wins: number
@@ -255,13 +274,26 @@ export function parseEvent(body: unknown, espnId: string): Game | null {
   const competitors = Array.isArray(comp.competitors) ? comp.competitors : []
 
   let isHome: boolean | null = null
+  // `winner` is a real boolean on each competitor when the game is decided, and
+  // false on both while it is not. Reading BOTH sides is what distinguishes a
+  // loss from an undecided game: my side false alone means nothing.
+  let mineWon = false
+  let opponentWon = false
   for (const c of competitors) {
-    if (strOf(c, 'id') === espnId) {
+    const isMine = strOf(c, 'id') === espnId
+    const won = asObj(c).winner === true
+    if (isMine) {
       isHome = strOf(c, 'homeAway') === 'home'
-      break
+      mineWon = won
+    } else if (won) {
+      opponentWon = true
     }
   }
   if (isHome === null) return null
+
+  // Neither flag set means undecided or a tie. Both cases render as no result
+  // rather than as a guess (see `Game.result`).
+  const result: GameResult = mineWon ? 'win' : opponentWon ? 'loss' : null
 
   const nameSplit = splitEventName(strOf(obj, 'name'))
   const shortSplit = splitShortName(strOf(obj, 'shortName'))
@@ -280,6 +312,7 @@ export function parseEvent(body: unknown, espnId: string): Game | null {
     // actually known is a smaller harm than showing a confident, possibly
     // wrong kickoff time (docs/LESSONS.md #18).
     timeTbd: timeValid !== true,
+    result,
   }
 }
 
@@ -434,6 +467,10 @@ export class FootballSource extends EventEmitter {
   private blockedUrls = new Set<string>()
 
   private logoCache = new Map<Team, Image>()
+  /** One accent colour per team, taken from the RAW crest. A `null` VALUE means
+   * the crest has no usable accent; an absent key means the logo has not loaded
+   * yet. */
+  private teamColors = new Map<Team, Rgb | null>()
   private logoPending = new Set<Team>()
   private logoRetryAt = new Map<Team, number>()
 
@@ -674,6 +711,15 @@ export class FootballSource extends EventEmitter {
    * Mirrors `SpotifySource.getArt`: decodes off the render path, caches the
    * result, and starts exactly one load per miss (guarded by `logoPending`).
    */
+  /**
+   * The team's accent colour, taken from its crest, or null when the crest has
+   * none or has not loaded. Never triggers work — the colour is computed once,
+   * when the logo is decoded.
+   */
+  getTeamColor(team: Team): Rgb | null {
+    return this.teamColors.get(team) ?? null
+  }
+
   getLogo(team: Team): Image | null {
     const cached = this.logoCache.get(team)
     if (cached) return cached
@@ -703,6 +749,16 @@ export class FootballSource extends EventEmitter {
       log.clearOnce(`football-logo-http-${team}`)
       const bytes = Buffer.from(await res.arrayBuffer())
       const raw = await this.loadImageFn(bytes)
+      // The team's accent colour, from the RAW crest — never the composited one,
+      // whose reserved bottom band is a flat fill of `theme.bg` and would only
+      // dilute the count. Extracted ONCE here, off the render path, exactly as
+      // the Spotify source extracts an album's colour.
+      try {
+        this.teamColors.set(team, dominantColor(raw))
+      } catch (e) {
+        this.teamColors.set(team, null)
+        log.once(`football-logo-color-${team}`, `Team colour extraction for ${team} failed: ${String(e)}`)
+      }
       let composited: Image
       try {
         composited = await this.compositeLogoFn(raw, this.loadImageFn)

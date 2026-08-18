@@ -1,12 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import { CodexPage } from '../../src/pages/codex-page.js'
-import { FootballPage } from '../../src/pages/football-page.js'
 import { SystemPage } from '../../src/pages/system-page.js'
 import { WeatherPage } from '../../src/pages/weather-page.js'
 import type { PlayerReader } from '../../src/pages/spotify-page.js'
 import type { CodexReader } from '../../src/pages/codex-page.js'
-import type { FootballReader } from '../../src/pages/football-page.js'
 import type { SystemReader } from '../../src/pages/system-page.js'
 import type { WeatherReader } from '../../src/pages/weather-page.js'
 import type { DayForecast } from '../../src/sources/weather.js'
@@ -70,17 +68,18 @@ describe('pages that must keep the default 1000 ms render interval', () => {
     expect(page.tickMs).toBeUndefined()
   })
 
-  it('FootballPage declares no tickMs', () => {
-    const fake = {
-      getSchedule: () => [],
-      getStatus: () => 'ok',
-      getRecord: () => null,
-      isStale: () => false,
-      setVisible: () => {},
-    } as unknown as FootballReader
-    const page: Page = new FootballPage(fake)
-    expect(page.tickMs).toBeUndefined()
-  })
+  /*
+   * FootballPage USED to be asserted here. Task 45 gave it a scrolling schedule
+   * tape, so it raises its rate while the tape moves.
+   *
+   * Its case moved to `tests/pages/football-page.test.ts`, and for the reason this
+   * file keeps re-learning: the fake here returned an EMPTY schedule, which is
+   * exactly the no-tape case, so the assertion would have gone green against a
+   * page that always raised its rate. That is the third page to hit this — weather
+   * and stocks were the first two. When a page here gains a conditional rate, move
+   * its case to that page's own suite, where the fakes carry real data.
+   */
+
 
   it('SystemPage declares no tickMs', () => {
     const fake = {

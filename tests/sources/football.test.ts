@@ -226,6 +226,96 @@ describe('splitShortName', () => {
 // parseEvent
 // ---------------------------------------------------------------------------
 
+/**
+ * Fixtures for the `winner` flag, built from the REAL payload shape probed live on
+ * 2026-08-18. Each competitor carries `winner` inline beside `homeAway`, and
+ * `score` is a `$ref` this parser deliberately does not follow:
+ *
+ *   { id: '18', homeAway: 'home', winner: false, score: { $ref: '...' } }
+ *   { id: '30', homeAway: 'away', winner: true,  score: { $ref: '...' } }
+ */
+function decidedFixture(jaguarsWon: boolean) {
+  return {
+    id: '401873281',
+    date: '2026-08-15T20:00Z',
+    name: 'Jacksonville Jaguars at New Orleans Saints',
+    shortName: 'JAX @ NO',
+    timeValid: true,
+    competitions: [
+      {
+        competitors: [
+          { id: '18', homeAway: 'home', winner: !jaguarsWon, score: { $ref: 'http://example/score' } },
+          { id: JAGUARS_ESPN_ID, homeAway: 'away', winner: jaguarsWon, score: { $ref: 'http://example/score' } },
+        ],
+      },
+    ],
+  }
+}
+
+describe('parseEvent: the result ESPN already sends inline', () => {
+  it('reads a win for the team being asked about', () => {
+    expect(parseEvent(decidedFixture(true), JAGUARS_ESPN_ID)!.result).toBe('win')
+  })
+
+  it('reads a loss from the OPPONENT being the winner, not from its own flag alone', () => {
+    // My side's `winner: false` means nothing by itself — it is also false on an
+    // undecided game. The loss is only knowable from the other competitor.
+    expect(parseEvent(decidedFixture(false), JAGUARS_ESPN_ID)!.result).toBe('loss')
+  })
+
+  it('reads the same game from the OTHER team\'s point of view, inverted', () => {
+    // The Saints (id 18) won the game the Jaguars lost.
+    expect(parseEvent(decidedFixture(false), '18')!.result).toBe('win')
+    expect(parseEvent(decidedFixture(true), '18')!.result).toBe('loss')
+  })
+
+  it('reports no result for an undecided game, where both flags are false', () => {
+    const undecided = {
+      ...decidedFixture(true),
+      competitions: [
+        {
+          competitors: [
+            { id: '18', homeAway: 'home', winner: false },
+            { id: JAGUARS_ESPN_ID, homeAway: 'away', winner: false },
+          ],
+        },
+      ],
+    }
+    expect(parseEvent(undecided, JAGUARS_ESPN_ID)!.result).toBeNull()
+  })
+
+  it('reports no result when the flags are missing entirely, as on an unplayed game', () => {
+    // The existing fixtures carry no `winner` at all — the shape ESPN sends before
+    // a game is played.
+    expect(parseEvent(jaguarsAwayFixture(), JAGUARS_ESPN_ID)!.result).toBeNull()
+    expect(parseEvent(jaguarsHomeFixture(), JAGUARS_ESPN_ID)!.result).toBeNull()
+  })
+
+  it('treats a non-boolean winner as no result rather than as truthy', () => {
+    const hostile = {
+      ...decidedFixture(true),
+      competitions: [
+        {
+          competitors: [
+            { id: '18', homeAway: 'home', winner: 'yes' },
+            { id: JAGUARS_ESPN_ID, homeAway: 'away', winner: 'true' },
+          ],
+        },
+      ],
+    }
+    expect(parseEvent(hostile, JAGUARS_ESPN_ID)!.result).toBeNull()
+  })
+
+  it('never follows the score $ref, so parsing costs no extra request', () => {
+    // The scores are behind their own refs. This parser reads only what the event
+    // payload already contains; fetching them is separate, deliberate work.
+    const fixture = decidedFixture(true)
+    const g = parseEvent(fixture, JAGUARS_ESPN_ID)!
+    expect(g.result).toBe('win')
+    expect(Object.keys(g)).not.toContain('score')
+  })
+})
+
 describe('parseEvent', () => {
   it('parses an away game: opponent, home/away, kickoff, not TBD', () => {
     const g = parseEvent(jaguarsAwayFixture(), JAGUARS_ESPN_ID)!
@@ -610,6 +700,89 @@ describe('FootballSource visibility and polling', () => {
 // ---------------------------------------------------------------------------
 // getLogo / compositeLogo
 // ---------------------------------------------------------------------------
+
+describe('FootballSource.getTeamColor (task 45)', () => {
+  /** Fetches a real PNG crest through the real decode pipeline, then waits for it.
+   * The composite path uses native codecs on libuv's thread pool, so this needs a
+   * real macrotask tick rather than a few microtasks. */
+  async function loadCrest(paint: (ctx: ReturnType<ReturnType<typeof createCanvas>['getContext']>) => void) {
+    const raw = createCanvas(40, 40)
+    paint(raw.getContext('2d'))
+    const bytes = raw.toBuffer('image/png')
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+      arrayBuffer: async () =>
+        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    }))
+    const src = new FootballSource(fetchFn as never, () => NOW)
+    src.getLogo('jaguars')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    return src
+  }
+
+  it('is null before the crest has loaded, and never starts work of its own', () => {
+    const src = new FootballSource(neverFetch as never, () => NOW)
+    expect(src.getTeamColor('jaguars')).toBeNull()
+    expect(src.getTeamColor('gators')).toBeNull()
+  })
+
+  it('extracts the crest\'s accent colour once it has loaded', async () => {
+    const src = await loadCrest((ctx) => {
+      ctx.fillStyle = 'rgb(0, 103, 120)' // Jaguars teal
+      ctx.fillRect(0, 0, 40, 40)
+    })
+    const colour = src.getTeamColor('jaguars')
+    expect(colour).not.toBeNull()
+    // Teal: blue and green lead, red trails.
+    expect(colour![2]).toBeGreaterThan(colour![0]! + 40)
+    expect(colour![1]).toBeGreaterThan(colour![0]! + 40)
+  })
+
+  it('finds a small vivid mark on a mostly transparent crest', async () => {
+    // Most crests are largely transparent, so the accent has to survive being a
+    // minority of the pixels. `dominantColor` skips anything under half opacity,
+    // which is what makes that work.
+    //
+    // NOTE on a claim this test does NOT make: the source reads the RAW crest
+    // rather than the composited one, whose bottom third is a flat fill of
+    // `theme.bg`. That is the right choice — it does not depend on another
+    // function's internals — but it is NOT load-bearing, and this suite should not
+    // pretend to prove it. Breaking the code to read the composited image instead
+    // leaves every assertion here passing, because `theme.bg` is `(10,10,12)`:
+    // chroma 2, so the chroma filter discards that whole band anyway. An earlier
+    // version of this test was named for that distinction and could not fail on it.
+    const src = await loadCrest((ctx) => {
+      ctx.clearRect(0, 0, 40, 40)
+      ctx.fillStyle = 'rgb(220, 40, 30)'
+      ctx.fillRect(4, 4, 10, 10)
+    })
+    const colour = src.getTeamColor('jaguars')
+    expect(colour).not.toBeNull()
+    expect(colour![0]).toBeGreaterThan(colour![1]! + 60)
+  })
+
+  it('is null for a greyscale crest, rather than inventing a hue', async () => {
+    const src = await loadCrest((ctx) => {
+      for (let i = 0; i < 5; i++) {
+        const v = 40 + i * 40
+        ctx.fillStyle = `rgb(${v}, ${v}, ${v})`
+        ctx.fillRect(0, i * 8, 40, 8)
+      }
+    })
+    expect(src.getTeamColor('jaguars')).toBeNull()
+  })
+
+  it('leaves the other team untouched', async () => {
+    const src = await loadCrest((ctx) => {
+      ctx.fillStyle = 'rgb(0, 103, 120)'
+      ctx.fillRect(0, 0, 40, 40)
+    })
+    expect(src.getTeamColor('jaguars')).not.toBeNull()
+    expect(src.getTeamColor('gators')).toBeNull()
+  })
+})
 
 describe('FootballSource.getLogo', () => {
   it('returns null and starts a load on first call, then the composited image once it resolves', async () => {

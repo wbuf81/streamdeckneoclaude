@@ -426,6 +426,26 @@ survived a green suite and a preview the user approved, and all four were found
 by simulating the user's actual week. **Preview the real data distribution, not
 one of everything.**
 
+### New invariants added by task 45 (football glance value)
+
+- `blend` lives in `render/theme.ts` and is shared by every page that tints a key
+  from data. Do not re-implement colour mixing in a page.
+- `Game.result` comes from ESPN's INLINE `winner` flags, read from BOTH
+  competitors. My own side's `false` is indistinguishable from an undecided game.
+  `null` covers both "not played" and a tie, and never renders as a loss.
+- `upcoming()` keeps a game for a game-length window AFTER kickoff, so a game in
+  progress stays on the grid. Do not tighten it back to `>= nowMs`.
+- The two round buttons differ on this page ALONE, one per team row. Every other
+  page shows one board-level signal and uses two identical lights.
+- The team colour is extracted in the SOURCE, once per crest, at decode time.
+  Reading it from the raw crest rather than the composited one is deliberate but
+  NOT load-bearing — `theme.bg` is excluded by the chroma filter either way, and
+  the test says so rather than pretending to prove it.
+- `FootballPage.tickMs` answers `undefined` before the first render rather than
+  guessing from an epoch clock; the daemon re-arms one tick later.
+
+---
+
 ### New invariants added by task 44 (the Spotify page rebuild)
 
 - The art block is **3 keys wide**, and a square cover MUST be crop-corrected to
