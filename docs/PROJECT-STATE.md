@@ -440,6 +440,14 @@ one of everything.**
   isPlaying reading.
 - `drawIdleRain`'s stride is `IDLE_MAX_COLS`. At 2, two of the six cells collide
   and rain identically.
+- The two control keys wear the album's colour: a heavily darkened wash, with the
+  glyph LIFTED toward white when the album is dark. Without the lift a deep-red
+  cover puts a dark glyph on a near-black wash and the controls vanish.
+- The transport glyphs are TEXT-mode `▶`, `❚❚` and `▶▶`. Menlo has no `⏸` or `⏭`
+  — they render as tofu — and the emoji forms cannot be tinted.
+- The Spotify tick rate has now been inverted three times, and the rule that
+  survived is: **the rate follows what actually moves**, never "is a track
+  playing". Playing breathes one key, paused drifts six, idle rains six.
 - Volume, the volume "thump", and previous were removed by the user's explicit
   choice. A test asserts their glyphs are absent, so they cannot creep back into
   a layout with no room for them.

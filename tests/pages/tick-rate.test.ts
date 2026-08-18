@@ -165,8 +165,12 @@ describe('SpotifyPage tickMs: fast only while something actually moves', () => {
   /*
    * Task 27 gave the page an idle animation, so the rate rose while nothing was
    * playing. Task 38 added the volume key's "thump", so it rose during playback
-   * too. Task 44 deleted that key and gave PAUSED its own drifting layer, so the
-   * condition inverted: playing is now the static case.
+   * too. Task 44 deleted that key, gave PAUSED its own drifting layer, and then
+   * gave the play/pause glyph a breath — so now something moves in EVERY loaded
+   * state, and the rate is raised unless the data is stale.
+   *
+   * The rule that survived all three revisions: the rate follows what actually
+   * moves. It is not a property of "is a track playing".
    *
    * Note the shape of the bug this file keeps almost missing — twice now, for
    * weather and for stocks, an assertion here stayed green because the minimal
@@ -190,8 +194,17 @@ describe('SpotifyPage tickMs: fast only while something actually moves', () => {
   const playing = { isPlaying: true, trackId: 't', durationMs: 1000, positionMs: 0 }
   const paused = { ...playing, isPlaying: false }
 
-  it('keeps the default 1000 ms tick while a track is PLAYING, since nothing moves then', () => {
+  it('raises the tick rate while a track is PLAYING, for the play/pause glyph breath', () => {
     const page = new SpotifyPage(fakeReader({ interpolate: () => playing as never }))
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
+  })
+
+  it('keeps the default 1000 ms tick behind a dead device, even with a stale playing snapshot (M5)', () => {
+    const page = new SpotifyPage(fakeReader({
+      interpolate: () => playing as never,
+      getStatus: () => 'no-device',
+    }))
     expect(page.tickMs).toBeUndefined()
   })
 

@@ -842,6 +842,33 @@ with text against both edges: that text is not visible. Album covers are
 centre-weighted so this is the right trade for a full-bleed image, but a
 letterboxed alternative is a one-constant change.
 
+### Menlo has no media-control glyphs — they render as tofu
+
+Measured on 2026-08-18. In TEXT mode (`glyphFont` absent or `'text'`), these all
+render as the SAME missing-glyph box, byte-identical to each other at 202 ink
+pixels: `⏵` `⏸` `⏭` `‖`. Reaching for `⏸` outside emoji mode silently puts a box
+on the deck.
+
+Real Menlo glyphs, with distinct healthy coverage:
+
+| Glyph | Ink pixels | Used for |
+| --- | --- | --- |
+| `▶` | 241 | play |
+| `❚❚` | 607 | pause |
+| `▶▶` | 481 | next |
+| `▮▮` | 441 | (lighter pause alternative) |
+| `▶\|` | 367 | (alternative next) |
+
+Note how this was found: four candidates measuring the IDENTICAL pixel count was
+the tell. Equal numbers across supposedly different glyphs mean a shared
+fallback, not a coincidence — the same reasoning lesson 22 records for a centring
+proof that compared four byte-identical emoji.
+
+The emoji forms (`▶️`, `⏸️`, `⏭️`) do exist, but they are Apple's glossy blue-grey
+buttons and, being bitmap glyphs, they ignore `fillStyle` (lesson 15) — so they
+can never take a page's own colour. That is why the Spotify controls use text
+glyphs tinted by the album.
+
 ### Album colour extraction
 
 `dominantColor` downscales the cover to 28x28, buckets pixels at 5 bits per

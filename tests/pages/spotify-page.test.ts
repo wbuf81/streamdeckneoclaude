@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import { createCanvas, loadImage } from '@napi-rs/canvas'
-import { SpotifyPage } from '../../src/pages/spotify-page.js'
+import { SpotifyPage, controlWash, controlGlyphColor, breathePhase } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
 import type { Rgb } from '../../src/render/specs.js'
 import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
@@ -117,29 +117,46 @@ describe('SpotifyPage layout', () => {
 
   // Task 38: every control glyph moved to the colour-emoji font, the user's
   // pick over task 37's plain-text Geometric Shapes set.
-  it('shows a pause glyph on key 3 while playing, drawn in emoji mode', () => {
-    const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
+  it('shows a real Menlo pause glyph on key 3 while playing, tinted by the album', () => {
+    // TEXT mode, not emoji. Apple's glossy media emoji read as plastic stickers
+    // against the art, and being bitmap glyphs they ignore `fillStyle`, so they
+    // could never take the album's colour (lesson 15).
+    const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART, [250, 210, 40])
     const key = page.render(NOW).keys[3]!
-    expect(key.glyph).toBe('⏸️')
-    expect(key.glyphFont).toBe('emoji')
+    expect(key.glyph).toBe('❚❚')
+    expect(key.glyphFont).not.toBe('emoji')
+    expect(key.glyphColor).toBeDefined()
+    expect(key.bg).toBeDefined()
   })
 
-  it('shows a play glyph on key 3 while paused, drawn in emoji mode', () => {
+  it('avoids the media-control characters Menlo does not have', () => {
+    // MEASURED: `⏵`, `⏸`, `⏭` and `‖` all render as the SAME missing-glyph box in
+    // Menlo, byte-identical at 202 ink pixels. Shipping one in text mode would put
+    // a tofu box on the deck, and nothing would report it.
+    const TOFU = ['⏵', '⏸', '⏭', '⏮', '‖', '⏯']
+    for (const playing of [true, false]) {
+      const { page } = build(player({ isPlaying: playing }), 'ok', FAKE_ART)
+      const glyphs = page.render(NOW).keys.map((k) => k.glyph).filter(Boolean)
+      for (const g of glyphs) {
+        expect(TOFU, `glyph ${g} has no Menlo form`).not.toContain(g)
+      }
+    }
+  })
+
+  it('shows a real Menlo play glyph on key 3 while paused', () => {
     const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART)
     const key = page.render(NOW).keys[3]!
-    expect(key.glyph).toBe('▶️')
-    expect(key.glyphFont).toBe('emoji')
+    expect(key.glyph).toBe('▶')
+    expect(key.glyphFont).not.toBe('emoji')
   })
 
-  it('shows the next-track glyph on key 7, and no previous or volume button anywhere', () => {
-    // Previous and volume were dropped when the art grew to six keys — the user
-    // asked for play/pause and the cover, and those were the cost. Asserted GONE
-    // rather than merely moved, so a later edit cannot quietly reintroduce a
+  it('shows the next glyph on key 7, and no previous or volume button anywhere', () => {
+    // Previous and volume were dropped when the art grew to six keys. Asserted
+    // GONE rather than merely moved, so a later edit cannot quietly reintroduce a
     // control this layout has no room for.
     const { page } = build(player(), 'ok', FAKE_ART)
     const keys = page.render(NOW).keys
-    expect(keys[7]!.glyph).toBe('⏭️')
-    expect(keys[7]!.glyphFont).toBe('emoji')
+    expect(keys[7]!.glyph).toBe('▶▶')
     const glyphs = keys.map((k) => k.glyph).filter(Boolean)
     expect(glyphs).not.toContain('⏮️')
     expect(glyphs).not.toContain('🔊')
@@ -174,14 +191,26 @@ describe('SpotifyPage layout', () => {
   // affects one. `now` (the playback position clock) is held FIXED between
   // the two renders — only `nowMs` (the animation clock) advances — so this
   // isolates the thump from anything position-driven.
-  it('changes NO key hash when only nowMs advances during playback', () => {
-    // The volume "thump" used to make exactly one key change every frame. With
-    // volume gone, a PLAYING page is completely static between polls, so the
-    // daemon writes nothing at all.
+  it('changes ONLY the play/pause key when nowMs advances during playback', () => {
+    // The one thing that moves during playback is the play/pause glyph's breath,
+    // so exactly one key is rewritten per frame — about ten key-writes a second
+    // against a measured ceiling of 362. The six art cells and the next key must
+    // stay byte-stable, or a still cover would be redrawn 10 times a second for
+    // nothing.
     const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
     const a = page.render(NOW, 1_000).keys.map(keyHash)
-    const b = page.render(NOW, 1_500).keys.map(keyHash)
-    expect(b).toEqual(a)
+    const b = page.render(NOW, 1_300).keys.map(keyHash)
+    expect(b[3]).not.toBe(a[3])
+    for (const i of [0, 1, 2, 4, 5, 6, 7]) {
+      expect(b[i], `key ${i} should be stable while playing`).toBe(a[i])
+    }
+  })
+
+  it('does not breathe while paused, or behind a dead device', () => {
+    const paused = build(player({ isPlaying: false }), 'ok', FAKE_ART)
+    expect(paused.page.render(NOW, 1_000).keys[3]!.glyphPulse).toBeUndefined()
+    const dead = build(player({ isPlaying: true }), 'no-device', FAKE_ART)
+    expect(dead.page.render(NOW, 1_000).keys[3]!.glyphPulse).toBeUndefined()
   })
 
   it('changes every art key hash when only nowMs advances while PAUSED', () => {
@@ -362,9 +391,15 @@ describe('SpotifyPage tickMs', () => {
     expect(page.tickMs!).toBeLessThan(1000)
   })
 
-  it('is undefined (the 1000 ms default) while a track is loaded and playing, since nothing moves', () => {
+  it('is defined and faster than 1000 ms while playing, for the glyph breath', () => {
+    // Inverted TWICE now, and each time for the same reason: the rate follows what
+    // actually moves. Task 38 raised it for the volume "thump"; task 44 dropped
+    // that key and lowered it again; then the user asked for the controls to feel
+    // alive, so the play/pause glyph breathes and it is raised once more. Only ONE
+    // key changes per frame while playing, which is what makes that affordable.
     const { page } = build(player({ isPlaying: true }))
-    expect(page.tickMs).toBeUndefined()
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
   })
 
   it('is defined while nothing is loaded, for the idle animation', () => {
@@ -814,5 +849,76 @@ describe('SpotifyPage album-colour theming (task 44)', () => {
     const { page, calls } = build(null, 'no-device')
     page.render(NOW, 1_000)
     expect(calls.some((c) => c.startsWith('artColor:'))).toBe(false)
+  })
+})
+
+describe('SpotifyPage control-key styling (task 44 follow-up)', () => {
+  /** Real accents spanning the range an album can produce: bright, mid, very
+   * dark, saturated-dark, and near-white. */
+  const ACCENTS: readonly Rgb[] = [
+    [250, 210, 40],   // bright gold
+    [40, 120, 220],   // mid blue
+    [90, 20, 20],     // dark red — the case that breaks a naive tint
+    [26, 0, 60],      // near-black violet
+    [240, 240, 250],  // near-white
+    [70, 200, 110],   // green
+  ]
+  const lum = (c: readonly number[]) => c[0]! + c[1]! + c[2]!
+
+  it('keeps every glyph clearly brighter than its own wash, for any album', () => {
+    // The whole point of lifting the glyph. Without it a dark-red cover puts a
+    // dark red glyph on a near-black wash and the controls disappear.
+    for (const accent of ACCENTS) {
+      const wash = controlWash(accent)
+      const glyph = controlGlyphColor(accent)
+      expect(lum(glyph), `accent ${accent}`).toBeGreaterThan(lum(wash) * 2.5)
+    }
+  })
+
+  it('keeps every wash dark enough to sit beside album art without glowing', () => {
+    for (const accent of ACCENTS) {
+      expect(lum(controlWash(accent)), `accent ${accent}`).toBeLessThan(200)
+    }
+  })
+
+  it('leaves an already-bright accent alone, and lifts only a dark one', () => {
+    const bright: Rgb = [250, 210, 40]
+    expect(controlGlyphColor(bright)).toEqual(bright)
+    const dark: Rgb = [26, 0, 60]
+    const lifted = controlGlyphColor(dark)
+    expect(lum(lifted)).toBeGreaterThan(lum(dark))
+    // The hue survives the lift: violet stays blue-dominant rather than washing
+    // out to pure white.
+    expect(lifted[2]).toBeGreaterThan(lifted[1]!)
+  })
+
+  it('renders the glyph visibly against the wash on the real key', () => {
+    // The colours could satisfy the arithmetic and still fail on the glass, so
+    // this probes the rendered pixels for the hardest accent.
+    const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART, [90, 20, 20])
+    const key = page.render(NOW, 1_000).keys[3]!
+    const buf = renderKey(key)
+    let brightest = 0
+    for (let y = 0; y < 96; y++) {
+      for (let x = 0; x < 96; x++) brightest = Math.max(brightest, lum(probe(buf, x, y)))
+    }
+    expect(brightest).toBeGreaterThan(lum(key.bg!) * 2.5)
+  })
+
+  it('breathes from the injected clock only, and advances between frames', () => {
+    expect(breathePhase(0)).toBe(0)
+    expect(breathePhase(600)).toBeGreaterThan(breathePhase(0))
+    // Identical clocks give identical phases, so two renders at one instant match.
+    expect(breathePhase(1_234)).toBe(breathePhase(1_234))
+    // And a hostile clock degrades rather than reaching a font string as NaN.
+    expect(breathePhase(Number.NaN)).toBe(0)
+    expect(breathePhase(Number.POSITIVE_INFINITY)).toBe(0)
+  })
+
+  it('falls back to the theme wash when the album has no colour', () => {
+    const { page } = build(player(), 'ok', FAKE_ART, null)
+    const key = page.render(NOW, 1_000).keys[3]!
+    expect(key.bg).toEqual(controlWash(theme.gray))
+    expect(key.glyphColor).toEqual(controlGlyphColor(theme.gray))
   })
 })

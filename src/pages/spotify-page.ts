@@ -6,7 +6,6 @@ import type { Image } from '@napi-rs/canvas'
 import type { Page, PressOutcome } from './types.js'
 import type { PlayerState, SpotifyStatus } from '../sources/spotify.js'
 
-const VOLUME_STEP = 10
 /**
  * The four transport-control glyphs, drawn with the colour-emoji font
  * (task 38 — the user's pick over task 37's plain-text Geometric Shapes
@@ -26,47 +25,64 @@ const VOLUME_STEP = 10
  * key on this same page could still use the text path if that ever made
  * sense for it.
  */
-const PLAY_GLYPH = '▶️'
-const PAUSE_GLYPH = '⏸️'
-const PREVIOUS_GLYPH = '⏮️'
-const NEXT_GLYPH = '⏭️'
 /**
- * DO NOT replace this with a `🔈 → 🔉 → 🔊` cycle for the "thump" below —
- * it was tried, measured, and rejected; re-attempting it as an "obvious"
- * improvement will reproduce the same defect. Measured chromatic pixel
- * weight at `EMOJI_GLYPH_SIZE`: `🔈` 49, `🔉` 92, `🔊` 279 — an UNEVEN step
- * (small jump, then a 3x jump), not a smooth progression. Worse, the three
- * glyphs' own ink CENTRES differ from each other by up to 2px (a real,
- * measured jitter, not anti-aliasing noise), so cycling between them reads
- * as the icon twitching sideways as much as it pulses outward — confirmed
- * visually, not just numerically (see the task's rejected-cycle preview:
- * `🔈` shows no wave lines at all, `🔉` adds a faint one, `🔊` pops in two
- * bright cyan waves — a visible identity change between frames, not a
- * radiating wave).
+ * The transport glyphs, drawn with the TEXT font rather than the colour-emoji
+ * one (task 44).
  *
- * A single glyph scaled by `glyphPulse` has none of that: its ink centre is
- * re-measured and re-corrected at every frame's actual size
- * (`render/canvas.ts`'s `drawCenteredGlyph`), so `🔊` alone is what
- * animates, and only its size changes from frame to frame — never its
- * colour or identity.
+ * The emoji versions were Apple's glossy blue-grey buttons. On a deck otherwise
+ * filled with album art they read as two plastic stickers on black voids — the
+ * user's words were "out of place and not fun" — and being bitmap glyphs they
+ * ignore `fillStyle`, so they could never take the album's colour either
+ * (lesson 15).
+ *
+ * MEASURED on 2026-08-18, because Menlo does not have the media-control block:
+ * `⏵`, `⏸`, `⏭` and `‖` all render as the SAME missing-glyph box, byte-identical
+ * to each other at 202 ink pixels. Reaching for `⏸` in text mode silently gives
+ * you tofu. These three are real Menlo glyphs with distinct, healthy coverage:
+ * `▶` 241 px, `❚❚` 607 px, `▶▶` 481 px.
  */
-const VOLUME_UP_GLYPH = '🔊'
+const PLAY_GLYPH = '▶'
+const PAUSE_GLYPH = '❚❚'
+const NEXT_GLYPH = '▶▶'
+
 /**
- * One full "thump" cycle, in milliseconds. Nothing in the data this page
- * reads carries the track's actual tempo — Spotify's audio-features
- * endpoint has it, but this app has no access to that endpoint, and this
- * page must not attempt it (it would need the user's real OAuth token,
- * which pages never touch directly). This is a fixed, decorative rhythm,
- * not synced to the music.
+ * How the two control keys wear the album's colour.
+ *
+ * The wash is the accent heavily darkened, so white-hot glyphs still read on it.
+ * The glyph is the accent LIFTED toward white when the album is dark — without
+ * that, a deep-red cover would put a dark red glyph on a near-black wash and the
+ * controls would vanish. The lift is what makes the treatment safe for any cover
+ * rather than only for bright ones.
  */
-const VOLUME_THUMP_PERIOD_MS = 800
-/** How often the render loop should tick while the idle animation is
- * showing instead of album art — see the `tickMs` getter below. Matches the
- * rate already proven smooth for the Claude page's crab animation, well
- * inside what a handful of 96x96 keys can sustain (docs/VERIFIED-FACTS.md's
- * throughput table: `renderKey` costs 0.032 ms, all eight keys sustain
- * 45 fps). */
+const CONTROL_WASH_FACTOR = 0.22
+/** The luminance a control glyph must reach, summed across the three channels. */
+const CONTROL_GLYPH_MIN_LUM = 330
+
+/**
+ * How fast the play/pause glyph breathes while a track is playing, and how far.
+ *
+ * It is the only thing that moves during playback, and only ONE key changes per
+ * frame — so the cost is about ten key-writes a second against a measured USB
+ * ceiling of 362 (docs/VERIFIED-FACTS.md). A still deck during playback was the
+ * other half of "not fun".
+ */
+const BREATHE_PERIOD_MS = 2400
+const BREATHE_AMPLITUDE = 1
+
+/** How often the render loop should tick while anything on this page is moving —
+ * the idle rain, the paused layer, or the play/pause glyph's breath. Matches the
+ * rate already proven smooth for the Claude page's crab animation, well inside
+ * what a handful of 96x96 keys can sustain (docs/VERIFIED-FACTS.md's throughput
+ * table: `renderKey` costs 0.032 ms, all eight keys sustain 45 fps). */
 const IDLE_TICK_MS = 100
+
+/**
+ * Which of `render/canvas.ts`'s three cyberpunk idle animations ships. The user
+ * chose `'rain'` from the previews on 2026-08-13: "i like the matrix one that is
+ * sick". It is also the only variant correct across the three-column art block
+ * task 44 introduced — `grid` and `glitch` draw one 2x2 scene and clamp.
+ */
+const IDLE_VARIANT: IdleVariant = 'rain'
 
 /**
  * What a PAUSED cover shows beneath itself. Slow, colourless haze reads as
@@ -74,40 +90,7 @@ const IDLE_TICK_MS = 100
  */
 const PAUSED_FX_VARIANT = 'fog' as const
 const PAUSED_FX_INTENSITY = 0.8
-/**
- * Which of `render/canvas.ts`'s three cyberpunk idle animations ships on the
- * four album-art keys while nothing is playing (task 39, replacing the
- * earlier green equaliser): `'grid'` (a synthwave horizon with a sliced sun),
- * `'rain'` (falling cyan/near-white character streams), or `'glitch'` (drifting
- * scanlines, an occasional slip band, and a flickering `OFFLINE` on key 0).
- * This ONE constant is the whole switch between them — change it here, no
- * other file needs to know. The user picks the shipped default, not the
- * agent; see the task's preview images.
- *
- * The user chose `'rain'` from the previews on 2026-08-13: "i like the
- * matrix one that is sick".
- */
-const IDLE_VARIANT: IdleVariant = 'rain'
-/**
- * Coarse, character-count pre-limits — NOT the thing that guarantees a fit.
- * `renderStrip` (`src/render/canvas.ts`) is what actually measures both
- * lines against the real font and shrinks whichever one needs it to make
- * room for the right-aligned clock, so these two constants only bound how
- * much text this page ever hands to the renderer in the first place.
- *
- * An earlier version of this comment reasoned from one example value (the
- * clock `2:17 / 2:33` "needs 11" characters) to conclude the budget always
- * fit — exactly the habit lesson 17 in docs/LESSONS.md exists to stop. A
- * two-hour track's clock (`120:00 / 120:00`) needs 15, and an 18-character
- * artist beside it measured 22.3 px of real overlap before the renderer
- * started measuring for itself (I5).
- *
- * The title gets the WHOLE first line, and the artist shares the second
- * line with the clock. An earlier version joined the artist and the title
- * on one line and truncated the pair at 34 characters. A track with three
- * artists then filled the budget and the TITLE became a single ellipsis,
- * which loses the one thing the user most wants to read.
- */
+
 const TITLE_CHARS = 30
 const ARTIST_CHARS = 18
 /** Album name shown on key 0 while art is still downloading. */
@@ -206,33 +189,24 @@ export class SpotifyPage implements Page {
    * message there, not the animation.
    */
   get tickMs(): number | undefined {
+    // Unauthorized shows text on key 0, so nothing animates.
     if (this.source.getStatus() === 'unauthorized') return undefined
     const state = this.source.interpolate(0)
-    // The idle animation needs the fast tick whenever nothing is loaded,
-    // REGARDLESS of `status` — it animates through a normal `no-device` or
-    // `offline` idle state just as much as a genuinely empty one.
+    // Nothing loaded: the matrix rain runs across all six art keys, whatever the
+    // status says — a `no-device` or `offline` idle animates just as much as a
+    // genuinely empty one.
     if (!state) return IDLE_TICK_MS
-    // Per M5: `status` can report `no-device` (a failed transport command)
-    // while `state` — the last known player snapshot — still says a track
-    // was playing, since a control failure never clears it. Checked here,
-    // AFTER the idle-animation case above but BEFORE reading `isPlaying`, so a
-    // stale "was playing" snapshot cannot keep the fast tick alive for a device
-    // that is gone.
-    if (this.source.getStatus() === 'no-device') return undefined
-    // INVERTED by task 44, and this is the important half of that change.
+    // A track IS loaded, so something moves unless the data is stale: playing
+    // breathes on the play/pause glyph, and paused drifts a layer under all six
+    // art cells.
     //
-    // The fast tick used to follow `isPlaying`, because the volume key's "thump"
-    // animated during playback. That key is gone, so a PLAYING page is now
-    // completely static between polls and gains nothing from a faster clock —
-    // while a PAUSED one animates, because the cover dims and a layer drifts
-    // beneath it.
-    //
-    // Leaving this as it was would have been the worst of both: burning the fast
-    // rate on a static page, and starving the one animation on the page down to
-    // a frame a second. Caught by a retired golden hash firing, not by the
-    // animation being watched.
-    return state.isPlaying ? undefined : IDLE_TICK_MS
+    // Reads the SAME `isStale` predicate every dimmed element reads, rather than
+    // re-deriving it from `status` — which is how M5's case (a failed transport
+    // command leaving `isPlaying` true behind a dead device) stays covered for
+    // free instead of needing its own check here.
+    return isStale(this.source.getStatus(), state) ? undefined : IDLE_TICK_MS
   }
+
 
   onEnter(): void {
     this.source.setVisible(true)
@@ -290,15 +264,28 @@ export class SpotifyPage implements Page {
         {
           kind: 'control',
           glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH,
-          glyphFont: 'emoji',
+          glyphColor: controlGlyphColor(accent),
+          bg: controlWash(accent),
           border: accent,
+          // Breathes only while a track is genuinely PLAYING and the data is not
+          // stale. A pulsing glyph over a dead device would be decoration with no
+          // meaning, exactly as the old volume "thump" was held to.
+          glyphPulse:
+            state?.isPlaying && !stale ? { phase: breathePhase(nowMs) } : undefined,
           dim: stale,
         },
         // Row 1: three art cells, then next.
         this.spanArtKey(state, status, art, stale, artCrop(0, 1), nowMs, 0, 1, paused),
         this.spanArtKey(state, status, art, stale, artCrop(1, 1), nowMs, 1, 1, paused),
         this.spanArtKey(state, status, art, stale, artCrop(2, 1), nowMs, 2, 1, paused),
-        { kind: 'control', glyph: NEXT_GLYPH, glyphFont: 'emoji', border: accent, dim: stale },
+        {
+          kind: 'control',
+          glyph: NEXT_GLYPH,
+          glyphColor: controlGlyphColor(accent),
+          bg: controlWash(accent),
+          border: accent,
+          dim: stale,
+        },
       ],
       strip: this.strip(state, status, stale, nowMs, accent),
       buttons: [accent, accent],
@@ -431,16 +418,17 @@ export class SpotifyPage implements Page {
   }
 }
 
+
 /**
  * The ONE staleness predicate for this whole page (I3). Every element that
- * dims — the four transport keys, the strip, and the four album-art keys —
+ * dims — the two control keys, the strip, and the six album-art keys —
  * reads this same function, so they can no longer disagree the way `dead`
  * (which omitted `'offline'`) and the strip's own `status === 'offline'`
  * check used to.
  *
  * `!state` counts as stale too: nothing is loaded, so there is nothing valid
  * for a transport press to act on — matching the original `dead` formula's
- * treatment of that case. The four idle-animation art keys never reach this
+ * treatment of that case. The six idle-animation art keys never reach this
  * predicate for their OWN dimming (an idle scene is not "stale data", it is
  * "no data"), but the control glyphs still need it while idle, exactly as
  * before.
@@ -449,21 +437,43 @@ function isStale(status: SpotifyStatus, state: PlayerState | null): boolean {
   return status === 'no-device' || status === 'unauthorized' || status === 'offline' || !state
 }
 
-function volumeLabel(state: PlayerState | null): string {
-  if (!state || state.volumePercent === null) return '—'
-  return `${state.volumePercent}%`
-}
 
 /**
  * Phase for the volume key's "thump", the same `nowMs`-driven pattern
  * `idleSpec` below uses for the idle animation: never `Date.now()`, so two
  * calls with the same `nowMs` always agree, and the phase actually advances
- * from one render to the next so `keyHash` sees a new value every tick
- * (lesson 11 — the exact defect that once hit this page's `imageCrop`, and
- * would just as easily freeze this animation after one frame).
+
+/** The control keys' background: the album's accent, heavily darkened. */
+export function controlWash(accent: Rgb): Rgb {
+  return [
+    Math.round(accent[0] * CONTROL_WASH_FACTOR),
+    Math.round(accent[1] * CONTROL_WASH_FACTOR),
+    Math.round(accent[2] * CONTROL_WASH_FACTOR),
+  ]
+}
+
+/**
+ * The control glyphs' colour: the album's accent, lifted toward white until it is
+ * bright enough to read against `controlWash`. A dark album would otherwise put a
+ * dark glyph on a near-black wash.
  */
-function volumePulsePhase(nowMs: number): number {
-  return (nowMs / VOLUME_THUMP_PERIOD_MS) * 2 * Math.PI
+export function controlGlyphColor(accent: Rgb): Rgb {
+  const lum = accent[0] + accent[1] + accent[2]
+  if (lum >= CONTROL_GLYPH_MIN_LUM) return accent
+  // Mix toward white by however much is missing, so the hue survives the lift.
+  const t = Math.min(1, (CONTROL_GLYPH_MIN_LUM - lum) / (765 - lum))
+  return [
+    Math.round(accent[0] + (255 - accent[0]) * t),
+    Math.round(accent[1] + (255 - accent[1]) * t),
+    Math.round(accent[2] + (255 - accent[2]) * t),
+  ]
+}
+
+/** The breathing phase for the play/pause glyph. Never `Date.now()` — the daemon
+ * injects the clock, so two renders at one instant are identical. */
+export function breathePhase(nowMs: number): number {
+  if (!Number.isFinite(nowMs)) return 0
+  return ((nowMs % BREATHE_PERIOD_MS) / BREATHE_PERIOD_MS) * 2 * Math.PI
 }
 
 /**
