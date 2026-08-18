@@ -117,6 +117,27 @@ const TAPE_PX_PER_SEC = 60
 const TAPE_TICK_MS = 40
 
 /**
+ * The granularity of the DRIFT's own clock, in milliseconds.
+ *
+ * The page renders every 40 ms so the tape stays smooth. The tiles do not need
+ * that: a drifting particle crosses the key in one to four seconds, so it looks
+ * the same at 12 frames per second as at 25.
+ *
+ * This matters because of how the daemon writes the device. It writes a key only
+ * when that key's `keyHash` changes, and `fx.nowMs` is part of the hash — so an
+ * unquantised clock makes all EIGHT keys rewrite on every single frame. Measured
+ * on the real deck: 200 key-writes per second, against a measured USB ceiling of
+ * 362, and the daemon sat at 35 to 40 percent of a core. Rendering was not the
+ * cost; the writes were. The render path itself measures 0.99 ms per frame,
+ * which is 2.5 percent at this tick.
+ *
+ * Quantising the drift clock lets the dirty-key check do its job: the tiles now
+ * change twice in five frames instead of five, and the tape still updates every
+ * frame because its offset is NOT quantised.
+ */
+const DRIFT_QUANTUM_MS = 80
+
+/**
  * The smallest share of the wash any real, non-zero move gets, so a small move
  * is a faint hint rather than rounding away to nothing.
  *
@@ -461,10 +482,13 @@ export class StocksPage implements Page {
     if (quote) return this.detailFrame(this.selected!, quote, now)
 
     const marketState = this.source.getMarketState()
+    // The drift's clock is quantised so the daemon's dirty-key check can skip
+    // most key writes. The TAPE's clock below is not, so it stays smooth.
+    const driftMs = Math.floor(ms / DRIFT_QUANTUM_MS) * DRIFT_QUANTUM_MS
     const keys = SYMBOLS.map((symbol, i) =>
       // `i` is the seed: each tile drifts on its own phase, so eight tiles moving
       // the same way still read as eight tiles rather than one sheet.
-      this.tickerKey(quotes.get(symbol), symbol, marketState, ms, i),
+      this.tickerKey(quotes.get(symbol), symbol, marketState, driftMs, i),
     )
     // Both buttons take ONE colour. They are page navigation, so two different
     // colours would read as two different controls; one board-level signal is

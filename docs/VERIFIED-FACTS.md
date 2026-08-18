@@ -758,6 +758,38 @@ Holding full brightness over the leading half, instead of fading the whole way,
 raises the average alpha as well as the area. That matters more than the peak,
 which barely moved.
 
+### The daemon's cost is USB WRITES, not rendering
+
+Measured on 2026-08-18, with the stocks page visible and the wash, the drift and
+the ticker tape all running.
+
+| Path | Cost |
+| --- | --- |
+| `renderKey` with `fx` | 0.108 ms |
+| `renderKey` without `fx` | 0.038 ms |
+| `renderStrip` with a tape | 0.067 ms |
+| `renderStrip` without | 0.038 ms |
+| `StocksPage.render` | 0.054 ms |
+| **A whole frame: 8 keys + strip + page** | **0.99 ms** |
+
+At a 40 ms tick that whole render path is **2.5 percent** of one core. Yet the
+live daemon measured **35 to 40 percent**. Rendering was never the cost.
+
+The cost is that the daemon writes a key whenever its `keyHash` changes, and
+`fx.nowMs` is part of that hash — so an unquantised drift clock rewrote all
+EIGHT keys on every one of 25 frames a second. That is 200 key-writes per second
+against a measured ceiling of 362.
+
+Quantising the drift's clock to 80 ms (while leaving the tape's offset
+unquantised, because it must stay smooth) let the dirty-key check work as
+designed and brought the daemon to **20 to 25 percent**. The remainder is HID
+write overhead for roughly 80 key-writes and 25 strip-writes a second, and it
+applies only while the stocks page is actually visible.
+
+**Do not raise an animated page's tick rate without checking how many keys the
+new rate rewrites.** The render budget is not the binding constraint; the write
+rate is.
+
 ### Overlapping particles confound a per-particle probe
 
 At 22 px long with twenty of them on a 96 px key, particles overlap. A test that

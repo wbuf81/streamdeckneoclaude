@@ -1475,6 +1475,28 @@ describe('StocksPage directional drift (task 43)', () => {
     expect(b).toBeGreaterThan(a)
   })
 
+  it('quantises the drift clock, so the tiles do not rewrite on every frame', () => {
+    // This is a THROUGHPUT property, not a cosmetic one. The daemon writes a key
+    // only when its `keyHash` changes, and `fx.nowMs` is in that hash — so an
+    // unquantised clock rewrote all eight keys 25 times a second. Measured on the
+    // real deck: 200 key-writes per second against a 362 ceiling, and 35 to 40
+    // percent of a core. Rendering was never the cost.
+    const { page } = build({ quotes: movingQuotes(), marketState: 'open' })
+    const at = (ms: number) => page.render(NOW, ms).keys[0]!.fx!.nowMs
+    // Two renders inside one quantum give an identical spec, so the key is not
+    // rewritten at all.
+    expect(at(10_000)).toBe(at(10_039))
+    // And the drift still advances across quanta, so it is not frozen.
+    expect(at(10_200)).toBeGreaterThan(at(10_000))
+  })
+
+  it('does NOT quantise the tape, which has to stay smooth', () => {
+    const { page } = build({ quotes: movingQuotes(), marketState: 'open' })
+    const a = page.render(NOW, 10_000).strip.tape!.offsetPx
+    const b = page.render(NOW, 10_039).strip.tape!.offsetPx
+    expect(b).toBeGreaterThan(a)
+  })
+
   it('does not drift a flat or unknown move, since there is no direction', () => {
     expect(tileFor(0).fx).toBeUndefined()
     expect(tileFor(null).fx).toBeUndefined()
