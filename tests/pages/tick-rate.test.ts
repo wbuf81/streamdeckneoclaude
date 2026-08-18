@@ -161,38 +161,54 @@ describe('WeatherPage tickMs: fast only while a condition effect shows', () => {
  * (docs/VERIFIED-FACTS.md). So `tickMs` here is a getter, re-read every time
  * the page becomes current, rather than a fixed value like the other pages'.
  */
-describe('SpotifyPage tickMs: fast only while the idle animation shows', () => {
+describe('SpotifyPage tickMs: fast only while something actually moves', () => {
+  /*
+   * Task 27 gave the page an idle animation, so the rate rose while nothing was
+   * playing. Task 38 added the volume key's "thump", so it rose during playback
+   * too. Task 44 deleted that key and gave PAUSED its own drifting layer, so the
+   * condition inverted: playing is now the static case.
+   *
+   * Note the shape of the bug this file keeps almost missing — twice now, for
+   * weather and for stocks, an assertion here stayed green because the minimal
+   * fake supplied exactly the state that disables the animation. So these fakes
+   * are explicit about `isPlaying` rather than handing over an empty object.
+   */
   function fakeReader(over: Partial<PlayerReader>): PlayerReader {
     return {
       interpolate: () => null,
       getStatus: () => 'ok',
       getArt: () => null,
+      getArtColor: () => null,
       play: async () => true,
       pause: async () => true,
       next: async () => true,
-      previous: async () => true,
-      setVolume: async () => true,
       setVisible: () => {},
       ...over,
     } as unknown as PlayerReader
   }
 
-  it('keeps the default 1000 ms tick while a track is loaded, playing or paused', () => {
-    const fake = fakeReader({ interpolate: () => ({} as never), getStatus: () => 'ok' })
-    const page = new SpotifyPage(fake)
+  const playing = { isPlaying: true, trackId: 't', durationMs: 1000, positionMs: 0 }
+  const paused = { ...playing, isPlaying: false }
+
+  it('keeps the default 1000 ms tick while a track is PLAYING, since nothing moves then', () => {
+    const page = new SpotifyPage(fakeReader({ interpolate: () => playing as never }))
     expect(page.tickMs).toBeUndefined()
   })
 
-  it('raises the tick rate while nothing is playing', () => {
-    const fake = fakeReader({ interpolate: () => null, getStatus: () => 'no-device' })
-    const page = new SpotifyPage(fake)
+  it('raises the tick rate while a track is PAUSED, for the drifting layer', () => {
+    const page = new SpotifyPage(fakeReader({ interpolate: () => paused as never }))
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
+  })
+
+  it('raises the tick rate while nothing is playing, for the idle animation', () => {
+    const page = new SpotifyPage(fakeReader({ interpolate: () => null, getStatus: () => 'no-device' }))
     expect(page.tickMs).toBeDefined()
     expect(page.tickMs!).toBeLessThan(1000)
   })
 
   it('keeps the default 1000 ms tick while unauthorized, since key 0 shows text, not the animation', () => {
-    const fake = fakeReader({ interpolate: () => null, getStatus: () => 'unauthorized' })
-    const page = new SpotifyPage(fake)
+    const page = new SpotifyPage(fakeReader({ interpolate: () => null, getStatus: () => 'unauthorized' }))
     expect(page.tickMs).toBeUndefined()
   })
 })

@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import * as esbuild from 'esbuild'
-import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
+import { createCanvas, loadImage, type Canvas, type Image } from '@napi-rs/canvas'
 import {
   renderKey,
   renderStrip,
@@ -17,6 +17,7 @@ import {
   FX_STORM_STRIKE_DURATION_MS,
   fxWindStreakSpan,
   tapeLoopWidthPx,
+  dominantColor,
   fxDriftParticleSpan,
   FX_MAX_ALPHA,
   FX_INTENSITY_MIN,
@@ -2834,6 +2835,187 @@ describe('fx drift variant (task 43)', () => {
       return Math.abs(a - b)
     }
     expect(travelled(1)).toBeGreaterThan(travelled(0.3))
+  })
+})
+
+describe('dominantColor (task 44)', () => {
+  /** Builds a real decoded Image from a canvas, the same way album art arrives:
+   * encoded to PNG and decoded again, so this exercises the real path. */
+  async function imageOf(paint: (ctx: ReturnType<Canvas['getContext']>) => void, size = 64): Promise<Image> {
+    const canvas = createCanvas(size, size)
+    const ctx = canvas.getContext('2d')
+    paint(ctx)
+    return loadImage(canvas.toBuffer('image/png'))
+  }
+
+  it('picks the dominant colour of a two-tone cover, not the average', async () => {
+    // Three quarters deep blue, one quarter orange. An AVERAGE would land on a
+    // muddy blue-grey; the answer must be the blue itself.
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(30, 70, 200)'
+      ctx.fillRect(0, 0, 64, 64)
+      ctx.fillStyle = 'rgb(230, 120, 20)'
+      ctx.fillRect(0, 48, 64, 16)
+    })
+    const colour = dominantColor(img)
+    expect(colour).not.toBeNull()
+    // Blue leads, and it is a real blue rather than a desaturated mix.
+    expect(colour![2]).toBeGreaterThan(colour![0]! + 60)
+    expect(Math.max(...colour!) - Math.min(...colour!)).toBeGreaterThan(80)
+  })
+
+  it('finds a small vivid accent on an otherwise dark cover', async () => {
+    // The case an average destroys completely: 90 percent near-black, with one
+    // bright magenta band. Near-black is excluded, so the accent wins.
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(6, 6, 8)'
+      ctx.fillRect(0, 0, 64, 64)
+      ctx.fillStyle = 'rgb(220, 30, 180)'
+      ctx.fillRect(0, 28, 64, 8)
+    })
+    const colour = dominantColor(img)
+    expect(colour).not.toBeNull()
+    expect(colour![0]).toBeGreaterThan(150)
+    expect(colour![2]).toBeGreaterThan(120)
+    expect(colour![1]).toBeLessThan(100)
+  })
+
+  it('ignores a SATURATED near-black field in favour of a brighter accent', async () => {
+    // The case the luminance floor exists for, and the chroma filter cannot
+    // cover: `rgb(26,0,2)` is nearly black but strongly saturated, so it passes
+    // the chroma test. Without the floor it would win on pixel count and the
+    // page would theme itself to something indistinguishable from black.
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(26, 0, 2)'
+      ctx.fillRect(0, 0, 64, 64)
+      ctx.fillStyle = 'rgb(40, 220, 220)'
+      ctx.fillRect(0, 56, 64, 8)
+    })
+    const colour = dominantColor(img)
+    expect(colour).not.toBeNull()
+    // The cyan accent, not the near-black red.
+    expect(colour![1]).toBeGreaterThan(120)
+    expect(colour![2]).toBeGreaterThan(120)
+  })
+
+  it('ignores a PALE near-white field in favour of a deeper accent', async () => {
+    // The ceiling's own case: a cream `rgb(255,250,200)` is saturated enough to
+    // pass the chroma test but far too bright to read as an accent against white
+    // text.
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(255, 250, 200)'
+      ctx.fillRect(0, 0, 64, 64)
+      ctx.fillStyle = 'rgb(20, 60, 200)'
+      ctx.fillRect(0, 56, 64, 8)
+    })
+    const colour = dominantColor(img)
+    expect(colour).not.toBeNull()
+    expect(colour![2]).toBeGreaterThan(colour![0]! + 80)
+  })
+
+  it('returns null for a greyscale cover, rather than inventing a hue', async () => {
+    const img = await imageOf((ctx) => {
+      for (let i = 0; i < 8; i++) {
+        const v = 30 + i * 25
+        ctx.fillStyle = `rgb(${v}, ${v}, ${v})`
+        ctx.fillRect(0, i * 8, 64, 8)
+      }
+    })
+    expect(dominantColor(img)).toBeNull()
+  })
+
+  it('returns null for an almost-black cover', async () => {
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(3, 4, 5)'
+      ctx.fillRect(0, 0, 64, 64)
+    })
+    expect(dominantColor(img)).toBeNull()
+  })
+
+  it('returns null for a pure white cover', async () => {
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(255, 255, 255)'
+      ctx.fillRect(0, 0, 64, 64)
+    })
+    expect(dominantColor(img)).toBeNull()
+  })
+
+  it('is deterministic for one image', async () => {
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(40, 160, 90)'
+      ctx.fillRect(0, 0, 64, 64)
+      ctx.fillStyle = 'rgb(200, 40, 40)'
+      ctx.fillRect(32, 0, 32, 64)
+    })
+    expect(dominantColor(img)).toEqual(dominantColor(img))
+  })
+
+  it('survives a 1x1 image without throwing', async () => {
+    const img = await imageOf((ctx) => {
+      ctx.fillStyle = 'rgb(200, 40, 40)'
+      ctx.fillRect(0, 0, 1, 1)
+    }, 1)
+    expect(() => dominantColor(img)).not.toThrow()
+  })
+
+  it('never returns a channel outside 0 to 255', async () => {
+    const img = await imageOf((ctx) => {
+      const grad = ctx.createLinearGradient(0, 0, 64, 64)
+      grad.addColorStop(0, 'rgb(250, 10, 10)')
+      grad.addColorStop(1, 'rgb(10, 10, 250)')
+      ctx.fillStyle = grad
+      ctx.fillRect(0, 0, 64, 64)
+    })
+    const colour = dominantColor(img)
+    expect(colour).not.toBeNull()
+    for (const c of colour!) {
+      expect(c).toBeGreaterThanOrEqual(0)
+      expect(c).toBeLessThanOrEqual(255)
+    }
+  })
+})
+
+describe('idle rain across a 3-wide block (task 44)', () => {
+  const CELLS: readonly { col: 0 | 1 | 2; row: 0 | 1 }[] = [
+    { col: 0, row: 0 }, { col: 1, row: 0 }, { col: 2, row: 0 },
+    { col: 0, row: 1 }, { col: 1, row: 1 }, { col: 2, row: 1 },
+  ]
+
+  it('draws all SIX cells differently, so no two tiles rain alike', () => {
+    // The collision this catches: with a stride of 2, cell (col 2, row 0) and
+    // cell (col 0, row 1) both index 2, and two tiles fall identically. A test
+    // that only checked the six SPECS were distinct could not see it — the page
+    // emits six distinct specs either way, and the duplication happens in here.
+    const buffers = CELLS.map((cell) =>
+      renderKey({ kind: 'control', idle: { variant: 'rain', nowMs: 4200, ...cell } }),
+    )
+    for (let i = 0; i < buffers.length; i++) {
+      for (let j = i + 1; j < buffers.length; j++) {
+        expect(
+          buffers[i]!.equals(buffers[j]!),
+          `cell ${JSON.stringify(CELLS[i])} renders identically to ${JSON.stringify(CELLS[j])}`,
+        ).toBe(false)
+      }
+    }
+  })
+
+  it('clamps the scene-based variants to two columns instead of tearing', () => {
+    // `grid` and `glitch` draw one scene sized to a 2x2 block, so a third column
+    // has no scene to show. They repeat the right-hand column rather than drawing
+    // a broken one — the bad outcome made impossible, not merely documented.
+    for (const variant of ['grid', 'glitch'] as const) {
+      const atCol1 = renderKey({ kind: 'control', idle: { variant, nowMs: 4200, col: 1, row: 0 } })
+      const atCol2 = renderKey({ kind: 'control', idle: { variant, nowMs: 4200, col: 2, row: 0 } })
+      expect(atCol2.equals(atCol1), variant).toBe(true)
+    }
+  })
+
+  it('still accepts a third column through the sanitizer', () => {
+    const buf = renderKey({
+      kind: 'control',
+      idle: { variant: 'rain', nowMs: Number.NaN, col: 9 as never, row: 5 as never },
+    })
+    expect(buf.length).toBe(KEY_SIZE * KEY_SIZE * 4)
   })
 })
 

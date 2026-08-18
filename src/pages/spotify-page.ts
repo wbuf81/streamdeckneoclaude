@@ -1,4 +1,4 @@
-import type { DeckFrame, KeySpec, StripSpec, ImageCrop, IdleSpec, IdleVariant } from '../render/specs.js'
+import type { DeckFrame, KeySpec, Rgb, StripSpec, ImageCrop, IdleSpec, IdleVariant } from '../render/specs.js'
 import { blankKey } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatClock, formatEasternTime } from '../render/text.js'
@@ -67,6 +67,13 @@ const VOLUME_THUMP_PERIOD_MS = 800
  * throughput table: `renderKey` costs 0.032 ms, all eight keys sustain
  * 45 fps). */
 const IDLE_TICK_MS = 100
+
+/**
+ * What a PAUSED cover shows beneath itself. Slow, colourless haze reads as
+ * suspended; anything falling or rushing would read as still playing.
+ */
+const PAUSED_FX_VARIANT = 'fog' as const
+const PAUSED_FX_INTENSITY = 0.8
 /**
  * Which of `render/canvas.ts`'s three cyberpunk idle animations ships on the
  * four album-art keys while nothing is playing (task 39, replacing the
@@ -112,21 +119,53 @@ const ALBUM_FALLBACK_CHARS = 10
  * top row, 4 and 5 are the row beneath them), so the crops split the image
  * into top-left, top-right, bottom-left and bottom-right.
  */
-const CROP_TOP_LEFT: ImageCrop = { sx: 0.0, sy: 0.0, sw: 0.5, sh: 0.5 }
-const CROP_TOP_RIGHT: ImageCrop = { sx: 0.5, sy: 0.0, sw: 0.5, sh: 0.5 }
-const CROP_BOTTOM_LEFT: ImageCrop = { sx: 0.0, sy: 0.5, sw: 0.5, sh: 0.5 }
-const CROP_BOTTOM_RIGHT: ImageCrop = { sx: 0.5, sy: 0.5, sw: 0.5, sh: 0.5 }
+/**
+ * The six crops of the 3x2 art block (task 44), and why they are not simply
+ * `1/3 x 1/2`.
+ *
+ * Album art is SQUARE — 640x640 — and three keys wide by two tall is 3:2. Naive
+ * `sw: 1/3, sh: 1/2` crops would hand each key a 213x320 source rect to draw
+ * into a 96x96 key, squashing every tile vertically. `drawCroppedImage` always
+ * fills the whole key regardless of the source rect's shape, so the distortion
+ * would be silent.
+ *
+ * So the block shows the CENTRAL 3:2 slice of the cover: source y from 1/6 to
+ * 5/6. Each key then takes a `1/3 x 1/3` rect of the square source, which IS
+ * square, so nothing distorts.
+ *
+ * The cost is the top and bottom sixth of the cover. Album covers are
+ * centre-weighted, so this is the right trade for a full-bleed image — but it can
+ * clip a title printed hard against the top or bottom edge.
+ */
+const ART_COLS = 3
+const ART_ROWS = 2
+/** Where the central 3:2 slice starts, as a fraction of the square source. */
+const ART_SLICE_TOP = 1 / 6
+/** Each key's source rect, square by construction. */
+const ART_CELL = 1 / 3
+
+/** The crop for one cell of the art block. Exported so a test can prove the six
+ * cells tile the slice exactly, with no gap, no overlap and no distortion. */
+export function artCrop(col: number, row: number): ImageCrop {
+  return {
+    sx: col * ART_CELL,
+    sy: ART_SLICE_TOP + row * ART_CELL,
+    sw: ART_CELL,
+    sh: ART_CELL,
+  }
+}
 
 /** The part of `SpotifySource` this page needs. */
 export interface PlayerReader {
   interpolate(now: number): PlayerState | null
   getStatus(): SpotifyStatus
   getArt(trackId: string, url: string | null): Image | null
+  /** The current cover's accent colour, or null when it has none. Computed once
+   * per track when the art is decoded — never on the render path. */
+  getArtColor(trackId: string): Rgb | null
   play(): Promise<boolean>
   pause(): Promise<boolean>
   next(): Promise<boolean>
-  previous(): Promise<boolean>
-  setVolume(percent: number): Promise<boolean>
   setVisible(visible: boolean): void
 }
 
@@ -176,12 +215,23 @@ export class SpotifyPage implements Page {
     // Per M5: `status` can report `no-device` (a failed transport command)
     // while `state` — the last known player snapshot — still says a track
     // was playing, since a control failure never clears it. Checked here,
-    // AFTER the idle-animation case above but BEFORE `state.isPlaying`, so
-    // a stale "was playing" snapshot cannot keep the fast tick (and the
-    // volume key's "thump", which `render()` below no longer even draws for
-    // a dead device) alive for a device that is gone.
+    // AFTER the idle-animation case above but BEFORE reading `isPlaying`, so a
+    // stale "was playing" snapshot cannot keep the fast tick alive for a device
+    // that is gone.
     if (this.source.getStatus() === 'no-device') return undefined
-    return state.isPlaying ? IDLE_TICK_MS : undefined
+    // INVERTED by task 44, and this is the important half of that change.
+    //
+    // The fast tick used to follow `isPlaying`, because the volume key's "thump"
+    // animated during playback. That key is gone, so a PLAYING page is now
+    // completely static between polls and gains nothing from a faster clock —
+    // while a PAUSED one animates, because the cover dims and a layer drifts
+    // beneath it.
+    //
+    // Leaving this as it was would have been the worst of both: burning the fast
+    // rate on a static page, and starving the one animation on the page down to
+    // a frame a second. Caught by a retired golden hash firing, not by the
+    // animation being watched.
+    return state.isPlaying ? undefined : IDLE_TICK_MS
   }
 
   onEnter(): void {
@@ -220,33 +270,38 @@ export class SpotifyPage implements Page {
     const stale = isStale(status, state)
     const art = state ? this.source.getArt(state.trackId, state.artUrl) : null
 
+    // The cover's own accent colour, or the theme when it has none. It borders
+    // the two control keys, fills the strip's progress bar, and lights both
+    // round buttons, so the whole deck takes on each album.
+    const accent = (state ? this.source.getArtColor(state.trackId) : null) ?? theme.gray
+    // Paused, with a track loaded, is its own visual state: the art dims and an
+    // ambient layer shows THROUGH it. That works only because `renderKey` draws
+    // the background, then `fx`, then the image — and `dim` applies to the image
+    // through `globalAlpha`, so a 45-percent-opaque cover reveals the layer
+    // beneath. No renderer change was needed for this at all.
+    const paused = state !== null && !state.isPlaying && !stale
+
     return {
       keys: [
-        this.primaryArtKey(state, status, art, stale, CROP_TOP_LEFT, nowMs),
-        this.spanArtKey(state, status, art, stale, CROP_TOP_RIGHT, nowMs, 1, 0),
-        { kind: 'control', glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH, glyphFont: 'emoji', dim: stale },
+        // Row 0: three art cells, then play/pause.
+        this.primaryArtKey(state, status, art, stale, artCrop(0, 0), nowMs, paused),
+        this.spanArtKey(state, status, art, stale, artCrop(1, 0), nowMs, 1, 0, paused),
+        this.spanArtKey(state, status, art, stale, artCrop(2, 0), nowMs, 2, 0, paused),
         {
           kind: 'control',
-          glyph: VOLUME_UP_GLYPH,
+          glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH,
           glyphFont: 'emoji',
-          glyphCaption: volumeLabel(state),
-          // The "thump" — only while a track is actually PLAYING AND the
-          // page is not otherwise marking this data stale (no device, no
-          // authorization, or an offline connection: per M5, `isPlaying`
-          // alone survived a failed transport command, and per I3 it also
-          // used to survive `'offline'`). A thumping speaker beside a
-          // paused, dead, or disconnected track would be decoration with no
-          // meaning; static here matches static everywhere else on the page.
-          glyphPulse: state?.isPlaying && !stale ? { phase: volumePulsePhase(nowMs) } : undefined,
+          border: accent,
           dim: stale,
         },
-        this.spanArtKey(state, status, art, stale, CROP_BOTTOM_LEFT, nowMs, 0, 1),
-        this.spanArtKey(state, status, art, stale, CROP_BOTTOM_RIGHT, nowMs, 1, 1),
-        { kind: 'control', glyph: PREVIOUS_GLYPH, glyphFont: 'emoji', dim: stale },
-        { kind: 'control', glyph: NEXT_GLYPH, glyphFont: 'emoji', dim: stale },
+        // Row 1: three art cells, then next.
+        this.spanArtKey(state, status, art, stale, artCrop(0, 1), nowMs, 0, 1, paused),
+        this.spanArtKey(state, status, art, stale, artCrop(1, 1), nowMs, 1, 1, paused),
+        this.spanArtKey(state, status, art, stale, artCrop(2, 1), nowMs, 2, 1, paused),
+        { kind: 'control', glyph: NEXT_GLYPH, glyphFont: 'emoji', border: accent, dim: stale },
       ],
-      strip: this.strip(state, status, stale, nowMs),
-      buttons: [theme.gray, theme.gray],
+      strip: this.strip(state, status, stale, nowMs, accent),
+      buttons: [accent, accent],
     }
   }
 
@@ -265,6 +320,7 @@ export class SpotifyPage implements Page {
     stale: boolean,
     crop: ImageCrop,
     nowMs: number,
+    paused: boolean,
   ): KeySpec {
     if (status === 'unauthorized') {
       return { kind: 'control', lines: ['SPOTIFY', 'SIGN IN'], align: 'center', dim: true }
@@ -277,7 +333,10 @@ export class SpotifyPage implements Page {
       // key used to be the one thing on this screen with no staleness
       // signal at all, so a dead device or a dropped connection still
       // showed a bright cover behind dim transport glyphs.
-      return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop, dim: stale }
+      //
+      // Routes through the SAME `artKey` builder as the other five cells, so the
+      // paused treatment cannot land on five of six.
+      return artKey(art, state.trackId, crop, stale, paused, nowMs)
     }
     // The art downloads in the background. Show the album name meanwhile.
     return {
@@ -302,16 +361,23 @@ export class SpotifyPage implements Page {
     stale: boolean,
     crop: ImageCrop,
     nowMs: number,
-    col: 0 | 1,
+    col: 0 | 1 | 2,
     row: 0 | 1,
+    paused: boolean,
   ): KeySpec {
     if (status === 'unauthorized') return blankKey()
     if (!state) return { kind: 'control', idle: idleSpec(nowMs, col, row) }
     if (!art) return blankKey()
-    return { kind: 'image', image: art, imageKey: state.trackId, imageCrop: crop, dim: stale }
+    return artKey(art, state.trackId, crop, stale, paused, nowMs)
   }
 
-  private strip(state: PlayerState | null, status: SpotifyStatus, stale: boolean, nowMs: number): StripSpec {
+  private strip(
+    state: PlayerState | null,
+    status: SpotifyStatus,
+    stale: boolean,
+    nowMs: number,
+    accent: Rgb,
+  ): StripSpec {
     if (status === 'unauthorized') {
       return { lines: ['spotify not connected', 'run: deckd auth spotify'], dim: true }
     }
@@ -328,7 +394,10 @@ export class SpotifyPage implements Page {
     return {
       lines: [truncate(state.title, TITLE_CHARS), truncate(state.artist, ARTIST_CHARS)],
       right: `${formatClock(state.positionMs / 1000)} / ${formatClock(state.durationMs / 1000)}`,
-      bar: { value: fraction, color: theme.green },
+      // The album's own accent colour, so the bar belongs to the cover above it.
+      // Falls back to the theme when the cover has no usable colour — never a
+      // fabricated hue.
+      bar: { value: fraction, color: accent },
       // I3: the SAME `stale` predicate the keys use, not a separate
       // `status === 'offline'` check — that check alone left the strip
       // bright on `'no-device'` while the transport glyphs already dimmed.
@@ -337,47 +406,28 @@ export class SpotifyPage implements Page {
   }
 
   async onKeyPress(index: number): Promise<PressOutcome> {
-    // Press handling needs playback flags and volume, not the interpolated
-    // position. A fixed clock keeps the page pure and deterministic.
+    // `interpolate(0)`, matching what this handler has always done: it needs the
+    // playback FLAGS, not an interpolated position, and those do not depend on the
+    // clock.
     const state = this.source.interpolate(0)
 
-    switch (index) {
-      case 2: {
-        const ok = await (state?.isPlaying ? this.source.pause() : this.source.play())
-        return ok ? 'handled' : 'failed'
-      }
-      case 3: {
-        // M4: an unknown volume (lesson 18 — absent is UNKNOWN, not a
-        // measured 50%) used to fall back to an assumed 50 and step from
-        // there, so the caption showed "—" while the press asserted a real
-        // number nobody measured. With no baseline to step from, this press
-        // does nothing rather than guess one — the daemon still gives
-        // visible feedback (the red ring for `'ignored'`), so silence is
-        // never mistaken for a press the deck never received.
-        if (state?.volumePercent == null) return 'ignored'
-        // `Math.min(100, ...)`, not `> 100 ? 0 : ...`: the old wrap-to-zero
-        // meant a volume already at or near 100 could never land exactly on
-        // 100, and one more press from there muted the device outright.
-        // Clamping means the last few presses before the ceiling simply stop
-        // climbing, which is what "raise the volume" should do at the top.
-        const ok = await this.source.setVolume(Math.min(100, state.volumePercent + VOLUME_STEP))
-        return ok ? 'handled' : 'failed'
-      }
-      case 6: {
-        const ok = await this.source.previous()
-        return ok ? 'handled' : 'failed'
-      }
-      case 7: {
-        const ok = await this.source.next()
-        return ok ? 'handled' : 'failed'
-      }
-      default:
-        // Keys 0, 1, 4 and 5 (the album art) do nothing, and so does any
-        // other index. Shuffle and repeat are gone: the user named
-        // play/pause, volume, previous and next as what they use, and an
-        // unused key invites a misfire.
-        return 'ignored'
+    // Key 7 advances the track. EVERY other key toggles playback — the six art
+    // cells as well as the labelled play/pause on key 3 — so the control the user
+    // asked for is always under a finger, wherever they press. Key 3 stays as the
+    // discoverable, glyphed one.
+    if (index === 7) {
+      const ok = await this.source.next()
+      return ok ? 'handled' : 'failed'
     }
+
+    if (index < 0 || index > 6) return 'ignored'
+
+    // Nothing loaded means nothing to toggle. The daemon still flashes the red
+    // ring, so a press is never silently swallowed.
+    if (!state) return 'ignored'
+
+    const ok = state.isPlaying ? await this.source.pause() : await this.source.play()
+    return ok ? 'handled' : 'failed'
   }
 }
 
@@ -417,6 +467,45 @@ function volumePulsePhase(nowMs: number): number {
 }
 
 /**
+ * One art cell. `paused` dims the cover and puts an ambient layer beneath it, so
+ * a glance says "paused" without reading a glyph.
+ *
+ * ONE function for all six cells, so the paused treatment cannot land on five of
+ * them and be forgotten on the sixth — the family-drift defect this project calls
+ * its dominant pattern.
+ */
+function artKey(
+  art: Image,
+  trackId: string,
+  crop: ImageCrop,
+  stale: boolean,
+  paused: boolean,
+  nowMs: number,
+): KeySpec {
+  const key: KeySpec = {
+    kind: 'image',
+    image: art,
+    imageKey: trackId,
+    imageCrop: crop,
+    dim: stale,
+  }
+  if (paused) {
+    // `dim` is what lets the layer show through: it drops the image to
+    // `DIM_FACTOR` opacity, and the layer is drawn before the image.
+    key.dim = true
+    key.fx = {
+      variant: PAUSED_FX_VARIANT,
+      nowMs,
+      intensity: PAUSED_FX_INTENSITY,
+      // Seeded from the crop, so the six cells drift out of step with each other
+      // instead of moving as one sheet.
+      seed: Math.round(crop.sx * 100 + crop.sy * 10),
+    }
+  }
+  return key
+}
+
+/**
  * Builds the idle-animation spec for one of the four idle art keys. `col`
  * and `row` (each 0 or 1) place this key at its own corner of the shared 2x2
  * design, and `nowMs` — never `Date.now()`, supplied by the daemon's render
@@ -425,6 +514,6 @@ function volumePulsePhase(nowMs: number): number {
  * (lesson 11 in docs/LESSONS.md: a field that never changes freezes the
  * animation after one frame).
  */
-function idleSpec(nowMs: number, col: 0 | 1, row: 0 | 1): IdleSpec {
+function idleSpec(nowMs: number, col: 0 | 1 | 2, row: 0 | 1): IdleSpec {
   return { variant: IDLE_VARIANT, nowMs, col, row }
 }

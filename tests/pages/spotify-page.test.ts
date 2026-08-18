@@ -1,8 +1,9 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createHash } from 'node:crypto'
-import { createCanvas } from '@napi-rs/canvas'
+import { createCanvas, loadImage } from '@napi-rs/canvas'
 import { SpotifyPage } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
+import type { Rgb } from '../../src/render/specs.js'
 import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { keyHash } from '../../src/render/specs.js'
 import { theme } from '../../src/render/theme.js'
@@ -25,17 +26,21 @@ function player(over: Partial<PlayerState> = {}): PlayerState {
  */
 const FAKE_ART = { width: 300, height: 300 } as unknown as Image
 
-function build(state: PlayerState | null, status: SpotifyStatus = 'ok', art: Image | null = null) {
+function build(
+  state: PlayerState | null,
+  status: SpotifyStatus = 'ok',
+  art: Image | null = null,
+  artColor: Rgb | null = null,
+) {
   const calls: string[] = []
   const source = {
     interpolate: () => state,
     getStatus: () => status,
     getArt: () => art,
+    getArtColor: (trackId: string) => { calls.push(`artColor:${trackId}`); return artColor },
     play: async () => { calls.push('play'); return true },
     pause: async () => { calls.push('pause'); return true },
     next: async () => { calls.push('next'); return true },
-    previous: async () => { calls.push('previous'); return true },
-    setVolume: async (p: number) => { calls.push(`volume:${p}`); return true },
     setVisible: (v: boolean) => { calls.push(`visible:${v}`) },
   }
   return { page: new SpotifyPage(source as never), calls }
@@ -57,17 +62,35 @@ describe('SpotifyPage layout', () => {
     }
   })
 
-  it('gives keys 0, 1, 4 and 5 the four distinct quadrant crops', () => {
+  it('tiles the central 3:2 slice of the cover across all six art keys, with square cells', () => {
+    // The cover is SQUARE and the block is 3:2, so naive 1/3 x 1/2 crops would
+    // squash every tile — `drawCroppedImage` fills the whole key whatever shape
+    // the source rect is, so the distortion would be silent. This proves the
+    // arithmetic the page actually emits: six cells, each square, tiling the
+    // central slice exactly with no gap and no overlap.
     const { page } = build(player(), 'ok', FAKE_ART)
     const keys = page.render(NOW).keys
-    expect(keys[0]!.imageCrop).toEqual({ sx: 0.0, sy: 0.0, sw: 0.5, sh: 0.5 })
-    expect(keys[1]!.imageCrop).toEqual({ sx: 0.5, sy: 0.0, sw: 0.5, sh: 0.5 })
-    expect(keys[4]!.imageCrop).toEqual({ sx: 0.0, sy: 0.5, sw: 0.5, sh: 0.5 })
-    expect(keys[5]!.imageCrop).toEqual({ sx: 0.5, sy: 0.5, sw: 0.5, sh: 0.5 })
-    // All four crops must be pairwise distinct, or three quadrants would
-    // share a hash with a fourth and never redraw independently.
-    const crops = [0, 1, 4, 5].map((i) => JSON.stringify(keys[i]!.imageCrop))
-    expect(new Set(crops).size).toBe(4)
+    const crops = [0, 1, 2, 4, 5, 6].map((i) => keys[i]!.imageCrop!)
+    for (const crop of crops) {
+      expect(crop).toBeDefined()
+      // Square source rect: no distortion when drawn into a square key.
+      expect(crop.sw).toBeCloseTo(crop.sh, 10)
+    }
+    // All six cells distinct.
+    const cells = new Set(crops.map((c) => `${c.sx.toFixed(4)}:${c.sy.toFixed(4)}`))
+    expect(cells.size).toBe(6)
+    const xs = [...new Set(crops.map((c) => Number(c.sx.toFixed(6))))].sort((a, b) => a - b)
+    const ys = [...new Set(crops.map((c) => Number(c.sy.toFixed(6))))].sort((a, b) => a - b)
+    expect(xs).toHaveLength(3)
+    expect(ys).toHaveLength(2)
+    // Full width, and a vertically CENTRED slice.
+    expect(xs[0]).toBeCloseTo(0, 6)
+    expect(xs[2]! + crops[0]!.sw).toBeCloseTo(1, 6)
+    const sliceTop = ys[0]!
+    const sliceBottom = ys[1]! + crops[0]!.sh
+    expect(sliceTop).toBeCloseTo(1 - sliceBottom, 6)
+    // And the slice really is 3:2 — full width against two thirds of the height.
+    expect(sliceBottom - sliceTop).toBeCloseTo(2 / 3, 6)
   })
 
   it('shows the album-name fallback on key 0 only when art is absent, and leaves 1, 4, 5 blank', () => {
@@ -94,102 +117,55 @@ describe('SpotifyPage layout', () => {
 
   // Task 38: every control glyph moved to the colour-emoji font, the user's
   // pick over task 37's plain-text Geometric Shapes set.
-  it('shows a pause glyph on key 2 while playing, drawn in emoji mode', () => {
-    const { page } = build(player({ isPlaying: true }))
-    const key = page.render(NOW).keys[2]!
+  it('shows a pause glyph on key 3 while playing, drawn in emoji mode', () => {
+    const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
+    const key = page.render(NOW).keys[3]!
     expect(key.glyph).toBe('⏸️')
     expect(key.glyphFont).toBe('emoji')
   })
 
-  it('shows a play glyph on key 2 while paused, drawn in emoji mode', () => {
-    const { page } = build(player({ isPlaying: false }))
-    const key = page.render(NOW).keys[2]!
+  it('shows a play glyph on key 3 while paused, drawn in emoji mode', () => {
+    const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART)
+    const key = page.render(NOW).keys[3]!
     expect(key.glyph).toBe('▶️')
     expect(key.glyphFont).toBe('emoji')
   })
 
-  it('shows the previous-track glyph on key 6 and the next-track glyph on key 7, both in emoji mode', () => {
-    const { page } = build(player())
+  it('shows the next-track glyph on key 7, and no previous or volume button anywhere', () => {
+    // Previous and volume were dropped when the art grew to six keys — the user
+    // asked for play/pause and the cover, and those were the cost. Asserted GONE
+    // rather than merely moved, so a later edit cannot quietly reintroduce a
+    // control this layout has no room for.
+    const { page } = build(player(), 'ok', FAKE_ART)
     const keys = page.render(NOW).keys
-    expect(keys[6]!.glyph).toBe('⏮️')
-    expect(keys[6]!.glyphFont).toBe('emoji')
     expect(keys[7]!.glyph).toBe('⏭️')
     expect(keys[7]!.glyphFont).toBe('emoji')
+    const glyphs = keys.map((k) => k.glyph).filter(Boolean)
+    expect(glyphs).not.toContain('⏮️')
+    expect(glyphs).not.toContain('🔊')
   })
 
   // Task 37: the volume key moved off the `lines`/`align` text path onto the
   // same `glyph`/`glyphCaption` path as its three neighbours, so all four
   // control keys share one render path and one optical centring instead of
   // the volume key alone reading as a two-line text tile.
-  it('gives key 3 a glyph, like its three neighbours, not a lines-based tile', () => {
-    const { page } = build(player())
-    const key = page.render(NOW).keys[3]!
-    expect(key.glyph).toBeDefined()
-    expect(key.lines).toBeUndefined()
-  })
 
-  it('shows the current percent as key 3\'s caption', () => {
-    const { page } = build(player({ volumePercent: 55 }))
-    const key = page.render(NOW).keys[3]!
-    expect(key.glyphCaption).toBe('55%')
-  })
 
-  it('shows a placeholder caption on key 3 when the volume is unknown', () => {
-    const { page } = build(player({ volumePercent: null }))
-    const key = page.render(NOW).keys[3]!
-    expect(key.glyphCaption).not.toMatch(/\d/)
-  })
 
   // Task 38: only the volume key's speaker "thumps," and only while a
   // track is actually PLAYING — a thumping speaker beside a paused track
   // would be decoration with no meaning.
-  it('gives key 3 a glyphPulse while playing', () => {
-    const { page } = build(player({ isPlaying: true }))
-    expect(page.render(NOW).keys[3]!.glyphPulse).toBeDefined()
-  })
 
-  it('gives key 3 no glyphPulse while paused', () => {
-    const { page } = build(player({ isPlaying: false }))
-    expect(page.render(NOW).keys[3]!.glyphPulse).toBeUndefined()
-  })
 
   it('gives key 3 no glyphPulse when there is no device', () => {
     const { page } = build(null, 'no-device')
     expect(page.render(NOW).keys[3]!.glyphPulse).toBeUndefined()
   })
 
-  it('M5: gives key 3 no glyphPulse when a failed transport command leaves a STALE "isPlaying" state behind a no-device status', () => {
-    // The real defect: `SpotifySource` sets `status: 'no-device'` on a
-    // 403/404 from a control call but leaves `state` (with `isPlaying`
-    // still true from before the failure) in place until the next poll.
-    // `state?.isPlaying` alone survived that: the key kept thumping beside
-    // a device the source was simultaneously reporting as gone.
-    const { page } = build(player({ isPlaying: true }), 'no-device')
-    const key3 = page.render(NOW).keys[3]!
-    expect(key3.glyphPulse).toBeUndefined()
-    expect(key3.dim).toBe(true)
-  })
 
-  it('never calls Date.now() for the thump: the same nowMs always produces the same phase', () => {
-    const { page } = build(player({ isPlaying: true }))
-    const a = page.render(NOW, 12345).keys[3]!.glyphPulse!.phase
-    const b = page.render(NOW, 12345).keys[3]!.glyphPulse!.phase
-    expect(a).toBe(b)
-  })
 
-  it('advances the thump phase as nowMs advances', () => {
-    const { page } = build(player({ isPlaying: true }))
-    const phaseAt = (nowMs: number) => page.render(NOW, nowMs).keys[3]!.glyphPulse!.phase
-    expect(phaseAt(0)).not.toBe(phaseAt(200))
-  })
 
   // Lesson 17: measure the actual rendered pixels, not just the spec field.
-  it('renders visibly different pixels for the volume key at two different clocks while playing', () => {
-    const { page } = build(player({ isPlaying: true }))
-    const bufA = renderKey(page.render(NOW, 0).keys[3]!)
-    const bufB = renderKey(page.render(NOW, 200).keys[3]!)
-    expect(bufA.equals(bufB)).toBe(false)
-  })
 
   // The coordinator's specific concern: a tick that only advances the
   // animation must touch exactly ONE key's hash (the volume key), so the
@@ -198,22 +174,32 @@ describe('SpotifyPage layout', () => {
   // affects one. `now` (the playback position clock) is held FIXED between
   // the two renders — only `nowMs` (the animation clock) advances — so this
   // isolates the thump from anything position-driven.
-  it('changes exactly one of the eight keys\' hash when only nowMs advances during playback', () => {
-    const { page } = build(player({ isPlaying: true }))
-    const before = page.render(NOW, 1000).keys.map((k) => keyHash(k))
-    const after = page.render(NOW, 1100).keys.map((k) => keyHash(k))
-    const changed = before.map((h, i) => h !== after[i]).filter(Boolean).length
-    expect(changed).toBe(1)
-    expect(before[3]).not.toBe(after[3])
+  it('changes NO key hash when only nowMs advances during playback', () => {
+    // The volume "thump" used to make exactly one key change every frame. With
+    // volume gone, a PLAYING page is completely static between polls, so the
+    // daemon writes nothing at all.
+    const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
+    const a = page.render(NOW, 1_000).keys.map(keyHash)
+    const b = page.render(NOW, 1_500).keys.map(keyHash)
+    expect(b).toEqual(a)
   })
 
-  it('dims keys 2, 3, 6 and 7 when there is no device', () => {
-    const { page } = build(null, 'no-device')
+  it('changes every art key hash when only nowMs advances while PAUSED', () => {
+    // Paused is the animated state now: the cover dims and a layer drifts
+    // beneath it, so the six art cells do change frame to frame.
+    const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART)
+    const a = page.render(NOW, 1_000).keys.map(keyHash)
+    const b = page.render(NOW, 1_500).keys.map(keyHash)
+    for (const i of [0, 1, 2, 4, 5, 6]) expect(b[i], `art key ${i}`).not.toBe(a[i])
+    // The control keys carry no layer, so they are untouched.
+    expect(b[3]).toBe(a[3])
+    expect(b[7]).toBe(a[7])
+  })
+
+  it('dims both control keys when there is no device', () => {
+    const { page } = build(player(), 'no-device', FAKE_ART)
     const keys = page.render(NOW).keys
-    expect(keys[2]!.dim).toBe(true)
-    expect(keys[3]!.dim).toBe(true)
-    expect(keys[6]!.dim).toBe(true)
-    expect(keys[7]!.dim).toBe(true)
+    for (const i of [3, 7]) expect(keys[i]!.dim, `key ${i}`).toBe(true)
   })
 
   it('does not render shuffle or repeat anywhere on the deck', () => {
@@ -313,74 +299,95 @@ describe('SpotifyPage idle animation (nothing playing) — task 39, replacing th
   // those four keys to the device. `now` (the playback position clock) plays
   // no role here since nothing is loaded; only `nowMs` (the animation clock)
   // advances.
-  it('changes exactly the four art keys\' hashes (0, 1, 4, 5) when only nowMs advances while idle', () => {
+  it('changes all SIX art key hashes when only nowMs advances while idle', () => {
     const { page } = build(null, 'no-device')
-    const before = page.render(NOW, 1000).keys.map((k) => keyHash(k))
-    const after = page.render(NOW, 1100).keys.map((k) => keyHash(k))
-    const changedIndices = before.map((h, i) => (h !== after[i] ? i : -1)).filter((i) => i >= 0)
-    expect(changedIndices).toEqual([0, 1, 4, 5])
-  })
-})
-
-describe('SpotifyPage playing state stays untouched by the idle-animation rewrite (task 39)', () => {
-  // Golden hashes captured from the pre-task-39 implementation (the old
-  // green equaliser), for the exact same fixture this file already uses
-  // everywhere else. Task 39 only touches the idle-state branches
-  // (`primaryArtKey`/`spanArtKey`'s `!state` case) — the play/pause, volume
-  // "thump," previous and next keys must render BYTE-IDENTICAL to before,
-  // proving the rewrite left the playing state alone rather than merely
-  // "probably" leaving it alone.
-  const GOLDEN_SHA256: Record<number, string> = {
-    2: 'ecccfec53d18d947937fcb88520e2b64ed320327fd2918c377f149ee9c3e9ccb',
-    3: '5b5c93cce80786cddbe57a4ecd5b194e4869ba4f5d35224a55e5f97cfdbb04ff',
-    6: '4e55e2edd99a626a6c304b105a624f81c189cdfcb592ea37cb7870b345893c51',
-    7: '3ba9b075332a7c7e243074a477cf126319b24b46be9a920b727dcf2f33df1865',
-  }
-
-  it('renders keys 2, 3, 6 and 7 byte-identical to the pre-task-39 build while playing', () => {
-    const { page } = build(player({ isPlaying: true }))
-    const frame = page.render(NOW, 1000)
-    for (const i of [2, 3, 6, 7]) {
-      const sha = createHash('sha256').update(renderKey(frame.keys[i]!)).digest('hex')
-      expect(sha).toBe(GOLDEN_SHA256[i])
+    const a = page.render(NOW, 1_000).keys.map(keyHash)
+    const b = page.render(NOW, 1_100).keys.map(keyHash)
+    for (const i of [0, 1, 2, 4, 5, 6]) {
+      expect(b[i], `art key ${i} froze`).not.toBe(a[i])
     }
+    expect(b[3]).toBe(a[3])
+    expect(b[7]).toBe(a[7])
+  })
+
+  it('gives every one of the six idle cells its own position, so no two rain alike', () => {
+    // The user's very first request in this project was this animation. Six keys
+    // needs six distinct (col, row) pairs — on a 2-wide grid two would collide and
+    // two tiles would fall identically.
+    const { page } = build(null, 'no-device')
+    const keys = page.render(NOW, 1_000).keys
+    const cells = new Set<string>()
+    for (const i of [0, 1, 2, 4, 5, 6]) {
+      const idle = keys[i]!.idle
+      expect(idle, `key ${i} has no idle spec`).toBeDefined()
+      cells.add(`${idle!.col}:${idle!.row}`)
+    }
+    expect(cells.size).toBe(6)
   })
 })
+
+/*
+ * RETIRED, deliberately: golden sha256 hashes of keys 2, 3, 6 and 7, captured
+ * from the pre-task-39 build to prove that task 39's idle-animation rewrite had
+ * left the playing state byte-identical.
+ *
+ * Task 39 landed. AGENTS.md's rule is that "a point-in-time proof (a golden
+ * hash pinning another page's bytes) retires when its change lands. Do not
+ * leave it to fire on the next legitimate change." It was left, and it fired on
+ * task 44 — which moves play/pause to key 3, drops volume and previous
+ * entirely, and grows the art to six keys, all by the user's explicit request.
+ *
+ * Re-baselining would preserve a proof of a claim nobody makes any more. The
+ * playing state's real properties are covered by the layout and press blocks
+ * above.
+ *
+ * It did earn its keep on the way out, though: it was the failure that exposed
+ * `tickMs` still following `isPlaying` from the deleted volume "thump", which
+ * would have burned the fast tick on a static playing page and starved the new
+ * paused animation to one frame a second.
+ */
 
 describe('SpotifyPage tickMs', () => {
-  // Task 38: a loaded, PAUSED track is the one "loaded" case left at the
-  // 1000 ms default — nothing on the page animates then. This used to be
-  // true for ANY loaded track (task 27); it stopped being true the moment
-  // the volume key's "thump" started animating during playback.
-  it('is undefined (the 1000 ms default) while a track is loaded but paused', () => {
+  /*
+   * INVERTED by task 44, and the inversion is the point.
+   *
+   * Task 38 tied the fast tick to `isPlaying`, because the volume key's "thump"
+   * animated during playback. Task 44 deleted that key, so a PLAYING page is
+   * static between polls — and a PAUSED one animates, because the cover dims and
+   * a layer drifts beneath it. The rate follows what actually moves.
+   */
+  it('is defined and faster than 1000 ms while a track is loaded but PAUSED', () => {
     const { page } = build(player({ isPlaying: false }))
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
+  })
+
+  it('is undefined (the 1000 ms default) while a track is loaded and playing, since nothing moves', () => {
+    const { page } = build(player({ isPlaying: true }))
     expect(page.tickMs).toBeUndefined()
   })
 
-  it('is defined and faster than 1000 ms while a track is loaded and PLAYING (task 38\'s thump)', () => {
-    const { page } = build(player({ isPlaying: true }))
-    expect(page.tickMs).toBeDefined()
-    expect(page.tickMs!).toBeLessThan(1000)
-  })
-
-  it('is defined and faster than 1000 ms while nothing is playing', () => {
+  it('is defined while nothing is loaded, for the idle animation', () => {
     const { page } = build(null, 'no-device')
     expect(page.tickMs).toBeDefined()
     expect(page.tickMs!).toBeLessThan(1000)
   })
 
-  it('M5: is undefined for a STALE "isPlaying" state behind a no-device status, even though the idle-equaliser case above stays fast', () => {
-    // Distinct from the test above: here `state` is NOT null (a control
-    // failure left the last known snapshot in place, still `isPlaying`),
-    // so the idle-equaliser branch does not apply. The render loop must
-    // not keep ticking at 100 ms for an animation `render()` no longer even
-    // draws for a device the source reports as gone.
+  it('is undefined while unauthorized, since key 0 shows text rather than an animation', () => {
+    const { page } = build(null, 'unauthorized')
+    expect(page.tickMs).toBeUndefined()
+  })
+
+  it('is undefined for a stale "was playing" snapshot behind a dead device (M5)', () => {
+    // A failed transport command leaves `isPlaying` true while `status` reports
+    // `no-device`. Nothing should animate for a device that is gone — and with the
+    // rate now inverted, the naive reading would have made this case FAST.
     const { page } = build(player({ isPlaying: true }), 'no-device')
     expect(page.tickMs).toBeUndefined()
   })
 
-  it('is undefined while unauthorized, since key 0 shows the sign-in text, not the animation', () => {
-    const { page } = build(null, 'unauthorized')
+  it('is undefined for a stale PAUSED snapshot behind a dead device too', () => {
+    const { page } = build(player({ isPlaying: false }), 'no-device')
     expect(page.tickMs).toBeUndefined()
   })
 })
@@ -422,10 +429,6 @@ describe('SpotifyPage staleness (I3): one predicate for the whole page, includin
     }
   })
 
-  it('does not thump the volume key while offline, even if the stale state still says isPlaying', () => {
-    const { page } = build(player({ isPlaying: true }), 'offline', FAKE_ART)
-    expect(page.render(NOW).keys[3]!.glyphPulse).toBeUndefined()
-  })
 
   it('freezes the interpolated position while offline, instead of tracking the wall clock forward for up to 5 minutes behind dim art', () => {
     const calls: number[] = []
@@ -436,6 +439,7 @@ describe('SpotifyPage staleness (I3): one predicate for the whole page, includin
       },
       getStatus: () => 'offline' as SpotifyStatus,
       getArt: () => FAKE_ART,
+      getArtColor: () => null,
       play: async () => true,
       pause: async () => true,
       next: async () => true,
@@ -463,6 +467,7 @@ describe('SpotifyPage staleness (I3): one predicate for the whole page, includin
       },
       getStatus: () => status,
       getArt: () => FAKE_ART,
+      getArtColor: () => null,
       play: async () => true,
       pause: async () => true,
       next: async () => true,
@@ -613,34 +618,9 @@ describe('SpotifyPage presses', () => {
     expect(calls).toContain('play')
   })
 
-  it('raises the volume by 10 points on key 3', async () => {
-    const { page, calls } = build(player({ volumePercent: 55 }))
-    await page.onKeyPress(3)
-    expect(calls).toContain('volume:65')
-  })
 
-  it('M4: ignores the volume press when the volume is unknown, instead of assuming 50 percent', async () => {
-    // Lesson 18: a missing value is UNKNOWN, not a measured 50%. The old
-    // behaviour showed "—" on the key's caption but silently asserted a real
-    // number on a press — 'ignored' still gives visible feedback (the red
-    // ring), so the press is never mistaken for one the deck never received.
-    const { page, calls } = build(player({ volumePercent: null }))
-    const outcome = await page.onKeyPress(3)
-    expect(outcome).toBe('ignored')
-    expect(calls).toEqual([])
-  })
 
-  it('M4: clamps the volume at 100 instead of wrapping to zero', async () => {
-    const { page, calls } = build(player({ volumePercent: 100 }))
-    await page.onKeyPress(3)
-    expect(calls).toContain('volume:100')
-  })
 
-  it('M4: reaches exactly 100 from 95, instead of jumping past it to zero', async () => {
-    const { page, calls } = build(player({ volumePercent: 95 }))
-    await page.onKeyPress(3)
-    expect(calls).toContain('volume:100')
-  })
 
   it('does not read the wall clock while handling a press', async () => {
     const now = vi.spyOn(Date, 'now')
@@ -653,11 +633,6 @@ describe('SpotifyPage presses', () => {
     }
   })
 
-  it('goes to the previous track on key 6', async () => {
-    const { page, calls } = build(player())
-    await page.onKeyPress(6)
-    expect(calls).toContain('previous')
-  })
 
   it('advances to the next track on key 7', async () => {
     const { page, calls } = build(player())
@@ -665,13 +640,32 @@ describe('SpotifyPage presses', () => {
     expect(calls).toContain('next')
   })
 
-  it('does nothing on any of the four album-art keys', async () => {
-    const { page, calls } = build(player())
-    await page.onKeyPress(0)
-    await page.onKeyPress(1)
-    await page.onKeyPress(4)
-    await page.onKeyPress(5)
-    expect(calls).toEqual([])
+  it('toggles playback on every art key, so the control is always under a finger', async () => {
+    // The inverse of the old behaviour, by the user's request: they wanted to play
+    // and pause and see the cover, so seven of the eight keys now do it.
+    for (const i of [0, 1, 2, 4, 5, 6]) {
+      const { page, calls } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
+      expect(await page.onKeyPress(i)).toBe('handled')
+      expect(calls, `key ${i}`).toContain('pause')
+    }
+    for (const i of [0, 1, 2, 4, 5, 6]) {
+      const { page, calls } = build(player({ isPlaying: false }), 'ok', FAKE_ART)
+      expect(await page.onKeyPress(i)).toBe('handled')
+      expect(calls, `key ${i}`).toContain('play')
+    }
+  })
+
+  it('toggles playback on the labelled key 3 too', async () => {
+    const { page, calls } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
+    expect(await page.onKeyPress(3)).toBe('handled')
+    expect(calls).toContain('pause')
+  })
+
+  it('ignores a press when nothing is loaded, rather than guessing', async () => {
+    const { page, calls } = build(null, 'no-device')
+    for (const i of [0, 3, 6]) expect(await page.onKeyPress(i)).toBe('ignored')
+    expect(calls).not.toContain('play')
+    expect(calls).not.toContain('pause')
   })
 
   it('tells the source when it becomes visible', () => {
@@ -696,6 +690,7 @@ describe('SpotifyPage presses report the real outcome, keys 0 to 7', () => {
       interpolate: () => player({ isPlaying: true, volumePercent: 50 }),
       getStatus: () => 'ok' as SpotifyStatus,
       getArt: () => null,
+      getArtColor: () => null,
       play: async () => false,
       pause: async () => false,
       next: async () => false,
@@ -710,10 +705,114 @@ describe('SpotifyPage presses report the real outcome, keys 0 to 7', () => {
     expect(await page.onKeyPress(7)).toBe('failed')
   })
 
-  it('reports ignored for every album-art key, 0, 1, 4 and 5', async () => {
-    const { page } = build(player())
-    for (const i of [0, 1, 4, 5]) {
-      expect(await page.onKeyPress(i)).toBe('ignored')
+  it('reports handled for every key when a track is loaded', async () => {
+    for (let i = 0; i <= 7; i++) {
+      const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
+      expect(await page.onKeyPress(i), `key ${i}`).toBe('handled')
     }
+  })
+})
+
+describe('SpotifyPage paused state (task 44)', () => {
+  it('dims the cover AND puts a layer beneath it while paused', () => {
+    const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART)
+    const keys = page.render(NOW, 1_000).keys
+    for (const i of [0, 1, 2, 4, 5, 6]) {
+      expect(keys[i]!.dim, `key ${i}`).toBe(true)
+      expect(keys[i]!.fx, `key ${i}`).toBeDefined()
+    }
+  })
+
+  it('shows the cover clean and undimmed while playing', () => {
+    const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
+    const keys = page.render(NOW, 1_000).keys
+    for (const i of [0, 1, 2, 4, 5, 6]) {
+      expect(keys[i]!.dim, `key ${i}`).not.toBe(true)
+      expect(keys[i]!.fx, `key ${i}`).toBeUndefined()
+    }
+  })
+
+  it('gives the six paused cells distinct seeds, so they do not drift as one sheet', () => {
+    const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART)
+    const keys = page.render(NOW, 1_000).keys
+    const seeds = [0, 1, 2, 4, 5, 6].map((i) => keys[i]!.fx!.seed)
+    expect(new Set(seeds).size).toBe(6)
+  })
+
+  it('does not add a paused layer when the data is merely stale', () => {
+    // A dead device already dims everything through `stale`. Adding drifting haze
+    // on top would claim the track is paused when we do not know that.
+    const { page } = build(player({ isPlaying: false }), 'no-device', FAKE_ART)
+    const keys = page.render(NOW, 1_000).keys
+    for (const i of [0, 1, 2, 4, 5, 6]) {
+      expect(keys[i]!.dim, `key ${i}`).toBe(true)
+      expect(keys[i]!.fx, `key ${i}`).toBeUndefined()
+    }
+  })
+
+  it('actually reveals the layer through the dimmed cover, on the glass', async () => {
+    // The whole mechanism rests on draw order plus `dim`: background, then the
+    // layer, then the image at DIM_FACTOR opacity, so a 45-percent-opaque cover
+    // lets the layer through.
+    //
+    // Needs a REAL decoded image, not this file's `FAKE_ART` stand-in. FAKE_ART is
+    // a bare `{ width, height }` object, which is fine for the spec-level tests
+    // but draws nothing — so a pixel-level claim made with it compares two
+    // coverless renders and proves nothing about the cover at all.
+    const cover = createCanvas(64, 64)
+    const cctx = cover.getContext('2d')
+    cctx.fillStyle = 'rgb(200, 60, 40)'
+    cctx.fillRect(0, 0, 64, 64)
+    const realArt = await loadImage(cover.toBuffer('image/png'))
+
+    const { page } = build(player({ isPlaying: false }), 'ok', realArt)
+    const key = page.render(NOW, 1_000).keys[0]!
+    expect(key.fx).toBeDefined()
+
+    const withLayer = renderKey(key)
+    const withoutLayer = renderKey({ ...key, fx: undefined })
+    expect(withLayer.equals(withoutLayer)).toBe(false)
+
+    // And the cover is genuinely visible through the dimming, not blacked out:
+    // the red channel still leads.
+    const px = probe(withLayer, 48, 48)
+    expect(px[0]).toBeGreaterThan(px[1]! + 10)
+  })
+})
+
+describe('SpotifyPage album-colour theming (task 44)', () => {
+  const BLUE: Rgb = [40, 120, 220]
+
+  it('borders both control keys, fills the progress bar and lights both round buttons', () => {
+    const { page } = build(player(), 'ok', FAKE_ART, BLUE)
+    const frame = page.render(NOW, 1_000)
+    expect(frame.keys[3]!.border).toEqual(BLUE)
+    expect(frame.keys[7]!.border).toEqual(BLUE)
+    expect(frame.strip.bar!.color).toEqual(BLUE)
+    expect(frame.buttons[0]).toEqual(BLUE)
+    expect(frame.buttons[1]).toEqual(BLUE)
+  })
+
+  it('falls back to the theme when the cover has no usable colour, never a fabricated hue', () => {
+    const { page } = build(player(), 'ok', FAKE_ART, null)
+    const frame = page.render(NOW, 1_000)
+    expect(frame.keys[3]!.border).toEqual(theme.gray)
+    expect(frame.strip.bar!.color).toEqual(theme.gray)
+  })
+
+  it('asks the source for the colour rather than computing one, so no pixels are read on the render path', () => {
+    // The hard invariant: nothing decodes or measures pixels while rendering. The
+    // page may only ASK, and the source computes once per track at decode time.
+    const { page, calls } = build(player(), 'ok', FAKE_ART, BLUE)
+    for (let i = 0; i < 5; i++) page.render(NOW, 1_000 + i)
+    const asks = calls.filter((c) => c.startsWith('artColor:'))
+    expect(asks.length).toBe(5)
+    expect(asks[0]).toBe(`artColor:${player().trackId}`)
+  })
+
+  it('does not ask for a colour when nothing is loaded', () => {
+    const { page, calls } = build(null, 'no-device')
+    page.render(NOW, 1_000)
+    expect(calls.some((c) => c.startsWith('artColor:'))).toBe(false)
   })
 })

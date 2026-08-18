@@ -426,6 +426,26 @@ survived a green suite and a preview the user approved, and all four were found
 by simulating the user's actual week. **Preview the real data distribution, not
 one of everything.**
 
+### New invariants added by task 44 (the Spotify page rebuild)
+
+- The art block is **3 keys wide**, and a square cover MUST be crop-corrected to
+  the central 3:2 slice. Naive `1/3 x 1/2` crops squash every tile silently.
+- `dominantColor` runs in the SOURCE, once per track, right after the decode.
+  The render loop never reads a pixel — the project's first hard invariant.
+- A `null` album colour is a real answer. The page falls back to the theme; it
+  never invents a hue.
+- **The Spotify tick rate is inverted from task 38**: fast while PAUSED (the
+  drifting layer) and while idle (the rain), default while PLAYING, because
+  nothing on the page moves during playback any more. Do not "restore" the
+  isPlaying reading.
+- `drawIdleRain`'s stride is `IDLE_MAX_COLS`. At 2, two of the six cells collide
+  and rain identically.
+- Volume, the volume "thump", and previous were removed by the user's explicit
+  choice. A test asserts their glyphs are absent, so they cannot creep back into
+  a layout with no room for them.
+
+---
+
 ### New invariants added by task 43 (stocks board and ticker tape)
 
 - Drift particles must stay LARGE enough to register on a tile that already

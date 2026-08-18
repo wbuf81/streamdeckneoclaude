@@ -40,13 +40,18 @@ export interface IdleSpec {
    */
   nowMs: number
   /**
-   * This key's position in the 2x2 album-art block: `col` 0 is left, 1 is
-   * right; `row` 0 is top, 1 is bottom. Each of the four keys renders its own
-   * quadrant of one shared design deterministically from `nowMs` plus this
-   * position — no two keys share both values, so `keyHash` (which includes
-   * this whole object) always tells them apart.
+   * This key's position in the album-art block: `col` 0 is leftmost, `row` 0 is
+   * top. Each key renders its own cell of one design deterministically from
+   * `nowMs` plus this position — no two keys share both values, so `keyHash`
+   * (which includes this whole object) always tells them apart.
+   *
+   * `col` allows a THIRD column because task 44 grew the Spotify art block from
+   * 2x2 to 3x2. Only the `rain` variant is independent per key and therefore
+   * correct at that width; `grid` and `glitch` draw one scene sized to a 2x2
+   * block and clamp `col` to at most 1 internally, so switching `IDLE_VARIANT`
+   * degrades to a repeated column rather than a torn scene.
    */
-  col: 0 | 1
+  col: 0 | 1 | 2
   row: 0 | 1
 }
 

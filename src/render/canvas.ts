@@ -35,6 +35,9 @@ const SPARK_LABEL_BAND_H = 18
  * 1) place a key's own 96x96 window at one corner of it.
  */
 const IDLE_SCENE = KEY_SIZE * 2
+/** How many columns the idle block can span. `rain` honours all of them; the
+ * scene-based variants clamp through `sceneColumn`. */
+const IDLE_MAX_COLS = 3
 /**
  * Usable text width of one key: 96 − 3 border − 6 padding each side.
  * Matches docs/VERIFIED-FACTS.md's measured text budget table. Used to
@@ -223,6 +226,13 @@ function finiteOr(n: number, fallback: number): number {
  * this function is the one that covers everything else, including the
  * fields `clamp01` never touched.
  */
+/** Coerces an idle column to one of the three the layout allows. */
+function idleColumn(n: number): 0 | 1 | 2 {
+  if (n >= 2) return 2
+  if (n >= 1) return 1
+  return 0
+}
+
 function sanitizeKeySpec(spec: KeySpec): KeySpec {
   const out: KeySpec = { ...spec }
 
@@ -255,7 +265,7 @@ function sanitizeKeySpec(spec: KeySpec): KeySpec {
     out.idle = {
       ...out.idle,
       nowMs: finiteOr(out.idle.nowMs, 0),
-      col: finiteOr(out.idle.col, 0) === 1 ? 1 : 0,
+      col: idleColumn(finiteOr(out.idle.col, 0)),
       row: finiteOr(out.idle.row, 0) === 1 ? 1 : 0,
     }
   }
@@ -475,8 +485,20 @@ const GRID_VLINE_COUNT = 6
  * perspective floor of converging lines scrolls toward the viewer across the
  * bottom two.
  */
+/**
+ * The `grid` and `glitch` variants draw ONE scene sized to a 2x2 block
+ * (`IDLE_SCENE`), so a third column has no scene to show. They clamp instead of
+ * tearing: a page using three columns with either variant repeats the right-hand
+ * column rather than drawing a broken scene. `rain` is independent per key and
+ * needs no clamp. Making the bad outcome impossible beats documenting it
+ * (lesson 21).
+ */
+function sceneColumn(col: 0 | 1 | 2): 0 | 1 {
+  return col >= 1 ? 1 : 0
+}
+
 function drawIdleGrid(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
-  const originX = idle.col * KEY_SIZE
+  const originX = sceneColumn(idle.col) * KEY_SIZE
   const originY = idle.row * KEY_SIZE
   ctx.save()
   ctx.translate(-originX, -originY)
@@ -604,7 +626,11 @@ export function rainColumnSpan(
 }
 
 function drawIdleRain(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
-  const keyIndex = idle.row * 2 + idle.col
+  // Spans THREE columns since task 44 grew the Spotify art block to 3x2, so the
+  // stride is 3 rather than 2. Every key gets a distinct index, and therefore its
+  // own column seeds — without the wider stride, key (0,2) and key (1,0) would
+  // both index 2 and two tiles would rain identically.
+  const keyIndex = idle.row * IDLE_MAX_COLS + idle.col
   const x0 = BORDER + PAD
   const x1 = KEY_SIZE - PAD
   const colSpacing = (x1 - x0) / RAIN_COLS
@@ -682,7 +708,7 @@ const GLITCH_QUADRANT_PHASE_JITTER = 0.4
  * 0, `row` 0) carries the flickering "OFFLINE" text.
  */
 function drawIdleGlitch(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
-  const keyIndex = idle.row * 2 + idle.col
+  const keyIndex = idle.row * 2 + sceneColumn(idle.col)
   // Offset away from 0 (M7): `pseudoRandom(0)` is exactly 0, which locked key
   // 0's slip band below to nowMs epoch boundaries instead of a phase of its
   // own, the same weak-hash-at-small-seeds failure mode as I1. `+ 1000`
@@ -720,7 +746,7 @@ function drawIdleGlitch(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void 
   // rendering: it does not need the fix, and giving it continuous scanline
   // motion too would add sub-pixel noise inside the exact region the text's
   // OWN slow-breathe animation is measured over, for no benefit.
-  const isTextKey = idle.col === 0 && idle.row === 0
+  const isTextKey = sceneColumn(idle.col) === 0 && idle.row === 0
   for (let y = -GLITCH_SCANLINE_SPACING; y < KEY_SIZE + GLITCH_SCANLINE_SPACING; y += GLITCH_SCANLINE_SPACING) {
     const yy = isTextKey ? Math.round(y + scrollOffset) : y + scrollOffset
     if (isTextKey ? yy < 0 || yy >= KEY_SIZE : yy < -1 || yy > KEY_SIZE) continue
@@ -744,7 +770,7 @@ function drawIdleGlitch(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void 
     }
   }
 
-  if (idle.col === 0 && idle.row === 0) {
+  if (sceneColumn(idle.col) === 0 && idle.row === 0) {
     const breathe = 0.55 + 0.45 * Math.sin((idle.nowMs / GLITCH_TEXT_BREATHE_MS) * 2 * Math.PI)
     const alpha = bandActive && bandT < GLITCH_TEXT_DROPOUT_MS ? 0.08 : breathe
     ctx.fillStyle = cssAlpha(theme.cyan, alpha, dim)
@@ -1791,6 +1817,90 @@ export function renderKey(rawSpec: KeySpec): Buffer {
 }
 
 /** Renders the 248 by 58 info strip as one image. The result is a raw RGBA buffer. */
+/* ---------- Album colour extraction (task 44) ---------- */
+
+/** The square the cover is downscaled to before its pixels are counted. Small
+ * enough to be cheap, large enough that a small accent colour still registers. */
+const DOMINANT_SAMPLE = 28
+/** How coarsely colours are bucketed. 5 bits per channel groups near-identical
+ * shades together, so one flat region does not split across many buckets. */
+const DOMINANT_BUCKET_SHIFT = 3
+/** Pixels outside this brightness band are ignored: a cover is usually mostly
+ * black or white, and neither makes a usable accent. */
+const DOMINANT_MIN_LUM = 40
+const DOMINANT_MAX_LUM = 700
+/** How far a pixel's channels must spread before it counts as coloured rather
+ * than grey. A greyscale sleeve legitimately has no accent colour. */
+const DOMINANT_MIN_CHROMA = 24
+
+/**
+ * The dominant accent colour of an album cover, or `null` when it has none.
+ *
+ * An AVERAGE would be wrong: averaging a cover's pixels converges on mud, and
+ * on most covers the mud is a dark grey-brown. This instead downscales the
+ * cover, buckets the pixels coarsely, and takes the most populated bucket that
+ * is neither near-black, near-white, nor nearly grey.
+ *
+ * `null` is a real answer, not a failure — a greyscale or almost-black sleeve
+ * genuinely has no accent, and the caller falls back to the theme rather than
+ * inventing a hue.
+ *
+ * MUST run off the render path. It decodes nothing, but it does allocate a
+ * canvas and read pixels, so `SpotifySource` calls it once per track right after
+ * `loadImage` resolves and caches the result beside the decoded image.
+ */
+export function dominantColor(img: Image): Rgb | null {
+  const w = Math.max(1, Math.min(DOMINANT_SAMPLE, img.width || DOMINANT_SAMPLE))
+  const h = Math.max(1, Math.min(DOMINANT_SAMPLE, img.height || DOMINANT_SAMPLE))
+  const canvas = createCanvas(w, h)
+  const ctx = canvas.getContext('2d')
+  try {
+    ctx.drawImage(img, 0, 0, w, h)
+  } catch {
+    // A hostile or zero-sized image must not take the source down with it.
+    return null
+  }
+  const data = ctx.getImageData(0, 0, w, h).data
+
+  const counts = new Map<number, { n: number; r: number; g: number; b: number }>()
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3]!
+    if (a < 128) continue
+    const r = data[i]!
+    const g = data[i + 1]!
+    const b = data[i + 2]!
+    const lum = r + g + b
+    if (lum < DOMINANT_MIN_LUM || lum > DOMINANT_MAX_LUM) continue
+    if (Math.max(r, g, b) - Math.min(r, g, b) < DOMINANT_MIN_CHROMA) continue
+    const key =
+      ((r >> DOMINANT_BUCKET_SHIFT) << 10) |
+      ((g >> DOMINANT_BUCKET_SHIFT) << 5) |
+      (b >> DOMINANT_BUCKET_SHIFT)
+    const bucket = counts.get(key)
+    if (bucket) {
+      bucket.n++
+      bucket.r += r
+      bucket.g += g
+      bucket.b += b
+    } else {
+      counts.set(key, { n: 1, r, g, b })
+    }
+  }
+
+  let best: { n: number; r: number; g: number; b: number } | null = null
+  for (const bucket of counts.values()) {
+    if (!best || bucket.n > best.n) best = bucket
+  }
+  if (!best) return null
+  // The bucket's own mean, so the result is a real colour from the cover rather
+  // than the centre of a quantisation cell.
+  return [
+    Math.round(best.r / best.n),
+    Math.round(best.g / best.n),
+    Math.round(best.b / best.n),
+  ]
+}
+
 /** The separator drawn between tape segments, and the band the tape occupies. */
 const TAPE_SEPARATOR = '  ·  '
 

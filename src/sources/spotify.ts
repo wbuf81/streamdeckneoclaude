@@ -2,6 +2,8 @@ import { EventEmitter } from 'node:events'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadImage, type Image } from '@napi-rs/canvas'
+import { dominantColor } from '../render/canvas.js'
+import type { Rgb } from '../render/specs.js'
 import { paths } from '../paths.js'
 import { log } from '../log.js'
 import { TokenStore, refreshTokens, type Tokens } from './spotify-auth.js'
@@ -154,6 +156,10 @@ export class SpotifySource extends EventEmitter {
   private stopped = false
   /** Decoded images, keyed by track id. */
   private artCache = new Map<string, Image>()
+  /** One accent colour per cached cover, evicted with `artCache`. A `null` VALUE
+   * means the cover genuinely has no usable accent; an absent key means the art
+   * has not been decoded yet. */
+  private artColors = new Map<string, Rgb | null>()
   /** Track ids with a load in flight, so one miss starts one load. */
   private pending = new Set<string>()
   /** Track ids whose last attempt failed (or had no URL), mapped to the
@@ -557,12 +563,42 @@ export class SpotifySource extends EventEmitter {
 
   private remember(trackId: string, img: Image): void {
     this.artCache.set(trackId, img)
+    // The cover's accent colour, extracted ONCE here — off the render path, in
+    // the same place the decode already happens. It allocates a small canvas and
+    // reads pixels, which the render loop must never do (docs/PROJECT-STATE.md's
+    // first hard invariant).
+    //
+    // `null` is a real answer: a greyscale or almost-black sleeve has no accent,
+    // and the page falls back to its own theme rather than inventing a hue. It is
+    // stored as `null` rather than left absent, so a later `getArtColor` can tell
+    // "no colour" apart from "not computed yet" without recomputing.
+    try {
+      this.artColors.set(trackId, dominantColor(img))
+    } catch (e) {
+      // Colour extraction must never cost the page its artwork. `log.once`, not
+      // `log.warn`: this runs once per track, but a systematically failing
+      // decoder would otherwise fill the log (lesson 5).
+      this.artColors.set(trackId, null)
+      log.once(`art-color-${trackId}`, `album colour extraction failed: ${String(e)}`)
+    }
     // A Map keeps insertion order, so the first key is the oldest.
     while (this.artCache.size > ART_CACHE_MAX) {
       const oldest = this.artCache.keys().next().value
       if (oldest === undefined) break
       this.artCache.delete(oldest)
+      // Evicted together, so the two maps cannot drift apart in size or content.
+      this.artColors.delete(oldest)
     }
+  }
+
+  /**
+   * The current cover's accent colour, or null when it has none or the art has
+   * not loaded yet. Never triggers work — the colour is computed once, when the
+   * image is decoded.
+   */
+  getArtColor(trackId: string): Rgb | null {
+    if (!trackId) return null
+    return this.artColors.get(trackId) ?? null
   }
 
   /** Bounded the same way as `artCache`: unlike a decoded image, a cooldown

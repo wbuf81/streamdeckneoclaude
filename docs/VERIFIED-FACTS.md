@@ -823,6 +823,65 @@ Measured on 2026-08-18.
 
 ---
 
+## The Spotify page rebuild (task 44)
+
+### A square cover in a 3:2 block must be crop-corrected
+
+Album art is 640x640. The rebuilt art block is three keys wide by two tall,
+which is 3:2. Slicing the square source into six `1/3 x 1/2` rects hands each key
+a 213x320 source rect to draw into a 96x96 key, and `drawCroppedImage` fills the
+whole key regardless of the source rect's shape — so every tile squashes
+vertically and NOTHING reports it.
+
+The page therefore shows the central 3:2 slice: source y from `1/6` to `5/6`,
+then six `1/3 x 1/3` cells, each square. Verified by eye on a rendered cover
+containing a circle, which stays circular.
+
+The cost is the top and bottom sixth of the cover. Confirmed on a synthetic cover
+with text against both edges: that text is not visible. Album covers are
+centre-weighted so this is the right trade for a full-bleed image, but a
+letterboxed alternative is a one-constant change.
+
+### Album colour extraction
+
+`dominantColor` downscales the cover to 28x28, buckets pixels at 5 bits per
+channel, and takes the most populated bucket that is not near-black, near-white
+or nearly grey. Three filters, each load-bearing and each proven by breaking it:
+
+- Without the BUCKETS, a two-tone cover returns the average, which is mud.
+- Without the CHROMA filter, a greyscale sleeve returns a fake hue instead of
+  null.
+- Without the LUMINANCE band, a saturated near-black field like `rgb(26,0,2)`
+  wins on pixel count — it passes the chroma test — and the page themes itself to
+  something indistinguishable from black. A pale cream `rgb(255,250,200)` fails
+  the same way at the other end.
+
+It runs once per track inside `SpotifySource.loadArt`, right after `loadImage`
+resolves, and is evicted with the decoded image. The render loop never reads a
+pixel.
+
+### The paused state needs no renderer change
+
+`renderKey` draws the background, then the `fx` layer, then the image — and `dim`
+applies to the image through `globalAlpha` at `DIM_FACTOR`. So a dimmed cover is
+45 percent opaque and reveals 55 percent of the layer beneath it. That is the
+whole mechanism behind "paused looks paused".
+
+### The idle rain spans three columns
+
+`IdleSpec.col` is `0 | 1 | 2`. `drawIdleRain` seeds per key with a stride of
+`IDLE_MAX_COLS`, not 2 — at stride 2, cells (col 2, row 0) and (col 0, row 1)
+both index 2 and two tiles rain IDENTICALLY. A test asserting the six specs were
+distinct could not see that, because the page emits six distinct specs either
+way; the duplication happens inside the renderer, so the proof must compare six
+rendered buffers.
+
+`grid` and `glitch` draw one scene sized to a 2x2 block and clamp `col` to at
+most 1, so switching `IDLE_VARIANT` degrades to a repeated column rather than a
+torn scene.
+
+---
+
 ## macOS specifics
 
 - **Per-window focus needs Accessibility permission**, which is NOT granted.
