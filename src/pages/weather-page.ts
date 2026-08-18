@@ -1,4 +1,5 @@
-import type { DeckFrame, KeySpec, Rgb, StripSpec } from '../render/specs.js'
+import type { DeckFrame, FxSpec, FxVariant, KeySpec, Rgb, StripSpec } from '../render/specs.js'
+import { FX_INTENSITY_MIN } from '../render/canvas.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
@@ -13,6 +14,15 @@ const PLACE_CHARS = 10
 /** Rain at or above this percent gets the emphasis colour. */
 const PRECIP_HOT_THRESHOLD = 50
 const DAY_TILE_COUNT = 7
+/**
+ * How often to render while a condition effect is showing. The same value the
+ * Spotify page's idle animation uses (`IDLE_TICK_MS`), for the same reason: the
+ * device's own render interval is the only throughput constraint, and eight
+ * animated keys at this rate is about 80 key-writes per second against a
+ * measured ceiling of 362 (docs/VERIFIED-FACTS.md). The effect layer itself was
+ * measured at 0.37 ms per eight-key frame, against this 100 ms budget.
+ */
+const FX_TICK_MS = 100
 
 /**
  * The four bands of a day tile, measured so none can collide (see the task
@@ -73,30 +83,84 @@ const HEAT_WARM = 80
 const HEAT_MILD = 70
 
 /**
- * Dark background washes, one per forecast condition, keyed by the SAME
- * emoji the forecast already picked (`weatherEmoji` in `sources/weather.ts`).
- * Keying on the emoji rather than re-matching the forecast text means the
- * tint and the icon can never disagree — there is only one lookup, not two
- * keyword lists drifting apart. Every value stays dark, because the key's
- * white text must stay crisp on top of it.
+ * One row per forecast condition, keyed by the SAME emoji the forecast already
+ * picked (`weatherEmoji` in `sources/weather.ts`). The row carries BOTH the
+ * dark background wash and the ambient effect drawn over it, so the icon, the
+ * tint, and the motion behind the numbers all come from a single lookup —
+ * there is no second keyword list to drift apart from the first (lesson 21 in
+ * docs/LESSONS.md: one decision, one function).
+ *
+ * Every `tint` stays dark, because the key's white text must stay crisp on top
+ * of it. These are the same eight values the earlier `CONDITION_TINTS` held,
+ * unchanged.
+ *
+ * `intensity` is either the literal `'precip'`, meaning the tile's own real
+ * chance-of-rain drives how heavy the effect looks, or a fixed fraction for a
+ * condition that carries no such reading.
  */
-const CONDITION_TINTS: Readonly<Record<string, Rgb>> = {
-  '⛈': [28, 24, 48], // thunder: deep blue-violet
-  '🌨': [26, 32, 40], // snow, sleet, ice: dark slate
-  '🌧': [18, 28, 44], // rain, showers, drizzle: dark blue
-  '🌫': [28, 28, 30], // fog, haze, mist: flat dark grey
-  '💨': [20, 26, 32], // wind: dark cool grey-blue
-  '☁️': [22, 24, 28], // cloudy, overcast: neutral dark
-  '⛅': [28, 26, 24], // partly cloudy: slightly warm dark
-  '☀️': [34, 27, 18], // sunny, clear: warm dark amber-brown
+interface ConditionStyle {
+  tint: Rgb
+  fx: FxVariant
+  intensity: 'precip' | number
 }
-/** Falls back to the cloudy tint — the same default `weatherEmoji` itself uses. */
-const DEFAULT_TINT: Rgb = CONDITION_TINTS['☁️']!
+
+const CONDITION_STYLES: Readonly<Record<string, ConditionStyle>> = {
+  // thunder: deep blue-violet
+  '⛈': { tint: [28, 24, 48], fx: 'storm', intensity: 'precip' },
+  // snow, sleet, ice: dark slate
+  '🌨': { tint: [26, 32, 40], fx: 'snow', intensity: 'precip' },
+  // rain, showers, drizzle: dark blue
+  '🌧': { tint: [18, 28, 44], fx: 'rain', intensity: 'precip' },
+  // fog, haze, mist: flat dark grey
+  '🌫': { tint: [28, 28, 30], fx: 'fog', intensity: 0.7 },
+  // wind: dark cool grey-blue
+  '💨': { tint: [20, 26, 32], fx: 'wind', intensity: 0.7 },
+  // cloudy, overcast: neutral dark
+  '☁️': { tint: [22, 24, 28], fx: 'cloud', intensity: 0.75 },
+  // partly cloudy: slightly warm dark. The SAME variant as overcast, at a
+  // lower intensity — partly cloudy is cloudy, with less of it.
+  '⛅': { tint: [28, 26, 24], fx: 'cloud', intensity: 0.4 },
+  // sunny, clear: warm dark amber-brown
+  '☀️': { tint: [34, 27, 18], fx: 'sun', intensity: 0.8 },
+}
+
+/** Falls back to the cloudy row — the same default `weatherEmoji` itself uses. */
+const DEFAULT_STYLE: ConditionStyle = CONDITION_STYLES['☁️']!
 
 /** Looks up the background wash for `emoji`. Exported so a test can prove it
  * agrees with `weatherEmoji`'s own output for the same forecast string. */
 export function conditionTint(emoji: string): Rgb {
-  return CONDITION_TINTS[emoji] ?? DEFAULT_TINT
+  return (CONDITION_STYLES[emoji] ?? DEFAULT_STYLE).tint
+}
+
+/**
+ * Maps a real chance-of-rain percentage onto an effect intensity.
+ *
+ * A null or non-finite reading is UNKNOWN, not zero (see AGENTS.md: never
+ * infer a state from missing data), so it takes the floor rather than
+ * switching the effect off — an inert tile beside six moving ones reads as a
+ * broken page, not as missing data. A real 0 percent takes the same floor,
+ * which is honest: the digits on the tile still say `0%`.
+ */
+export function precipIntensity(pct: number | null): number {
+  if (typeof pct !== 'number' || !Number.isFinite(pct)) return FX_INTENSITY_MIN
+  const frac = Math.min(100, Math.max(0, pct)) / 100
+  return FX_INTENSITY_MIN + frac * (1 - FX_INTENSITY_MIN)
+}
+
+/**
+ * Builds the ambient effect for one tile, from the same emoji that already
+ * chose the tile's icon and wash. `seed` decorrelates neighbouring tiles; the
+ * key index is enough, and without it seven tiles of the same condition
+ * animate in lockstep and read as one block rather than seven days.
+ */
+export function conditionFx(
+  emoji: string, precipPercent: number | null, nowMs: number, seed: number,
+): FxSpec {
+  const style = CONDITION_STYLES[emoji] ?? DEFAULT_STYLE
+  const intensity =
+    style.intensity === 'precip' ? precipIntensity(precipPercent) : style.intensity
+  return { variant: style.fx, nowMs, intensity, seed }
 }
 
 /** Grades the high temperature (or the low, when there is no high) into one
@@ -255,6 +319,33 @@ export class WeatherPage implements Page {
   }
 
   /**
+   * Raised only while a condition effect is actually showing. A stale,
+   * offline, or empty forecast freezes every effect (see `render`), so a
+   * faster clock would buy nothing there — the same rule
+   * `SpotifyPage.tickMs` follows for its idle animation.
+   *
+   * Reads `isDimmed`, the one function `render` uses too, so the declared
+   * rate can never disagree with what the frame actually draws.
+   */
+  get tickMs(): number | undefined {
+    const days = this.source.getDays()
+    return this.isDimmed(days, this.source.getStatus()) ? undefined : FX_TICK_MS
+  }
+
+  /**
+   * Whether the whole page must present as not-current: the forecast is
+   * stale, the source is not ok, or no data has arrived at all.
+   *
+   * ONE function, read by both `render` and `tickMs`. Two callers reasoning
+   * about this separately would diverge — lesson 21's "one decision, one
+   * function", and the reason the render rate and the drawn frame cannot
+   * disagree about whether anything is animating.
+   */
+  private isDimmed(days: DayForecast[], status: WeatherStatus): boolean {
+    return this.source.isStale() || status !== 'ok' || days.length === 0
+  }
+
+  /**
    * The day matching `this.selected`'s identity, or null when nothing is
    * selected OR the selected day is no longer in `days` (per I1, this must
    * never fall back to "whatever day is now at the old index" — it is
@@ -269,19 +360,27 @@ export class WeatherPage implements Page {
     return days.find((d) => d.id !== '' && d.id === this.selected) ?? null
   }
 
-  render(_now: number): DeckFrame {
+  render(now: number, nowMs?: number): DeckFrame {
     const days = this.source.getDays()
     const status = this.source.getStatus()
-    const stale = this.source.isStale()
-    const absent = status !== 'ok' || days.length === 0
-    const dim = stale || absent
+    const dim = this.isDimmed(days, status)
+    // A page never reads the wall clock. The daemon injects both, and the
+    // seconds value is the documented fallback for the millisecond one.
+    const ms = nowMs ?? now * 1000
+    // A stale or absent forecast draws no effect at all. The tiles already
+    // dim; now the motion stops too. That is a stronger staleness signal than
+    // dimming alone, and it keeps the page from animating data it does not
+    // have — the same rule as never inferring a state from missing data.
+    const fxMs = dim ? null : ms
 
     const day = this.activeDay(days)
-    if (day) return this.detailFrame(day, dim)
+    if (day) return this.detailFrame(day, dim, fxMs)
 
     const keys: KeySpec[] = []
     for (let i = 0; i < DAY_TILE_COUNT; i++) {
-      keys.push(this.dayKey(days[i], dim))
+      // `i` is the seed: each tile animates on its own phase, so seven days of
+      // the same weather read as seven tiles rather than one block.
+      keys.push(this.dayKey(days[i], dim, fxMs, i))
     }
     keys.push(this.conditionsKey(dim))
 
@@ -292,7 +391,9 @@ export class WeatherPage implements Page {
     }
   }
 
-  private dayKey(day: DayForecast | undefined, dim: boolean): KeySpec {
+  private dayKey(
+    day: DayForecast | undefined, dim: boolean, fxMs: number | null, seed: number,
+  ): KeySpec {
     if (!day) {
       // Same four-band layout and centred alignment as a populated tile —
       // just with placeholder text and no emoji. Without this, a partial
@@ -306,7 +407,7 @@ export class WeatherPage implements Page {
         lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
         lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
         align: 'center',
-        bg: DEFAULT_TINT,
+        bg: DEFAULT_STYLE.tint,
         dim: true,
       }
     }
@@ -328,6 +429,9 @@ export class WeatherPage implements Page {
       // disagree with each other.
       bg: conditionTint(day.emoji),
     }
+    // The ambient effect, from that same single lookup. Null `fxMs` means the
+    // forecast is stale, absent, or offline, so nothing animates.
+    if (fxMs !== null) key.fx = conditionFx(day.emoji, day.precipPercent, fxMs, seed)
     if (dim) key.dim = true
     return key
   }
@@ -372,11 +476,13 @@ export class WeatherPage implements Page {
    * - Key 6: RAIN, the day and night percentages side by side.
    * - Key 7: BACK.
    */
-  private detailFrame(day: DayForecast, dim: boolean): DeckFrame {
+  private detailFrame(day: DayForecast, dim: boolean, fxMs: number | null): DeckFrame {
     const keys: KeySpec[] = [
-      this.dayKey(day, dim),
-      this.periodKey('DAY', day.day, dim),
-      this.periodKey('NIGHT', day.night, dim),
+      // Three distinct seeds, so the combined tile and its two halves each
+      // animate on their own phase rather than in lockstep.
+      this.dayKey(day, dim, fxMs, 0),
+      this.periodKey('DAY', day.day, dim, fxMs, 1),
+      this.periodKey('NIGHT', day.night, dim, fxMs, 2),
       this.windKey(day, dim),
       this.textKey('DAY', day.day, dim),
       this.textKey('NIGHT', day.night, dim),
@@ -399,7 +505,10 @@ export class WeatherPage implements Page {
    * `dayKey` uses for a day with no data at all, always dimmed, since there
    * is nothing behind it to show.
    */
-  private periodKey(label: string, period: PeriodDetail | null, dim: boolean): KeySpec {
+  private periodKey(
+    label: string, period: PeriodDetail | null, dim: boolean,
+    fxMs: number | null, seed: number,
+  ): KeySpec {
     if (!period) {
       return {
         kind: 'gauge',
@@ -407,7 +516,7 @@ export class WeatherPage implements Page {
         lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
         lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
         align: 'center',
-        bg: DEFAULT_TINT,
+        bg: DEFAULT_STYLE.tint,
         dim: true,
       }
     }
@@ -426,6 +535,9 @@ export class WeatherPage implements Page {
       emoji: period.emoji,
       bg: conditionTint(period.emoji),
     }
+    // Each half carries its OWN condition and its own rain chance, so a rainy
+    // day with a clear night shows each on its own tile.
+    if (fxMs !== null) key.fx = conditionFx(period.emoji, period.precipPercent, fxMs, seed)
     if (dim) key.dim = true
     return key
   }

@@ -220,12 +220,18 @@ export class Daemon {
     const tickMs = this.pages.current().tickMs ?? DEFAULT_TICK_MS
     this.armedTickMs = tickMs
     this.timer = setInterval(() => {
-      // A page may change its own rate WITHOUT a page change: the Spotify page
-      // asks for 100 ms while it animates its idle state and the default rate
-      // while a track is loaded. Reading `tickMs` only on a page switch would
-      // leave that animation frozen until the user flipped pages — the same
-      // "flip away and back to fix it" defect the user already reported once.
-      // So compare every tick and re-arm when the page has changed its mind.
+      // A page may change its own rate WITHOUT a page change. Two do:
+      //
+      // - Spotify asks for 100 ms while it animates its idle state, and the
+      //   default rate while a track is loaded.
+      // - Weather (task 42) asks for 100 ms while its condition effects run,
+      //   and the default rate once the forecast goes stale, offline, or
+      //   empty, because those freeze every effect.
+      //
+      // Reading `tickMs` only on a page switch would leave an animation frozen
+      // until the user flipped pages — the same "flip away and back to fix it"
+      // defect the user already reported once. So compare every tick and
+      // re-arm when the page has changed its mind.
       if ((this.pages.current().tickMs ?? DEFAULT_TICK_MS) !== this.armedTickMs) {
         this.armTimer()
       }

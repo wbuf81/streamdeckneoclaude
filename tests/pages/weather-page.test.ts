@@ -1,12 +1,16 @@
 import { describe, it, expect } from 'vitest'
 import { createCanvas } from '@napi-rs/canvas'
-import { WeatherPage, conditionTint, heatColor, wrapText } from '../../src/pages/weather-page.js'
+import { WeatherPage, conditionTint, conditionFx, precipIntensity, heatColor, wrapText } from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
-import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT, FONT } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT, FONT, FX_INTENSITY_MIN } from '../../src/render/canvas.js'
 import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
 import type { Conditions, DayForecast, PeriodDetail, WeatherStatus } from '../../src/sources/weather.js'
+import type { KeySpec } from '../../src/render/specs.js'
 
 const NOW = 1786549560
+/** The millisecond clock the daemon injects, for the proofs that need the
+ * ambient effects actually running. */
+const FX_NOW_MS = NOW * 1000
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near3(actual: readonly number[], expected: readonly number[], tol = 12): boolean {
@@ -14,6 +18,42 @@ function near3(actual: readonly number[], expected: readonly number[], tol = 12)
     if (Math.abs(actual[i]! - expected[i]!) > tol) return false
   }
   return true
+}
+
+/**
+ * Strips a key's own content, keeping its background wash and its ambient
+ * effect exactly as they were. Rendering this and the real key, then diffing
+ * the two, isolates content ink — text, emoji, border — from the moving layer
+ * underneath it.
+ *
+ * The effect is a pure function of its spec and was measured byte-identical
+ * across two renders (docs/VERIFIED-FACTS.md), so every differing pixel is
+ * content and nothing else is.
+ */
+function withoutContent(key: KeySpec): KeySpec {
+  return { ...key, lines: undefined, lineColors: undefined, emoji: undefined }
+}
+
+/**
+ * Whether row `y` of `key` carries any CONTENT ink between `x0` and `x1`,
+ * ignoring whatever the ambient effect painted underneath.
+ *
+ * This replaces comparing pixels against `key.bg`. That comparison stopped
+ * describing the whole background the moment a key could carry an animated
+ * effect (task 42) — every one of these proofs would have failed for the right
+ * reason and the wrong cause. Loosening them instead would have left the
+ * page's real geometry unproven, which is lesson 22's exact shape. The
+ * property under test never changed: content must stay inside its own band.
+ */
+function contentInkOnRow(key: KeySpec, y: number, x0 = 9, x1 = 90): boolean {
+  const withContent = renderKey(key)
+  const layerOnly = renderKey(withoutContent(key))
+  for (let x = x0; x < x1; x++) {
+    // Tolerance 1, not near3's default 12: both buffers share an identical
+    // layer, so any real difference here is a glyph, not anti-aliasing noise.
+    if (!near3(probe(withContent, x, y), probe(layerOnly, x, y), 1)) return true
+  }
+  return false
 }
 
 /** The eight condition emoji this page ever picks a tint for — the same
@@ -97,13 +137,13 @@ function build(over: Partial<Fakes> = {}) {
 describe('WeatherPage layout', () => {
   it('returns 8 keys: 7 day tiles plus a conditions tile', () => {
     const { page } = build()
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys).toHaveLength(8)
   })
 
   it('labels the day tiles in order', () => {
     const { page } = build()
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     LABELS.forEach((label, i) => expect(keys[i]!.lines![0]).toBe(label))
   })
 
@@ -382,12 +422,11 @@ describe('WeatherPage day tile layout details', () => {
     const days = sevenDays()
     days[0] = day('NOW', { high: -10, low: -25 })
     const { page } = build({ days })
-    const key = page.render(NOW).keys[0]!
-    const buf = renderKey(key)
+    const key = page.render(NOW, FX_NOW_MS).keys[0]!
+    // Content ink only: the ambient effect legitimately paints into the margin,
+    // the temperature text must not.
     for (let y = 0; y < KEY_SIZE; y++) {
-      for (let x = 90; x < KEY_SIZE; x++) {
-        expect(near3(probe(buf, x, y), key.bg!)).toBe(true)
-      }
+      expect(contentInkOnRow(key, y, 90, KEY_SIZE)).toBe(false)
     }
   })
 
@@ -430,69 +469,67 @@ describe('WeatherPage day tile: rendered band geometry has no overlap, for every
   // through the real `renderKey`, so a future change to either the page's
   // constants or the emoji band cannot drift out of sync with this proof
   // the way it did for the empty-tile case (finding A4).
-  const inkOnRow = (buf: Buffer, bg: readonly number[], y: number) => {
-    for (let x = 9; x < 90; x++) {
-      if (!near3(probe(buf, x, y), bg)) return true
-    }
-    return false
-  }
-
   it.each(ALL_CONDITION_EMOJI)('keeps every band clear of the others, for %s', (emoji) => {
     const days = sevenDays()
     days[0] = day('NOW', { emoji, high: 95, low: 77 })
     const { page } = build({ days })
-    const key = page.render(NOW).keys[0]!
-    const buf = renderKey(key)
-    const bg = key.bg!
+    const key = page.render(NOW, FX_NOW_MS).keys[0]!
+    // The effect IS running for this proof. A version of this test that
+    // silently ran without one would prove the geometry of a key the page
+    // never ships.
+    expect(key.fx).toBeDefined()
 
-    // Ink inside each of the three text bands (label ~4-12, temperature
-    // ~55-67, rain chance ~77-90 — measured for every emoji in this set by
-    // the review, see review-A-render-pages.md's "verified claims" #2).
-    expect(inkOnRow(buf, bg, 10)).toBe(true)
-    expect(inkOnRow(buf, bg, 60)).toBe(true)
-    expect(inkOnRow(buf, bg, 80)).toBe(true)
-    // Background in the gaps: between the label and the emoji band, between
-    // the emoji band and the temperature line, and between the temperature
-    // line and the rain chance.
-    expect(inkOnRow(buf, bg, 16)).toBe(false)
-    expect(inkOnRow(buf, bg, 52)).toBe(false)
-    expect(inkOnRow(buf, bg, 72)).toBe(false)
+    // Content ink inside each of the three text bands (label ~4-12,
+    // temperature ~55-67, rain chance ~77-90 — measured for every emoji in
+    // this set by the review, see review-A-render-pages.md's "verified
+    // claims" #2).
+    expect(contentInkOnRow(key, 10)).toBe(true)
+    expect(contentInkOnRow(key, 60)).toBe(true)
+    expect(contentInkOnRow(key, 80)).toBe(true)
+    // No content ink in the gaps: between the label and the emoji band,
+    // between the emoji band and the temperature line, and between the
+    // temperature line and the rain chance. The ambient effect paints freely
+    // through all three gaps; only content is forbidden there.
+    expect(contentInkOnRow(key, 16)).toBe(false)
+    expect(contentInkOnRow(key, 52)).toBe(false)
+    expect(contentInkOnRow(key, 72)).toBe(false)
   })
 
   it('holds for the empty-tile placeholder layout too (finding A4), matching the populated tiles', () => {
     const days = sevenDays().slice(0, 0) // every slot absent
     const { page } = build({ days })
-    const key = page.render(NOW).keys[0]!
-    const buf = renderKey(key)
-    const bg = key.bg!
+    const key = page.render(NOW, FX_NOW_MS).keys[0]!
+    // An absent tile carries no effect: a placeholder reports no condition,
+    // so there is nothing for one to mean.
+    expect(key.fx).toBeUndefined()
     // A '--' dash is a much thinner glyph than real letters, so its ink
     // sits at different (measured) rows than the populated tiles' — but it
     // must still land inside each band and stay clear of the gaps.
-    expect(inkOnRow(buf, bg, 8)).toBe(true) // the '--' label
-    expect(inkOnRow(buf, bg, 62)).toBe(true) // the '--' temperature
-    expect(inkOnRow(buf, bg, 85)).toBe(true) // the '--' precip
-    expect(inkOnRow(buf, bg, 16)).toBe(false)
-    expect(inkOnRow(buf, bg, 52)).toBe(false)
-    expect(inkOnRow(buf, bg, 72)).toBe(false)
+    expect(contentInkOnRow(key, 8)).toBe(true) // the '--' label
+    expect(contentInkOnRow(key, 62)).toBe(true) // the '--' temperature
+    expect(contentInkOnRow(key, 85)).toBe(true) // the '--' precip
+    expect(contentInkOnRow(key, 16)).toBe(false)
+    expect(contentInkOnRow(key, 52)).toBe(false)
+    expect(contentInkOnRow(key, 72)).toBe(false)
   })
 })
 
 describe('WeatherPage staleness', () => {
   it('dims every key when the source reports stale', () => {
     const { page } = build({ stale: true })
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys.every((k) => k.dim === true)).toBe(true)
   })
 
   it('dims every key when the status is not ok', () => {
     const { page } = build({ status: 'offline' })
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys.every((k) => k.dim === true)).toBe(true)
   })
 
   it('dims every key when there is no data yet', () => {
     const { page } = build({ status: 'empty', days: [] })
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys.every((k) => k.dim === true)).toBe(true)
   })
 
@@ -633,7 +670,7 @@ describe('WeatherPage presses: entering and leaving detail mode', () => {
     const { page } = build()
     page.onKeyPress(2)
     page.onKeyPress(7)
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys).toHaveLength(8)
     LABELS.forEach((label, i) => expect(keys[i]!.lines![0]).toBe(label))
   })
@@ -641,7 +678,7 @@ describe('WeatherPage presses: entering and leaving detail mode', () => {
   it('does nothing when pressing a day tile with no forecast behind it at all', () => {
     const { page } = build({ days: sevenDays().slice(0, 3) })
     page.onKeyPress(5)
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     // Still the grid, not detail.
     expect(keys).toHaveLength(8)
     expect(keys[5]!.lines).toEqual(['--', '--', '--'])
@@ -660,7 +697,7 @@ describe('WeatherPage presses: entering and leaving detail mode', () => {
     const { page } = build()
     page.onKeyPress(1)
     page.onLeave!()
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     LABELS.forEach((label, i) => expect(keys[i]!.lines![0]).toBe(label))
   })
 
@@ -668,7 +705,7 @@ describe('WeatherPage presses: entering and leaving detail mode', () => {
     const { page, f } = build()
     page.onKeyPress(6) // selects the 7th day
     f.days = sevenDays().slice(0, 3) // a later refresh shrinks the array
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys).toHaveLength(8)
     expect(keys[0]!.lines![0]).toBe(LABELS[0])
   })
@@ -710,7 +747,7 @@ describe('WeatherPage identity (I1 / lesson 19): selection follows the day, neve
     const { page, f } = build({ days })
     page.onKeyPress(1) // selects SAT, id 2026-08-15:day
     f.days = [day('NOW', { id: '2026-08-16:day' })] // 2026-08-15:day is gone entirely
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys).toHaveLength(8) // the grid, not a mislabelled detail view
     expect(keys[0]!.lines![0]).toBe('NOW')
     expect(keys[1]!.lines).toEqual(['--', '--', '--']) // no SAT day anymore — dashed, not fabricated
@@ -808,7 +845,7 @@ describe('WeatherPage detail view layout', () => {
     })
     const { page } = build({ days })
     page.onKeyPress(0)
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys[4]!.lines).toEqual(['DAY', 'Chance Rain', 'Showers then', 'Sunny'])
     expect(keys[5]!.lines).toEqual(['NIGHT', 'Chance Rain', 'Showers then', 'Cloudy'])
     expect(keys[4]!.lines).not.toEqual(keys[5]!.lines)
@@ -838,7 +875,7 @@ describe('WeatherPage detail view layout', () => {
     days[0] = day('NOW', { day: null, night: periodDetail() })
     const { page } = build({ days })
     page.onKeyPress(0)
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys[1]!.lines).toEqual(['DAY', '--', '--'])
     expect(keys[1]!.dim).toBe(true)
     expect(keys[3]!.lines![1]).toBe('D --')
@@ -851,7 +888,7 @@ describe('WeatherPage detail view layout', () => {
     days[6] = day(LABELS[6]!, { day: periodDetail(), night: null })
     const { page } = build({ days })
     page.onKeyPress(6)
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     expect(keys[2]!.lines).toEqual(['NIGHT', '--', '--'])
     expect(keys[2]!.dim).toBe(true)
     expect(keys[3]!.lines![2]).toBe('N --')
@@ -871,7 +908,7 @@ describe('WeatherPage detail view staleness', () => {
     days[0] = fullDay('NOW')
     const { page } = build({ days, stale: true })
     page.onKeyPress(0)
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     for (const key of keys.slice(0, 7)) expect(key.dim).toBe(true)
     expect(keys[7]!.dim).not.toBe(true)
   })
@@ -881,7 +918,7 @@ describe('WeatherPage detail view staleness', () => {
     days[0] = fullDay('NOW')
     const { page } = build({ days })
     page.onKeyPress(0)
-    const keys = page.render(NOW).keys
+    const keys = page.render(NOW, FX_NOW_MS).keys
     for (const key of keys.slice(0, 7)) expect(key.dim).not.toBe(true)
   })
 })
@@ -1042,10 +1079,18 @@ describe('WeatherPage detail view text fits the usable key width', () => {
   // of gap (ink at x=95 on a 96 px key survives a probe that only checks
   // x=90). This probes the whole band from the usable-width edge to the
   // key's last column instead.
-  function noInkAtOrPastRightEdge(buf: Buffer, bg: readonly number[] = theme.bg): boolean {
+  /**
+   * Now a content-ink diff rather than a comparison against a flat
+   * background, for the same reason `contentInkOnRow` is: a detail-view tile
+   * can carry an ambient effect, and that effect paints into the right margin
+   * by design. Text must not.
+   */
+  function noContentInkAtOrPastRightEdge(key: KeySpec): boolean {
+    const withContent = renderKey(key)
+    const layerOnly = renderKey(withoutContent(key))
     for (let y = 0; y < KEY_SIZE; y++) {
       for (let x = RIGHT_EDGE_X; x <= RIGHT_EDGE_BAND_END; x++) {
-        if (!near3(probe(buf, x, y), bg)) return false
+        if (!near3(probe(withContent, x, y), probe(layerOnly, x, y), 1)) return false
       }
     }
     return true
@@ -1066,7 +1111,7 @@ describe('WeatherPage detail view text fits the usable key width', () => {
     const { page } = build({ days })
     page.onKeyPress(0)
     const key = page.render(NOW).keys[3]!
-    expect(noInkAtOrPastRightEdge(renderKey(key))).toBe(true)
+    expect(noContentInkAtOrPastRightEdge(key)).toBe(true)
   })
 
   it('keeps the DAY/NIGHT text tiles clear of the right margin for the longest real shortForecast', () => {
@@ -1080,9 +1125,9 @@ describe('WeatherPage detail view text fits the usable key width', () => {
     })
     const { page } = build({ days })
     page.onKeyPress(0)
-    const keys = page.render(NOW).keys
-    expect(noInkAtOrPastRightEdge(renderKey(keys[4]!))).toBe(true)
-    expect(noInkAtOrPastRightEdge(renderKey(keys[5]!))).toBe(true)
+    const keys = page.render(NOW, FX_NOW_MS).keys
+    expect(noContentInkAtOrPastRightEdge(keys[4]!)).toBe(true)
+    expect(noContentInkAtOrPastRightEdge(keys[5]!)).toBe(true)
   })
 
   it('keeps every detail-view tile clear of the right margin across every day label', () => {
@@ -1092,10 +1137,298 @@ describe('WeatherPage detail view text fits the usable key width', () => {
       days[idx] = fullDay(label)
       const { page } = build({ days })
       page.onKeyPress(idx)
-      const keys = page.render(NOW).keys
+      const keys = page.render(NOW, FX_NOW_MS).keys
       for (const key of keys) {
-        expect(noInkAtOrPastRightEdge(renderKey(key), key.bg)).toBe(true)
+        expect(noContentInkAtOrPastRightEdge(key)).toBe(true)
       }
+    }
+  })
+})
+
+/**
+ * Task 42: each tile draws a live effect behind its numbers, chosen by the same
+ * emoji lookup that already picked its icon and its background wash.
+ */
+describe('WeatherPage condition effects: the mapping', () => {
+  it('gives every emoji weatherEmoji can produce a variant, driven from the real classifier', () => {
+    // Built from `weatherEmoji`'s OWN output for real forecast strings, not a
+    // hand-written emoji list. A new rule added to the source cannot leave a
+    // condition with no effect without failing here (lesson 22: assert the
+    // property, not the instance). The last entry is deliberately unmapped, to
+    // prove the fallback rather than assume it.
+    const forecasts = [
+      'Scattered Thunderstorms',
+      'Snow Showers',
+      'Chance Light Rain',
+      'Patchy Fog',
+      'Breezy',
+      'Mostly Cloudy',
+      'Partly Sunny',
+      'Sunny',
+      'Sharknado',
+    ]
+    for (const f of forecasts) {
+      const fx = conditionFx(weatherEmoji(f), 40, 1000, 0)
+      expect(fx.variant).toBeTruthy()
+      expect(fx.intensity).toBeGreaterThan(0)
+      expect(fx.intensity).toBeLessThanOrEqual(1)
+      expect(fx.nowMs).toBe(1000)
+    }
+  })
+
+  it('keeps the tint and the effect on ONE lookup, so they cannot disagree', () => {
+    // Both read the same row of the same table, keyed by the same emoji. This
+    // is the property that replaced two drifting keyword lists.
+    for (const emoji of ALL_CONDITION_EMOJI) {
+      expect(conditionTint(emoji)).toBeDefined()
+      expect(conditionFx(emoji, null, 0, 0).variant).toBeDefined()
+    }
+  })
+
+  it('gives thunder, snow and rain their own distinct variants', () => {
+    expect(conditionFx('⛈', 50, 0, 0).variant).toBe('storm')
+    expect(conditionFx('🌨', 50, 0, 0).variant).toBe('snow')
+    expect(conditionFx('🌧', 50, 0, 0).variant).toBe('rain')
+    expect(conditionFx('☀️', 50, 0, 0).variant).toBe('sun')
+  })
+
+  it('draws partly cloudy more faintly than overcast, using the same variant', () => {
+    const partly = conditionFx('⛅', null, 0, 0)
+    const overcast = conditionFx('☁️', null, 0, 0)
+    expect(partly.variant).toBe(overcast.variant)
+    expect(partly.intensity).toBeLessThan(overcast.intensity)
+  })
+
+  it('scales a precip-driven effect with the real percentage', () => {
+    expect(precipIntensity(100)).toBeGreaterThan(precipIntensity(50))
+    expect(precipIntensity(50)).toBeGreaterThan(precipIntensity(10))
+    expect(precipIntensity(100)).toBeLessThanOrEqual(1)
+    expect(conditionFx('🌧', 90, 0, 0).intensity)
+      .toBeGreaterThan(conditionFx('🌧', 10, 0, 0).intensity)
+  })
+
+  it('treats an unknown precip percent as the floor, never as zero', () => {
+    // Missing data is UNKNOWN, not a reading of zero. An inert tile beside six
+    // moving ones would read as a broken page.
+    expect(precipIntensity(null)).toBe(FX_INTENSITY_MIN)
+    expect(precipIntensity(Number.NaN)).toBe(FX_INTENSITY_MIN)
+    expect(precipIntensity(0)).toBe(FX_INTENSITY_MIN)
+  })
+
+  it('clamps an out-of-range percent instead of trusting it', () => {
+    expect(precipIntensity(500)).toBeLessThanOrEqual(1)
+    expect(precipIntensity(-20)).toBeGreaterThanOrEqual(FX_INTENSITY_MIN)
+  })
+
+  it('ignores precip for a variant whose intensity is fixed', () => {
+    expect(conditionFx('☀️', 0, 0, 0).intensity).toBe(conditionFx('☀️', 100, 0, 0).intensity)
+    expect(conditionFx('🌫', 0, 0, 0).intensity).toBe(conditionFx('🌫', 100, 0, 0).intensity)
+  })
+
+  it('passes the seed straight through, so two tiles never share a phase', () => {
+    expect(conditionFx('🌧', 50, 1000, 0).seed).not.toBe(conditionFx('🌧', 50, 1000, 3).seed)
+  })
+})
+
+describe('WeatherPage condition effects: which keys carry them', () => {
+  it('gives every populated day tile an effect', () => {
+    const { page } = build()
+    const keys = page.render(NOW, FX_NOW_MS).keys
+    for (let i = 0; i < 7; i++) expect(keys[i]!.fx).toBeDefined()
+  })
+
+  it('gives each tile its own seed, so neighbours do not animate in lockstep', () => {
+    const { page } = build()
+    const keys = page.render(NOW, FX_NOW_MS).keys
+    const seeds = new Set(keys.slice(0, 7).map((k) => k.fx!.seed))
+    expect(seeds.size).toBe(7)
+  })
+
+  it('uses the injected clock, never the wall clock', () => {
+    const { page } = build()
+    expect(page.render(NOW, 5000).keys[0]!.fx!.nowMs).toBe(5000)
+    // Absent nowMs, the seconds clock still yields a usable millisecond value.
+    expect(page.render(NOW).keys[0]!.fx!.nowMs).toBe(NOW * 1000)
+  })
+
+  it('advances the effect clock between two renders, so nothing freezes', () => {
+    const { page } = build()
+    const a = page.render(NOW, FX_NOW_MS).keys[0]!.fx!.nowMs
+    const b = page.render(NOW, FX_NOW_MS + 100).keys[0]!.fx!.nowMs
+    expect(b).toBeGreaterThan(a)
+  })
+
+  it('leaves the conditions tile with no effect, since it reports no condition', () => {
+    const { page } = build()
+    expect(page.render(NOW, FX_NOW_MS).keys[7]!.fx).toBeUndefined()
+  })
+
+  it('gives an absent day tile no effect, since a placeholder is not a condition', () => {
+    const days = sevenDays()
+    days.length = 3
+    const { page } = build({ days })
+    const keys = page.render(NOW, FX_NOW_MS).keys
+    expect(keys[0]!.fx).toBeDefined()
+    expect(keys[4]!.fx).toBeUndefined()
+  })
+
+  it('drives each tile from its OWN condition, not the first tile\'s', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { emoji: '🌧', precipPercent: 90 })
+    days[1] = day('THU', { emoji: '☀️', precipPercent: 0 })
+    days[2] = day('FRI', { emoji: '🌨', precipPercent: 70 })
+    const { page } = build({ days })
+    const keys = page.render(NOW, FX_NOW_MS).keys
+    expect(keys[0]!.fx!.variant).toBe('rain')
+    expect(keys[1]!.fx!.variant).toBe('sun')
+    expect(keys[2]!.fx!.variant).toBe('snow')
+  })
+
+  it('gives the detail view its own effects, one per period', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', {
+      emoji: '🌧',
+      day: periodDetail({ emoji: '⛈', precipPercent: 80 }),
+      night: periodDetail({ emoji: '🌨', precipPercent: 60 }),
+    })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const keys = page.render(NOW, FX_NOW_MS).keys
+    expect(keys[0]!.fx!.variant).toBe('rain') // the combined tile
+    expect(keys[1]!.fx!.variant).toBe('storm') // the DAY half
+    expect(keys[2]!.fx!.variant).toBe('snow') // the NIGHT half
+    // The tiles that report no condition carry no effect.
+    expect(keys[3]!.fx).toBeUndefined() // WIND
+    expect(keys[7]!.fx).toBeUndefined() // BACK
+  })
+
+  it('gives the detail view\'s three animated tiles three distinct seeds', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { day: periodDetail(), night: periodDetail() })
+    const { page } = build({ days })
+    page.onKeyPress(0)
+    const keys = page.render(NOW, FX_NOW_MS).keys
+    const seeds = [keys[0]!.fx!.seed, keys[1]!.fx!.seed, keys[2]!.fx!.seed]
+    expect(new Set(seeds).size).toBe(3)
+  })
+})
+
+describe('WeatherPage condition effects: staleness stops the motion', () => {
+  it('freezes every effect when the forecast is stale', () => {
+    const { page } = build({ stale: true })
+    expect(page.render(NOW, FX_NOW_MS).keys.every((k) => k.fx === undefined)).toBe(true)
+  })
+
+  it('freezes every effect when the status is not ok', () => {
+    const { page } = build({ status: 'offline' })
+    expect(page.render(NOW, FX_NOW_MS).keys.every((k) => k.fx === undefined)).toBe(true)
+  })
+
+  it('freezes every effect when there is no data yet', () => {
+    const { page } = build({ status: 'empty', days: [] })
+    expect(page.render(NOW, FX_NOW_MS).keys.every((k) => k.fx === undefined)).toBe(true)
+  })
+
+  it('freezes the detail view\'s effects too, not just the grid\'s', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { day: periodDetail(), night: periodDetail() })
+    const { page } = build({ days, stale: true })
+    page.onKeyPress(0)
+    expect(page.render(NOW, FX_NOW_MS).keys.every((k) => k.fx === undefined)).toBe(true)
+  })
+
+  it('runs the effects again once the forecast is fresh', () => {
+    const { page } = build()
+    expect(page.render(NOW, FX_NOW_MS).keys[0]!.fx).toBeDefined()
+  })
+})
+
+describe('WeatherPage condition effects: legibility on the real tiles', () => {
+  it('keeps the text brighter than the effect behind it, for every condition', () => {
+    // The cap in render/canvas.ts bounds the layer in the abstract. This proves
+    // the result on the REAL shipped tiles, at the heaviest intensity the data
+    // can ask for: the brightest effect pixel must stay clearly below the text,
+    // or the numbers stop reading at a glance — which is the whole point of the
+    // page.
+    const lum = (p: readonly number[]) => p[0]! + p[1]! + p[2]!
+    for (const emoji of ALL_CONDITION_EMOJI) {
+      const days = sevenDays()
+      days[0] = day('NOW', { emoji, high: 95, low: 77, precipPercent: 100 })
+      const { page } = build({ days })
+      const key = page.render(NOW, FX_NOW_MS).keys[0]!
+      expect(key.fx).toBeDefined()
+      const withContent = renderKey(key)
+      const layerOnly = renderKey(withoutContent(key))
+      let brightestLayer = 0
+      let brightestContent = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          const under = probe(layerOnly, x, y)
+          const over = probe(withContent, x, y)
+          brightestLayer = Math.max(brightestLayer, lum(under))
+          if (!near3(over, under, 1)) brightestContent = Math.max(brightestContent, lum(over))
+        }
+      }
+      expect(brightestContent).toBeGreaterThan(brightestLayer * 1.5)
+    }
+  })
+
+  it('leaves the content undisturbed by whatever the effect does underneath it', () => {
+    // Two different effect clocks, same tile. Opaque content pixels must barely
+    // move between them, which is what "the layer is composited UNDER the
+    // content" looks like in pixels.
+    //
+    // A pixel counts as opaque content when it sits more than
+    // `OPAQUE_CONTENT_LUM` brighter than what the layer alone painted at that
+    // position, measured from the FIRST clock only — so the selection never
+    // depends on the comparison it feeds.
+    //
+    // Two earlier versions of this proof were wrong, and both were caught by
+    // measuring rather than reasoning (lesson 17):
+    //
+    // - Selecting pixels that match `theme.text` found only 57 of them, because
+    //   this tile colours its temperature line by heat and its rain line by
+    //   chance. Only the label is `theme.text`.
+    // - Demanding byte-exact equality failed on 13 to 55 pixels per condition.
+    //   A glyph edge is anti-aliased by design, so its final value blends with
+    //   whatever sits underneath; that is physics, not a bug.
+    //
+    // Measured on 2026-08-18, across all eight conditions: the worst channel
+    // shift on any opaque-content pixel is 26, on the snow tile, and the
+    // smallest selected set is 537 pixels, on the sunny tile. A layer drawn
+    // OVER the content instead would both collapse the selected set and push
+    // the shift far past this bound.
+    const OPAQUE_CONTENT_LUM = 250
+    const MIN_OPAQUE_PIXELS = 400
+    const MAX_CONTENT_SHIFT = 32
+    const lum = (p: readonly number[]) => p[0]! + p[1]! + p[2]!
+
+    for (const emoji of ALL_CONDITION_EMOJI) {
+      const days = sevenDays()
+      days[0] = day('NOW', { emoji, high: 95, low: 77, precipPercent: 100 })
+      const { page } = build({ days })
+      const keyA = page.render(NOW, FX_NOW_MS).keys[0]!
+      const keyB = page.render(NOW, FX_NOW_MS + 3000).keys[0]!
+      // The two frames must really differ underneath, or this proves nothing.
+      expect(keyA.fx!.nowMs).not.toBe(keyB.fx!.nowMs)
+
+      const a = renderKey(keyA)
+      const b = renderKey(keyB)
+      const layerA = renderKey(withoutContent(keyA))
+
+      let compared = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) {
+          const pa = probe(a, x, y)
+          if (lum(pa) - lum(probe(layerA, x, y)) <= OPAQUE_CONTENT_LUM) continue
+          compared++
+          const pb = probe(b, x, y)
+          for (let i = 0; i < 3; i++) {
+            expect(Math.abs(pa[i]! - pb[i]!)).toBeLessThanOrEqual(MAX_CONTENT_SHIFT)
+          }
+        }
+      }
+      expect(compared).toBeGreaterThan(MIN_OPAQUE_PIXELS)
     }
   })
 })
