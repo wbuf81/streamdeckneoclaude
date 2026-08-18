@@ -653,6 +653,64 @@ case. `sun` passes only a non-finite radius and was measured to survive it.
 This is why only those two are tested in a child process — testing a fatal case
 in-process kills the whole vitest worker instead of failing one test.
 
+### The strike period must not alias with the render tick
+
+Measured on 2026-08-18, on a simulated real forecast week (seven tiles, all
+thunderstorms and rain — the actual August weather that exposed this).
+
+The first version used a flat 4300 ms strike period with a 90 ms lit window. The
+weather page renders every 100 ms, and **4300 ms is exactly 43 ticks**, so each
+tile sampled one single phase value forever. A tile therefore either always
+caught its flash or never did:
+
+| Tile seed | Frames lit, of 860 | Strikes caught, of 20 |
+| --- | --- | --- |
+| 0, 1, 2, 3, 6 | 40 | 20 |
+| 5 | 20 | 20 |
+| **4** | **0** | **0** |
+
+Seed 4 never lit once, permanently, by construction. After widening the window
+to 240 ms and moving the period off a tick multiple, every seed catches 20/20.
+
+Two properties fix it, and they are independent:
+
+- **The lit window must exceed one tick.** A 240 ms window always contains at
+  least two points of a 100 ms grid, whatever the phase. This alone defeats the
+  aliasing — verified by restoring the flat 4300 ms period, which did NOT
+  reintroduce the bug.
+- **The period must not be a whole number of ticks.** Defence in depth, so
+  narrowing the window later cannot bring the bug back. Asserted separately,
+  because the sampling test cannot see it.
+
+### What a lightning flash must NOT be
+
+The first version filled the whole key with white at full strength. Composited
+at the cap, that produced a flat, evenly lit key — which reads as the tile being
+greyed out, and **collides with the page's own staleness signal**, where a
+washed-out key means the data is old.
+
+A bolt has to be bright and LOCAL. And it cannot be made brighter than the cap,
+so the contrast has to come from inside the layer: the rain streaks recede while
+the bolt is lit, exactly as real lightning outshines the rain in front of it. At
+the first attempt the bolt was 3 px of white at the same alpha as the storm
+streaks, and it read as one more streak.
+
+### Storm rain against plain rain, and light rain against heavy
+
+Both differences were invisible on the real deck, and both needed more than the
+obvious knob:
+
+- Storm rain differed from plain rain only by 5 px of extra slant. Only the
+  background tint and the emoji really told them apart. Storm now runs faster,
+  50 percent longer, 11 px of slant, and in cyan rather than blue.
+- Intensity drove only the drop COUNT. Across a real week that meant 10 streaks
+  against 15 — measured ink coverage ratio **2.09**, which nobody can see at a
+  glance. Length and opacity now scale with intensity too: ratio **3.30**.
+
+That 2.09 measurement also exposed a test that could not fail. A threshold of
+1.8 on that ratio passed with the scaling removed, because the drop count alone
+already cleared it. The threshold is now 2.7, between the two measured values.
+
 ### Text pixels on a weather day tile
 
 Two measurements that each corrected a wrong assumption in a test:

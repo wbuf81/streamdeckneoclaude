@@ -426,6 +426,14 @@ into this file before it is cleaned.
   comparing pixels against `key.bg`: that comparison cannot describe a key
   carrying an animated layer, and it would fail for the right reason and the
   wrong cause.
+- A storm strike's lit window must stay **wider than one render tick**, and its
+  period must **not** be a whole number of ticks. Both are asserted separately.
+  A flat 4300 ms period at the page's 100 ms rate left one tile in seven unable
+  to flash at all, permanently — see docs/VERIFIED-FACTS.md.
+- A lightning flash must be **local and bright**, never a uniform full-key wash.
+  A flat wash reads as a dimmed key and collides with the staleness signal. The
+  bolt gets its contrast from the rain receding around it, not from exceeding
+  the cap — nothing may exceed the cap.
 - `tests/render/canvas.test.ts`'s child-process probe block bundles **once** and
   spawns **three** processes. Keeping it cheap is load-bearing for an unrelated
   test: `statusline-wrapper.test.ts`'s M-8 signals the wrapper after a flat

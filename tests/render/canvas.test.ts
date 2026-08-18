@@ -12,7 +12,9 @@ import {
   rainColumnSpan,
   fxRainDropSpan,
   fxSnowFlakeY,
-  fxStormFlashOn,
+  fxStormStrike,
+  fxStormStrikePeriodMs,
+  FX_STORM_STRIKE_DURATION_MS,
   fxWindStreakSpan,
   FX_MAX_ALPHA,
   FX_INTENSITY_MIN,
@@ -2250,21 +2252,93 @@ describe('fx layer', () => {
     expect(spans.some((s) => s.lead <= 0)).toBe(true)
   })
 
-  it('flashes the storm lightning sometimes, and keeps it off most of the time', () => {
-    // A strike is rare and brief. A stuck-on flash is a bright key, not a
-    // storm, and a flash that never fires is not a storm either.
-    const samples = Array.from({ length: 1000 }, (_, i) => fxStormFlashOn(2, i * 10))
-    const on = samples.filter(Boolean).length
-    expect(on).toBeGreaterThan(0)
-    expect(on).toBeLessThan(samples.length / 5)
+  /** The render rate the weather page actually uses while its effects run. A
+   * strike must be reachable at THIS sampling rate, not merely in continuous
+   * time. */
+  const PAGE_TICK_MS = 100
+
+  it('strikes sometimes, and stays dark most of the time', () => {
+    const samples = Array.from({ length: 1000 }, (_, i) => fxStormStrike(2, i * 10))
+    const lit = samples.filter((v) => v !== null).length
+    expect(lit).toBeGreaterThan(0)
+    expect(lit).toBeLessThan(samples.length / 5)
   })
 
-  it('makes the storm brighter than plain rain at a real flash instant', () => {
-    // The instant comes from the predicate itself, not a guessed timestamp,
-    // so this cannot silently start sampling a non-flash frame.
-    const flashMs = Array.from({ length: 2000 }, (_, i) => i * 5)
-      .find((ms) => fxStormFlashOn(2, ms))
-    expect(flashMs).toBeDefined()
+  it('lets EVERY tile catch its strikes at the page\'s real 100 ms tick', () => {
+    // The defect this exists for: the first version used a flat 4300 ms period,
+    // which is exactly 43 ticks at 100 ms. Every tile therefore sampled ONE
+    // phase value forever, so a tile either always caught its flash or never
+    // did — measured on the real seven-tile deck, seed 4 never lit once in 860
+    // consecutive frames, permanently.
+    //
+    // Sampling on the exact tick grid is the whole point. A test that swept a
+    // finer grid, or continuous time, would have passed against that bug.
+    for (let seed = 0; seed < 8; seed++) {
+      let lit = 0
+      for (let frame = 0; frame < 900; frame++) {
+        if (fxStormStrike(seed, frame * PAGE_TICK_MS) !== null) lit++
+      }
+      expect(lit, `seed ${seed} never lights at a ${PAGE_TICK_MS} ms tick`).toBeGreaterThan(0)
+    }
+  })
+
+  it('keeps no seed\'s strike period at a whole number of render ticks', () => {
+    // Pins the period property on its OWN, because the widened strike window
+    // already defeats the aliasing by itself: breaking the period back to a flat
+    // 4300 ms did NOT fail the sampling test above, since a 240 ms window always
+    // contains at least two points of a 100 ms grid whatever the phase. The
+    // non-multiple period is therefore defence in depth — it keeps the bug from
+    // returning if the window is ever narrowed again — and defence in depth that
+    // nothing asserts is just a comment.
+    for (let seed = 0; seed < 8; seed++) {
+      const period = fxStormStrikePeriodMs(seed)
+      const ticks = period / PAGE_TICK_MS
+      expect(Math.abs(ticks - Math.round(ticks)), `seed ${seed} period is ${period} ms`)
+        .toBeGreaterThan(0.02)
+    }
+  })
+
+  it('keeps the strike window wider than one render tick', () => {
+    expect(FX_STORM_STRIKE_DURATION_MS).toBeGreaterThan(PAGE_TICK_MS * 2)
+  })
+
+  it('keeps each strike lit for at least two render frames', () => {
+    // A window narrower than the tick makes catching a strike a coin toss.
+    for (let seed = 0; seed < 8; seed++) {
+      let best = 0
+      let run = 0
+      for (let frame = 0; frame < 900; frame++) {
+        run = fxStormStrike(seed, frame * PAGE_TICK_MS) !== null ? run + 1 : 0
+        best = Math.max(best, run)
+      }
+      expect(best, `seed ${seed} never stays lit for two frames`).toBeGreaterThanOrEqual(2)
+    }
+  })
+
+  it('holds one bolt still for the whole strike, then draws a different one next time', () => {
+    // A bolt re-jittered every frame reads as noise. The shape comes from the
+    // strike index, so it is stable within a strike and new between strikes.
+    const frames: number[] = []
+    for (let frame = 0; frame < 900; frame++) {
+      if (fxStormStrike(3, frame * PAGE_TICK_MS) !== null) frames.push(frame)
+    }
+    expect(frames.length).toBeGreaterThan(2)
+    const indexAt = (frame: number) => fxStormStrike(3, frame * PAGE_TICK_MS)!.index
+    // Consecutive lit frames belong to the same strike.
+    const firstRun = frames.filter((f, i) => i === 0 || f === frames[i - 1]! + 1)
+    expect(firstRun.length).toBeGreaterThanOrEqual(2)
+    expect(indexAt(firstRun[0]!)).toBe(indexAt(firstRun[1]!))
+    // A later strike is a different index, so a different shape.
+    const later = frames.find((f) => indexAt(f) !== indexAt(frames[0]!))
+    expect(later).toBeDefined()
+  })
+
+  it('makes the storm brighter than plain rain at a real strike instant', () => {
+    // The instant comes from the predicate itself, not a guessed timestamp, so
+    // this cannot silently start sampling a dark frame.
+    const strikeMs = Array.from({ length: 2000 }, (_, i) => i * 5)
+      .find((ms) => fxStormStrike(2, ms) !== null)
+    expect(strikeMs).toBeDefined()
     const total = (buf: Buffer) => {
       let sum = 0
       for (let y = 0; y < KEY_SIZE; y++) {
@@ -2273,21 +2347,69 @@ describe('fx layer', () => {
       return sum
     }
     const fxAt = (variant: FxVariant) => renderKey({
-      kind: 'gauge', bg: BG, fx: { variant, nowMs: flashMs!, intensity: 1, seed: 2 },
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: strikeMs!, intensity: 1, seed: 2 },
     })
     expect(total(fxAt('storm'))).toBeGreaterThan(total(fxAt('rain')))
   })
 
-  it('keeps the storm flash under the cap, even though the flash draws at full strength', () => {
-    // `drawFxStorm` fills the whole scratch layer with solid white. Only the
-    // composite's cap stops that from becoming a white key, so this is the
-    // proof that the cap is applied at the composite and not per variant.
-    const flashMs = Array.from({ length: 2000 }, (_, i) => i * 5)
-      .find((ms) => fxStormFlashOn(2, ms))!
+  it('draws a bolt, not a uniform wash, so a strike cannot read as a dimmed key', () => {
+    // The first version filled the whole key evenly at full strength. That read
+    // as the tile being greyed out — colliding with the page's own staleness
+    // signal — rather than as lightning. A bolt is bright and LOCAL, so the
+    // brightest pixel must stand well clear of the key's average.
+    const strikeMs = Array.from({ length: 2000 }, (_, i) => i * 5)
+      .find((ms) => fxStormStrike(2, ms) !== null)!
+    const buf = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant: 'storm', nowMs: strikeMs, intensity: 1, seed: 2 },
+    })
+    let brightest = 0
+    let sum = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const l = lum(probe(buf, x, y))
+        brightest = Math.max(brightest, l)
+        sum += l
+      }
+    }
+    const mean = sum / (KEY_SIZE * KEY_SIZE)
+    expect(brightest).toBeGreaterThan(mean * 1.6)
+  })
+
+  it('keeps a strike under the cap, bolt and sky glow together', () => {
+    const strikeMs = Array.from({ length: 2000 }, (_, i) => i * 5)
+      .find((ms) => fxStormStrike(2, ms) !== null)!
     assertUnderCap(
-      renderKey({ kind: 'gauge', bg: BG, fx: { variant: 'storm', nowMs: flashMs, intensity: 1, seed: 2 } }),
+      renderKey({ kind: 'gauge', bg: BG, fx: { variant: 'storm', nowMs: strikeMs, intensity: 1, seed: 2 } }),
       BG,
     )
+  })
+
+  it('leans and lengthens storm rain well past plain rain, between strikes', () => {
+    // Between strikes the two variants differ only in their streaks, which is
+    // exactly the case that was indistinguishable on the real deck. Compares
+    // ink coverage: a longer, wider, more slanted streak covers more pixels.
+    const darkMs = Array.from({ length: 4000 }, (_, i) => i * 5)
+      .find((ms) => fxStormStrike(5, ms) === null)!
+    const at = (variant: FxVariant) => renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: darkMs, intensity: 0.7, seed: 5 },
+    })
+    expect(inkCount(at('storm'), BG)).toBeGreaterThan(inkCount(at('rain'), BG) * 1.3)
+  })
+
+  it('separates a light shower from a heavy one by more than the drop count', () => {
+    // 40 percent against 90 percent used to differ only by five streaks out of
+    // sixteen, which is not a visible difference on a 96 px key. Length and
+    // opacity now scale with intensity as well.
+    //
+    // The threshold is MEASURED, not guessed, because the obvious version of
+    // this test could not fail: at 1.8 it passed even with length and opacity
+    // scaling removed, since the drop count alone already clears that. Measured
+    // on 2026-08-18 — count only: 2.09. With length and opacity scaling: 3.30.
+    // 2.7 sits between them with margin on both sides.
+    const MEASURED_SCALING_RATIO = 2.7
+    const light = renderKey({ kind: 'gauge', bg: BG, fx: { variant: 'rain', nowMs: 4200, intensity: 0.4, seed: 1 } })
+    const heavy = renderKey({ kind: 'gauge', bg: BG, fx: { variant: 'rain', nowMs: 4200, intensity: 0.95, seed: 1 } })
+    expect(inkCount(heavy, BG)).toBeGreaterThan(inkCount(light, BG) * MEASURED_SCALING_RATIO)
   })
 
   it('leaves the key\'s own content brighter than the layer beneath it', () => {

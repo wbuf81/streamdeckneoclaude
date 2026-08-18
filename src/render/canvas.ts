@@ -876,9 +876,27 @@ const FX_RAIN_SLANT = 2
 const FX_RAIN_WIDTH = 1.4
 const FX_RAIN_PERIOD_BASE_MS = 820
 const FX_RAIN_PERIOD_VAR_MS = 420
-/** The storm variant drives the same streaks harder and leans them further. */
-const FX_STORM_PERIOD_SCALE = 0.66
-const FX_STORM_SLANT = 5
+/**
+ * How much `intensity` stretches a streak and how much it brightens one.
+ *
+ * The drop COUNT alone was not enough. On a real storm-and-rain week the tiles
+ * ran from 40 to 90 percent, which is 10 streaks against 15 — a difference
+ * nobody can see on a 96 px key at a glance. Length and opacity scale with
+ * intensity too, so a 90 percent tile reads as heavier rain rather than as
+ * slightly more of the same rain.
+ */
+const FX_RAIN_LEN_INTENSITY_GAIN = 0.6
+const FX_RAIN_ALPHA_FLOOR = 0.35
+
+/**
+ * The storm variant drives the same streaks harder: faster, longer, and leaning
+ * much further over. At 5 px of slant over a 12 px streak, storm rain was
+ * indistinguishable from plain rain on the glass — only the background tint and
+ * the emoji told them apart, which is not what a "storm" tile should rely on.
+ */
+const FX_STORM_PERIOD_SCALE = 0.55
+const FX_STORM_SLANT = 11
+const FX_STORM_LEN_SCALE = 1.5
 
 /**
  * One rain streak's vertical extent at one instant. `head` is the leading
@@ -905,20 +923,30 @@ export function fxRainDropSpan(
 }
 
 function drawFxRain(
-  ctx: SKRSContext2D, fx: FxSpec, intensity: number, storm: boolean,
+  ctx: SKRSContext2D, fx: FxSpec, intensity: number, storm: boolean, recede = 0,
 ): void {
   const count = Math.max(2, Math.round(intensity * FX_RAIN_MAX_DROPS))
   const slant = storm ? FX_STORM_SLANT : FX_RAIN_SLANT
   const scale = storm ? FX_STORM_PERIOD_SCALE : 1
-  ctx.lineWidth = FX_RAIN_WIDTH
+  const lengthScale =
+    (storm ? FX_STORM_LEN_SCALE : 1) * (1 - FX_RAIN_LEN_INTENSITY_GAIN + FX_RAIN_LEN_INTENSITY_GAIN * intensity * 2)
+  ctx.lineWidth = storm ? FX_RAIN_WIDTH * 1.2 : FX_RAIN_WIDTH
   ctx.lineCap = 'round'
   for (let i = 0; i < count; i++) {
     const s = fx.seed * 131 + i * 17
     const x = pseudoRandom(s + 2) * KEY_SIZE
     const { head, tail } = fxRainDropSpan(fx.seed, i, fx.nowMs, scale)
-    ctx.strokeStyle = fxCss(theme.blue, 0.55 + 0.45 * pseudoRandom(s + 3))
+    // The span carries the LOOP geometry, which the tests prove. Length scaling
+    // shortens the drawn streak from the head backwards, so a lighter shower
+    // still enters and leaves on exactly the same proven travel.
+    const drawnTail = head - (head - tail) * lengthScale
+    const alpha =
+      (FX_RAIN_ALPHA_FLOOR +
+        (1 - FX_RAIN_ALPHA_FLOOR) * intensity * (0.6 + 0.4 * pseudoRandom(s + 3))) *
+      (1 - recede)
+    ctx.strokeStyle = fxCss(storm ? theme.cyan : theme.blue, alpha)
     ctx.beginPath()
-    ctx.moveTo(x, tail)
+    ctx.moveTo(x, drawnTail)
     ctx.lineTo(x + slant, head)
     ctx.stroke()
   }
@@ -969,36 +997,150 @@ function drawFxSnow(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   }
 }
 
-const FX_STORM_FLASH_PERIOD_MS = 4300
-const FX_STORM_FLASH_MS = 90
-const FX_STORM_SECOND_FLASH_AT_MS = 210
-const FX_STORM_SECOND_FLASH_MS = 60
+/**
+ * The strike period. Two properties matter, and the first version had neither.
+ *
+ * It must NOT be a whole number of render ticks. The first version used a flat
+ * 4300 ms, which is exactly 43 ticks at the page's 100 ms rate, so every tile
+ * sampled one single phase value forever: a tile either always caught its
+ * flash or NEVER DID. Measured across seven tiles, seed 4 never lit once in 860
+ * consecutive frames. A base that is not a tick multiple, plus a per-seed
+ * variance, makes the phase sweep instead, so every strike is reachable.
+ *
+ * And the lit window must be at least two render frames wide, so catching a
+ * strike is not a coin toss against the tick.
+ */
+const FX_STORM_PERIOD_BASE_MS = 3370
+const FX_STORM_PERIOD_VAR_MS = 2630
+const FX_STORM_STRIKE_MS = 240
+
+const FX_BOLT_SEGMENTS = 5
+const FX_BOLT_JITTER = 10
+const FX_BOLT_WIDTH = 3.4
+const FX_BOLT_GLOW_WIDTH = 9
+const FX_BOLT_SKY_ALPHA = 0.24
+/**
+ * How far the rain recedes while the bolt is lit.
+ *
+ * The cap is a hard, deliberate ceiling on the whole layer, so a bolt cannot
+ * simply be drawn brighter than everything else — nothing can exceed the cap.
+ * The only honest way to make it stand out is RELATIVE contrast inside the
+ * layer: real lightning outshines the rain in front of it, so the streaks dim
+ * while it flashes and the bolt becomes the brightest thing on the tile.
+ *
+ * Rendered and checked: at the first attempt the bolt was 2.2 px of white at the
+ * same alpha as the cyan storm streaks, and it read as one more streak rather
+ * than as lightning.
+ */
+const FX_BOLT_RAIN_RECEDE = 0.55
 
 /**
- * Whether the storm's lightning is lit at this instant. Two short windows
- * inside one long period, so a strike reads as the real double flash rather
- * than a single blink.
+ * The storm's current lightning strike, or null between strikes.
  *
- * Exported so a test finds a real flash instant from the predicate instead of
- * guessing a timestamp, and so it can prove the flash stays rare rather than
- * sticking on — a stuck flash is a bright key, not a storm.
+ * `index` counts strikes, so the bolt's shape can be derived from it and stay
+ * still for the whole strike — a bolt re-jittered every frame reads as noise,
+ * not as lightning. `progress` runs 0 to 1 through the lit window and drives
+ * the brightness envelope.
+ *
+ * Exported so a test finds real strike instants from the predicate rather than
+ * guessing timestamps, proves strikes stay rare, and proves that EVERY seed
+ * actually catches them at the real 100 ms tick.
  */
-export function fxStormFlashOn(seed: number, nowMs: number): boolean {
-  const offset = pseudoRandom(seed * 313 + 7) * FX_STORM_FLASH_PERIOD_MS
-  const phase = (nowMs + offset) % FX_STORM_FLASH_PERIOD_MS
-  if (phase < FX_STORM_FLASH_MS) return true
-  const second = phase - FX_STORM_SECOND_FLASH_AT_MS
-  return second >= 0 && second < FX_STORM_SECOND_FLASH_MS
+export function fxStormStrikePeriodMs(seed: number): number {
+  return FX_STORM_PERIOD_BASE_MS + pseudoRandom(seed * 313 + 7) * FX_STORM_PERIOD_VAR_MS
+}
+
+/** How long one strike stays lit. Exported so a test can compare it against the
+ * page's real render interval rather than hard-coding a duplicate. */
+export const FX_STORM_STRIKE_DURATION_MS = FX_STORM_STRIKE_MS
+
+export function fxStormStrike(
+  seed: number, nowMs: number,
+): { index: number; progress: number } | null {
+  const period = fxStormStrikePeriodMs(seed)
+  const offset = pseudoRandom(seed * 313 + 11) * period
+  const t = nowMs + offset
+  const phase = t % period
+  if (phase >= FX_STORM_STRIKE_MS) return null
+  return { index: Math.floor(t / period), progress: phase / FX_STORM_STRIKE_MS }
+}
+
+/**
+ * Brightness through one strike: a hard first flash, a dip, a second flash, then
+ * a decay. Real lightning flickers, and a single square pulse read as the key
+ * being switched on and off.
+ */
+function boltEnvelope(progress: number): number {
+  if (progress < 0.22) return 1
+  if (progress < 0.36) return 0.2
+  if (progress < 0.56) return 0.8
+  return Math.max(0, (1 - progress) / 0.44) * 0.45
+}
+
+/**
+ * Draws one jagged bolt from the top edge downward, with a soft glow behind it,
+ * plus a short branch. The path is derived from the strike `index`, so it holds
+ * still for the strike's whole duration and a new strike gets a new shape.
+ */
+function drawBolt(ctx: SKRSContext2D, seed: number, index: number, alpha: number): void {
+  const s = seed * 977 + index * 131
+  const startX = 14 + pseudoRandom(s) * (KEY_SIZE - 28)
+  const endY = KEY_SIZE * (0.55 + 0.4 * pseudoRandom(s + 1))
+
+  const points: { x: number; y: number }[] = [{ x: startX, y: 0 }]
+  for (let i = 1; i <= FX_BOLT_SEGMENTS; i++) {
+    const t = i / FX_BOLT_SEGMENTS
+    points.push({
+      x: startX + (pseudoRandom(s + i * 7) - 0.5) * 2 * FX_BOLT_JITTER + (t - 0.5) * 10,
+      y: endY * t,
+    })
+  }
+
+  const trace = (): void => {
+    ctx.beginPath()
+    ctx.moveTo(points[0]!.x, points[0]!.y)
+    for (const pt of points.slice(1)) ctx.lineTo(pt.x, pt.y)
+    ctx.stroke()
+  }
+
+  // The glow first, then the core over it, so the bolt has a bright centre.
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.lineWidth = FX_BOLT_GLOW_WIDTH
+  ctx.strokeStyle = fxCss(theme.cyan, alpha * 0.5)
+  trace()
+  ctx.lineWidth = FX_BOLT_WIDTH
+  ctx.strokeStyle = fxCss(theme.white, alpha)
+  trace()
+
+  // One short branch, off a middle joint.
+  const from = points[Math.max(1, Math.floor(FX_BOLT_SEGMENTS / 2))]!
+  ctx.lineWidth = FX_BOLT_WIDTH * 0.6
+  ctx.strokeStyle = fxCss(theme.white, alpha * 0.8)
+  ctx.beginPath()
+  ctx.moveTo(from.x, from.y)
+  ctx.lineTo(
+    from.x + (pseudoRandom(s + 71) - 0.5) * 30,
+    from.y + 14 + pseudoRandom(s + 73) * 14,
+  )
+  ctx.stroke()
 }
 
 function drawFxStorm(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
-  drawFxRain(ctx, fx, intensity, true)
-  if (!fxStormFlashOn(fx.seed, fx.nowMs)) return
-  // A full-key wash at full strength on the scratch layer. The composite's own
-  // cap is the only thing keeping this from becoming a white key, which is
-  // exactly the point of putting the cap there.
-  ctx.fillStyle = fxCss(theme.white, 1)
+  const strike = fxStormStrike(fx.seed, fx.nowMs)
+  const alpha = strike ? boltEnvelope(strike.progress) : 0
+
+  drawFxRain(ctx, fx, intensity, true, FX_BOLT_RAIN_RECEDE * alpha)
+
+  if (!strike || alpha <= 0) return
+
+  // A modest sky glow, NOT the old full-strength white wash. That wash lit the
+  // whole key evenly, which read as the tile being greyed out rather than as
+  // lightning — and it collided with the page's own staleness signal, where a
+  // flat, washed-out key means "this data is old".
+  ctx.fillStyle = fxCss(theme.white, FX_BOLT_SKY_ALPHA * alpha)
   ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
+  drawBolt(ctx, fx.seed, strike.index, alpha)
 }
 
 const FX_FOG_BANDS = 3
