@@ -24,3 +24,4 @@ spotify.json
 # Contact-sheet preview from scripts/crab-contact-sheet.ts. A human aid for
 # judging frame legibility, not a project asset.
 /crab-frames.png
+/weather-fx.png

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
@@ -1649,7 +1649,7 @@ describe('renderKey idle animations (the Spotify cyberpunk idle screens, task 39
  * `Number.isFinite` check at the `arc` call itself are what make the
  * post-fix assertion below true.
  */
-describe('C1: drawIdleGrid does not abort the process on a non-finite clock', () => {
+describe('C1: no spec aborts the process on a non-finite number — the fatal cases, in a child process', () => {
   /**
    * Bundles `src/render/canvas.ts` (and its two local dependencies) into one
    * self-contained ESM file with `esbuild` — a real dependency of `vitest`
@@ -1659,10 +1659,20 @@ describe('C1: drawIdleGrid does not abort the process on a non-finite clock', ()
    * INSIDE the project root (not the system tmpdir) so plain Node's ESM
    * resolver walks up and finds `node_modules` normally.
    */
-  function renderHostileSpecInChildProcess(specLiteral: string): {
-    status: number | null
-    signal: NodeJS.Signals | null
-  } {
+  /**
+   * The bundle and its directory, built ONCE for every case in this block.
+   *
+   * Each case used to run its own `esbuild.buildSync`, create its own temp
+   * directory, and remove it again. That was fine at two cases; task 42 added
+   * six more for the effect layer, and paying for eight bundles multiplied both
+   * the runtime and the amount of filesystem and subprocess churn inside the
+   * project root for no gain. The bundle does not vary by case — only the spec
+   * literal does.
+   */
+  let probeDir: string | null = null
+  let bundleFile: string | null = null
+
+  beforeAll(() => {
     const result = esbuild.buildSync({
       entryPoints: [join(process.cwd(), 'src/render/canvas.ts')],
       bundle: true,
@@ -1671,26 +1681,55 @@ describe('C1: drawIdleGrid does not abort the process on a non-finite clock', ()
       write: false,
       external: ['@napi-rs/canvas'],
     })
-    const bundled = result.outputFiles[0]!.text
-    const dir = mkdtempSync(join(process.cwd(), '.c1-probe-'))
-    try {
-      const bundleFile = join(dir, 'canvas.bundle.mjs')
-      writeFileSync(bundleFile, bundled)
-      const probeFile = join(dir, 'probe.mjs')
-      writeFileSync(
-        probeFile,
-        [
-          `import { renderKey } from ${JSON.stringify(bundleFile)}`,
-          `const buf = renderKey(${specLiteral})`,
-          `if (buf.length !== 96 * 96 * 4) throw new Error('unexpected buffer length: ' + buf.length)`,
-        ].join('\n'),
-      )
-      const r = spawnSync(process.execPath, [probeFile], { encoding: 'utf8' })
-      return { status: r.status, signal: r.signal }
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
+    probeDir = mkdtempSync(join(process.cwd(), '.c1-probe-'))
+    bundleFile = join(probeDir, 'canvas.bundle.mjs')
+    writeFileSync(bundleFile, result.outputFiles[0]!.text)
+  })
+
+  afterAll(() => {
+    if (probeDir) rmSync(probeDir, { recursive: true, force: true })
+    probeDir = null
+    bundleFile = null
+  })
+
+  /**
+   * Renders every spec in `specLiterals` inside ONE child process, and reports
+   * how that process exited. A Rust panic kills the process, so a clean exit is
+   * the proof that no spec in the list reached a fatal drawing primitive.
+   */
+  function renderHostileSpecsInChildProcess(specLiterals: readonly string[]): {
+    status: number | null
+    signal: NodeJS.Signals | null
+  } {
+    if (!probeDir || !bundleFile) throw new Error('probe bundle was not built')
+    // One probe file per case, named from a counter, so two cases can never
+    // race on the same path.
+    const probeFile = join(probeDir, `probe-${probeCounter++}.mjs`)
+    writeFileSync(
+      probeFile,
+      [
+        `import { renderKey } from ${JSON.stringify(bundleFile)}`,
+        ...specLiterals.map((spec) => [
+          `{`,
+          `  const buf = renderKey(${spec})`,
+          `  if (buf.length !== 96 * 96 * 4) throw new Error('unexpected buffer length: ' + buf.length)`,
+          `}`,
+        ].join('\n')),
+      ].join('\n'),
+    )
+    const r = spawnSync(process.execPath, [probeFile], { encoding: 'utf8' })
+    return { status: r.status, signal: r.signal }
   }
+
+  /** The single-spec form, for the callers that only need one. */
+  function renderHostileSpecInChildProcess(specLiteral: string): {
+    status: number | null
+    signal: NodeJS.Signals | null
+  } {
+    return renderHostileSpecsInChildProcess([specLiteral])
+  }
+
+  let probeCounter = 0
 
   function gridSpec(nowMsLiteral: string): string {
     return `{ kind: 'control', idle: { variant: 'grid', nowMs: ${nowMsLiteral}, col: 0, row: 0 } }`
@@ -1730,19 +1769,32 @@ describe('C1: drawIdleGrid does not abort the process on a non-finite clock', ()
    * fatal case in-process would mean a future regression in `sanitizeKeySpec`
    * aborts this whole file's vitest worker instead of failing one test.
    */
-  it.each([
-    ['snow', 'NaN'], ['snow', 'Infinity'], ['snow', '-Infinity'],
-    ['cloud', 'NaN'], ['cloud', 'Infinity'], ['cloud', '-Infinity'],
-  ])('renders a full key buffer, in a real child process, for fx %s with non-finite %s', (variant, bad) => {
-    const spec = `{ kind: 'gauge', fx: { variant: '${variant}', nowMs: ${bad}, intensity: ${bad}, seed: ${bad} } }`
-    const { status, signal } = renderHostileSpecInChildProcess(spec)
+  /**
+   * All three non-finite values for one variant go through ONE child process,
+   * rather than one process each.
+   *
+   * The failure being detected is fatal to the whole process, so a single child
+   * that renders all three still dies if any one of them aborts, and the
+   * variant name still identifies what broke — which is the actionable part.
+   * Spawning six processes instead of two bought no extra information, and it
+   * measurably raised the subprocess load of the whole suite: a pre-existing
+   * fixed-sleep race in `tests/install/statusline-wrapper.test.ts` (M-8, which
+   * signals the wrapper after a flat 300 ms) began firing about once in six
+   * full-suite runs, while never failing in ten isolated runs of its own file.
+   * Keeping this block cheap is what keeps that unrelated race asleep.
+   */
+  it.each(['snow', 'cloud'])('renders a full key buffer, in a real child process, for every non-finite fx %s', (variant) => {
+    const specs = ['NaN', 'Infinity', '-Infinity']
+      .map((bad) => `{ kind: 'gauge', fx: { variant: '${variant}', nowMs: ${bad}, intensity: ${bad}, seed: ${bad} } }`)
+    const { status, signal } = renderHostileSpecsInChildProcess(specs)
     expect(signal).toBeNull()
     expect(status).toBe(0)
   })
 
-  it.each(['snow', 'cloud'])('still renders a real clock correctly for fx %s through the same child-process path', (variant) => {
-    const spec = `{ kind: 'gauge', fx: { variant: '${variant}', nowMs: 1786549560000, intensity: 1, seed: 3 } }`
-    const { status, signal } = renderHostileSpecInChildProcess(spec)
+  it('still renders a real clock correctly for both fatal-capable variants through the same child-process path', () => {
+    const specs = ['snow', 'cloud']
+      .map((v) => `{ kind: 'gauge', fx: { variant: '${v}', nowMs: 1786549560000, intensity: 1, seed: 3 } }`)
+    const { status, signal } = renderHostileSpecsInChildProcess(specs)
     expect(signal).toBeNull()
     expect(status).toBe(0)
   })

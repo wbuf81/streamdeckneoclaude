@@ -407,6 +407,32 @@ into this file before it is cleaned.
   brief's own suggested 34 px at y 34 overlapped the label, found by pixel probe. Tests assert
   the gaps are background, so drift fails the suite instead of reaching the glass.
 
+### New invariants added by task 42 (weather ambient effects)
+
+- `KeySpec.fx` is **opt-in per key**. Absent, the render path is byte-identical
+  to before the field existed. Three pages' pixel proofs depend on that, so
+  never make it non-optional.
+- The brightness cap is applied **once**, at the composite in `drawFx`, never
+  per variant. A variant draws at full strength onto a scratch canvas, and that
+  canvas lands on the key at `FX_MAX_ALPHA`. Do not move the cap into the
+  variants: exceeding it is currently impossible, not merely unreached.
+- The condition tint AND the effect come from **one table row**, keyed by the
+  emoji `weatherEmoji` already produced. Do not add a second keyword list.
+- `WeatherPage` freezes every effect when the forecast is stale, offline, or
+  absent, and `tickMs` reads the same one `isDimmed` decision, so the declared
+  render rate can never disagree with what the frame actually draws.
+- The weather tile geometry proofs assert **content ink**, by diffing a render
+  against the same key with its text and emoji removed. Do not revert them to
+  comparing pixels against `key.bg`: that comparison cannot describe a key
+  carrying an animated layer, and it would fail for the right reason and the
+  wrong cause.
+- `tests/render/canvas.test.ts`'s child-process probe block bundles **once** and
+  spawns **three** processes. Keeping it cheap is load-bearing for an unrelated
+  test: `statusline-wrapper.test.ts`'s M-8 signals the wrapper after a flat
+  300 ms, and it began failing about once in six full-suite runs when this block
+  spawned eight processes, while never failing in ten isolated runs of its own
+  file. That fixed sleep is a real latent race in M-8, independent of this task.
+
 ---
 
 ## Working agreements with the user

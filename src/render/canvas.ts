@@ -1001,36 +1001,58 @@ function drawFxStorm(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
 }
 
-const FX_FOG_BANDS = 4
-const FX_FOG_BAND_H = 11
-const FX_FOG_WIDTH = 70
+const FX_FOG_BANDS = 3
+const FX_FOG_BAND_H = 26
+const FX_FOG_WIDTH = 108
+const FX_FOG_PEAK_ALPHA = 0.62
 const FX_FOG_PERIOD_BASE_MS = 11000
 const FX_FOG_PERIOD_VAR_MS = 6000
 
 /**
- * Slow horizontal haze. Each band is a soft-edged block that drifts sideways
- * and wraps, drawn twice so the wrap seam is never visible. A linear gradient
- * gives the soft edges; `createLinearGradient` needs finite coordinates, which
- * `sanitizeKeySpec` guarantees.
+ * Slow horizontal haze: a few wide, soft blobs drifting sideways, each drawn
+ * twice so the wrap seam never shows.
+ *
+ * Softness runs in BOTH directions. A horizontal gradient fades each end, and
+ * the band is built from single-pixel rows whose alpha follows a vertical bell,
+ * so the top and bottom edges fade too.
+ *
+ * The first version drew four 70 px bands as plain `fillRect`s with only a
+ * horizontal gradient. Their flat top and bottom edges made each band read as a
+ * rectangle rather than as haze, which is why the vertical falloff exists.
+ *
+ * A note on how that was found, because the first diagnosis was WRONG: the
+ * contact sheet showed a pale block behind the fog tile's numbers, and the
+ * obvious conclusion was that these bands had piled up in the middle of the
+ * key. Rendering the emoji and the layer separately disproved it — the block is
+ * Apple's `🌫` glyph itself, a hazy grey square, and it predates this layer
+ * entirely. The peak alpha had already been cut on that false premise before
+ * the isolation render corrected it. Measure the parts, do not reason about the
+ * composite (lesson 17).
  */
 function drawFxFog(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   for (let b = 0; b < FX_FOG_BANDS; b++) {
     const s = fx.seed * 419 + b * 37
-    const y =
-      ((b + 0.5) / FX_FOG_BANDS) * KEY_SIZE - FX_FOG_BAND_H / 2 + pseudoRandom(s) * 6 - 3
+    const centreY = ((b + 0.5) / FX_FOG_BANDS) * KEY_SIZE + pseudoRandom(s) * 8 - 4
     const period = FX_FOG_PERIOD_BASE_MS + pseudoRandom(s + 1) * FX_FOG_PERIOD_VAR_MS
     const dir = pseudoRandom(s + 2) < 0.5 ? -1 : 1
     const t = ((fx.nowMs + pseudoRandom(s + 3) * period) % period) / period
     const span = KEY_SIZE + FX_FOG_WIDTH
     const x = dir > 0 ? -FX_FOG_WIDTH + t * span : KEY_SIZE - t * span
-    const alpha = intensity * (0.45 + 0.4 * pseudoRandom(s + 4))
+    const peak = intensity * FX_FOG_PEAK_ALPHA * (0.7 + 0.3 * pseudoRandom(s + 4))
+    const half = FX_FOG_BAND_H / 2
+
     for (const ox of [x, x + (dir > 0 ? -span : span)]) {
-      const grad = ctx.createLinearGradient(ox, 0, ox + FX_FOG_WIDTH, 0)
-      grad.addColorStop(0, fxCss(theme.gray, 0))
-      grad.addColorStop(0.5, fxCss(theme.gray, alpha))
-      grad.addColorStop(1, fxCss(theme.gray, 0))
-      ctx.fillStyle = grad
-      ctx.fillRect(ox, y, FX_FOG_WIDTH, FX_FOG_BAND_H)
+      for (let dy = -half; dy <= half; dy++) {
+        // A raised cosine: 1 at the band's centre line, 0 at both edges.
+        const falloff = 0.5 * (1 + Math.cos((dy / half) * Math.PI))
+        if (falloff <= 0) continue
+        const grad = ctx.createLinearGradient(ox, 0, ox + FX_FOG_WIDTH, 0)
+        grad.addColorStop(0, fxCss(theme.gray, 0))
+        grad.addColorStop(0.5, fxCss(theme.gray, peak * falloff))
+        grad.addColorStop(1, fxCss(theme.gray, 0))
+        ctx.fillStyle = grad
+        ctx.fillRect(ox, centreY + dy, FX_FOG_WIDTH, 1)
+      }
     }
   }
 }
@@ -1109,13 +1131,13 @@ function drawFxSun(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   const r = FX_SUN_GLOW_R * pulse
 
   const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-  grad.addColorStop(0, fxCss(theme.amber, intensity * 0.85))
+  grad.addColorStop(0, fxCss(theme.amber, intensity * 0.72))
   grad.addColorStop(1, fxCss(theme.amber, 0))
   ctx.fillStyle = grad
   ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
 
   const spin = (fx.nowMs / FX_SUN_ROTATE_PERIOD_MS) * 2 * Math.PI + spinPhase
-  ctx.fillStyle = fxCss(theme.amber, intensity * 0.4)
+  ctx.fillStyle = fxCss(theme.amber, intensity * 0.32)
   for (let i = 0; i < FX_SUN_RAYS; i++) {
     const a = spin + (i / FX_SUN_RAYS) * 2 * Math.PI
     ctx.beginPath()
@@ -1145,7 +1167,11 @@ function drawFxCloud(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
     const t = ((fx.nowMs + pseudoRandom(s + 3) * period) % period) / period
     const span = KEY_SIZE + 2 * r
     const x = -r + t * span
-    ctx.fillStyle = fxCss(theme.gray, intensity * (0.5 + 0.4 * pseudoRandom(s + 4)))
+    // Measured against the contact sheet: at the original 0.5-to-0.9 range over
+    // the neutral overcast tint, the blobs were very nearly invisible — a
+    // grey layer over a grey wash. These are brighter so overcast reads as
+    // moving cloud rather than as a still key.
+    ctx.fillStyle = fxCss(theme.white, intensity * (0.28 + 0.22 * pseudoRandom(s + 4)))
     for (const ox of [x, x - span]) {
       ctx.beginPath()
       ctx.arc(ox, y, r, 0, Math.PI * 2)

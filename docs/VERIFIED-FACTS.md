@@ -616,6 +616,68 @@ at a fixed `lineY` inside that reserved band.
 
 ---
 
+## Ambient effect layer (task 42)
+
+Measured on this Mac on 2026-08-18, with `@napi-rs/canvas` 0.1.100.
+
+### Canvas-to-canvas compositing
+
+A canvas composites onto another canvas through `ctx.drawImage(canvas, 0, 0)`.
+This is a surface blit, not an image decode, so it does not violate the
+"nothing decodes an image on the render path" invariant.
+
+| Property | Measurement |
+| --- | --- |
+| Blend is exact | `rgba(90,150,255,1)` at `globalAlpha` 0.28 over `rgb(18,28,44)` gives exactly `(38,62,103)` |
+| `clearRect` fully resets a reused canvas | Yes, alpha included — so ONE module-level scratch canvas is safe |
+| The cap holds against a hostile layer | A layer filled solid white at alpha 1 still composited to `(84,91,103)` |
+| Determinism | Two identical renders are byte-identical |
+| Cost | 0.37 ms per 8-key frame, against a 100 ms tick budget |
+
+The cap therefore does not depend on each variant behaving. `FX_MAX_ALPHA` is
+applied once, at the composite, so exceeding it is impossible by construction.
+
+### Which variants are FATAL on a non-finite number
+
+Measured by deleting the `out.fx` block from `sanitizeKeySpec` and running each
+variant through an isolated child process:
+
+| Variant | Result unguarded |
+| --- | --- |
+| `snow`, `cloud` | **exit 134, SIGABRT** — a Rust panic inside `ctx.arc` |
+| `wind` | exit 1, an ordinary catchable JS throw |
+| `rain`, `storm`, `fog`, `sun` | exit 0, survived |
+
+`snow` and `cloud` pass a non-finite CENTRE to `ctx.arc`, which is the fatal
+case. `sun` passes only a non-finite radius and was measured to survive it.
+This is why only those two are tested in a child process — testing a fatal case
+in-process kills the whole vitest worker instead of failing one test.
+
+### Text pixels on a weather day tile
+
+Two measurements that each corrected a wrong assumption in a test:
+
+- Selecting text pixels by proximity to `theme.text` finds only **57** on a real
+  day tile, because the tile colours its temperature line by heat and its rain
+  line by chance. Only the label is `theme.text`. The same selection on a key
+  with no `lineColors` finds 204 — which is why the first version of that proof
+  looked adequate and was not.
+- Demanding byte-exact equality of content pixels across two effect clocks fails
+  on **13 to 55** pixels per condition. An anti-aliased glyph edge blends with
+  whatever sits underneath it by design. The worst real channel shift is **26**
+  of 255, on the snow tile, and the smallest opaque-content set is 537 pixels,
+  on the sunny tile.
+
+### The `🌫` emoji is itself a pale block
+
+Apple's fog emoji renders as a hazy grey square that fills most of the emoji
+band. On a contact sheet this looks exactly like an effect layer that has piled
+up in the middle of the key, and it was misdiagnosed as one. Rendering the emoji
+and the layer separately is what settled it. The block predates the effect
+layer entirely.
+
+---
+
 ## macOS specifics
 
 - **Per-window focus needs Accessibility permission**, which is NOT granted.

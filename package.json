@@ -17,7 +17,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke": "npm run build && node dist/scripts/smoke.js",
     "extract:crabs": "npm run build && node dist/scripts/extract-crab-frames.js",
-    "crab:contact-sheet": "npm run build && node dist/scripts/crab-contact-sheet.js"
+    "crab:contact-sheet": "npm run build && node dist/scripts/crab-contact-sheet.js",
+    "fx:contact-sheet": "npm run build && node dist/scripts/fx-contact-sheet.js"
   },
   "dependencies": {
     "@elgato-stream-deck/node": "^7.1.2",
