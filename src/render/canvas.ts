@@ -1,5 +1,5 @@
-import { createCanvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
-import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, IdleSpec } from './specs.js'
+import { createCanvas, type Canvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
+import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, IdleSpec, FxSpec } from './specs.js'
 import { theme } from './theme.js'
 
 export const KEY_SIZE = 96
@@ -257,6 +257,20 @@ function sanitizeKeySpec(spec: KeySpec): KeySpec {
       nowMs: finiteOr(out.idle.nowMs, 0),
       col: finiteOr(out.idle.col, 0) === 1 ? 1 : 0,
       row: finiteOr(out.idle.row, 0) === 1 ? 1 : 0,
+    }
+  }
+  if (out.fx) {
+    // `drawFxSun`, `drawFxSnow` and `drawFxCloud` all reach `ctx.arc`, which
+    // PANICS in Rust on a non-finite argument and aborts the whole process —
+    // not a catchable throw, so the render loop's own try/catch cannot save
+    // it. The gradient variants reach `createLinearGradient` and
+    // `createRadialGradient`, which need finite coordinates too. This is the
+    // one boundary that keeps all of that unreachable.
+    out.fx = {
+      ...out.fx,
+      nowMs: finiteOr(out.fx.nowMs, 0),
+      intensity: clamp01(finiteOr(out.fx.intensity, 0)),
+      seed: finiteOr(out.fx.seed, 0),
     }
   }
   return out
@@ -747,6 +761,399 @@ function drawIdle(ctx: SKRSContext2D, idle: IdleSpec, dim: boolean): void {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * Ambient effects (task 42)
+ *
+ * One effect draws BEHIND a key's own content, chosen by whatever the key is
+ * reporting — the weather page maps each forecast condition to one, so the
+ * forecast reads across the room before the digits do.
+ *
+ * These are deliberately separate from the three `IdleSpec` animations above.
+ * An idle animation OWNS its key: nothing is drawn over it, so it can use the
+ * whole brightness range. An effect is a LAYER: text lands on top of it, so it
+ * lives under a hard brightness cap. Merging the two would mean one of them
+ * losing the property that makes it work.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The hard ceiling on how bright any ambient effect can get.
+ *
+ * Enforced ONCE, at the composite in `drawFx`, and never trusted to each
+ * variant: a variant draws at full strength onto its own scratch canvas, and
+ * that whole canvas lands on the key at this alpha. So a variant CANNOT exceed
+ * the budget, whatever it does to its own context — the harm is impossible by
+ * construction rather than merely unreached (lesson 21 in docs/LESSONS.md).
+ *
+ * Measured on 2026-08-18: a scratch layer filled solid white at alpha 1
+ * composited over the rain tint `(18,28,44)` to `(84,91,103)`. Text renders at
+ * 235, so content always wins. See docs/VERIFIED-FACTS.md.
+ */
+export const FX_MAX_ALPHA = 0.28
+
+/**
+ * The floor for a data-driven intensity. A 0-percent chance of rain is a real
+ * reading, not missing data, so its tile still shows a trace of the effect
+ * rather than going inert and looking like a broken page.
+ */
+export const FX_INTENSITY_MIN = 0.25
+
+/**
+ * One reused scratch canvas for every effect, created on first use.
+ *
+ * Safe as module state because `renderKey` is synchronous, single-threaded and
+ * never re-entrant, and because `clearRect` was measured to reset the surface
+ * completely, alpha included (2026-08-18). A fresh canvas per key per frame
+ * would allocate 80 canvases a second for no benefit.
+ */
+let fxScratch: Canvas | null = null
+
+function fxScratchContext(): { canvas: Canvas; ctx: SKRSContext2D } {
+  if (!fxScratch) fxScratch = createCanvas(KEY_SIZE, KEY_SIZE)
+  const ctx = fxScratch.getContext('2d')
+  ctx.clearRect(0, 0, KEY_SIZE, KEY_SIZE)
+  // Reset every piece of context state a variant may have left behind, since
+  // this surface is reused across keys and frames.
+  ctx.globalAlpha = 1
+  ctx.lineWidth = 1
+  ctx.lineCap = 'butt'
+  return { canvas: fxScratch, ctx }
+}
+
+/**
+ * An effect's own per-particle opacity. Never the cap — that is applied once,
+ * at the composite, so this value is free to run all the way to 1.
+ */
+function fxCss(c: Rgb, alpha: number): string {
+  return `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${clamp01(alpha)})`
+}
+
+/**
+ * Draws one ambient effect beneath a key's content. The variant paints at full
+ * strength onto the scratch canvas; this function composites it at
+ * `FX_MAX_ALPHA`, reduced again by `DIM_FACTOR` when the key is dim, so a
+ * stale key's layer darkens by the same fraction as its text.
+ *
+ * `dim` has to act through `globalAlpha` here: a composited surface ignores
+ * `fillStyle`, exactly like a bitmap colour emoji does (lesson 15).
+ */
+function drawFx(ctx: SKRSContext2D, fx: FxSpec, dim: boolean): void {
+  const { canvas, ctx: layer } = fxScratchContext()
+  const intensity = clamp01(fx.intensity)
+
+  switch (fx.variant) {
+    case 'rain':
+      drawFxRain(layer, fx, intensity, false)
+      break
+    case 'storm':
+      drawFxStorm(layer, fx, intensity)
+      break
+    case 'snow':
+      drawFxSnow(layer, fx, intensity)
+      break
+    case 'fog':
+      drawFxFog(layer, fx, intensity)
+      break
+    case 'wind':
+      drawFxWind(layer, fx, intensity)
+      break
+    case 'sun':
+      drawFxSun(layer, fx, intensity)
+      break
+    case 'cloud':
+      drawFxCloud(layer, fx, intensity)
+      break
+  }
+
+  const prev = ctx.globalAlpha
+  ctx.globalAlpha = prev * FX_MAX_ALPHA * (dim ? DIM_FACTOR : 1)
+  ctx.drawImage(canvas, 0, 0)
+  ctx.globalAlpha = prev
+}
+
+const FX_RAIN_MAX_DROPS = 16
+const FX_RAIN_LEN = 12
+const FX_RAIN_SLANT = 2
+const FX_RAIN_WIDTH = 1.4
+const FX_RAIN_PERIOD_BASE_MS = 820
+const FX_RAIN_PERIOD_VAR_MS = 420
+/** The storm variant drives the same streaks harder and leans them further. */
+const FX_STORM_PERIOD_SCALE = 0.66
+const FX_STORM_SLANT = 5
+
+/**
+ * One rain streak's vertical extent at one instant. `head` is the leading
+ * (lowest) end, `tail` the trailing end above it. Exported so a test proves
+ * the loop geometry instead of trusting this comment.
+ *
+ * The head enters one full streak-length ABOVE the key and travels one full
+ * length BELOW it before wrapping, so at the wrap instant the whole streak is
+ * off-key and the loop is invisible. The matrix rain shipped once with travel
+ * that stopped at `KEY_SIZE`, and whole strands vanished mid-key while their
+ * comment claimed otherwise — see `rainColumnSpan`. Do not shorten the travel.
+ */
+export function fxRainDropSpan(
+  seed: number, index: number, nowMs: number, periodScale = 1,
+): { head: number; tail: number } {
+  const s = seed * 131 + index * 17
+  const period =
+    (FX_RAIN_PERIOD_BASE_MS + pseudoRandom(s) * FX_RAIN_PERIOD_VAR_MS) * periodScale
+  const phase = pseudoRandom(s + 1) * period
+  const t = ((nowMs + phase) % period) / period
+  const travel = KEY_SIZE + 2 * FX_RAIN_LEN
+  const head = -FX_RAIN_LEN + t * travel
+  return { head, tail: head - FX_RAIN_LEN }
+}
+
+function drawFxRain(
+  ctx: SKRSContext2D, fx: FxSpec, intensity: number, storm: boolean,
+): void {
+  const count = Math.max(2, Math.round(intensity * FX_RAIN_MAX_DROPS))
+  const slant = storm ? FX_STORM_SLANT : FX_RAIN_SLANT
+  const scale = storm ? FX_STORM_PERIOD_SCALE : 1
+  ctx.lineWidth = FX_RAIN_WIDTH
+  ctx.lineCap = 'round'
+  for (let i = 0; i < count; i++) {
+    const s = fx.seed * 131 + i * 17
+    const x = pseudoRandom(s + 2) * KEY_SIZE
+    const { head, tail } = fxRainDropSpan(fx.seed, i, fx.nowMs, scale)
+    ctx.strokeStyle = fxCss(theme.blue, 0.55 + 0.45 * pseudoRandom(s + 3))
+    ctx.beginPath()
+    ctx.moveTo(x, tail)
+    ctx.lineTo(x + slant, head)
+    ctx.stroke()
+  }
+}
+
+const FX_SNOW_MAX_FLAKES = 20
+export const FX_SNOW_R = 1.7
+const FX_SNOW_PERIOD_BASE_MS = 5200
+const FX_SNOW_PERIOD_VAR_MS = 3200
+const FX_SNOW_SWAY_PX = 7
+const FX_SNOW_SWAY_PERIOD_MS = 3100
+
+/**
+ * One snowflake's vertical position, and the travel it loops over. Snow falls
+ * far more slowly than rain and sways sideways, so it needs its own geometry
+ * rather than a reskinned rain streak. Same slide-in and slide-out rule as
+ * `fxRainDropSpan`: a flake is fully off-key at the wrap instant.
+ */
+export function fxSnowFlakeY(
+  seed: number, index: number, nowMs: number,
+): { y: number; travel: number } {
+  const s = seed * 211 + index * 29
+  const period = FX_SNOW_PERIOD_BASE_MS + pseudoRandom(s) * FX_SNOW_PERIOD_VAR_MS
+  const phase = pseudoRandom(s + 1) * period
+  const t = ((nowMs + phase) % period) / period
+  const travel = KEY_SIZE + 4 * FX_SNOW_R
+  return { y: -2 * FX_SNOW_R + t * travel, travel }
+}
+
+function drawFxSnow(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  const count = Math.max(3, Math.round(intensity * FX_SNOW_MAX_FLAKES))
+  for (let i = 0; i < count; i++) {
+    // The SAME seed expression `fxSnowFlakeY` uses, so the drawn flake and the
+    // tested geometry cannot drift apart.
+    const s = fx.seed * 211 + i * 29
+    const baseX = pseudoRandom(s + 2) * KEY_SIZE
+    const { y } = fxSnowFlakeY(fx.seed, i, fx.nowMs)
+    const sway =
+      FX_SNOW_SWAY_PX *
+      Math.sin(
+        (fx.nowMs / FX_SNOW_SWAY_PERIOD_MS) * 2 * Math.PI + pseudoRandom(s + 3) * 2 * Math.PI,
+      )
+    const r = FX_SNOW_R * (0.7 + 0.6 * pseudoRandom(s + 4))
+    ctx.fillStyle = fxCss(theme.white, 0.5 + 0.5 * pseudoRandom(s + 5))
+    ctx.beginPath()
+    ctx.arc(baseX + sway, y, r, 0, Math.PI * 2)
+    ctx.fill()
+  }
+}
+
+const FX_STORM_FLASH_PERIOD_MS = 4300
+const FX_STORM_FLASH_MS = 90
+const FX_STORM_SECOND_FLASH_AT_MS = 210
+const FX_STORM_SECOND_FLASH_MS = 60
+
+/**
+ * Whether the storm's lightning is lit at this instant. Two short windows
+ * inside one long period, so a strike reads as the real double flash rather
+ * than a single blink.
+ *
+ * Exported so a test finds a real flash instant from the predicate instead of
+ * guessing a timestamp, and so it can prove the flash stays rare rather than
+ * sticking on — a stuck flash is a bright key, not a storm.
+ */
+export function fxStormFlashOn(seed: number, nowMs: number): boolean {
+  const offset = pseudoRandom(seed * 313 + 7) * FX_STORM_FLASH_PERIOD_MS
+  const phase = (nowMs + offset) % FX_STORM_FLASH_PERIOD_MS
+  if (phase < FX_STORM_FLASH_MS) return true
+  const second = phase - FX_STORM_SECOND_FLASH_AT_MS
+  return second >= 0 && second < FX_STORM_SECOND_FLASH_MS
+}
+
+function drawFxStorm(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  drawFxRain(ctx, fx, intensity, true)
+  if (!fxStormFlashOn(fx.seed, fx.nowMs)) return
+  // A full-key wash at full strength on the scratch layer. The composite's own
+  // cap is the only thing keeping this from becoming a white key, which is
+  // exactly the point of putting the cap there.
+  ctx.fillStyle = fxCss(theme.white, 1)
+  ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
+}
+
+const FX_FOG_BANDS = 4
+const FX_FOG_BAND_H = 11
+const FX_FOG_WIDTH = 70
+const FX_FOG_PERIOD_BASE_MS = 11000
+const FX_FOG_PERIOD_VAR_MS = 6000
+
+/**
+ * Slow horizontal haze. Each band is a soft-edged block that drifts sideways
+ * and wraps, drawn twice so the wrap seam is never visible. A linear gradient
+ * gives the soft edges; `createLinearGradient` needs finite coordinates, which
+ * `sanitizeKeySpec` guarantees.
+ */
+function drawFxFog(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  for (let b = 0; b < FX_FOG_BANDS; b++) {
+    const s = fx.seed * 419 + b * 37
+    const y =
+      ((b + 0.5) / FX_FOG_BANDS) * KEY_SIZE - FX_FOG_BAND_H / 2 + pseudoRandom(s) * 6 - 3
+    const period = FX_FOG_PERIOD_BASE_MS + pseudoRandom(s + 1) * FX_FOG_PERIOD_VAR_MS
+    const dir = pseudoRandom(s + 2) < 0.5 ? -1 : 1
+    const t = ((fx.nowMs + pseudoRandom(s + 3) * period) % period) / period
+    const span = KEY_SIZE + FX_FOG_WIDTH
+    const x = dir > 0 ? -FX_FOG_WIDTH + t * span : KEY_SIZE - t * span
+    const alpha = intensity * (0.45 + 0.4 * pseudoRandom(s + 4))
+    for (const ox of [x, x + (dir > 0 ? -span : span)]) {
+      const grad = ctx.createLinearGradient(ox, 0, ox + FX_FOG_WIDTH, 0)
+      grad.addColorStop(0, fxCss(theme.gray, 0))
+      grad.addColorStop(0.5, fxCss(theme.gray, alpha))
+      grad.addColorStop(1, fxCss(theme.gray, 0))
+      ctx.fillStyle = grad
+      ctx.fillRect(ox, y, FX_FOG_WIDTH, FX_FOG_BAND_H)
+    }
+  }
+}
+
+const FX_WIND_MAX_STREAKS = 10
+const FX_WIND_LEN = 28
+const FX_WIND_WIDTH = 1.2
+const FX_WIND_PERIOD_BASE_MS = 1300
+const FX_WIND_PERIOD_VAR_MS = 800
+
+/**
+ * One wind streak's horizontal extent. `lead` is the right-hand end, `trail`
+ * the left. Same fully-in, fully-out rule as the falling variants, rotated
+ * ninety degrees.
+ */
+export function fxWindStreakSpan(
+  seed: number, index: number, nowMs: number,
+): { lead: number; trail: number } {
+  const s = seed * 523 + index * 41
+  const period = FX_WIND_PERIOD_BASE_MS + pseudoRandom(s) * FX_WIND_PERIOD_VAR_MS
+  const phase = pseudoRandom(s + 1) * period
+  const t = ((nowMs + phase) % period) / period
+  const travel = KEY_SIZE + 2 * FX_WIND_LEN
+  const lead = -FX_WIND_LEN + t * travel
+  return { lead, trail: lead - FX_WIND_LEN }
+}
+
+function drawFxWind(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  const count = Math.max(2, Math.round(intensity * FX_WIND_MAX_STREAKS))
+  ctx.lineWidth = FX_WIND_WIDTH
+  ctx.lineCap = 'round'
+  for (let i = 0; i < count; i++) {
+    const s = fx.seed * 523 + i * 41
+    const y = pseudoRandom(s + 2) * KEY_SIZE
+    const { lead, trail } = fxWindStreakSpan(fx.seed, i, fx.nowMs)
+    // Fades in from the trailing end, so each streak reads as moving right
+    // even in a still frame.
+    const grad = ctx.createLinearGradient(trail, y, lead, y)
+    grad.addColorStop(0, fxCss(theme.cyan, 0))
+    grad.addColorStop(1, fxCss(theme.cyan, 0.5 + 0.5 * pseudoRandom(s + 3)))
+    ctx.strokeStyle = grad
+    ctx.beginPath()
+    ctx.moveTo(trail, y)
+    ctx.lineTo(lead, y)
+    ctx.stroke()
+  }
+}
+
+const FX_SUN_RAYS = 12
+const FX_SUN_ROTATE_PERIOD_MS = 26000
+const FX_SUN_GLOW_R = 52
+const FX_SUN_RAY_HALF_ANGLE = 0.05
+const FX_SUN_PULSE_PERIOD_MS = 5400
+const FX_SUN_PULSE_AMPLITUDE = 0.12
+
+/**
+ * A warm central glow with slowly turning rays. Both breathe on one slow
+ * pulse, so a clear-sky tile still moves without anything crossing it — a
+ * falling or drifting particle would contradict what the tile reports.
+ */
+function drawFxSun(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  const cx = KEY_SIZE / 2
+  const cy = KEY_SIZE / 2
+  // Per-key phase offsets. Without these the sun was the ONE variant that
+  // ignored `seed`, so a whole week of clear days pulsed and turned in perfect
+  // lockstep — read as one throbbing block rather than seven tiles. Every
+  // other variant gets its decorrelation for free, because it seeds per
+  // particle; this one has no particles, so it needs the offset explicitly.
+  // Caught by the seed test, not by eye.
+  const phase = pseudoRandom(fx.seed * 733 + 3) * 2 * Math.PI
+  const spinPhase = pseudoRandom(fx.seed * 733 + 11) * 2 * Math.PI
+  const pulse =
+    1 +
+    FX_SUN_PULSE_AMPLITUDE *
+      Math.sin((fx.nowMs / FX_SUN_PULSE_PERIOD_MS) * 2 * Math.PI + phase)
+  const r = FX_SUN_GLOW_R * pulse
+
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
+  grad.addColorStop(0, fxCss(theme.amber, intensity * 0.85))
+  grad.addColorStop(1, fxCss(theme.amber, 0))
+  ctx.fillStyle = grad
+  ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
+
+  const spin = (fx.nowMs / FX_SUN_ROTATE_PERIOD_MS) * 2 * Math.PI + spinPhase
+  ctx.fillStyle = fxCss(theme.amber, intensity * 0.4)
+  for (let i = 0; i < FX_SUN_RAYS; i++) {
+    const a = spin + (i / FX_SUN_RAYS) * 2 * Math.PI
+    ctx.beginPath()
+    ctx.moveTo(cx, cy)
+    ctx.arc(cx, cy, r * 1.15, a - FX_SUN_RAY_HALF_ANGLE, a + FX_SUN_RAY_HALF_ANGLE)
+    ctx.closePath()
+    ctx.fill()
+  }
+}
+
+const FX_CLOUD_BLOBS = 3
+const FX_CLOUD_RADII = [23, 16, 28] as const
+const FX_CLOUD_PERIOD_BASE_MS = 14000
+const FX_CLOUD_PERIOD_VAR_MS = 9000
+
+/**
+ * Slow drifting blobs, wrapping horizontally, each drawn twice so the wrap
+ * seam never shows. `⛅` uses this same variant at a lower intensity rather
+ * than a variant of its own — partly cloudy IS cloudy, with less of it.
+ */
+function drawFxCloud(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  for (let b = 0; b < FX_CLOUD_BLOBS; b++) {
+    const s = fx.seed * 617 + b * 53
+    const r = (FX_CLOUD_RADII[b] ?? FX_CLOUD_RADII[0]) * (0.8 + 0.4 * pseudoRandom(s))
+    const y = pseudoRandom(s + 1) * KEY_SIZE
+    const period = FX_CLOUD_PERIOD_BASE_MS + pseudoRandom(s + 2) * FX_CLOUD_PERIOD_VAR_MS
+    const t = ((fx.nowMs + pseudoRandom(s + 3) * period) % period) / period
+    const span = KEY_SIZE + 2 * r
+    const x = -r + t * span
+    ctx.fillStyle = fxCss(theme.gray, intensity * (0.5 + 0.4 * pseudoRandom(s + 4)))
+    for (const ox of [x, x - span]) {
+      ctx.beginPath()
+      ctx.arc(ox, y, r, 0, Math.PI * 2)
+      ctx.fill()
+    }
+  }
+}
+
 /**
  * Draws `img` onto the whole key. With no `crop`, this scales the entire
  * image edge to edge, exactly as before `imageCrop` existed. With a `crop`,
@@ -954,6 +1361,11 @@ export function renderKey(rawSpec: KeySpec): Buffer {
 
   ctx.fillStyle = css(spec.bg ?? theme.bg)
   ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
+
+  // Beneath everything else: the background wash, then this ambient layer,
+  // then the key's own content on top. Opt-in — absent `fx`, this whole path
+  // is skipped and the render is byte-identical to before the field existed.
+  if (spec.fx) drawFx(ctx, spec.fx, dim)
 
   if (spec.image) {
     // The producer already decoded this. With no crop, it scales to the key,

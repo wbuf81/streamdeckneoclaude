@@ -304,6 +304,49 @@ describe('keyHash', () => {
   })
 })
 
+/**
+ * Lesson 11 in docs/LESSONS.md: a new `KeySpec` field must affect `keyHash`,
+ * or the daemon's dirty-key check leaves stale pixels on the glass. `fx`
+ * carries a per-frame `nowMs`, so a hash that ignored it would freeze every
+ * ambient effect after its first frame — the exact defect `imageCrop` and
+ * `IdleSpec` both had to be proven against.
+ */
+describe('keyHash covers the fx layer', () => {
+  const base: KeySpec = {
+    kind: 'gauge',
+    fx: { variant: 'rain', nowMs: 1000, intensity: 0.5, seed: 0 },
+  }
+
+  it('differs when only nowMs advances', () => {
+    const later: KeySpec = { ...base, fx: { ...base.fx!, nowMs: 1100 } }
+    expect(keyHash(later)).not.toBe(keyHash(base))
+  })
+
+  it('differs when the variant changes', () => {
+    const other: KeySpec = { ...base, fx: { ...base.fx!, variant: 'snow' } }
+    expect(keyHash(other)).not.toBe(keyHash(base))
+  })
+
+  it('differs when the intensity changes', () => {
+    const other: KeySpec = { ...base, fx: { ...base.fx!, intensity: 0.9 } }
+    expect(keyHash(other)).not.toBe(keyHash(base))
+  })
+
+  it('differs when only the seed changes, so two tiles never share one hash', () => {
+    const other: KeySpec = { ...base, fx: { ...base.fx!, seed: 3 } }
+    expect(keyHash(other)).not.toBe(keyHash(base))
+  })
+
+  it('matches for two equal fx specs', () => {
+    expect(keyHash({ ...base })).toBe(keyHash(base))
+  })
+
+  it('differs between a key with fx and the same key without it', () => {
+    const { fx, ...without } = base
+    expect(keyHash(without as KeySpec)).not.toBe(keyHash(base))
+  })
+})
+
 describe('stripHash', () => {
   it('differs when the bar value changes', () => {
     expect(stripHash({ lines: ['a'], bar: { value: 0.1, color: [0, 255, 0] } }))

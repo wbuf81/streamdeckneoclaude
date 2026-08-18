@@ -50,6 +50,32 @@ export interface IdleSpec {
   row: 0 | 1
 }
 
+/**
+ * The seven ambient effects a key can draw BEHIND its own content. Task 42
+ * built them for the weather page, where each forecast condition picks one,
+ * so the forecast reads across the room before the digits do. A later
+ * standalone animation page reuses the same layer.
+ */
+export type FxVariant = 'rain' | 'snow' | 'storm' | 'fog' | 'wind' | 'sun' | 'cloud'
+
+export interface FxSpec {
+  variant: FxVariant
+  /**
+   * The daemon's injected clock, in unix milliseconds. A page must never call
+   * `Date.now()` — the same rule `IdleSpec.nowMs` follows, so a test passes an
+   * explicit clock and gets a byte-identical frame.
+   */
+  nowMs: number
+  /** 0 to 1. Scales density, rate, or brightness, depending on the variant. */
+  intensity: number
+  /**
+   * Decorrelates neighbouring keys. Two tiles with the same variant and the
+   * same seed animate in lockstep, which reads as one wide effect rather than
+   * seven separate tiles; the key index is enough to break it.
+   */
+  seed: number
+}
+
 export interface SparkSpec {
   /** Oldest first. Fewer than 2 points draws nothing. */
   values: number[]
@@ -216,6 +242,19 @@ export interface KeySpec {
    * docs/LESSONS.md describes for the same four keys' `imageCrop`.
    */
   idle?: IdleSpec
+  /**
+   * An ambient effect drawn BENEATH this key's own content — the background
+   * wash first, then this layer, then the image, border, glyph, emoji and
+   * text. Opt-in per key: absent, the render path is byte-identical to
+   * before this field existed, exactly as `lineSizes` and `SparkSpec.slice`
+   * are. That is what keeps every other page's pixel proof valid.
+   *
+   * `nowMs` changes every frame, so a key carrying `fx` rewrites every frame
+   * by design. `keyHash` covers this field and must keep covering it, or the
+   * daemon's dirty-key check sees no difference and the effect freezes after
+   * one frame — lesson 11 in docs/LESSONS.md.
+   */
+  fx?: FxSpec
   dim?: boolean
   /**
    * A thin outline drawn around the whole key perimeter, on top of every

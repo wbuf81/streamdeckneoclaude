@@ -10,6 +10,13 @@ import {
   renderStrip,
   probe,
   rainColumnSpan,
+  fxRainDropSpan,
+  fxSnowFlakeY,
+  fxStormFlashOn,
+  fxWindStreakSpan,
+  FX_MAX_ALPHA,
+  FX_INTENSITY_MIN,
+  FX_SNOW_R,
   KEY_SIZE,
   STRIP_WIDTH,
   STRIP_HEIGHT,
@@ -17,7 +24,7 @@ import {
   FLASH_RING_THICKNESS,
 } from '../../src/render/canvas.js'
 import { theme } from '../../src/render/theme.js'
-import type { KeySpec } from '../../src/render/specs.js'
+import type { FxVariant, KeySpec, Rgb } from '../../src/render/specs.js'
 
 /** Allows a small difference, because canvas anti-aliases edges. */
 function near(actual: readonly number[], expected: readonly number[], tol = 12) {
@@ -1652,7 +1659,7 @@ describe('C1: drawIdleGrid does not abort the process on a non-finite clock', ()
    * INSIDE the project root (not the system tmpdir) so plain Node's ESM
    * resolver walks up and finds `node_modules` normally.
    */
-  function renderHostileGridInChildProcess(nowMsLiteral: string): {
+  function renderHostileSpecInChildProcess(specLiteral: string): {
     status: number | null
     signal: NodeJS.Signals | null
   } {
@@ -1674,7 +1681,7 @@ describe('C1: drawIdleGrid does not abort the process on a non-finite clock', ()
         probeFile,
         [
           `import { renderKey } from ${JSON.stringify(bundleFile)}`,
-          `const buf = renderKey({ kind: 'control', idle: { variant: 'grid', nowMs: ${nowMsLiteral}, col: 0, row: 0 } })`,
+          `const buf = renderKey(${specLiteral})`,
           `if (buf.length !== 96 * 96 * 4) throw new Error('unexpected buffer length: ' + buf.length)`,
         ].join('\n'),
       )
@@ -1685,17 +1692,57 @@ describe('C1: drawIdleGrid does not abort the process on a non-finite clock', ()
     }
   }
 
+  function gridSpec(nowMsLiteral: string): string {
+    return `{ kind: 'control', idle: { variant: 'grid', nowMs: ${nowMsLiteral}, col: 0, row: 0 } }`
+  }
+
   it.each(['NaN', 'Infinity', '-Infinity'])(
     'renders a full key buffer, in a real child process, for grid idle.nowMs = %s',
     (nowMsLiteral) => {
-      const { status, signal } = renderHostileGridInChildProcess(nowMsLiteral)
+      const { status, signal } = renderHostileSpecInChildProcess(gridSpec(nowMsLiteral))
       expect(signal).toBeNull()
       expect(status).toBe(0)
     },
   )
 
   it('still renders a real clock correctly through the same child-process path', () => {
-    const { status, signal } = renderHostileGridInChildProcess('1786549560000')
+    const { status, signal } = renderHostileSpecInChildProcess(gridSpec('1786549560000'))
+    expect(signal).toBeNull()
+    expect(status).toBe(0)
+  })
+
+  /**
+   * The same fatal class, for the ambient effect layer (task 42).
+   *
+   * MEASURED on 2026-08-18, with the `out.fx` block deleted from
+   * `sanitizeKeySpec` and the variants bundled through this same path:
+   *
+   * | variant | non-finite result |
+   * | --- | --- |
+   * | `snow`, `cloud` | exit 134, SIGABRT — a Rust panic inside `ctx.arc` |
+   * | `wind` | exit 1, an ordinary catchable JS throw |
+   * | `rain`, `storm`, `fog`, `sun` | exit 0, survived unguarded |
+   *
+   * So only `snow` and `cloud` belong here. They pass a non-finite CENTRE to
+   * `ctx.arc`, which is the fatal case; `sun` passes only a non-finite radius
+   * and was measured to survive it. The other five are covered in-process
+   * below, exactly as `C1/I4` already splits the idle variants — testing a
+   * fatal case in-process would mean a future regression in `sanitizeKeySpec`
+   * aborts this whole file's vitest worker instead of failing one test.
+   */
+  it.each([
+    ['snow', 'NaN'], ['snow', 'Infinity'], ['snow', '-Infinity'],
+    ['cloud', 'NaN'], ['cloud', 'Infinity'], ['cloud', '-Infinity'],
+  ])('renders a full key buffer, in a real child process, for fx %s with non-finite %s', (variant, bad) => {
+    const spec = `{ kind: 'gauge', fx: { variant: '${variant}', nowMs: ${bad}, intensity: ${bad}, seed: ${bad} } }`
+    const { status, signal } = renderHostileSpecInChildProcess(spec)
+    expect(signal).toBeNull()
+    expect(status).toBe(0)
+  })
+
+  it.each(['snow', 'cloud'])('still renders a real clock correctly for fx %s through the same child-process path', (variant) => {
+    const spec = `{ kind: 'gauge', fx: { variant: '${variant}', nowMs: 1786549560000, intensity: 1, seed: 3 } }`
+    const { status, signal } = renderHostileSpecInChildProcess(spec)
     expect(signal).toBeNull()
     expect(status).toBe(0)
   })
@@ -1952,3 +1999,295 @@ async function solidImage(r: number, g: number, b: number): Promise<Image> {
  * `keyHash` coverage is tested per field). Do not re-add cross-page
  * golden hashes; see docs/LESSONS.md lesson 22.
  */
+
+/**
+ * The ambient effect layer (task 42). Every effect draws BENEATH a key's own
+ * content, so the properties that matter are: it paints, it moves, it stays
+ * under the brightness cap, it loops invisibly, and it is deterministic for
+ * one clock. Each of those is asserted over a REGION, never one pixel column
+ * (lesson 22 in docs/LESSONS.md).
+ */
+describe('fx layer', () => {
+  const BG: Rgb = [18, 28, 44]
+  const ALL_VARIANTS: readonly FxVariant[] = [
+    'rain', 'snow', 'storm', 'fog', 'wind', 'sun', 'cloud',
+  ]
+
+  /**
+   * An ABSOLUTE brightness ceiling for any effect pixel over a dark condition
+   * tint — deliberately NOT derived from `FX_MAX_ALPHA`.
+   *
+   * The first version of this proof computed its ceiling from `FX_MAX_ALPHA`
+   * itself, so raising that constant raised the bar in lockstep and the test
+   * could not fail. Breaking the fix (setting the cap to 1) exposed it: the
+   * cap tests all still passed. That is lesson 22's exact shape, caught by
+   * the discipline rather than by review.
+   *
+   * Measured on 2026-08-18: a solid-white layer at the shipped cap composites
+   * to at most `(84,91,103)` over the rain tint `(18,28,44)`, the brightest of
+   * the eight tints in this direction. 110 leaves headroom for anti-aliasing
+   * while still failing if the cap rises to 0.35.
+   */
+  const FX_ABSOLUTE_CEILING = 110
+
+  function assertUnderCap(buf: Buffer, _bg: Rgb): void {
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const px = probe(buf, x, y)
+        for (let i = 0; i < 3; i++) {
+          expect(px[i]!).toBeLessThanOrEqual(FX_ABSOLUTE_CEILING)
+        }
+      }
+    }
+  }
+
+  it('keeps the cap constant itself inside its design bound', () => {
+    // The absolute ceiling above catches a large increase. This catches any
+    // increase at all, so the constant cannot creep upward unnoticed.
+    expect(FX_MAX_ALPHA).toBeLessThanOrEqual(0.3)
+    expect(FX_MAX_ALPHA).toBeGreaterThan(0)
+  })
+
+  /** Counts pixels that differ from the flat background, so a test can compare
+   * how much of the key an effect actually covers. */
+  function inkCount(buf: Buffer, bg: Rgb): number {
+    let n = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const p = probe(buf, x, y)
+        if (
+          Math.abs(p[0]! - bg[0]) > 1 ||
+          Math.abs(p[1]! - bg[1]) > 1 ||
+          Math.abs(p[2]! - bg[2]) > 1
+        ) n++
+      }
+    }
+    return n
+  }
+
+  function lum(p: readonly number[]): number {
+    return p[0]! + p[1]! + p[2]!
+  }
+
+  it.each(ALL_VARIANTS)('paints into the key, for %s', (variant) => {
+    const plain = renderKey({ kind: 'gauge', bg: BG })
+    const withFx = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 4200, intensity: 1, seed: 3 },
+    })
+    expect(withFx.equals(plain)).toBe(false)
+  })
+
+  it.each(ALL_VARIANTS)('never exceeds the alpha cap at full intensity, for %s', (variant) => {
+    const buf = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 4200, intensity: 1, seed: 3 },
+    })
+    assertUnderCap(buf, BG)
+  })
+
+  it.each(ALL_VARIANTS)('animates over time, for %s', (variant) => {
+    // Three seconds apart, which is longer than the fastest variant's whole
+    // period and far enough into the slowest one's to move it visibly. The
+    // property is "time moves it", not "it moves within one tick".
+    const at = (nowMs: number) => renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs, intensity: 1, seed: 3 },
+    })
+    expect(at(0).equals(at(3000))).toBe(false)
+  })
+
+  it.each(ALL_VARIANTS)('is deterministic for one clock, for %s', (variant) => {
+    const at = (nowMs: number) => renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs, intensity: 1, seed: 3 },
+    })
+    expect(at(4200).equals(at(4200))).toBe(true)
+  })
+
+  it.each(ALL_VARIANTS)('differs between two seeds, so neighbours do not animate in lockstep, for %s', (variant) => {
+    const at = (seed: number) => renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 4200, intensity: 1, seed },
+    })
+    expect(at(0).equals(at(5))).toBe(false)
+  })
+
+  it.each(ALL_VARIANTS)('dims along with the rest of the key, for %s', (variant) => {
+    const fx = { variant, nowMs: 4200, intensity: 1, seed: 3 } as const
+    const bright = renderKey({ kind: 'gauge', bg: BG, fx })
+    const dimmed = renderKey({ kind: 'gauge', bg: BG, fx, dim: true })
+    expect(dimmed.equals(bright)).toBe(false)
+    // Dimming must REDUCE the layer, not merely change it — a stale key whose
+    // effect stayed bright is the exact defect lesson 15 describes.
+    expect(inkCount(dimmed, BG)).toBeLessThan(inkCount(bright, BG))
+  })
+
+  it('renders byte-identical output when fx is absent', () => {
+    const a = renderKey({ kind: 'gauge', bg: BG, lines: ['NOW', '95°/77°'] })
+    const b = renderKey({ kind: 'gauge', bg: BG, lines: ['NOW', '95°/77°'] })
+    expect(a.equals(b)).toBe(true)
+  })
+
+  // `snow` and `cloud` are deliberately excluded: both were MEASURED to abort
+  // the process (SIGABRT) on a non-finite `ctx.arc` centre, so they are proven
+  // through the isolated child-process probe instead. Running them here would
+  // mean a future sanitizer regression kills this whole file's vitest worker
+  // rather than failing one test — the same split `C1/I4` already uses for the
+  // `grid` idle variant.
+  const IN_PROCESS_SAFE_VARIANTS: readonly FxVariant[] = [
+    'rain', 'storm', 'fog', 'wind', 'sun',
+  ]
+
+  it.each(IN_PROCESS_SAFE_VARIANTS)('survives a non-finite fx without throwing, for %s', (variant) => {
+    // Measured: unguarded, `wind` throws a catchable error from
+    // `createLinearGradient`, and the other four survive. The sanitizer is
+    // what turns all five into a plain, safely-rendered key.
+    const buf = renderKey({
+      kind: 'gauge', bg: BG,
+      fx: {
+        variant,
+        nowMs: Number.NaN,
+        intensity: Number.POSITIVE_INFINITY,
+        seed: Number.NEGATIVE_INFINITY,
+      },
+    })
+    expect(buf.length).toBe(KEY_SIZE * KEY_SIZE * 4)
+  })
+
+  it.each(['rain', 'snow', 'fog', 'cloud', 'wind'] as const)('draws %s more sparsely or faintly at low intensity', (variant) => {
+    const full = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 7700, intensity: 1, seed: 1 },
+    })
+    const low = renderKey({
+      kind: 'gauge', bg: BG,
+      fx: { variant, nowMs: 7700, intensity: FX_INTENSITY_MIN, seed: 1 },
+    })
+    expect(inkCount(full, BG)).toBeGreaterThan(inkCount(low, BG))
+  })
+
+  it('slides a rain streak fully in from above and fully out below before it wraps', () => {
+    // At the wrap instant every part of the streak must be off-key, or the
+    // whole strand vanishes mid-key — the exact defect the matrix rain
+    // shipped with once. See `rainColumnSpan`'s own doc comment.
+    const spans = Array.from({ length: 400 }, (_, i) => fxRainDropSpan(3, 0, i * 25))
+    expect(spans.some((s) => s.tail < 0 && s.head > 0)).toBe(true)
+    expect(spans.some((s) => s.tail < KEY_SIZE && s.head > KEY_SIZE)).toBe(true)
+    for (const s of spans) {
+      expect(s.head).toBeGreaterThan(s.tail)
+    }
+    // The streak leaves completely: some sample has its trailing end at or
+    // past the bottom edge.
+    expect(spans.some((s) => s.tail >= KEY_SIZE - 1)).toBe(true)
+    // And it enters completely: some sample has its leading end at or above
+    // the top edge.
+    expect(spans.some((s) => s.head <= 0)).toBe(true)
+  })
+
+  it('drifts a snowflake fully in from above and fully out below before it wraps', () => {
+    const samples = Array.from({ length: 600 }, (_, i) => fxSnowFlakeY(5, 0, i * 40))
+    expect(samples.some((s) => s.y <= 0)).toBe(true)
+    expect(samples.some((s) => s.y >= KEY_SIZE)).toBe(true)
+    for (const s of samples) {
+      expect(s.y).toBeGreaterThanOrEqual(-2 * FX_SNOW_R - 1)
+      expect(s.y).toBeLessThanOrEqual(KEY_SIZE + 2 * FX_SNOW_R + 1)
+    }
+  })
+
+  it('slides a wind streak fully in from the left and out to the right before it wraps', () => {
+    const spans = Array.from({ length: 500 }, (_, i) => fxWindStreakSpan(4, 0, i * 15))
+    expect(spans.some((s) => s.trail < 0 && s.lead > 0)).toBe(true)
+    expect(spans.some((s) => s.trail < KEY_SIZE && s.lead > KEY_SIZE)).toBe(true)
+    for (const s of spans) expect(s.lead).toBeGreaterThan(s.trail)
+    expect(spans.some((s) => s.trail >= KEY_SIZE - 1)).toBe(true)
+    expect(spans.some((s) => s.lead <= 0)).toBe(true)
+  })
+
+  it('flashes the storm lightning sometimes, and keeps it off most of the time', () => {
+    // A strike is rare and brief. A stuck-on flash is a bright key, not a
+    // storm, and a flash that never fires is not a storm either.
+    const samples = Array.from({ length: 1000 }, (_, i) => fxStormFlashOn(2, i * 10))
+    const on = samples.filter(Boolean).length
+    expect(on).toBeGreaterThan(0)
+    expect(on).toBeLessThan(samples.length / 5)
+  })
+
+  it('makes the storm brighter than plain rain at a real flash instant', () => {
+    // The instant comes from the predicate itself, not a guessed timestamp,
+    // so this cannot silently start sampling a non-flash frame.
+    const flashMs = Array.from({ length: 2000 }, (_, i) => i * 5)
+      .find((ms) => fxStormFlashOn(2, ms))
+    expect(flashMs).toBeDefined()
+    const total = (buf: Buffer) => {
+      let sum = 0
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 0; x < KEY_SIZE; x++) sum += lum(probe(buf, x, y))
+      }
+      return sum
+    }
+    const fxAt = (variant: FxVariant) => renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: flashMs!, intensity: 1, seed: 2 },
+    })
+    expect(total(fxAt('storm'))).toBeGreaterThan(total(fxAt('rain')))
+  })
+
+  it('keeps the storm flash under the cap, even though the flash draws at full strength', () => {
+    // `drawFxStorm` fills the whole scratch layer with solid white. Only the
+    // composite's cap stops that from becoming a white key, so this is the
+    // proof that the cap is applied at the composite and not per variant.
+    const flashMs = Array.from({ length: 2000 }, (_, i) => i * 5)
+      .find((ms) => fxStormFlashOn(2, ms))!
+    assertUnderCap(
+      renderKey({ kind: 'gauge', bg: BG, fx: { variant: 'storm', nowMs: flashMs, intensity: 1, seed: 2 } }),
+      BG,
+    )
+  })
+
+  it('leaves the key\'s own content brighter than the layer beneath it', () => {
+    const fx = { variant: 'storm' as const, nowMs: 0, intensity: 1, seed: 2 }
+    const withText = renderKey({ kind: 'gauge', bg: BG, fx, lines: ['NOW', '95°/77°', '100%'] })
+    const layerOnly = renderKey({ kind: 'gauge', bg: BG, fx })
+    let brightestLayer = 0
+    let brightestContent = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const under = probe(layerOnly, x, y)
+        const over = probe(withText, x, y)
+        brightestLayer = Math.max(brightestLayer, lum(under))
+        if (!near3(over, under, 1)) brightestContent = Math.max(brightestContent, lum(over))
+      }
+    }
+    expect(brightestContent).toBeGreaterThan(brightestLayer * 1.5)
+  })
+
+  it('draws the layer beneath the text, never over it', () => {
+    // Same text, two different effect clocks: the opaque text pixels must be
+    // identical in both, because the layer is composited underneath and the
+    // glyph interiors are opaque.
+    //
+    // Uses the weather day tile's REAL line sizes and positions, not the 11 px
+    // default. Measured on 2026-08-18: at 11 px only 18 pixels of this text
+    // are within 6 of `theme.text`, because a small thin glyph is almost all
+    // anti-aliased edge — the shipped sizes give 204. Testing the default
+    // would have made this proof nearly vacuous (lesson 22).
+    const lines = ['NOW', '95°/77°', '100%']
+    const shipped = {
+      kind: 'gauge' as const, bg: BG, lines,
+      lineSizes: [12, [16, 13, 11], 20], lineY: [3, 54, 74], align: 'center' as const,
+    }
+    const a = renderKey({ ...shipped, fx: { variant: 'rain', nowMs: 0, intensity: 1, seed: 1 } })
+    const b = renderKey({ ...shipped, fx: { variant: 'rain', nowMs: 5000, intensity: 1, seed: 1 } })
+    const plain = renderKey(shipped)
+    let textPixels = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        // Only OPAQUE glyph interiors, matched against the real text colour.
+        // An anti-aliased glyph edge is partly transparent by design, so it
+        // legitimately blends with whatever moves underneath it; asserting on
+        // those pixels would test canvas anti-aliasing, not the draw order.
+        if (near3(probe(plain, x, y), theme.text, 6)) {
+          textPixels++
+          near(probe(a, x, y), probe(b, x, y), 1)
+        }
+      }
+    }
+    // Guards against a vacuous pass: there must BE text pixels to compare.
+    expect(textPixels).toBeGreaterThan(100)
+  })
+})
+
