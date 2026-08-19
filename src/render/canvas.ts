@@ -901,12 +901,73 @@ function drawFx(ctx: SKRSContext2D, fx: FxSpec, dim: boolean): void {
     case 'drift':
       drawFxDrift(layer, fx, intensity)
       break
+    case 'pulse':
+      drawFxPulse(layer, fx, intensity)
+      break
   }
 
   const prev = ctx.globalAlpha
   ctx.globalAlpha = prev * FX_MAX_ALPHA * (dim ? DIM_FACTOR : 1)
   ctx.drawImage(canvas, 0, 0)
   ctx.globalAlpha = prev
+}
+
+/**
+ * The colour a variant should draw in: the spec's own `color` when the page set
+ * one, otherwise the variant's natural hue.
+ *
+ * One resolver, called at each draw site, so "does this variant honour `color`?"
+ * is answered in exactly one place per variant rather than inferred from whether
+ * someone remembered to thread it through.
+ */
+function fxHue(fx: FxSpec, natural: Rgb): Rgb {
+  return fx.color ?? natural
+}
+
+/**
+ * One full brightening-and-dimming cycle of the `pulse` variant. Short enough to
+ * read as urgent, long enough not to strobe.
+ *
+ * Deliberately NOT a whole number of render ticks. At 1100 ms against the pages'
+ * 100 ms tick it would have been exactly eleven, so every tile would sample the
+ * same eleven phase values forever. A continuous pulse still looks smooth that way
+ * — unlike the storm strike, which could miss its narrow window entirely — but the
+ * lesson from that bug is cheap to apply here, and a sweeping phase means two
+ * cycles never render identically.
+ */
+const FX_PULSE_PERIOD_MS = 1150
+/** How far the pulse swings, as a share of the layer's full strength. It never
+ * reaches zero, so a pulsing tile is always visibly different from a still one
+ * even at the bottom of its cycle. */
+const FX_PULSE_FLOOR = 0.25
+
+/**
+ * The brightness of the `pulse` variant at one instant, 0 to 1. Exported so a test
+ * proves the cycle from the predicate rather than from rendered guesswork.
+ */
+export const FX_PULSE_PERIOD = FX_PULSE_PERIOD_MS
+
+export function fxPulseLevel(seed: number, nowMs: number): number {
+  const offset = pseudoRandom(seed * 149 + 5) * FX_PULSE_PERIOD_MS
+  const phase = ((nowMs + offset) % FX_PULSE_PERIOD_MS) / FX_PULSE_PERIOD_MS
+  // A raised cosine: smooth, with no corner at the turn.
+  const swing = 0.5 * (1 - Math.cos(phase * 2 * Math.PI))
+  return FX_PULSE_FLOOR + (1 - FX_PULSE_FLOOR) * swing
+}
+
+/**
+ * A whole-tile pulse. Task 46 built it for the one session state that means the
+ * USER is the bottleneck — Claude blocked awaiting permission — so it has to be
+ * impossible to miss from across the room.
+ *
+ * Nothing existing does this. `storm`'s flash is a lightning event with a bolt and
+ * a rain field; every other variant is particles that leave most of the key
+ * untouched.
+ */
+function drawFxPulse(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
+  const level = fxPulseLevel(fx.seed, fx.nowMs) * intensity
+  ctx.fillStyle = fxCss(fxHue(fx, theme.amber), level)
+  ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
 }
 
 const FX_RAIN_MAX_DROPS = 16
@@ -983,7 +1044,7 @@ function drawFxRain(
       (FX_RAIN_ALPHA_FLOOR +
         (1 - FX_RAIN_ALPHA_FLOOR) * intensity * (0.6 + 0.4 * pseudoRandom(s + 3))) *
       (1 - recede)
-    ctx.strokeStyle = fxCss(storm ? theme.cyan : theme.blue, alpha)
+    ctx.strokeStyle = fxCss(fxHue(fx, storm ? theme.cyan : theme.blue), alpha)
     ctx.beginPath()
     ctx.moveTo(x, drawnTail)
     ctx.lineTo(x + slant, head)
@@ -1029,7 +1090,7 @@ function drawFxSnow(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
         (fx.nowMs / FX_SNOW_SWAY_PERIOD_MS) * 2 * Math.PI + pseudoRandom(s + 3) * 2 * Math.PI,
       )
     const r = FX_SNOW_R * (0.7 + 0.6 * pseudoRandom(s + 4))
-    ctx.fillStyle = fxCss(theme.white, 0.5 + 0.5 * pseudoRandom(s + 5))
+    ctx.fillStyle = fxCss(fxHue(fx, theme.white), 0.5 + 0.5 * pseudoRandom(s + 5))
     ctx.beginPath()
     ctx.arc(baseX + sway, y, r, 0, Math.PI * 2)
     ctx.fill()
@@ -1169,7 +1230,12 @@ function drawFxStorm(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   const strike = fxStormStrike(fx.seed, fx.nowMs)
   const alpha = strike ? boltEnvelope(strike.progress) : 0
 
-  drawFxRain(ctx, fx, intensity, true, FX_BOLT_RAIN_RECEDE * alpha)
+  // `color` is stripped before the rain is drawn, so the WHOLE variant ignores it
+  // — a storm's palette is semantic (cyan rain, white lightning), and tinting half
+  // of it would be worse than tinting none. Suppressed here rather than trusted to
+  // callers not to set it.
+  const untinted: FxSpec = fx.color === undefined ? fx : { ...fx, color: undefined }
+  drawFxRain(ctx, untinted, intensity, true, FX_BOLT_RAIN_RECEDE * alpha)
 
   if (!strike || alpha <= 0) return
 
@@ -1227,10 +1293,11 @@ function drawFxFog(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
         // A raised cosine: 1 at the band's centre line, 0 at both edges.
         const falloff = 0.5 * (1 + Math.cos((dy / half) * Math.PI))
         if (falloff <= 0) continue
+        const hue = fxHue(fx, theme.gray)
         const grad = ctx.createLinearGradient(ox, 0, ox + FX_FOG_WIDTH, 0)
-        grad.addColorStop(0, fxCss(theme.gray, 0))
-        grad.addColorStop(0.5, fxCss(theme.gray, peak * falloff))
-        grad.addColorStop(1, fxCss(theme.gray, 0))
+        grad.addColorStop(0, fxCss(hue, 0))
+        grad.addColorStop(0.5, fxCss(hue, peak * falloff))
+        grad.addColorStop(1, fxCss(hue, 0))
         ctx.fillStyle = grad
         ctx.fillRect(ox, centreY + dy, FX_FOG_WIDTH, 1)
       }
@@ -1272,8 +1339,9 @@ function drawFxWind(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
     // Fades in from the trailing end, so each streak reads as moving right
     // even in a still frame.
     const grad = ctx.createLinearGradient(trail, y, lead, y)
-    grad.addColorStop(0, fxCss(theme.cyan, 0))
-    grad.addColorStop(1, fxCss(theme.cyan, 0.5 + 0.5 * pseudoRandom(s + 3)))
+    const hue = fxHue(fx, theme.cyan)
+    grad.addColorStop(0, fxCss(hue, 0))
+    grad.addColorStop(1, fxCss(hue, 0.5 + 0.5 * pseudoRandom(s + 3)))
     ctx.strokeStyle = grad
     ctx.beginPath()
     ctx.moveTo(trail, y)
@@ -1352,7 +1420,7 @@ function drawFxCloud(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
     // the neutral overcast tint, the blobs were very nearly invisible — a
     // grey layer over a grey wash. These are brighter so overcast reads as
     // moving cloud rather than as a still key.
-    ctx.fillStyle = fxCss(theme.white, intensity * (0.28 + 0.22 * pseudoRandom(s + 4)))
+    ctx.fillStyle = fxCss(fxHue(fx, theme.white), intensity * (0.28 + 0.22 * pseudoRandom(s + 4)))
     for (const ox of [x, x - span]) {
       ctx.beginPath()
       ctx.arc(ox, y, r, 0, Math.PI * 2)
@@ -1436,7 +1504,7 @@ export function fxDriftParticleSpan(
  */
 function drawFxDrift(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   const direction = fx.direction === 'down' ? 'down' : 'up'
-  const color = direction === 'up' ? theme.green : theme.red
+  const color = fxHue(fx, direction === 'up' ? theme.green : theme.red)
   const count = Math.max(3, Math.round(intensity * FX_DRIFT_MAX_PARTICLES))
   ctx.lineWidth = FX_DRIFT_WIDTH
   ctx.lineCap = 'round'

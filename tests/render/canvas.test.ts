@@ -19,6 +19,8 @@ import {
   tapeLoopWidthPx,
   dominantColor,
   fxDriftParticleSpan,
+  fxPulseLevel,
+  FX_PULSE_PERIOD,
   FX_MAX_ALPHA,
   FX_INTENSITY_MIN,
   FX_SNOW_R,
@@ -2067,7 +2069,7 @@ async function solidImage(r: number, g: number, b: number): Promise<Image> {
 describe('fx layer', () => {
   const BG: Rgb = [18, 28, 44]
   const ALL_VARIANTS: readonly FxVariant[] = [
-    'rain', 'snow', 'storm', 'fog', 'wind', 'sun', 'cloud', 'drift',
+    'rain', 'snow', 'storm', 'fog', 'wind', 'sun', 'cloud', 'drift', 'pulse',
   ]
 
   /**
@@ -2165,6 +2167,23 @@ describe('fx layer', () => {
     expect(at(0).equals(at(5))).toBe(false)
   })
 
+  /** Total ink MAGNITUDE, summed across every channel of every pixel.
+   *
+   * Not a pixel count: `pulse` covers the whole key at every brightness, so a
+   * count cannot tell a dim pulse from a bright one and the dim proof passed
+   * vacuously for it. Magnitude discriminates for every variant, particle-based or
+   * full-coverage. */
+  function inkWeight(buf: Buffer, bg: Rgb): number {
+    let total = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const p = probe(buf, x, y)
+        total += Math.abs(p[0]! - bg[0]) + Math.abs(p[1]! - bg[1]) + Math.abs(p[2]! - bg[2])
+      }
+    }
+    return total
+  }
+
   it.each(ALL_VARIANTS)('dims along with the rest of the key, for %s', (variant) => {
     const fx = { variant, nowMs: 4200, intensity: 1, seed: 3 } as const
     const bright = renderKey({ kind: 'gauge', bg: BG, fx })
@@ -2172,7 +2191,7 @@ describe('fx layer', () => {
     expect(dimmed.equals(bright)).toBe(false)
     // Dimming must REDUCE the layer, not merely change it — a stale key whose
     // effect stayed bright is the exact defect lesson 15 describes.
-    expect(inkCount(dimmed, BG)).toBeLessThan(inkCount(bright, BG))
+    expect(inkWeight(dimmed, BG)).toBeLessThan(inkWeight(bright, BG))
   })
 
   it('renders byte-identical output when fx is absent', () => {
@@ -2188,7 +2207,7 @@ describe('fx layer', () => {
   // rather than failing one test — the same split `C1/I4` already uses for the
   // `grid` idle variant.
   const IN_PROCESS_SAFE_VARIANTS: readonly FxVariant[] = [
-    'rain', 'storm', 'fog', 'wind', 'sun', 'drift',
+    'rain', 'storm', 'fog', 'wind', 'sun', 'drift', 'pulse',
   ]
 
   it.each(IN_PROCESS_SAFE_VARIANTS)('survives a non-finite fx without throwing, for %s', (variant) => {
@@ -3018,4 +3037,132 @@ describe('idle rain across a 3-wide block (task 44)', () => {
     expect(buf.length).toBe(KEY_SIZE * KEY_SIZE * 4)
   })
 })
+
+describe('FxSpec.color and the pulse variant (task 46)', () => {
+  const BG: Rgb = [12, 12, 16]
+  const MAGENTA: Rgb = [230, 40, 170]
+
+  /** Which variants honour `color`. `sun` and `storm` are excluded on purpose:
+   * their palettes are semantic, not decorative. */
+  const TINTABLE: readonly FxVariant[] = ['rain', 'snow', 'fog', 'wind', 'cloud', 'drift', 'pulse']
+
+  it.each(TINTABLE)('lets a page replace %s\'s own hue', (variant) => {
+    const natural = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 900, intensity: 1, seed: 2 },
+    })
+    const tinted = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 900, intensity: 1, seed: 2, color: MAGENTA },
+    })
+    expect(tinted.equals(natural)).toBe(false)
+    // And the tint really is the requested hue: red and blue lead, green trails.
+    let r = 0
+    let g = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const p = probe(tinted, x, y)
+        r += p[0]! - BG[0]
+        g += p[1]! - BG[1]
+      }
+    }
+    expect(r).toBeGreaterThan(g)
+  })
+
+  it.each(['sun', 'storm'] as const)('ignores color for %s, whose palette is semantic', (variant) => {
+    // The sun is amber because it IS the sun; lightning is white because it IS
+    // lightning. Tinting either would make the variant mean something else.
+    const natural = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 0, intensity: 1, seed: 2 },
+    })
+    const tinted = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant, nowMs: 0, intensity: 1, seed: 2, color: MAGENTA },
+    })
+    expect(tinted.equals(natural)).toBe(true)
+  })
+
+  it('brightens and dims the pulse over its cycle, never reaching zero', () => {
+    const levels = Array.from({ length: 240 }, (_, i) => fxPulseLevel(3, i * 10))
+    const min = Math.min(...levels)
+    const max = Math.max(...levels)
+    // A real swing...
+    expect(max - min).toBeGreaterThan(0.4)
+    // ...that never goes dark, so a pulsing tile always differs from a still one.
+    expect(min).toBeGreaterThan(0.1)
+    expect(max).toBeLessThanOrEqual(1)
+  })
+
+  it('keeps the pulse period off a whole number of render ticks', () => {
+    // Same lesson as the storm strike: a period that is an exact multiple of the
+    // render tick makes every tile sample one fixed set of phases forever. A
+    // continuous pulse survives that better than a narrow flash window does, but
+    // applying the lesson here costs nothing.
+    const PAGE_TICK_MS = 100
+    const ticks = FX_PULSE_PERIOD / PAGE_TICK_MS
+    expect(Math.abs(ticks - Math.round(ticks))).toBeGreaterThan(0.02)
+  })
+
+  it('renders smoothly at a page\'s real 100 ms tick, with no jump between frames', () => {
+    // The concern the old `pulseOn` test carried, brought forward: at a 10 fps
+    // render rate the attention signal must not strobe. Consecutive frames a tick
+    // apart may differ, but never by a jarring amount.
+    let worst = 0
+    for (let frame = 0; frame < 60; frame++) {
+      const a = fxPulseLevel(3, frame * 100)
+      const b = fxPulseLevel(3, (frame + 1) * 100)
+      worst = Math.max(worst, Math.abs(a - b))
+    }
+    // A full swing in one frame would be a strobe; a third of one is a pulse.
+    expect(worst).toBeLessThan(0.35)
+    expect(worst).toBeGreaterThan(0)
+  })
+
+  it('keeps the pulse deterministic for one clock, and moving between two', () => {
+    expect(fxPulseLevel(3, 1234)).toBe(fxPulseLevel(3, 1234))
+    expect(fxPulseLevel(3, 1234)).not.toBe(fxPulseLevel(3, 1734))
+  })
+
+  it('decorrelates two pulsing tiles, so a row does not strobe in unison', () => {
+    expect(fxPulseLevel(0, 500)).not.toBe(fxPulseLevel(4, 500))
+  })
+
+  it('covers the WHOLE tile, unlike the particle variants', () => {
+    // The point of the variant: it has to be impossible to miss, which particles
+    // covering a few percent of the key cannot be.
+    const buf = renderKey({
+      kind: 'gauge', bg: BG,
+      fx: { variant: 'pulse', nowMs: 0, intensity: 1, seed: 3, color: MAGENTA },
+    })
+    let touched = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        if (!near3(probe(buf, x, y), BG, 1)) touched++
+      }
+    }
+    expect(touched).toBeGreaterThan(KEY_SIZE * KEY_SIZE * 0.9)
+  })
+
+  it('keeps the pulse under the alpha cap at its brightest', () => {
+    // Found from the predicate, not guessed: the brightest instant in a cycle.
+    let brightestMs = 0
+    let best = 0
+    for (let ms = 0; ms < 1200; ms += 5) {
+      const level = fxPulseLevel(3, ms)
+      if (level > best) { best = level; brightestMs = ms }
+    }
+    const buf = renderKey({
+      kind: 'gauge', bg: BG,
+      fx: { variant: 'pulse', nowMs: brightestMs, intensity: 1, seed: 3, color: [255, 255, 255] },
+    })
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) {
+        const px = probe(buf, x, y)
+        for (let i = 0; i < 3; i++) expect(px[i]!).toBeLessThanOrEqual(FX_ABSOLUTE_CEILING_46)
+      }
+    }
+  })
+})
+
+/** The same absolute ceiling the fx block uses, restated here because that one is
+ * scoped inside its own describe. Derived from a measurement, never from
+ * `FX_MAX_ALPHA` — a ceiling computed from the constant it polices cannot fail. */
+const FX_ABSOLUTE_CEILING_46 = 110
 

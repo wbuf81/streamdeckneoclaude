@@ -7,9 +7,11 @@ import {
   ClaudePage, crabFrame, CRAB_STATE_PRIORITY, mostUrgentCrabState,
   formatResetIn, isWindowEnded, RESET_SIZES, EVIDENCE_SIZES,
 } from '../../src/pages/claude-page.js'
+import { keyHash } from '../../src/render/specs.js'
+import type { KeySpec } from '../../src/render/specs.js'
 import { theme } from '../../src/render/theme.js'
 import { loadCrabFrames } from '../../src/render/sprites.js'
-import { renderKey, renderStrip, probe, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
+import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import type { Session } from '../../src/sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../../src/sources/usage.js'
 
@@ -133,12 +135,59 @@ describe('ClaudePage layout', () => {
     expect(page.render(NOW).keys[0]!.border).toEqual(theme.blue)
   })
 
-  it('marks a permission key so it pulses', () => {
+  it('pulses the WHOLE permission tile, in the permission colour', () => {
+    // Task 46 replaced the old `pulseOn` border blink with a whole-tile pulse. The
+    // blink toggled the border on whole-second boundaries; this brightens the
+    // entire tile smoothly, which is strictly more visible for the one state that
+    // means the user is the bottleneck. Keeping both would have set a 1 Hz border
+    // blink against a 0.87 Hz tile pulse — two rhythms read as noise, not urgency.
     const { page } = build({ sessions: [session({ state: 'permission' })] })
-    const a = page.render(NOW).keys[0]!
-    const b = page.render(NOW + 1).keys[0]!
-    expect(a.border).toEqual(theme.amber)
-    expect(a.pulseOn).not.toBe(b.pulseOn)
+    const key = page.render(NOW, NOW * 1000).keys[0]!
+    expect(key.border).toEqual(theme.amber)
+    expect(key.fx?.variant).toBe('pulse')
+    // The motion carries the SAME hue the border does, so they cannot disagree.
+    expect(key.fx?.color).toEqual(theme.amber)
+    expect(key.pulseOn).toBeUndefined()
+  })
+
+  it('moves the permission pulse as the millisecond clock advances', () => {
+    const { page } = build({ sessions: [session({ state: 'permission' })] })
+    const a = page.render(NOW, NOW * 1000).keys[0]!
+    const b = page.render(NOW, NOW * 1000 + 300).keys[0]!
+    expect(b.fx!.nowMs).toBeGreaterThan(a.fx!.nowMs)
+  })
+
+  it('gives a tool session horizontal motion, on a different AXIS from thinking', () => {
+    // Two intensities of one motion are not tellable apart at a glance, so the two
+    // working states differ by axis: vertical drift against horizontal streaks.
+    const tool = build({ sessions: [session({ state: 'tool' })] })
+      .page.render(NOW, NOW * 1000).keys[0]!
+    const thinking = build({ sessions: [session({ state: 'thinking' })] })
+      .page.render(NOW, NOW * 1000).keys[0]!
+    expect(tool.fx?.variant).toBe('wind')
+    expect(thinking.fx?.variant).toBe('drift')
+    expect(tool.fx!.variant).not.toBe(thinking.fx!.variant)
+  })
+
+  it.each(['idle', 'done', 'unknown'] as const)('leaves a %s session perfectly still', (state) => {
+    // `unknown` included on purpose: an absent signal is not a state, so it must
+    // not be animated as though something were happening (lesson 18).
+    const { page } = build({ sessions: [session({ state })] })
+    expect(page.render(NOW, NOW * 1000).keys[0]!.fx).toBeUndefined()
+  })
+
+  it('gives four same-state sessions four different seeds, so they do not move in lockstep', () => {
+    const { page } = build({
+      sessions: [
+        session({ sessionId: 'a', state: 'thinking' }),
+        session({ sessionId: 'b', state: 'thinking' }),
+        session({ sessionId: 'c', state: 'thinking' }),
+      ],
+    })
+    const keys = page.render(NOW, NOW * 1000).keys.slice(0, 3)
+    const seeds = keys.map((k) => k.fx?.seed).filter((v) => v !== undefined)
+    expect(seeds.length).toBeGreaterThan(1)
+    expect(new Set(seeds).size).toBe(seeds.length)
   })
 
   it('does not pulse a non-permission key', () => {
@@ -622,9 +671,16 @@ describe('ClaudePage strip', () => {
     const longProject = 'p'.repeat(500)
     const longTool = 'x'.repeat(500)
     const { page } = build({ sessions: [session({ project: longProject, tool: longTool })] })
+    //
+    // Scoped to LINE 1's band (rows 0 to 15) by task 46. The ticker tape now owns
+    // line 2 and runs edge to edge ON PURPOSE — reaching the margin is what a tape
+    // does — so sweeping the full strip height would fail for the right reason and
+    // the wrong cause. The property this has always protected is that line 1 never
+    // overflows, and that is exactly what it still sweeps.
+    const LINE_1_BAND_END_Y = 16
     const strip = page.render(NOW).strip
     const buffer = renderStrip(strip)
-    for (let y = 0; y < STRIP_HEIGHT; y++) {
+    for (let y = 0; y < LINE_1_BAND_END_Y; y++) {
       for (let x = STRIP_WIDTH - STRIP_PAD; x < STRIP_WIDTH; x++) {
         expect(probe(buffer, x, y, STRIP_WIDTH)).toEqual(theme.bg)
       }
@@ -943,19 +999,21 @@ describe('ClaudePage renders the crab through the page, not just the helper', ()
     expect(first.imageKey).toBe(second.imageKey)
   })
 
-  it('does not disturb the once-per-second permission pulse at a 10 fps tick', () => {
-    // No crab frames loaded here on purpose: this test isolates the pulse,
-    // which must stay driven by whole seconds regardless of the millisecond
-    // clock or whether a crab is even present.
+  it('drives the permission pulse from the MILLISECOND clock, not whole seconds', () => {
+    // The inverse of what this test used to assert. The old `pulseOn` blink was
+    // deliberately quantised to whole seconds, so this once proved that a 10 fps
+    // tick did not disturb it. The pulse it replaced that with is continuous, so
+    // the property worth protecting flipped: sub-second renders MUST differ, or
+    // the pulse would step once a second and read as a blink again.
+    //
+    // No crab frames loaded here on purpose, so this isolates the pulse.
     const { page } = build({ sessions: [session({ state: 'permission' })] })
-    const a = page.render(NOW, 0).keys[0]!
-    const b = page.render(NOW, 40).keys[0]!
-    const c = page.render(NOW, 90).keys[0]!
-    // Same second (NOW), any millisecond within it: pulseOn must not change.
-    expect(a.pulseOn).toBe(b.pulseOn)
-    expect(b.pulseOn).toBe(c.pulseOn)
-    const d = page.render(NOW + 1, (NOW + 1) * 1000).keys[0]!
-    expect(d.pulseOn).not.toBe(a.pulseOn)
+    const a = page.render(NOW, NOW * 1000).keys[0]!
+    const b = page.render(NOW, NOW * 1000 + 400).keys[0]!
+    expect(b.fx!.nowMs).not.toBe(a.fx!.nowMs)
+    // And the same instant renders identically, so a frame is reproducible.
+    const c = page.render(NOW, NOW * 1000).keys[0]!
+    expect(keyHash(c)).toBe(keyHash(a))
   })
 
   it('picks the most urgent state across sessions for key 3\'s animation', async () => {
@@ -971,5 +1029,60 @@ describe('ClaudePage renders the crab through the page, not just the helper', ()
     })
     const key = page.render(NOW, 0).keys[3]!
     expect(key.imageKey).toBe('crab:permission:0')
+  })
+})
+
+describe('ClaudePage session tile legibility with motion (task 46)', () => {
+  const lum = (p: readonly number[]) => p[0]! + p[1]! + p[2]!
+
+  /**
+   * The brightest pixel of the MOTION LAYER alone — no text, and no border.
+   *
+   * Stripping the border matters: `stateColor` is a vivid hue drawn at full
+   * strength down the key's edge, so a first version of this proof compared the
+   * text against the BORDER rather than the layer and failed at 705 against 714.
+   * The border is content, not background.
+   */
+  function peakLayer(key: KeySpec): number {
+    const buf = renderKey({ ...key, lines: undefined, lineSizes: undefined, border: undefined })
+    let peak = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) peak = Math.max(peak, lum(probe(buf, x, y)))
+    }
+    return peak
+  }
+
+  it.each(['thinking', 'tool', 'permission'] as const)('keeps the text far brighter than the %s motion', (state) => {
+    // Measured on 2026-08-19: the layers peak at 160 (thinking), 147 (tool) and 142
+    // (permission), against a text peak of 705 — a margin of about 4.4x. The
+    // threshold sits well inside that, so it has room for anti-aliasing while still
+    // failing if the cap were meaningfully raised.
+    const { page } = build({ sessions: [session({ state, project: 'deckd', tool: 'Edit' })] })
+    const key = page.render(NOW, NOW * 1000).keys[0]!
+    expect(key.fx).toBeDefined()
+
+    const buf = renderKey(key)
+    let peakText = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 0; x < KEY_SIZE; x++) peakText = Math.max(peakText, lum(probe(buf, x, y)))
+    }
+    expect(peakText, `${state}: text must win`).toBeGreaterThan(peakLayer(key) * 2.5)
+  })
+
+  it('keeps the permission pulse itself under an absolute brightness bound', () => {
+    // Swept across the whole cycle rather than sampled at a guessed instant, since
+    // the pulse covers the entire tile and its peak is the hardest moment.
+    //
+    // The bound is a MEASUREMENT (142 at the brightest frame), not a value derived
+    // from `FX_MAX_ALPHA` — a ceiling computed from the constant it polices cannot
+    // fail, which is a trap this suite has already fallen into once.
+    const PERMISSION_LAYER_CEILING = 200
+    const { page } = build({ sessions: [session({ state: 'permission' })] })
+    let peak = 0
+    for (let ms = 0; ms < 1300; ms += 25) {
+      peak = Math.max(peak, peakLayer(page.render(NOW, ms).keys[0]!))
+    }
+    expect(peak).toBeGreaterThan(0)
+    expect(peak).toBeLessThan(PERMISSION_LAYER_CEILING)
   })
 })

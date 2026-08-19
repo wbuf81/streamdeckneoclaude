@@ -61,7 +61,8 @@ export interface IdleSpec {
  * so the forecast reads across the room before the digits do. A later
  * standalone animation page reuses the same layer.
  */
-export type FxVariant = 'rain' | 'snow' | 'storm' | 'fog' | 'wind' | 'sun' | 'cloud' | 'drift'
+export type FxVariant =
+  | 'rain' | 'snow' | 'storm' | 'fog' | 'wind' | 'sun' | 'cloud' | 'drift' | 'pulse'
 
 export interface FxSpec {
   variant: FxVariant
@@ -91,6 +92,18 @@ export interface FxSpec {
    * one of the two, the same way it already coerces `IdleSpec.col` and `row`.
    */
   direction?: 'up' | 'down'
+  /**
+   * Replaces the variant's own base hue, so motion can carry a page's meaning —
+   * a session's `stateColor`, a team's crest colour, a budget's `barColor`.
+   *
+   * Deliberately absent until task 46. With one consumer it would have been
+   * speculative; with three it pays for itself.
+   *
+   * `sun` and `storm` IGNORE it. Their palettes are semantic rather than
+   * decorative: the sun is amber because it is the sun, and lightning is white
+   * because it is lightning. Every other variant honours it.
+   */
+  color?: Rgb
 }
 
 export interface SparkSpec {

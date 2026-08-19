@@ -426,6 +426,33 @@ survived a green suite and a preview the user approved, and all four were found
 by simulating the user's actual week. **Preview the real data distribution, not
 one of everything.**
 
+### New invariants added by task 46 (Claude and Codex liveness)
+
+- `FxSpec.color` replaces a variant's base hue. `sun` and `storm` IGNORE it —
+  their palettes are semantic, and storm strips it before drawing its own rain so
+  the whole variant is consistent rather than half-tinted.
+- The two working session states differ by AXIS (vertical drift against
+  horizontal streaks), not by intensity. Two speeds of one motion are not
+  tellable apart at a glance, which is the entire point of the feature.
+- `permission` pulses the WHOLE tile and REPLACED the old `pulseOn` border blink.
+  Do not restore the blink: a 1 Hz border toggle against a 0.87 Hz tile pulse is
+  two rhythms, which reads as noise rather than urgency.
+- `idle`, `done` and `unknown` are perfectly still. `unknown` especially: an
+  absent signal is not a state.
+- A cap wash takes its hue from `barColor`, the same function the bar above it
+  uses. An unknown or stale figure gets NO wash.
+- `FX_PULSE_PERIOD_MS` is deliberately not a whole number of render ticks, for
+  the reason the storm strike taught.
+- **ClaudePage keeps its FIXED `tickMs`.** Task 46's own design claimed it should
+  become a getter; that was wrong, and the correction is recorded in the code. The
+  crab is a permanent mascot, so something on that page always moves. CodexPage
+  has no such animation, so it does get a conditional getter.
+- The session-tile legibility proof strips the BORDER as well as the text before
+  measuring the layer. `stateColor` is vivid and drawn at full strength, so a
+  proof that leaves it in compares the text against the border.
+
+---
+
 ### New invariants added by task 45 (football glance value)
 
 - `blend` lives in `render/theme.ts` and is shared by every page that tints a key

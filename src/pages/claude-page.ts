@@ -1,7 +1,7 @@
 import type { Image } from '@napi-rs/canvas'
-import type { DeckFrame, KeySpec, StripSpec, Rgb } from '../render/specs.js'
+import type { DeckFrame, FxSpec, FxVariant, KeySpec, StripSpec, Rgb, TapeSegment } from '../render/specs.js'
 import { blankKey } from '../render/specs.js'
-import { theme, stateColor, stateLabel, barColor } from '../render/theme.js'
+import { theme, stateColor, stateLabel, barColor, blend } from '../render/theme.js'
 import type { SessionStateName } from '../render/theme.js'
 import { truncate, formatDuration } from '../render/text.js'
 import { getSpriteFrame, getSpriteFrameIndex } from '../render/sprites.js'
@@ -10,6 +10,7 @@ import type { Session } from '../sources/claude.js'
 import type { UsageSnapshot, SessionMeta } from '../sources/usage.js'
 import { computePace, elapsedPercent } from '../sources/usage.js'
 import { KeyAssigner, SESSION_SLOTS } from './key-assigner.js'
+import { tapeOffsetPx } from '../render/canvas.js'
 
 export const PROJECT_CHARS = 10
 const FIVE_HOURS = 5 * 3600
@@ -156,6 +157,89 @@ export type FocusFn = (
   project: string,
 ) => Promise<boolean>
 
+/**
+ * How a session's state moves (task 46).
+ *
+ * The two working states differ by AXIS, not by speed: vertical drift against
+ * horizontal streaks. Two intensities of the same motion are not tellable apart at
+ * a glance, which is the whole point of the feature.
+ *
+ * `permission` pulses the WHOLE tile, because it is the one state that means the
+ * user is the bottleneck. `idle` and `done` are genuinely static, and `unknown`
+ * stays still because an absent signal is not a state (lesson 18).
+ */
+const STATE_FX: Partial<Record<SessionStateName, { variant: FxVariant; intensity: number }>> = {
+  thinking: { variant: 'drift', intensity: 0.55 },
+  tool: { variant: 'wind', intensity: 0.7 },
+  permission: { variant: 'pulse', intensity: 1 },
+}
+
+/** How strongly a cap tile's background carries its own percentage. Kept low for
+ * the reason every wash on this deck is: the tile's own big number has to stay
+ * crisp on top of it. */
+const CAP_WASH_MAX_BLEND = 0.28
+
+/** How many sessions the strip's tape lists. Bounded so the loop stays watchable. */
+const TAPE_SESSION_COUNT = 4
+/** Matches the other pages' tapes, tuned against a rendered preview. */
+const TAPE_PX_PER_SEC = 60
+
+/**
+ * The ambient motion for one session tile, or undefined when the session is not
+ * doing anything.
+ *
+ * The colour is `stateColor(state)` — the SAME hue the tile's border already
+ * carries, so the motion and the border can never disagree about what state this
+ * is.
+ */
+export function sessionFx(
+  state: SessionStateName, nowMs: number, seed: number,
+): FxSpec | undefined {
+  const spec = STATE_FX[state]
+  if (!spec) return undefined
+  return {
+    variant: spec.variant,
+    nowMs,
+    intensity: spec.intensity,
+    seed,
+    color: stateColor(state),
+    direction: 'up',
+  }
+}
+
+/**
+ * A cap tile's background wash, or undefined when there is nothing to show.
+ *
+ * The hue comes from `barColor` — the SAME function the tile's own bar uses — so
+ * the bar and the wash can never disagree about whether 87 percent is amber or
+ * red. The strength scales with the percentage, so a nearly-full budget is both
+ * redder and stronger.
+ */
+export function capWash(pct: number | null, stale: boolean): Rgb | undefined {
+  if (pct === null || !Number.isFinite(pct)) return undefined
+  // A stale sample keeps its own STALE treatment and no wash: a coloured budget
+  // that might be fifteen minutes old is worse than a plain one.
+  if (stale) return undefined
+  const fraction = Math.max(0, Math.min(1, pct / 100))
+  return blend(theme.bg, barColor(fraction), fraction * CAP_WASH_MAX_BLEND)
+}
+
+/**
+ * One tape segment per live session: its project, what it is doing, and how long
+ * it has been going, coloured by its own state.
+ *
+ * Bounded by `TAPE_SESSION_COUNT` so the loop stays watchable. Pure and exported
+ * so a test can prove the content without rasterising anything.
+ */
+export function tapeSegments(live: Session[], now: number): TapeSegment[] {
+  return live.slice(0, TAPE_SESSION_COUNT).map((s) => {
+    const elapsed = s.startedAt ? formatDuration(now - s.startedAt) : ''
+    const what = s.tool || s.label || stateLabel(s.state)
+    const parts = [s.project, what, elapsed].filter(Boolean)
+    return { text: parts.join(' · '), color: stateColor(s.state) }
+  })
+}
+
 export class ClaudePage implements Page {
   readonly name = 'claude'
   /**
@@ -163,6 +247,13 @@ export class ClaudePage implements Page {
    * (about 14 fps); a 100 ms tick samples it closely enough to read as
    * motion rather than a slideshow, without asking the daemon for a rate it
    * cannot use.
+   *
+   * Stays FIXED, unlike the conditional getters on Spotify, stocks, weather and
+   * football. Task 46's design claimed this was "wrong in both directions" and
+   * should become a getter; that was wrong. The crab is a permanent mascot on key
+   * 3 — it animates whether or not any session is running — so something on this
+   * page always moves, and the rate has no condition to follow. The rule is still
+   * "the rate follows what actually moves"; here the answer is simply always.
    */
   readonly tickMs = 100
 
@@ -197,12 +288,14 @@ export class ClaudePage implements Page {
     for (let i = 0; i < SESSION_SLOTS; i++) {
       const id = slots[i]
       const session = id ? byId.get(id) : undefined
-      keys.push(session ? this.sessionKey(session, now) : blankKey())
+      // `i` seeds the motion, so four sessions in the same state do not move in
+      // lockstep and read as one block.
+      keys.push(session ? this.sessionKey(session, now, nowMs, i) : blankKey())
     }
 
     keys.push(this.crabKey(live, nowMs))
 
-    const gauges = this.gaugeKeys(now)
+    const gauges = this.gaugeKeys(now, nowMs)
     for (const gauge of gauges) keys.push(gauge)
 
     // M3 — the key 0 session, by stable identity, rather than `live[0]`
@@ -216,12 +309,12 @@ export class ClaudePage implements Page {
 
     return {
       keys,
-      strip: this.strip(live, key0Session, overflow, now),
+      strip: this.strip(live, key0Session, overflow, now, nowMs),
       buttons: [theme.gray, theme.gray],
     }
   }
 
-  private sessionKey(s: Session, now: number): KeySpec {
+  private sessionKey(s: Session, now: number, nowMs: number, seed: number): KeySpec {
     const lines = [stateLabel(s.state), truncate(s.project, PROJECT_CHARS)]
     // I1 — this array used to be handed to `KeySpec` with NO `lineSizes` at
     // all, which sends every line through `resolveLineSpecs`'s legacy
@@ -244,8 +337,16 @@ export class ClaudePage implements Page {
       border: stateColor(s.state),
     }
 
-    // A pending permission pulses once per second, so the eye finds it.
-    if (s.state === 'permission') key.pulseOn = now % 2 === 0
+    // The state's own ambient motion, in the state's own colour (task 46).
+    //
+    // This REPLACES the old `pulseOn = now % 2 === 0` border blink for a pending
+    // permission. That blink toggled the border on whole-second boundaries; the
+    // pulse brightens the entire tile smoothly, which is strictly more visible for
+    // the one state that means the user is the bottleneck. Keeping both would have
+    // put a 1 Hz border blink against a 0.9 Hz tile pulse — two rhythms at once
+    // read as noise rather than as urgency.
+    const fx = sessionFx(s.state, nowMs, seed)
+    if (fx) key.fx = fx
 
     // No crab here, on purpose: task 22 drew the crab full-key, underneath
     // all three text lines, and measured 41% ink coverage in the text band
@@ -271,7 +372,7 @@ export class ClaudePage implements Page {
     return key
   }
 
-  private gaugeKeys(now: number): KeySpec[] {
+  private gaugeKeys(now: number, nowMs: number): KeySpec[] {
     const u = this.usage.getUsage()
     const stale = this.usage.isStale()
 
@@ -298,7 +399,7 @@ export class ClaudePage implements Page {
     return [
       this.capKey('5-HR CAP', five, stale, fiveEnded),
       this.capKey('WEEK CAP', seven, stale, sevenEnded),
-      this.burnRateKey(five, u.fiveHourResetsAt, now, stale, fiveEnded),
+      this.burnRateKey(five, u.fiveHourResetsAt, now, nowMs, stale, fiveEnded),
       this.resetKey(u.fiveHourResetsAt, now, stale, fiveEnded),
     ]
   }
@@ -337,13 +438,20 @@ export class ClaudePage implements Page {
       }
     }
 
-    return {
+    const key: KeySpec = {
       kind: 'gauge',
       lines: [label, value],
       lineSizes: [11, 28],
       align: 'center',
       bar: { value: pct / 100, color: barColor(pct / 100) },
     }
+    // The budget you can feel. Same `barColor` the bar above uses, so the two can
+    // never disagree about whether 87 percent is amber or red. Only reached on the
+    // fresh, known branch — the `--` and STALE branches above return before here,
+    // so an unknowable or lagging figure never gets a colour.
+    const wash = capWash(pct, false)
+    if (wash) key.bg = wash
+    return key
   }
 
   /**
@@ -357,6 +465,7 @@ export class ClaudePage implements Page {
     usedPct: number | null,
     resetsAt: number,
     now: number,
+    nowMs: number,
     stale: boolean,
     windowEnded: boolean,
   ): KeySpec {
@@ -398,13 +507,29 @@ export class ClaudePage implements Page {
       lineSizes.push(EVIDENCE_SIZES)
     }
 
-    return {
+    const key: KeySpec = {
       kind: 'gauge',
       lines,
       lineSizes,
       lineColors: [undefined, wordColor],
       align: 'center',
     }
+    // A FAST pace drifts upward, in the verdict's own colour: the direction
+    // carries the RATE and the colour carries the valence. `slow` and `even` stay
+    // still, because a budget you are inside of is not something to draw attention
+    // to. Only reached on the fresh, known branch — the `--` and STALE branches
+    // above return before here.
+    if (pace === 'fast') {
+      key.fx = {
+        variant: 'drift',
+        nowMs,
+        intensity: 0.6,
+        seed: 5,
+        color: wordColor,
+        direction: 'up',
+      }
+    }
+    return key
   }
 
   /** Key 7: the countdown to the five-hour reset, with a third line naming
@@ -427,7 +552,13 @@ export class ClaudePage implements Page {
     return spec
   }
 
-  private strip(live: Session[], key0: Session | null, overflow: number, now: number): StripSpec {
+  private strip(
+    live: Session[],
+    key0: Session | null,
+    overflow: number,
+    now: number,
+    nowMs: number,
+  ): StripSpec {
     if (!this.sessions.directoryExists()) {
       return { lines: ['claude', 'no session data'], dim: true }
     }
@@ -459,7 +590,17 @@ export class ClaudePage implements Page {
     // a pixel measurement — lesson 17). I6's own fix here is the geometry
     // TEST below, proven against a genuinely oversized (500-character)
     // input rather than this page's normal output.
-    return { lines: [parts.join(' · '), second] }
+    const spec: StripSpec = { lines: [parts.join(' · '), second] }
+
+    // Every live session's own description, crawling across line 2's band, so a
+    // long project and tool pair gets read in full instead of being truncated onto
+    // a 96 px key. Line 1 still names whatever key 0 shows, so the most important
+    // single fact needs no waiting.
+    const segments = tapeSegments(live, now)
+    if (segments.length > 0) {
+      spec.tape = { segments, offsetPx: tapeOffsetPx(nowMs, TAPE_PX_PER_SEC) }
+    }
+    return spec
   }
 
   /**

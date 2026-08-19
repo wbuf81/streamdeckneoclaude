@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { createCanvas } from '@napi-rs/canvas'
-import { CodexPage, formatTokenCount, formatResetIn, limitLabel } from '../../src/pages/codex-page.js'
+import { CodexPage, formatTokenCount, formatResetIn, limitLabel, taskFx, capWash, tapeSegments } from '../../src/pages/codex-page.js'
 import type { CodexSnapshot, CodexTask } from '../../src/sources/codex.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
@@ -675,5 +675,129 @@ describe('Codex page formatting', () => {
     expect(formatResetIn(NOW - 1, NOW)).toBe('ELAPSED')
     expect(formatResetIn(NOW, NOW)).toBe('ELAPSED')
     expect(formatResetIn(null, NOW)).toBe('--')
+  })
+})
+
+describe('CodexPage liveness (task 46)', () => {
+  const NOW_MS = NOW * 1000
+
+  it('drifts a task that moved recently, and leaves an older one still', () => {
+    // Codex tasks carry no state field — only `updatedAt` — so recency is the only
+    // honest signal available. "This one just moved" is real; an invented
+    // thinking/idle distinction would not be.
+    expect(taskFx(NOW - 30, NOW, NOW_MS, 0)).toBeDefined()
+    expect(taskFx(NOW - 30, NOW, NOW_MS, 0)!.variant).toBe('drift')
+    expect(taskFx(NOW - 600, NOW, NOW_MS, 0)).toBeUndefined()
+  })
+
+  it('survives a hostile clock rather than drifting on nonsense', () => {
+    expect(taskFx(Number.NaN, NOW, NOW_MS, 0)).toBeUndefined()
+    expect(taskFx(NOW, Number.NaN, NOW_MS, 0)).toBeUndefined()
+  })
+
+  it('reaches a recently-moved task tile on the real frame', () => {
+    const page = build(snapshot({ tasks: [task({ updatedAt: NOW - 10 })] }))
+    const key = page.render(NOW, NOW_MS).keys[0]!
+    expect(key.fx?.variant).toBe('drift')
+    expect(key.fx?.color).toEqual(theme.green)
+  })
+
+  it('gives several recent tasks different seeds, so they do not move in lockstep', () => {
+    const page = build(snapshot({
+      tasks: [
+        task({ threadId: 'a', updatedAt: NOW - 5 }),
+        task({ threadId: 'b', updatedAt: NOW - 6 }),
+      ],
+    }))
+    const keys = page.render(NOW, NOW_MS).keys
+    expect(keys[0]!.fx!.seed).not.toBe(keys[1]!.fx!.seed)
+  })
+
+  it('does not drift while the read is stale, so motion never implies a liveness we lack', () => {
+    const page = build(snapshot({ tasks: [task({ updatedAt: NOW - 10 })] }), true, true)
+    expect(page.render(NOW, NOW_MS).keys[0]!.fx).toBeUndefined()
+  })
+
+  it('washes the usage cap tile with barColor\'s own hue, scaled by the percentage', () => {
+    // Same function the bar above it uses, so the two cannot disagree about
+    // whether 87 percent is amber or red.
+    const low = capWash(20, false)!
+    const high = capWash(95, false)!
+    expect(low).toBeDefined()
+    // Low reads green-dominant, high reads red-dominant.
+    expect(low[1]).toBeGreaterThan(low[0])
+    expect(high[0]).toBeGreaterThan(high[1])
+    // And a fuller budget is stronger, not just a different hue.
+    const dist = (c: readonly number[]) =>
+      Math.abs(c[0]! - theme.bg[0]) + Math.abs(c[1]! - theme.bg[1]) + Math.abs(c[2]! - theme.bg[2])
+    expect(dist(high)).toBeGreaterThan(dist(low))
+  })
+
+  it('draws no cap wash for an unknown or stale percentage', () => {
+    expect(capWash(null, false)).toBeUndefined()
+    expect(capWash(Number.NaN, false)).toBeUndefined()
+    expect(capWash(80, true)).toBeUndefined()
+  })
+
+  it('tapes every task\'s FULL title, which the tile can only truncate', () => {
+    const longTitle = 'refactor the whole rendering pipeline and its tests end to end'
+    const segs = tapeSegments([task({ title: longTitle })])
+    expect(segs).toHaveLength(1)
+    expect(segs[0]!.text).toContain(longTitle)
+  })
+
+  it('caps the tape so the loop stays watchable', () => {
+    const many = Array.from({ length: 9 }, (_, i) => task({ threadId: `t${i}` }))
+    expect(tapeSegments(many).length).toBeLessThanOrEqual(4)
+  })
+
+  it('puts the tape on the strip beside the right-aligned timestamp, not over it', () => {
+    const page = build(snapshot({ tasks: [task()] }))
+    const strip = page.render(NOW, NOW_MS).strip
+    expect(strip.tape).toBeDefined()
+    // The timestamp is still there: the tape's clip excludes its gutter.
+    expect(strip.right).toBeTruthy()
+  })
+
+  it('shows no tape when there are no tasks', () => {
+    const page = build(snapshot({ tasks: [] }))
+    expect(page.render(NOW, NOW_MS).strip.tape).toBeUndefined()
+  })
+
+  it('advances the tape with the injected clock', () => {
+    const page = build(snapshot({ tasks: [task()] }))
+    const a = page.render(NOW, NOW_MS).strip.tape!.offsetPx
+    const b = page.render(NOW, NOW_MS + 400).strip.tape!.offsetPx
+    expect(b).toBeGreaterThan(a)
+  })
+})
+
+describe('CodexPage tickMs: fast only while something moves (task 46)', () => {
+  const NOW_MS = NOW * 1000
+
+  it('raises the rate while tasks are listed', () => {
+    const page = build(snapshot({ tasks: [task()] }))
+    page.render(NOW, NOW_MS)
+    expect(page.tickMs).toBeDefined()
+    expect(page.tickMs!).toBeLessThan(1000)
+  })
+
+  it('keeps the default rate with no tasks, so an idle page costs nothing', () => {
+    // Unlike the Claude page, this one has no permanent crab, so an idle Codex page
+    // is genuinely static.
+    const page = build(snapshot({ tasks: [] }))
+    page.render(NOW, NOW_MS)
+    expect(page.tickMs).toBeUndefined()
+  })
+
+  it('keeps the default rate when the source is unavailable', () => {
+    const page = build(snapshot({ tasks: [task()] }), false)
+    page.render(NOW, NOW_MS)
+    expect(page.tickMs).toBeUndefined()
+  })
+
+  it('keeps the default rate before the first render, rather than guessing', () => {
+    const page = build(snapshot({ tasks: [task()] }))
+    expect(page.tickMs).toBeUndefined()
   })
 })

@@ -1,7 +1,8 @@
-import type { DeckFrame, KeySpec, StripSpec } from '../render/specs.js'
-import { barColor, theme } from '../render/theme.js'
+import type { DeckFrame, FxSpec, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
+import { barColor, theme, blend } from '../render/theme.js'
+import { tapeOffsetPx } from '../render/canvas.js'
 import { formatDuration, formatEasternTime, truncate } from '../render/text.js'
-import type { CodexLimit, CodexSnapshot, CodexUsage } from '../sources/codex.js'
+import type { CodexLimit, CodexSnapshot, CodexTask, CodexUsage } from '../sources/codex.js'
 import type { Page, PressOutcome } from './types.js'
 
 const TASK_SLOTS = 3
@@ -162,6 +163,76 @@ export function formatResetIn(resetsAt: number | null, now: number): string {
   return remaining <= 0 ? 'ELAPSED' : formatDuration(remaining)
 }
 
+/**
+ * How recently a task must have moved to drift (task 46).
+ *
+ * Codex tasks carry no state field — only `updatedAt` — so unlike a Claude session
+ * there is no `thinking` or `tool` to read. What IS knowable is recency, and "this
+ * one just moved" is a real signal rather than an invented one. A task that has not
+ * moved inside this window stays perfectly still.
+ */
+const ACTIVE_MOTION_SECONDS = 120
+
+/** How strongly the usage-cap tile's background carries its own percentage. Kept
+ * low so the tile's big number stays crisp on top of it. */
+const CAP_WASH_MAX_BLEND = 0.28
+
+/** How often to render while anything on this page is moving. */
+const LIVE_TICK_MS = 100
+
+/** How many task titles the strip's tape lists, and how fast it crawls. Matches the
+ * other pages' tapes, tuned against a rendered preview. */
+const TAPE_TASK_COUNT = 4
+const TAPE_PX_PER_SEC = 60
+
+/**
+ * The gentle motion for a task that moved recently, or undefined for one that did
+ * not. Green, matching the border every task tile already carries.
+ */
+export function taskFx(
+  updatedAt: number, now: number, nowMs: number, seed: number,
+): FxSpec | undefined {
+  if (!Number.isFinite(updatedAt) || !Number.isFinite(now)) return undefined
+  if (now - updatedAt > ACTIVE_MOTION_SECONDS) return undefined
+  return {
+    variant: 'drift',
+    nowMs,
+    intensity: 0.5,
+    seed,
+    color: theme.green,
+    direction: 'up',
+  }
+}
+
+/**
+ * The usage-cap tile's background wash, or undefined when there is nothing to show.
+ *
+ * The hue comes from `barColor`, the SAME function the tile's own bar uses, so the
+ * bar and the wash can never disagree about whether 87 percent is amber or red.
+ */
+export function capWash(usedPct: number | null, stale: boolean): Rgb | undefined {
+  if (usedPct === null || !Number.isFinite(usedPct)) return undefined
+  // A stale sample keeps its own STALE treatment and no wash: a coloured budget
+  // that might be well out of date is worse than a plain one.
+  if (stale) return undefined
+  const fraction = Math.max(0, Math.min(1, usedPct / 100))
+  return blend(theme.bg, barColor(fraction), fraction * CAP_WASH_MAX_BLEND)
+}
+
+/**
+ * One tape segment per task: its project and its FULL title.
+ *
+ * Titles arrive up to 64 characters and are truncated hard onto a 96 px key, so the
+ * tape is where a long one actually gets read. Bounded by `TAPE_TASK_COUNT` so the
+ * loop stays watchable.
+ */
+export function tapeSegments(tasks: readonly CodexTask[]): TapeSegment[] {
+  return tasks.slice(0, TAPE_TASK_COUNT).map((t) => ({
+    text: [t.project, t.title].filter(Boolean).join(' · '),
+    color: theme.green,
+  }))
+}
+
 export class CodexPage implements Page {
   readonly name = 'codex'
 
@@ -175,7 +246,34 @@ export class CodexPage implements Page {
     this.source.setVisible(false)
   }
 
-  render(now: number): DeckFrame {
+  /**
+   * A fast tick only while something on this page moves: a recently-moved task
+   * drifting, or the title tape scrolling.
+   *
+   * Unlike the Claude page, this one has no permanent animation — no crab — so an
+   * idle Codex page is genuinely static and should cost nothing. Reads the same
+   * data `render` reads, so the declared rate cannot disagree with the frame.
+   *
+   * `null` before the first render: the answer depends on a clock nobody has
+   * supplied yet, and the daemon re-reads this every tick and re-arms when it
+   * changes, so the real rate arrives one tick later at worst.
+   */
+  get tickMs(): number | undefined {
+    if (this.lastRenderMs === null) return undefined
+    if (!this.source.isAvailable()) return undefined
+    const snapshot = this.source.getSnapshot()
+    if (snapshot.tasks.length === 0) return undefined
+    // The tape alone justifies the rate whenever any task is listed; the drift is
+    // a bonus on top of it.
+    return LIVE_TICK_MS
+  }
+
+  /** The clock the most recent `render` was given, so `tickMs` answers without
+   * reading the wall clock — which a page may never do. */
+  private lastRenderMs: number | null = null
+
+  render(now: number, nowMs: number = now * 1000): DeckFrame {
+    this.lastRenderMs = nowMs
     const snapshot = this.source.getSnapshot()
     const available = this.source.isAvailable()
     const readStale = this.source.isStale()
@@ -253,7 +351,11 @@ export class CodexPage implements Page {
 
     for (let i = 0; i < TASK_SLOTS; i++) {
       const task = snapshot.tasks[i]
-      keys.push(task ? {
+      if (!task) {
+        keys.push({ kind: 'blank' })
+        continue
+      }
+      const key: KeySpec = {
         kind: 'session',
         lines: staleLine
           ? [taskWord, task.project, task.title, task.model, staleLine]
@@ -261,7 +363,18 @@ export class CodexPage implements Page {
         lineSizes: [11, PROJECT_SIZES, TITLE_SIZES, MODEL_SIZES, STALE_AGE_SIZES],
         border: theme.green,
         dim: taskDim,
-      } : { kind: 'blank' })
+      }
+      // A task that moved in the last couple of minutes drifts; the rest stay
+      // still. `i` seeds it, so several recent tasks do not move in lockstep.
+      //
+      // Suppressed entirely when the read is stale or degraded: motion on data we
+      // are already labelling PARTIAL or STALE would claim a liveness we cannot
+      // support.
+      if (!taskDim && !staleLine) {
+        const fx = taskFx(task.updatedAt, now, nowMs, i)
+        if (fx) key.fx = fx
+      }
+      keys.push(key)
     }
 
     keys.push({
@@ -298,7 +411,7 @@ export class CodexPage implements Page {
 
     return {
       keys,
-      strip: this.strip(snapshot, usageUnknown, now),
+      strip: this.strip(snapshot, usageUnknown, now, nowMs),
       buttons: [theme.gray, theme.gray],
     }
   }
@@ -344,11 +457,16 @@ export class CodexPage implements Page {
         lineSizes: [LABEL_SIZES, PERCENT_SIZES, 11], align: 'center', dim: true,
       }
     }
-    return {
+    const key: KeySpec = {
       kind: 'gauge', lines: [label, value],
       lineSizes: [LABEL_SIZES, PERCENT_SIZES], align: 'center',
       bar: { value: limit.usedPct / 100, color: barColor(limit.usedPct / 100) },
     }
+    // The budget you can feel, sharing `barColor` with the bar right above it. Only
+    // reached on the fresh, known branch — the `--` and STALE branches return first.
+    const wash = capWash(limit.usedPct, false)
+    if (wash) key.bg = wash
+    return key
   }
 
   private planKey(plan: string, unknown: boolean, readStale: boolean): KeySpec {
@@ -416,7 +534,12 @@ export class CodexPage implements Page {
     }
   }
 
-  private strip(snapshot: CodexSnapshot, usageUnknown: boolean, now: number): StripSpec {
+  private strip(
+    snapshot: CodexSnapshot,
+    usageUnknown: boolean,
+    now: number,
+    nowMs: number,
+  ): StripSpec {
     if (!this.source.isAvailable()) return { lines: ['codex', 'task data unavailable'], dim: true }
     // The usage sample's own time, right-aligned on line 2 — the same slot
     // and helper the Spotify page's idle clock uses. It goes on the strip,
@@ -431,13 +554,24 @@ export class CodexPage implements Page {
     if (snapshot.tasks.length === 0) return { lines: ['codex', 'no active tasks'], right: usageTime, dim: true }
     const first = snapshot.tasks[0]!
     const overflow = Math.max(0, snapshot.tasks.length - TASK_SLOTS)
-    return {
+    const spec: StripSpec = {
       lines: [
         truncate(`${first.project} · ${first.title}`, STRIP_CHARS),
         overflow ? `+${overflow} more` : `${snapshot.tasks.length} active`,
       ],
       right: usageTime,
     }
+
+    // Every task's FULL title, crawling across line 2's band. Titles arrive up to 64
+    // characters and are truncated hard onto a 96 px key, so this is where a long one
+    // actually gets read. Line 1 still names the first task, so the most important
+    // one needs no waiting — and the tape's clip excludes `right`'s gutter, so the
+    // timestamp above stays untouched.
+    const segments = tapeSegments(snapshot.tasks)
+    if (segments.length > 0) {
+      spec.tape = { segments, offsetPx: tapeOffsetPx(nowMs, TAPE_PX_PER_SEC) }
+    }
+    return spec
   }
 
   /** The usage sample's own timestamp, formatted for display, or the same
