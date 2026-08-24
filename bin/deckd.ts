@@ -23,6 +23,7 @@ import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
 import { LockState } from '../src/lock-state.js'
+import { reportUnrecoverable } from '../src/unrecoverable.js'
 import { readFileSync, writeFileSync, chmodSync, realpathSync } from 'node:fs'
 import { runAuthFlow, TokenStore } from '../src/sources/spotify-auth.js'
 import { install, uninstall, refreshWrapper } from '../src/install/install.js'
@@ -79,7 +80,11 @@ async function start(): Promise<void> {
   await football.start()
   await system.start()
 
-  const device = new Device()
+  // The last rung of the device-health ladder. `Device` recycles a handle
+  // whose writes fail, and retries; when that stops helping it calls this,
+  // which restarts the process through launchd's `KeepAlive`. See
+  // `src/unrecoverable.ts` and `Device`'s health docblock.
+  const device = new Device(undefined, { onUnrecoverable: reportUnrecoverable })
   const pages = new PageManager()
   pages.add(new ClaudePage(claude, usage, focusWindow))
   pages.add(new CodexPage(codex))

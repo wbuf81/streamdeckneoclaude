@@ -180,6 +180,29 @@ anything still needed before that directory is cleaned.
   `src/device.ts`, `src/lock-state.ts`, or the daemon's repaint path, because these two paths
   have no automated coverage that can replace a person at the Mac.
 
+### Device health ladder (2026-08-24)
+
+`Device` now holds one invariant: **connected means the handle accepted a write recently.**
+It is enforced in three rungs, because each alone has a hole — see lesson 23 for the wedge
+that made this necessary.
+
+| Rung | Trigger | Action |
+|------|---------|--------|
+| 1 | any write rejects | recycle the handle, reconnect (about 2 s) |
+| 2 | no successful write in `HEARTBEAT_MS` (15 s) | re-send the brightness already on the device |
+| 3 | `MAX_FAILED_SESSIONS` (5) opens in a row with no write accepted | `reportUnrecoverable` → exit 1 |
+
+Rung 3 relies on `KeepAlive: true` in the plist, so launchd respawns a clean process with a
+fresh USB handle — the automated form of the `launchctl kickstart -k` that recovered the live
+wedge. It notifies the user at most once an hour, rate-limited through
+`~/.local/state/deckd/health.json` because an in-memory limit would reset on every respawn.
+
+An ABSENT deck resets the failed-session counter. Unplugging the cable is a correct state, not
+a wedge; counting it would have launchd respawning deckd forever.
+
+The heartbeat re-sends the brightness the device already has, so it is invisible when it
+works. Any other value would light a locked, blanked deck.
+
 ### Next work, in priority order
 
 #### DONE — tasks 31 to 35 are VERIFIED on the real deck

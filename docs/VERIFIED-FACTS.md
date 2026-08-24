@@ -36,6 +36,34 @@ strip, and both buttons within about two seconds. Escape at the lock screen keep
 and unlock restores the page. True system sleep/wake and USB unplug/reconnect are separate
 physical checks and are not yet recorded as verified.
 
+### Device write failures (measured 2026-08-23, fixed 2026-08-24)
+
+The deck can hold an OPEN handle whose every write fails. Measured error codes, all from
+`IOHIDDeviceSetReport`:
+
+- `(0xE00002D8) not ready` — transient, seen during cable churn; recovers on reconnect
+- `(0xE00002C2) invalid argument` — the wedged handle; persisted for three hours
+- `(0xE00002D7) device offline` — seen from `hid_open_path` while enumerating
+
+Two message shapes distinguish which call failed, and they are worth knowing when reading the
+log: pixel writes (`fillKeyBuffer`, `fillLcd`, `fillKeyColor`) say **"Cannot write to hid
+device"**; brightness says **"could not send feature report to device"**.
+
+The library's `'error'` event comes from the READ loop only. It does NOT fire when writes
+fail, so it cannot be the only trigger for a reconnect. See lesson 23.
+
+**Verified on 2026-08-24, in the failing state rather than a convenient one:** with the health
+ladder deployed, three real drops inside one 8-second burst each recycled the handle,
+reconnected in about two seconds, and logged `device write path recovered after 2s`. The
+process kept the same pid throughout and never escalated. Zero probe-side failures, so the
+heartbeat is not itself a source of churn.
+
+**The screen-lock grace period is 5 seconds** (`sysadminctl -screenLock status`), so
+`IOConsoleLocked` is still `No` when macOS suspends the daemon on an Apple-menu Sleep. deckd
+has no sleep notification and learns about sleep only after waking, from the clock-gap check
+in `handleTick`. A deck left lit through sleep is therefore expected UNLESS the lock lands
+first — it is not evidence of a fault.
+
 ### Real library methods
 
 ```

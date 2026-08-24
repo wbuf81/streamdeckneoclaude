@@ -227,3 +227,42 @@ the defects above reached hardware behind a green suite.
 widest realistic content, not the example. Build fixtures from **real** captured output. And for
 any test claiming to prove a fix: break the fix and watch it fail. If it still passes, the test
 is decoration.
+
+## 23. Half a transport has half a failure detector
+
+Measured live on 2026-08-23. After an afternoon of USB drops (76 reconnects, against about
+one a day all week), `openStreamDeck` returned a handle whose **every write** rejected with
+`(0xE00002C2) invalid argument`, while the library's `'error'` event — raised by the READ
+loop — never fired again.
+
+`handleLoss` was wired only to that read-side event. Every write path simply rejected to its
+caller. So `isConnected()` stayed `true`, no retry was ever scheduled, and the dead handle
+delivered no `down` events either. The deck had **neither input nor output for three hours**
+and no path back: only `launchctl kickstart` cleared it. The privacy blank at 23:12:42 failed
+on that handle — pixel write and brightness backstop both — and left a locked Mac's last
+frame lit.
+
+Two things made it invisible. `log.once('render', …)` had already fired, so every later
+failure was suppressed and the log looked healthy. And `writeFrame` skips unchanged keys, so
+"no write has failed recently" means nothing at all while a static page is showing.
+
+**A transport has two directions, and a failure detector wired to one of them detects half
+the failures.** Worse, the half it misses is the half that has no timeout of its own — a read
+loop notices silence, a write path only notices when something asks it to write.
+
+The fix deliberately does **not** classify IOKit error codes. A taxonomy only ever covers the
+failures already seen, and the next unknown code wedges you again the same way (lesson 21).
+State the invariant instead:
+
+> **Connected means the handle accepted a write recently.**
+
+Which needs three things, because each one alone has a hole:
+
+1. any failed write recycles the handle — a needless reconnect costs two seconds
+2. a heartbeat re-sends the brightness already on the device when nothing else has written
+   for a while, because skipped frames mean silence is not evidence
+3. repeated sessions that open but never accept a byte exit the process, so launchd's
+   `KeepAlive` does what the human had to do by hand
+
+The heartbeat probes with the value already on the glass. Probing with any other would light
+a locked, blanked deck — a privacy failure caused by the health check itself.
