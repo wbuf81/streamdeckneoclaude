@@ -23,6 +23,7 @@ import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
 import { log } from '../src/log.js'
 import { LockState } from '../src/lock-state.js'
+import { KnobNotifier } from '../src/knob-notify.js'
 import { reportUnrecoverable } from '../src/unrecoverable.js'
 import { readFileSync, writeFileSync, chmodSync, realpathSync } from 'node:fs'
 import { runAuthFlow, TokenStore } from '../src/sources/spotify-auth.js'
@@ -101,6 +102,12 @@ async function start(): Promise<void> {
   restorePage(pages)
 
   const lockState = new LockState()
+  // A knob display on the desk sleeps with this Mac. It listens for a heartbeat
+  // and treats silence as sleep, because a Mac going to sleep cannot announce
+  // it. Best-effort in both directions: the device fails open if it never hears
+  // anything, and every send here is caught, so a display that is unplugged or
+  // absent cannot affect the deck.
+  const knob = new KnobNotifier()
   const daemon = new Daemon(device, pages, undefined, undefined, lockState)
   try {
     await daemon.start()
@@ -123,9 +130,13 @@ async function start(): Promise<void> {
   football.on('change', onChange)
   system.on('change', onChange)
 
+  knob.start(lockState.isLocked())
+  lockState.onChange(() => knob.setLocked(lockState.isLocked()))
+
   const shutdown = async () => {
     log.info('deckd stopping')
     savePage(pages)
+    await knob.stop()
     await daemon.stop()
     // I4: an orderly shutdown used to disconnect with the last frame still
     // lit at full brightness. The documented `launchctl bootout` recovery
