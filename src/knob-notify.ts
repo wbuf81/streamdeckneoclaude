@@ -1,10 +1,20 @@
 import { log, type Logger } from './log.js'
 
 /**
- * The knob display's mDNS name. It advertises `_http._tcp` and answers two
- * paths, `/awake` and `/locked`, with 204.
+ * Where to look for the knob display, in order. It advertises `_http._tcp` and
+ * answers `/awake` and `/locked` with 204.
+ *
+ * More than one candidate because mDNS alone was not reliable enough. Measured
+ * on this Mac: `ping knob.local` resolves, but resolution from Node
+ * repeatedly failed or took longer than any sane request timeout, so the
+ * heartbeat never arrived and the device sat on a stale state. The IP is the
+ * fallback, and the first candidate that answers is remembered and tried first
+ * from then on - so a DHCP change costs one failed beat, not a permanent
+ * outage.
+ *
+ * Override with KNOB_HOSTS as a comma-separated list.
  */
-const DEFAULT_HOST = 'knob.local'
+const DEFAULT_HOSTS = ['knob.local', '192.168.1.50']
 
 /**
  * How often the state is repeated. The device treats silence as sleep, so this
@@ -15,12 +25,25 @@ const DEFAULT_HOST = 'knob.local'
  */
 const DEFAULT_INTERVAL_MS = 5000
 
-/** A wedged request must not delay the next heartbeat. */
-const REQUEST_TIMEOUT_MS = 2000
+/**
+ * A wedged request must not delay the next heartbeat, but this also has to
+ * survive a cold mDNS lookup. At 2000 ms the very first beat after a daemon
+ * restart aborted every time - macOS `.local` resolution from Node is slow
+ * until the name is cached - which logged an outage for a device that was
+ * answering fine a second later.
+ */
+const REQUEST_TIMEOUT_MS = 6000
 
 const LOG_UNREACHABLE = 'knob-notify-unreachable'
 
 export type KnobFetcher = (url: string, init: { signal: AbortSignal }) => Promise<{ ok: boolean; status: number }>
+
+function envHosts(): readonly string[] {
+  const raw = process.env['KNOB_HOSTS']
+  if (!raw) return DEFAULT_HOSTS
+  const parsed = raw.split(',').map((h) => h.trim()).filter((h) => h.length > 0)
+  return parsed.length > 0 ? parsed : DEFAULT_HOSTS
+}
 
 const realFetcher: KnobFetcher = async (url, init) => {
   const res = await fetch(url, init)
@@ -50,8 +73,11 @@ export class KnobNotifier {
    */
   private pending = false
 
+  /** Index into `hosts` that answered last. Tried first next time. */
+  private preferred = 0
+
   constructor(
-    private readonly host: string = DEFAULT_HOST,
+    private readonly hosts: readonly string[] = envHosts(),
     private readonly intervalMs: number = DEFAULT_INTERVAL_MS,
     private readonly fetcher: KnobFetcher = realFetcher,
     private readonly logger: Logger = log,
@@ -98,28 +124,38 @@ export class KnobNotifier {
       return this.inFlight
     }
     const path = this.locked ? 'locked' : 'awake'
-    const url = `http://${this.host}/${path}`
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
 
     const attempt = (async () => {
-      try {
-        const res = await this.fetcher(url, { signal: controller.signal })
+      let lastWhy = 'no candidates'
+      // Every candidate is tried before this counts as an outage, starting with
+      // whichever answered last.
+      for (let i = 0; i < this.hosts.length; i += 1) {
         if (this.stopped) return
-        if (res.ok) {
-          this.logger.clearOnce(LOG_UNREACHABLE)
-        } else {
-          this.logger.once(LOG_UNREACHABLE, `knob-notify: ${url} answered ${res.status}`)
+        const idx = (this.preferred + i) % this.hosts.length
+        const host = this.hosts[idx]
+        if (!host) continue
+        const url = `http://${host}/${path}`
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+        try {
+          const res = await this.fetcher(url, { signal: controller.signal })
+          if (this.stopped) return
+          if (res.ok) {
+            this.preferred = idx
+            this.logger.clearOnce(LOG_UNREACHABLE)
+            return
+          }
+          lastWhy = `${url} answered ${res.status}`
+        } catch (e) {
+          lastWhy = `${url} unreachable (${e instanceof Error ? e.message : String(e)})`
+        } finally {
+          clearTimeout(timeout)
         }
-      } catch (e) {
-        if (this.stopped) return
-        const why = e instanceof Error ? e.message : String(e)
-        // Once per outage. An unreachable display is the normal state when the
-        // device is unplugged, and this daemon must not fill its log with it.
-        this.logger.once(LOG_UNREACHABLE, `knob-notify: ${url} unreachable (${why})`)
-      } finally {
-        clearTimeout(timeout)
       }
+      if (this.stopped) return
+      // Once per outage. An unplugged display is a normal state and must not
+      // fill this daemon's log.
+      this.logger.once(LOG_UNREACHABLE, `knob-notify: ${lastWhy}`)
     })().finally(() => {
       this.inFlight = null
     })

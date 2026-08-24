@@ -13,13 +13,13 @@ describe('KnobNotifier', () => {
       urls.push(url)
       return { ok: true, status: 204 }
     })
-    const n = new KnobNotifier('knob.test', 5000, fetcher, quietLogger())
+    const n = new KnobNotifier(['knob.test'], 5000, fetcher, quietLogger())
     n.start(false)
     await n.stop()
     expect(urls).toEqual(['http://knob.test/awake'])
 
     urls.length = 0
-    const m = new KnobNotifier('knob.test', 5000, fetcher, quietLogger())
+    const m = new KnobNotifier(['knob.test'], 5000, fetcher, quietLogger())
     m.start(true)
     await m.stop()
     expect(urls).toEqual(['http://knob.test/locked'])
@@ -32,7 +32,7 @@ describe('KnobNotifier', () => {
       sent += 1
       return { ok: true, status: 204 }
     })
-    const n = new KnobNotifier('knob.test', 1000, fetcher, quietLogger())
+    const n = new KnobNotifier(['knob.test'], 1000, fetcher, quietLogger())
     n.start(false)
     await vi.advanceTimersByTimeAsync(3500)
     await n.stop()
@@ -51,12 +51,52 @@ describe('KnobNotifier', () => {
       urls.push(url)
       return { ok: true, status: 204 }
     })
-    const n = new KnobNotifier('knob.test', 60_000, fetcher, quietLogger())
+    const n = new KnobNotifier(['knob.test'], 60_000, fetcher, quietLogger())
     n.start(false)
     n.setLocked(true)
     await vi.waitFor(() => expect(urls).toContain('http://knob.test/locked'))
     expect(urls.at(-1)).toBe('http://knob.test/locked')
     await n.stop()
+  })
+
+  it('falls back to the next host and then prefers it', async () => {
+    // mDNS resolution from Node proved unreliable on this Mac even though the
+    // name pings, so a single host meant the heartbeat silently never arrived.
+    const urls: string[] = []
+    const fetcher = vi.fn<KnobFetcher>(async (url) => {
+      urls.push(url)
+      if (url.includes('bad.test')) throw new Error('ENOTFOUND')
+      return { ok: true, status: 204 }
+    })
+    const n = new KnobNotifier(['bad.test', 'good.test'], 60_000, fetcher, quietLogger())
+    n.start(false)
+    await vi.waitFor(() => expect(urls).toContain('http://good.test/awake'))
+    // The working host is remembered, so the dead one is not retried first
+    // every single beat.
+    urls.length = 0
+    n.setLocked(true)
+    await vi.waitFor(() => expect(urls).toContain('http://good.test/locked'))
+    expect(urls[0]).toBe('http://good.test/locked')
+    await n.stop()
+  })
+
+  it('logs only after every candidate fails', async () => {
+    vi.useFakeTimers()
+    const lines: string[] = []
+    const fetcher = vi.fn<KnobFetcher>(async () => {
+      throw new Error('ENOTFOUND')
+    })
+    const n = new KnobNotifier(
+      ['a.test', 'b.test'],
+      1000,
+      fetcher,
+      createLogger((l) => lines.push(l)),
+    )
+    n.start(false)
+    await vi.advanceTimersByTimeAsync(2500)
+    await n.stop()
+    // One outage line, not one per candidate per beat.
+    expect(lines.filter((l) => l.includes('unreachable')).length).toBe(1)
   })
 
   it('logs an unreachable device once per outage, not once per beat', async () => {
@@ -65,7 +105,7 @@ describe('KnobNotifier', () => {
     const fetcher = vi.fn<KnobFetcher>(async () => {
       throw new Error('ENOTFOUND')
     })
-    const n = new KnobNotifier('knob.test', 1000, fetcher, createLogger((l) => lines.push(l)))
+    const n = new KnobNotifier(['knob.test'], 1000, fetcher, createLogger((l) => lines.push(l)))
     n.start(false)
     await vi.advanceTimersByTimeAsync(5000)
     await n.stop()
@@ -82,7 +122,7 @@ describe('KnobNotifier', () => {
       if (!up) throw new Error('ENOTFOUND')
       return { ok: true, status: 204 }
     })
-    const n = new KnobNotifier('knob.test', 1000, fetcher, createLogger((l) => lines.push(l)))
+    const n = new KnobNotifier(['knob.test'], 1000, fetcher, createLogger((l) => lines.push(l)))
     n.start(false)
     await vi.advanceTimersByTimeAsync(1500)
     up = true
@@ -107,7 +147,7 @@ describe('KnobNotifier', () => {
       })
       return { ok: true, status: 204 }
     })
-    const n = new KnobNotifier('knob.test', 500, fetcher, quietLogger())
+    const n = new KnobNotifier(['knob.test'], 500, fetcher, quietLogger())
     n.start(false)
     await vi.advanceTimersByTimeAsync(2000)
     // A slow device must not accumulate one request per beat for as long as it
@@ -128,7 +168,7 @@ describe('KnobNotifier', () => {
           gate.release = r
         }),
     )
-    const n = new KnobNotifier('knob.test', 60_000, fetcher, createLogger((l) => lines.push(l)))
+    const n = new KnobNotifier(['knob.test'], 60_000, fetcher, createLogger((l) => lines.push(l)))
     n.start(false)
     await Promise.resolve()
     const stopping = n.stop()
