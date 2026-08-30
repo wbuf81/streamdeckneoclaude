@@ -3,6 +3,20 @@
 Use this checklist for the installed daemon on this Mac. The launchd label is
 `com.wbard.deckd`, and it runs the compiled output from this repository.
 
+## Triage a live complaint
+
+All read-only. Run in this order before touching anything.
+
+```bash
+launchctl print gui/$(id -u)/com.wbard.deckd | head -40   # state, pid, runs (>1 = crash loop)
+tail -40 ~/.local/state/deckd/deckd.log                   # see the caveat below
+ioreg -p IOUSB -w0 -l | grep -i "Stream Deck"             # device present on USB at all?
+pmset -g assertions | grep -i deckd                       # deckd never holds one; see VERIFIED-FACTS
+```
+
+`runs = 1` with a long `ELAPSED` means the process never restarted — which is NOT the same
+as healthy. A daemon can hold a dead handle indefinitely.
+
 ## Before deployment
 
 1. Read `docs/PROJECT-STATE.md` and check `git status --short`.

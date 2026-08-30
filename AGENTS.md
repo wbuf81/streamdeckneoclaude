@@ -7,6 +7,9 @@ Read these files before changing code:
 3. `docs/LESSONS.md` — recurring defects and review rules.
 4. `docs/DEPLOYMENT.md` — safe build, deployment, verification, and recovery.
 
+To diagnose a live complaint ("it stopped working"), start with `docs/DEPLOYMENT.md`'s
+"Triage a live complaint" section before reading code.
+
 ## Working rules
 
 - Use ASD-STE100-style prose: short sentences, active voice, and one idea per sentence.
@@ -21,6 +24,11 @@ Read these files before changing code:
 - Never read, print, replace, or commit `~/.local/state/deckd/spotify.json`.
 - Never print OAuth tokens, full Codex prompts, or unrelated Claude settings.
 - Use `log.once` for repeating failures and clear its key after recovery.
+- A quiet log is not a healthy log. A stuck `log.once` key suppresses every repeat, so read
+  silence as "no NEW failure kind", never as "no failure". Log state transitions, not just
+  first occurrences.
+- `vi.useFakeTimers()` mocks `Date.now` too, so code under test needs no injected clock to be
+  time-controllable — inject one only when a test must set an absolute time.
 - Treat absent platform signals as unknown. Do not infer a safe state from missing data.
 - Put private external schemas behind one source boundary. A schema change must not stop the
   daemon or unrelated pages.

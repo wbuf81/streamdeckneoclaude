@@ -64,6 +64,10 @@ has no sleep notification and learns about sleep only after waking, from the clo
 in `handleTick`. A deck left lit through sleep is therefore expected UNLESS the lock lands
 first — it is not evidence of a fault.
 
+**deckd holds no power assertion** (measured 2026-08-24, `pmset -g assertions`). If the Mac
+will not sleep, deckd is never the cause — look at `caffeinate`, `Jiggler`, and Electron apps
+holding `NoIdleSleepAssertion`.
+
 ### Real library methods
 
 ```
