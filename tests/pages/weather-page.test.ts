@@ -955,7 +955,7 @@ describe('WeatherPage detail view strip', () => {
 
   it('never draws detail-strip text past the strip edge for the longest real detailedForecast text', () => {
     // Measured live from api.weather.gov/gridpoints/OKX/33,37/forecast on
-    // 2026-08-13 (Brooklyn NY, this deck's fixed ZIP): the longest
+    // 2026-08-13, from the deck's own configured ZIP: the longest
     // detailedForecast in that response, 290 characters.
     const longest =
       'A slight chance of showers and thunderstorms before 9pm. Partly cloudy. Low around 77, with temperatures rising to around 78 overnight. Heat index values as high as 103. Southwest wind around 7 mph. Chance of precipitation is 20%. New rainfall amounts less than a tenth of an inch possible.'

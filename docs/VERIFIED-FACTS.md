@@ -446,12 +446,12 @@ US National Weather Service, **no API key**. **Rejects requests without a `User-
 
 1. `https://api.zippopotam.us/us/<ZIP>` → `places[0]`, carrying `place name`, `state
    abbreviation`, `latitude`, and `longitude`. The configured ZIP is not recorded here.
-2. `https://api.weather.gov/points/<lat>,<lon>` → `properties.forecast` (a URL). Office `OKX`.
+2. `https://api.weather.gov/points/<lat>,<lon>` → `properties.forecast` (a URL). Office code and grid cell omitted: together they name a 2.5 km square.
 3. GET that URL → `properties.periods`, ~14 entries alternating day and night.
 
 - `probabilityOfPrecipitation` is an **object** whose `.value` can be `null`. Null means
   unknown and must never render as `0%`.
-- `windSpeed` is a **string** like `"8 mph"`. Measured live on 2026-08-13 (OKX office): 14
+- `windSpeed` is a **string** like `"8 mph"`. Measured live on 2026-08-13 (one NWS office, 14 periods): 14
   periods, 4 distinct `windSpeed` values, 3 of the 4 a range like `"5 to 8 mph"` — a range is
   the COMMON shape here, not an edge case.
 - `windDirection` is a **string** like `"NE"`, already abbreviated (1 to 3 letters: `N`,
