@@ -48,14 +48,5 @@
       "fullName": "Jacksonville Jaguars",
       "logoUrl": "https://a.espncdn.com/i/teamlogos/nfl/500/jax.png"
     }
-  },
-
-  "knob": {
-    "_comment": [
-      "Optional companion display that sleeps with this Mac. Most likely",
-      "address first; the first one to answer is remembered. Omit the section",
-      "unless you have one - there is no default, and no heartbeat without it."
-    ],
-    "hosts": ["knob.local", "192.168.1.50"]
   }
 }

@@ -38,7 +38,7 @@ rendering change shows up in them on the next run.
 
 | Path | Note |
 | --- | --- |
-| `~/.local/state/deckd/config.json` | ZIP, watchlist, teams, knob hosts, Spotify client id. See `config.example.json` |
+| `~/.local/state/deckd/config.json` | ZIP, watchlist, teams, Spotify client id. See `config.example.json` |
 | `~/.local/state/deckd/spotify.json` | refresh token, mode 0600. **Never read or print.** Backup `.pre-rescope` |
 | `~/.local/state/deckd/usage.json` | rate limits, written by the statusline wrapper |
 | `~/.local/state/deckd/deckd.log` | contains a `SENTINEL do not delete` line — a tripwire proving tests do not write here |
@@ -86,7 +86,7 @@ Sources ──▶ Pages ──▶ Renderer ──▶ Device
 
 Files: `src/sources/{claude,codex,usage,spotify,spotify-auth,stocks,weather,football,system}.ts`,
 `src/pages/{claude,codex,spotify,stocks,weather,football,system}-page.ts`, `src/render/{specs,canvas,theme,text,sprites}.ts`,
-`src/{device,fake-device,daemon,page-manager,focus-window,lock-state,knob-notify,unrecoverable,log,paths}.ts`,
+`src/{device,fake-device,daemon,page-manager,focus-window,lock-state,unrecoverable,config,log,paths}.ts`,
 `src/install/{install.ts,statusline-wrapper.sh}`, `bin/deckd.ts`.
 
 ### Hard invariants
@@ -340,7 +340,7 @@ Definition of done:
 #### P1 — Add validated user configuration — PARTLY DONE
 
 **Landed** (`src/config.ts`, `tests/config.test.ts`, `config.example.json`): weather ZIP
-code, stock symbols, the two football teams, and the knob display's hosts. Each section is
+code, stock symbols, and the two football teams. Each section is
 validated on its own, so one bad section disables only its own page. An absent section is
 never filled from someone else's answer — no ZIP and no teams switch those pages off, and
 `bin/deckd.ts` adds a page only when its configuration exists. Unknown fields are preserved,
@@ -349,6 +349,13 @@ restart. Only the watchlist has a fallback, and it is deliberately generic.
 
 **Still to do:** brightness, polling intervals, and page enablement and order. Page order is
 still the `pages.add` order in `bin/deckd.ts`.
+
+**Removed rather than configured:** the knob display's hosts. `KnobNotifier` spoke
+`GET /awake`, an endpoint the knob's firmware deleted as a security fix — it was an
+unauthenticated write that outranked the device's token-checked channel. A proper Mac-side
+helper (`the knob helper`) speaks the replacement `POST /beat` and reports far more,
+so deckd's client was both obsolete and redundant. It had been answering 404 on every beat,
+hidden by `log.once`.
 
 The trigger for the landed half was making the repository publishable: the ZIP code, the
 watchlist, the teams, and a LAN address were all compiled in, which put one person's home

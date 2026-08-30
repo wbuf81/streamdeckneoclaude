@@ -310,6 +310,21 @@ export class StockSource extends EventEmitter {
     super()
   }
 
+  /**
+   * The symbols this source actually polls, in key order.
+   *
+   * The page used to import the module-level `SYMBOLS` for its tile layout.
+   * That was correct only while the watchlist was a compiled-in constant that
+   * both sides shared. Once the list became configuration, the page kept
+   * drawing the DEFAULT eight while this source fetched the configured ones,
+   * so five tiles looked up a symbol no quote existed for and rendered empty.
+   * The list has exactly one owner now, and it is whoever was constructed with
+   * it.
+   */
+  getSymbols(): readonly string[] {
+    return this.symbols
+  }
+
   /** Test helper. Swaps the fetch implementation mid-test. */
   setFetchForTest(f: FetchLike): void {
     this.fetchFn = f

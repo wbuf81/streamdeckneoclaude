@@ -152,26 +152,6 @@ describe('parseConfig — the teams', () => {
   })
 })
 
-describe('parseConfig — the knob hosts', () => {
-  it('is empty when absent, which disables the heartbeat', () => {
-    const { warn, messages } = collect()
-    expect(parseConfig({}, warn).knobHosts).toEqual([])
-    expect(messages).toEqual([])
-  })
-
-  it('keeps the configured order, because the first entry is tried first', () => {
-    const { warn } = collect()
-    const hosts = parseConfig({ knob: { hosts: ['a.local', '10.0.0.5'] } }, warn).knobHosts
-    expect(hosts).toEqual(['a.local', '10.0.0.5'])
-  })
-
-  it('reports a non-array and disables rather than guessing', () => {
-    const { warn, messages } = collect()
-    expect(parseConfig({ knob: { hosts: 'a.local' } }, warn).knobHosts).toEqual([])
-    expect(messages.join(' ')).toContain('knob.hosts')
-  })
-})
-
 describe('parseConfig — section independence', () => {
   it('keeps every good section when one is malformed', () => {
     // AGENTS.md: a schema problem must not stop the daemon or unrelated
@@ -184,6 +164,9 @@ describe('parseConfig — section independence', () => {
         weather: { zip: '90210' },
         stocks: { symbols: ['spy'] },
         football: { top: 'not an object', bottom: OTHER },
+        // An unknown section, of the kind an older or newer deckd may leave
+        // behind. It must be ignored, never fatal, and never dropped from the
+        // file — nothing here rewrites it.
         knob: { hosts: ['a.local'] },
       },
       warn,
@@ -191,7 +174,6 @@ describe('parseConfig — section independence', () => {
     expect(got.spotifyClientId).toBe('abc')
     expect(got.zip).toBe('90210')
     expect(got.symbols).toEqual(['SPY'])
-    expect(got.knobHosts).toEqual(['a.local'])
     expect(got.teams).toBeNull()
   })
 })
@@ -252,7 +234,6 @@ describe('loadConfig', () => {
           weather: { zip: '10001' },
           stocks: { symbols: ['aapl'] },
           football: { top: TEAM, bottom: OTHER },
-          knob: { hosts: ['knob.local'] },
         }),
       )
       const { warn, messages } = collect()
@@ -262,7 +243,6 @@ describe('loadConfig', () => {
       expect(got.zip).toBe('10001')
       expect(got.symbols).toEqual(['AAPL'])
       expect(got.teams?.[1]?.short).toBe('JAX')
-      expect(got.knobHosts).toEqual(['knob.local'])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

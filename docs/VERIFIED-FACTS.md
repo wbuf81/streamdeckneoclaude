@@ -314,6 +314,30 @@ Measured locally on 2026-08-13:
 
 ---
 
+## The companion knob display
+
+**`GET /awake` and `GET /locked` no longer exist on that device** (measured 2026-08-30).
+Every heartbeat deckd sent was answered `404`, on both the `.local` name and the IP, for
+weeks. The body the device returns says what it wants instead:
+
+```
+POST /beat with key=value lines and a valid token
+```
+
+The firmware removed those routes on purpose. They were unauthenticated writes to the one
+piece of state that can black out its screen, and it checked that reported state BEFORE its
+token-authenticated channel, so anything on the LAN could darken the display and outrank the
+real sender.
+
+`KnobNotifier` is deleted rather than ported. The knob has its own Mac-side helper,
+`the knob helper`, which speaks `POST /beat` and already sends lock state plus the
+computer name, output volume, mute, and playback. deckd had nothing to add.
+
+**The lesson is the detection, not the endpoint.** `log.once` collapsed the repeat, so weeks
+of total failure looked like one old warning. This is AGENTS.md's "a quiet log is not a
+healthy log" caught in the wild — the rule was already written, and the defect still shipped.
+
+
 ## Spotify
 
 - The client id is the author's own Spotify app, reused from an earlier project on the

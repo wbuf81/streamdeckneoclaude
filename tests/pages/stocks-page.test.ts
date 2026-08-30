@@ -44,6 +44,9 @@ function allQuotes(over: (symbol: string, i: number) => Partial<Quote> = () => (
 }
 
 interface Fakes {
+  /** The watchlist the fake source reports. Defaults to `SYMBOLS`; a test
+   * that cares about the page following CONFIGURATION overrides it. */
+  symbols: readonly string[]
   quotes: Map<string, Quote>
   status: StockStatus
   marketState: MarketState
@@ -56,6 +59,7 @@ interface Fakes {
 
 function build(over: Partial<Fakes> = {}) {
   const f: Fakes = {
+    symbols: SYMBOLS,
     quotes: new Map(),
     status: 'ok',
     marketState: 'open',
@@ -71,6 +75,7 @@ function build(over: Partial<Fakes> = {}) {
   // fix — as well as proving `onKeyPress` calls it at the right moments.
   const watchedSymbolCalls: (string | null)[] = []
   const source = {
+    getSymbols: () => f.symbols,
     getQuotes: () => f.quotes,
     getStatus: () => f.status,
     getMarketState: () => f.marketState,
@@ -1378,8 +1383,22 @@ describe('StocksPage ticker tape (task 43)', () => {
   })
 
   it('builds segments from the real symbol order', () => {
-    const segs = tapeSegments(allQuotes(), () => false)
+    const segs = tapeSegments(allQuotes(), () => false, SYMBOLS)
     SYMBOLS.forEach((sym, i) => expect(segs[i]!.text.startsWith(sym)).toBe(true))
+  })
+
+  it('follows the CONFIGURED watchlist, not the shipped default', () => {
+    // The regression this exists for: the page imported the module-level
+    // `SYMBOLS` for its layout while the source fetched the configured list,
+    // so a deck with its own watchlist drew the default eight and five tiles
+    // had no quote to find. Every symbol below is absent from `SYMBOLS`.
+    const mine = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF', 'GGG', 'HHH']
+    const quotes = new Map<string, Quote>()
+    mine.forEach((sym, i) => quotes.set(sym, quote(sym, { price: 100 + i, changePercent: 1 })))
+    const { page } = build({ quotes, symbols: mine })
+    const keys = page.render(NOW, MS).keys
+    mine.forEach((sym, i) => expect(keys[i]!.lines![0]).toBe(sym))
+    expect(tapeSegments(quotes, () => false, mine)[0]!.text.startsWith('AAA')).toBe(true)
   })
 })
 

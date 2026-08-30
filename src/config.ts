@@ -7,8 +7,8 @@ import { log } from './log.js'
  * directory.
  *
  * Everything here used to be a hardcoded constant, tuned to the author's own
- * ZIP code, watchlist, teams, and LAN. That made the daemon useless to anyone
- * else and put a home town in the source tree. The values now live outside the
+ * ZIP code, watchlist, and teams. That made the daemon useless to anyone else
+ * and put a home town in the source tree. The values now live outside the
  * repository, in the same 0600 file that already held the Spotify client id.
  *
  * Two rules shape this module, and both come from AGENTS.md:
@@ -17,9 +17,8 @@ import { log } from './log.js'
  *   section is validated on its own. A malformed `football` block disables the
  *   football page and nothing else.
  * - **An absent signal is unknown, never a safe default.** Where no generic
- *   default can be correct — a ZIP code, a pair of teams, the address of a
- *   device on your own network — the section is absent and the page that needs
- *   it is not added at all. Only the watchlist gets a default, because a
+ *   default can be correct — a ZIP code, a pair of teams — the section is
+ *   absent and the page that needs it is not added at all. Only the watchlist gets a default, because a
  *   broad-market list is a real answer rather than a guess about you.
  */
 
@@ -68,9 +67,6 @@ export interface DeckConfig {
   readonly symbols: readonly string[]
   /** Null omits the football page. */
   readonly teams: TeamPair | null
-  /** Hostnames or addresses for the companion knob display, most likely
-   * first. Empty disables the heartbeat entirely. */
-  readonly knobHosts: readonly string[]
 }
 
 /** What a completely absent or unreadable config file yields. */
@@ -79,7 +75,6 @@ export const EMPTY_CONFIG: DeckConfig = {
   zip: null,
   symbols: DEFAULT_SYMBOLS,
   teams: null,
-  knobHosts: [],
 }
 
 type Raw = Record<string, unknown>
@@ -191,18 +186,6 @@ function parseTeams(raw: Raw, warn: (m: string) => void): TeamPair | null {
   return [top, bottom]
 }
 
-function parseKnobHosts(raw: Raw, warn: (m: string) => void): readonly string[] {
-  const section = asRecord(raw['knob'])
-  if (!section) return []
-  if (section['hosts'] === undefined) return []
-  const hosts = asStringArray(section['hosts'])
-  if (hosts === null) {
-    warn('knob.hosts must be an array of strings. The knob heartbeat is off.')
-    return []
-  }
-  return hosts
-}
-
 function parseSpotifyClientId(raw: Raw): string {
   const section = asRecord(raw['spotify'])
   if (!section) return ''
@@ -230,7 +213,6 @@ export function parseConfig(value: unknown, warn: (m: string) => void = (m) => l
     zip: parseZip(raw, warn),
     symbols: parseSymbols(raw, warn),
     teams: parseTeams(raw, warn),
-    knobHosts: parseKnobHosts(raw, warn),
   }
 }
 

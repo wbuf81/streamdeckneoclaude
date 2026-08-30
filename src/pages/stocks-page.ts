@@ -4,7 +4,7 @@ import { tapeOffsetPx as sharedTapeOffsetPx } from '../render/canvas.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
 import type { MarketState, Quote, StockStatus, YearlyState } from '../sources/stocks.js'
-import { SYMBOLS, downsample, YEARLY_REFRESH_SECONDS } from '../sources/stocks.js'
+import { downsample, YEARLY_REFRESH_SECONDS } from '../sources/stocks.js'
 
 /** How many buckets the intraday series downsamples to for the tile. */
 const SPARK_BUCKETS = 12
@@ -373,6 +373,10 @@ function formatAsOfOrUnknown(asOf: number | null): string {
 
 /** The part of `StockSource` this page needs. */
 export interface StockReader {
+  /** The watchlist, in key order. The page draws one tile per entry and must
+   * never assume a default: the source owns this list, because the source is
+   * what fetches it. */
+  getSymbols(): readonly string[]
   getQuotes(): Map<string, Quote>
   getStatus(): StockStatus
   getMarketState(): MarketState
@@ -416,9 +420,10 @@ export function tapeOffsetPx(nowMs: number, pxPerSec: number = TAPE_PX_PER_SEC):
 export function tapeSegments(
   quotes: Map<string, Quote>,
   isStale: (symbol: string) => boolean,
+  symbols: readonly string[],
 ): TapeSegment[] {
   const segments: TapeSegment[] = []
-  for (const symbol of SYMBOLS) {
+  for (const symbol of symbols) {
     const quote = quotes.get(symbol)
     if (!quote || quote.price === null) continue
     const trend = trendOf(quote.changePercent)
@@ -483,7 +488,7 @@ export class StocksPage implements Page {
     // The drift's clock is quantised so the daemon's dirty-key check can skip
     // most key writes. The TAPE's clock below is not, so it stays smooth.
     const driftMs = Math.floor(ms / DRIFT_QUANTUM_MS) * DRIFT_QUANTUM_MS
-    const keys = SYMBOLS.map((symbol, i) =>
+    const keys = this.source.getSymbols().map((symbol, i) =>
       // `i` is the seed: each tile drifts on its own phase, so eight tiles moving
       // the same way still read as eight tiles rather than one sheet.
       this.tickerKey(quotes.get(symbol), symbol, marketState, driftMs, i),
@@ -781,7 +786,7 @@ export class StocksPage implements Page {
     if (this.source.getStatus() === 'offline') return false
     // A tape needs at least one real, priced quote. An empty board keeps its
     // static line 2, so an offline or not-yet-loaded deck still says so.
-    return tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym)).length > 0
+    return tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym), this.source.getSymbols()).length > 0
   }
 
   /**
@@ -822,7 +827,7 @@ export class StocksPage implements Page {
     // the fallback the offline and not-yet-loaded cases keep.
     if (this.hasTape(quotes)) {
       spec.tape = {
-        segments: tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym)),
+        segments: tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym), this.source.getSymbols()),
         offsetPx: tapeOffsetPx(nowMs),
       }
     }
@@ -833,7 +838,7 @@ export class StocksPage implements Page {
   onKeyPress(index: number): PressOutcome {
     const quotes = this.source.getQuotes()
     if (this.activeQuote(quotes) === null) {
-      const symbol = SYMBOLS[index]
+      const symbol = this.source.getSymbols()[index]
       if (!symbol) return 'ignored'
       // No quote at all for this key yet, or a quote with no price at all
       // (M1: a halted or non-trading instrument's `meta` can come back with

@@ -324,22 +324,31 @@ launchctl bootout gui/$(id -u)/com.wbard.deckd
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wbard.deckd.plist
 ```
 
-### The companion display
+### The companion display, and one thing this daemon does not do
 
-A separate device on the network, a Waveshare ESP32-S3 knob display running
-its own custom firmware, shows Spotify. It has no way to know when this Mac
-sleeps. So `deckd` sends it a heartbeat every 5 seconds over plain HTTP, and
-the knob treats silence as sleep with a 25-second timeout.
+A separate device on the desk — a Waveshare ESP32-S3 knob display running its
+own custom firmware — shows Spotify and needs to know when this Mac sleeps or
+locks. `deckd` used to tell it, with a plain `GET /awake` every 5 seconds.
 
-The heartbeat walks the `knob.hosts` list in `config.json`, most likely
-address first. Configure more than one — a `.local` name and a plain IP —
-because mDNS resolution from Node proved unreliable on this Mac. The first
-host to answer is remembered and tried first from then on, so a DHCP change
-costs one failed beat rather than a permanent outage. `KNOB_HOSTS` overrides
-the list. With no hosts configured, the heartbeat never starts.
+It does not any more, and the reason is worth recording.
 
-The link fails open in both directions. The knob treats "never heard from" as
-awake, and `deckd` never lets a missing display affect anything it does.
+The knob's firmware removed that endpoint deliberately. `GET /awake` and
+`GET /locked` were **unauthenticated writes to the one piece of state that can
+black out the screen**, and the device checked that reported state *ahead of*
+its token-authenticated channel — so anything on the LAN could darken the
+display and outrank the real sender. The endpoints are gone, replaced by a
+`POST /beat` that carries a token.
+
+The knob now has a proper Mac-side helper that speaks that protocol and sends
+far more than `deckd` ever did: lock state, the computer name, output volume
+and mute, and Spotify playback. So `deckd` had nothing left to contribute, and
+kept beating at a dead endpoint for weeks — every request answered `404`, every
+repeat swallowed by `log.once`, which is exactly the trap AGENTS.md warns
+about: *a quiet log is not a healthy log.*
+
+The right fix was to delete the client, not port it to `/beat`. Two processes
+writing the same state to one device is worse than one, and it would have meant
+a second copy of the token for no gain.
 
 That firmware lives in its own repository, and it is genuine custom firmware
 for an ESP32 board — unlike the Neo, which needs none. Its ancestor, an
@@ -477,7 +486,6 @@ your Spotify client id into it.
 | `weather.zip` | **The weather page is not added.** A five-digit US ZIP |
 | `stocks.symbols` | A generic default watchlist. Up to 8, one per key |
 | `football.top` / `football.bottom` | **The football page is not added.** Both are required |
-| `knob.hosts` | No heartbeat. Only useful if you own the companion display |
 | `spotify.clientId` | Key 0 shows `SIGN IN`. Written by `deckd auth spotify` |
 
 Two rules govern the whole file, and they are worth knowing before you debug
