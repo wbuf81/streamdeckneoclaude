@@ -111,7 +111,7 @@ blanked-stdin failure or the orphaned-child failure. This project is macOS-only,
 1. Find the exact process:
 
    ```bash
-   pgrep -fl '/Users/you/Vibecoding/streamdeckneoclaude/dist/bin/deckd.js start'
+   pgrep -fl 'dist/bin/deckd.js start'
    ```
 
 2. Stop only the reported PID with `kill <PID>`. Do not use a broad process pattern when an

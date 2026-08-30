@@ -47,10 +47,10 @@ const BACK_SIZE = 16
 const RECORD_BAND_TOP = Math.round(96 * LOGO_ART_FRACTION)
 const RECORD_Y = RECORD_BAND_TOP + 8
 
-const TEAM_LABELS: Readonly<Record<Team, string>> = { jaguars: 'JAGUARS', gators: 'GATORS' }
-/** Short strip abbreviations, matching the task brief's own example strip
- * text (`"UF vs UGA"`). */
-const TEAM_SHORT: Readonly<Record<Team, string>> = { jaguars: 'JAX', gators: 'UF' }
+/* Team labels and short codes used to live here as a `Record<Team, string>`
+ * keyed by the two compiled-in teams. They are configuration now, so the page
+ * asks the source for them (`getLabel`, `getShort`) instead of holding a map
+ * it could not populate for a team it has never heard of. */
 
 /** How many upcoming games each grid tile group shows. */
 const NEXT_COUNT = 3
@@ -254,6 +254,13 @@ export function resultWash(result: GameResult): Rgb | undefined {
 }
 
 export interface FootballReader {
+  /** The two configured teams, in row order: top row first. The page draws
+   * whatever it is given and never names a team itself. */
+  getTeams(): readonly [Team, Team]
+  /** The team's key label, for example `GATORS`. */
+  getLabel(team: Team): string
+  /** The team's short code for the tape and strip, for example `UF`. */
+  getShort(team: Team): string
   getSchedule(team: Team): Game[]
   getRecord(team: Team): TeamRecord | null
   getStatus(): FootballStatus
@@ -267,10 +274,10 @@ export interface FootballReader {
 }
 
 /**
- * The Florida Gators' and Jacksonville Jaguars' schedules. Keys 0 and 4 are
- * the logo tiles, each carrying the team's season (regular-season) record
- * beneath the crest, in the plain band `compositeLogo` reserves there. Keys
- * 1-3 show the Gators' next three games; keys 5-7 the Jaguars' next three.
+ * Two configured teams' schedules, one row each. Keys 0 and 4 are the logo
+ * tiles, each carrying the team's season (regular-season) record beneath the
+ * crest, in the plain band `compositeLogo` reserves there. Keys 1-3 show the
+ * TOP team's next three games; keys 5-7 the BOTTOM team's next three.
  * Pressing a logo tile opens that team's full schedule as a mode of the
  * page — the same mode-of-the-page pattern `stocks-page.ts` and
  * `weather-page.ts` use for their own drill-downs — with `◀ BACK` on key 7.
@@ -331,9 +338,10 @@ export class FootballPage implements Page {
     if (this.selected) return undefined
     const nowMs = this.nowMsForTick()
     if (nowMs === null) return undefined
-    const gators = this.source.getTeamColor('gators') ?? theme.gray
-    const jaguars = this.source.getTeamColor('jaguars') ?? theme.gray
-    const hasTape = this.tapeSegments(nowMs, gators, jaguars).length > 0
+    const [top, bottom] = this.source.getTeams()
+    const topColor = this.source.getTeamColor(top) ?? theme.gray
+    const bottomColor = this.source.getTeamColor(bottom) ?? theme.gray
+    const hasTape = this.tapeSegments(nowMs, topColor, bottomColor).length > 0
     return hasTape ? TAPE_TICK_MS : undefined
   }
 
@@ -359,26 +367,27 @@ export class FootballPage implements Page {
 
     if (this.selected) return this.scheduleFrame(this.selected.team, clockMs, dim)
 
+    const [top, bottom] = this.source.getTeams()
     // Each team's own colour, taken from its crest. Falls back to the theme when a
     // crest has no usable accent — never a fabricated hue.
-    const gatorsColor = this.source.getTeamColor('gators') ?? theme.gray
-    const jaguarsColor = this.source.getTeamColor('jaguars') ?? theme.gray
+    const topColor = this.source.getTeamColor(top) ?? theme.gray
+    const bottomColor = this.source.getTeamColor(bottom) ?? theme.gray
 
     const keys: KeySpec[] = [
-      this.logoKey('gators', dim, gatorsColor),
-      ...this.nextThreeKeys('gators', clockMs, dim, gatorsColor),
-      this.logoKey('jaguars', dim, jaguarsColor),
-      ...this.nextThreeKeys('jaguars', clockMs, dim, jaguarsColor),
+      this.logoKey(top, dim, topColor),
+      ...this.nextThreeKeys(top, clockMs, dim, topColor),
+      this.logoKey(bottom, dim, bottomColor),
+      ...this.nextThreeKeys(bottom, clockMs, dim, bottomColor),
     ]
 
     // The ONE page where the two round buttons should differ. Every other page
     // shows a single board-level signal, so two colours would read as two
-    // unrelated controls — but here the deck genuinely splits by row, Gators on
-    // top and Jaguars beneath, so each light names its own row.
+    // unrelated controls — but here the deck genuinely splits by row, one team on
+    // top and one beneath, so each light names its own row.
     return {
       keys,
-      strip: this.strip(clockMs, gatorsColor, jaguarsColor),
-      buttons: [gatorsColor, jaguarsColor],
+      strip: this.strip(clockMs, topColor, bottomColor),
+      buttons: [topColor, bottomColor],
     }
   }
 
@@ -411,7 +420,7 @@ export class FootballPage implements Page {
     }
     return {
       kind: 'control',
-      lines: [TEAM_LABELS[team], recordText],
+      lines: [this.source.getLabel(team), recordText],
       lineSizes: [HEADER_SIZE, RECORD_SIZES],
       align: 'center',
       dim,
@@ -512,7 +521,7 @@ export class FootballPage implements Page {
    * comparison over one that has one. */
   private nearestNext(nowMs: number): { team: Team; game: Game } | null {
     let best: { team: Team; game: Game } | null = null
-    for (const team of ['jaguars', 'gators'] as const) {
+    for (const team of this.source.getTeams()) {
       const game = upcoming(this.source.getSchedule(team), nowMs)[0]
       if (!game) continue
       if (!best || game.kickoffEpochMs === null) {
@@ -526,7 +535,7 @@ export class FootballPage implements Page {
     return best
   }
 
-  private strip(nowMs: number, gatorsColor: Rgb, jaguarsColor: Rgb): StripSpec {
+  private strip(nowMs: number, topColor: Rgb, bottomColor: Rgb): StripSpec {
     const status = this.source.getStatus()
     const nearest = this.nearestNext(nowMs)
 
@@ -541,7 +550,7 @@ export class FootballPage implements Page {
       // Team's own short code plus the FULL opponent name (never both the
       // short AND the full opponent name — that duplicated the same team
       // twice and pushed real matchups past the 30-character strip budget).
-      line1 = `${when} · ${TEAM_SHORT[nearest.team]} ${prefix} ${nearest.game.opponent}`
+      line1 = `${when} · ${this.source.getShort(nearest.team)} ${prefix} ${nearest.game.opponent}`
     }
 
     const updatedAt = this.source.getLastUpdatedAt()
@@ -553,7 +562,7 @@ export class FootballPage implements Page {
     // The season crawling across line 2's band, both teams in date order, each
     // segment in its own team's colour. Line 1 keeps the nearest game, so the
     // most useful fact is still readable without waiting for the tape.
-    const segments = this.tapeSegments(nowMs, gatorsColor, jaguarsColor)
+    const segments = this.tapeSegments(nowMs, topColor, bottomColor)
     if (segments.length > 0) {
       spec.tape = { segments, offsetPx: tapeOffsetPx(nowMs, TAPE_PX_PER_SEC) }
     }
@@ -568,9 +577,10 @@ export class FootballPage implements Page {
    * A game with no known kickoff still appears — it is real, upcoming
    * information — but sorts last, since it cannot be placed on the timeline.
    */
-  private tapeSegments(nowMs: number, gatorsColor: Rgb, jaguarsColor: Rgb): TapeSegment[] {
+  private tapeSegments(nowMs: number, topColor: Rgb, bottomColor: Rgb): TapeSegment[] {
+    const [top] = this.source.getTeams()
     const entries: { game: Game; team: Team }[] = []
-    for (const team of ['gators', 'jaguars'] as const) {
+    for (const team of this.source.getTeams()) {
       for (const game of upcoming(this.source.getSchedule(team), nowMs)) {
         entries.push({ game, team })
       }
@@ -584,14 +594,14 @@ export class FootballPage implements Page {
       return ak - bk
     })
     return entries.slice(0, TAPE_GAME_COUNT).map(({ game, team }) => ({
-      text: `${TEAM_SHORT[team]} ${formatShortDate(game.kickoffEpochMs)} ${game.isHome ? 'vs' : '@'} ${game.opponentShort || game.opponent}`,
-      color: team === 'gators' ? gatorsColor : jaguarsColor,
+      text: `${this.source.getShort(team)} ${formatShortDate(game.kickoffEpochMs)} ${game.isHome ? 'vs' : '@'} ${game.opponentShort || game.opponent}`,
+      color: team === top ? topColor : bottomColor,
     }))
   }
 
   private scheduleStrip(team: Team, fullSchedule: Game[], window: Game[]): StripSpec {
     const record = formatRecord(this.source.getRecord(team))
-    const line1 = truncate(`${TEAM_LABELS[team]} SCHEDULE · ${record}`, STRIP_CHARS)
+    const line1 = truncate(`${this.source.getLabel(team)} SCHEDULE · ${record}`, STRIP_CHARS)
     const hidden = fullSchedule.length - window.length
     const line2 = truncate(
       hidden > 0 ? `showing ${window.length} of ${fullSchedule.length} · ${hidden} more` : `showing all ${fullSchedule.length} games`,
@@ -619,9 +629,10 @@ export class FootballPage implements Page {
     }
 
     // Grid mode. Only the two logo tiles (0, 4) are interactive.
+    const [top, bottom] = this.source.getTeams()
     let team: Team | null = null
-    if (index === 0) team = 'gators'
-    else if (index === 4) team = 'jaguars'
+    if (index === 0) team = top
+    else if (index === 4) team = bottom
     if (!team) return 'ignored'
 
     // A logo with no schedule data at all has nothing to drill into — per

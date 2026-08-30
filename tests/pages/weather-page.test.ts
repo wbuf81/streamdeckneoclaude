@@ -3,11 +3,15 @@ import { createCanvas } from '@napi-rs/canvas'
 import { WeatherPage, conditionTint, conditionFx, precipIntensity, heatColor, wrapText } from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT, FONT, FX_INTENSITY_MIN } from '../../src/render/canvas.js'
-import { ZIP, weatherEmoji } from '../../src/sources/weather.js'
+import { weatherEmoji } from '../../src/sources/weather.js'
 import type { Conditions, DayForecast, PeriodDetail, WeatherStatus } from '../../src/sources/weather.js'
 import type { KeySpec } from '../../src/render/specs.js'
 
 const NOW = 1786549560
+/** The ZIP the fake reader reports. A fixture: the page reads the code from
+ * its source now, so this suite supplies one instead of importing a constant
+ * the source no longer has. */
+const ZIP = '10001'
 /** The millisecond clock the daemon injects, for the proofs that need the
  * ambient effects actually running. */
 const FX_NOW_MS = NOW * 1000
@@ -116,13 +120,14 @@ function build(over: Partial<Fakes> = {}) {
     days: sevenDays(),
     conditions: { windSpeed: '8 mph', temperature: 91, shortForecast: 'Sunny' },
     status: 'ok',
-    place: 'Brooklyn FL',
+    place: 'Brooklyn NY',
     stale: false,
     updatedAt: NOW - 3600,
     ...over,
   }
   const calls: string[] = []
   const source = {
+    getZip: () => ZIP,
     getDays: () => f.days,
     getConditions: () => f.conditions,
     getStatus: () => f.status,
@@ -544,7 +549,7 @@ describe('WeatherPage strip', () => {
   it('shows the place and the current short forecast on line 1', () => {
     const { page } = build()
     const line1 = page.render(NOW).strip.lines[0]!
-    expect(line1).toContain('Brooklyn FL')
+    expect(line1).toContain('Brooklyn NY')
     expect(line1).toContain('Sunny')
   })
 
@@ -950,7 +955,7 @@ describe('WeatherPage detail view strip', () => {
 
   it('never draws detail-strip text past the strip edge for the longest real detailedForecast text', () => {
     // Measured live from api.weather.gov/gridpoints/OKX/33,37/forecast on
-    // 2026-08-13 (Brooklyn FL, this deck's fixed ZIP): the longest
+    // 2026-08-13 (Brooklyn NY, this deck's fixed ZIP): the longest
     // detailedForecast in that response, 290 characters.
     const longest =
       'A slight chance of showers and thunderstorms before 9pm. Partly cloudy. Low around 77, with temperatures rising to around 78 overnight. Heat index values as high as 103. Southwest wind around 7 mph. Chance of precipitation is 20%. New rainfall amounts less than a tenth of an inch possible.'

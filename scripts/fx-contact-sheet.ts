@@ -104,11 +104,12 @@ function day(emoji: string, precipPercent: number | null): DayForecast {
  * network and no device. */
 function reader(days: DayForecast[], stale: boolean): WeatherReader {
   return {
+    getZip: () => '10001',
     getDays: () => days,
     getConditions: () => null,
     getStatus: () => 'ok',
     getLastUpdatedAt: () => 0,
-    getPlace: () => 'Brooklyn FL',
+    getPlace: () => 'Brooklyn NY',
     isStale: () => stale,
     setVisible: () => {},
   } as unknown as WeatherReader

@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events'
 import { log } from '../log.js'
 
-/** The ZIP code this whole app forecasts for. A single-user deck needs no
- * per-user configuration. */
-export const ZIP = '10001'
+/* The ZIP code used to be a constant here, set to the author's own. It is
+ * configuration now (`weather.zip` in `config.json`) and arrives through the
+ * constructor, because a forecast for someone else's town is worse than no
+ * weather page at all — which is what an unconfigured deck gets. */
 
 const ZIPPOPOTAM_BASE = 'https://api.zippopotam.us/us'
 const POINTS_BASE = 'https://api.weather.gov/points'
@@ -121,7 +122,7 @@ type FetchLike = (url: string, init?: Record<string, unknown>) => Promise<{
 interface Coordinates {
   lat: number
   lon: number
-  /** For example `Brooklyn FL`. Empty when the lookup carried no name. */
+  /** For example `Brooklyn NY`. Empty when the lookup carried no name. */
   place: string
 }
 
@@ -372,7 +373,7 @@ function extractForecastUrl(body: unknown): string | null {
 }
 
 /**
- * Reads the US National Weather Service forecast for a fixed ZIP code. It
+ * Reads the US National Weather Service forecast for the configured ZIP code. It
  * resolves the ZIP to coordinates and the coordinates to a forecast URL only
  * once per process, then re-fetches only the forecast itself on each poll —
  * re-resolving every time would triple the request count for no benefit. It
@@ -401,7 +402,7 @@ export class WeatherSource extends EventEmitter {
   private lastKey = ''
 
   constructor(
-    private readonly zip: string = ZIP,
+    private readonly zip: string,
     private fetchFn: FetchLike = fetch as unknown as FetchLike,
     private readonly now: () => number = () => Math.floor(Date.now() / 1000),
   ) {
@@ -444,7 +445,13 @@ export class WeatherSource extends EventEmitter {
     return this.lastSuccessAt
   }
 
-  /** For example `Brooklyn FL`. Empty before the ZIP resolves. */
+  /** The configured ZIP code. The page prints it on the conditions tile, so
+   * it reads it from here rather than from a module constant. */
+  getZip(): string {
+    return this.zip
+  }
+
+  /** For example `Brooklyn NY`. Empty before the ZIP resolves. */
   getPlace(): string {
     return this.coords?.place ?? ''
   }

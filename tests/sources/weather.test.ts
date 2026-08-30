@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
-  ZIP,
   WeatherSource,
   weatherEmoji,
   shortDayLabel,
@@ -9,6 +8,10 @@ import {
 import { log, setDefaultSink } from '../../src/log.js'
 
 const NOW = 1_755_000_000
+/** The ZIP this suite drives the source with. A fixture, not a default: the
+ * source has no built-in ZIP any more, so the suite states its own. Every
+ * captured response below was recorded for this code. */
+const ZIP = '10001'
 const FORECAST_URL = 'https://api.weather.gov/gridpoints/OKX/33,37/forecast'
 
 /**
@@ -488,8 +491,8 @@ function zipBody() {
       {
         'place name': 'Brooklyn',
         longitude: '-73.9967',
-        state: 'Florida',
-        'state abbreviation': 'FL',
+        state: 'New York',
+        'state abbreviation': 'NY',
         latitude: '40.7484',
       },
     ],
@@ -565,7 +568,7 @@ describe('WeatherSource', () => {
     await src.refresh()
     expect(src.getStatus()).toBe('ok')
     expect(src.getDays()).toHaveLength(7)
-    expect(src.getPlace()).toBe('Brooklyn FL')
+    expect(src.getPlace()).toBe('Brooklyn NY')
     expect(src.getLastUpdatedAt()).toBe(NOW)
   })
 
@@ -860,8 +863,18 @@ describe('WeatherSource stop() during an in-flight refresh', () => {
   })
 })
 
-describe('ZIP', () => {
-  it('is the configured ZIP code for this deck', () => {
-    expect(ZIP).toBe('10001')
+describe('the configured ZIP', () => {
+  it('is reported back, and drives the lookup, rather than any built-in default', async () => {
+    const urls: string[] = []
+    const fetchFn = vi.fn(async (url: string) => {
+      urls.push(url)
+      return { ok: false, status: 500, json: async () => ({}) }
+    })
+    const src = new WeatherSource('90210', fetchFn as never, () => NOW)
+    expect(src.getZip()).toBe('90210')
+    await src.refresh()
+    expect(urls[0]).toContain('/90210')
+    expect(urls.some((u) => u.includes(ZIP))).toBe(false)
+    await src.stop()
   })
 })

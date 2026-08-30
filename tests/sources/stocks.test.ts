@@ -675,8 +675,17 @@ describe('StockSource stop() during an in-flight refresh', () => {
 })
 
 describe('SYMBOLS', () => {
-  it('lists exactly the eight tickers, in order', () => {
-    expect(SYMBOLS).toEqual(['TSLA', 'MSFT', 'NVDA', 'NOW', 'SOFI', 'HIMS', 'SPCX', 'AMZN'])
+  it('lists exactly eight tickers, one per key', () => {
+    expect(SYMBOLS).toHaveLength(8)
+    expect(new Set(SYMBOLS).size).toBe(8)
+  })
+
+  it('is a generic default, not anyone in particular\'s watchlist', () => {
+    // The list used to be the author's own holdings, compiled in. It is the
+    // FALLBACK now, for a deck with no `stocks.symbols` in its config, so it
+    // has to say nothing about whoever installed it. Every entry is a
+    // broad-market ETF or one of the largest listed companies.
+    expect(SYMBOLS).toEqual(['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META'])
   })
 })
 

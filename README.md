@@ -28,12 +28,14 @@ press acts on the thing it shows.
 - [How it reads the data it shows](#how-it-reads-the-data-it-shows)
 - [Architecture](#architecture)
 - [Install](#install)
+- [Configure](#configure)
 - [Spotify](#spotify)
 - [Permissions and privacy](#permissions-and-privacy)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
 - [Documentation map](#documentation-map)
 - [Credits](#credits)
+- [License](#license)
 
 ---
 
@@ -93,8 +95,8 @@ empty grid.
 
 ![Stocks page](docs/images/page-stocks.png)
 
-Eight watchlist symbols: `TSLA`, `MSFT`, `NVDA`, `NOW`, `SOFI`, `HIMS`,
-`SPCX`, `AMZN`. Each tile carries the price, the day's change, and an
+Eight watchlist symbols, set in `config.json`. Each tile carries the price,
+the day's change, and an
 intraday sparkline. The heat wash is relative to the day's own spread, so a
 flat day does not paint eight identical tiles. The strip scrolls a ticker
 tape and names the market state.
@@ -113,14 +115,15 @@ bottom row. Key 7 goes back.
 Seven forecast tiles with a colour emoji, the high and low, and the rain
 chance. Each tile runs an ambient effect matched to its condition — rain
 falls, snow drifts, storms strike, wind streaks. Key 7 shows wind, the ZIP,
-and the place name. Data comes from the US National Weather Service.
+and the place name. Data comes from the US National Weather Service, for the
+ZIP code you configure.
 
 ### Football
 
 ![Football page](docs/images/page-football.png)
 
-Two teams, one row each. Key 0 and key 4 show the crest and the season
-record. The next three games follow on each row, with the opponent, the
+Two teams, one row each, both set in `config.json` by their ESPN team id. Key
+0 and key 4 show the crest and the season record. The next three games follow on each row, with the opponent, the
 kickoff date, and the local time. The two round buttons differ on this page
 alone: each light names its own row. The strip scrolls the combined
 schedule.
@@ -328,17 +331,20 @@ its own custom firmware, shows Spotify. It has no way to know when this Mac
 sleeps. So `deckd` sends it a heartbeat every 5 seconds over plain HTTP, and
 the knob treats silence as sleep with a 25-second timeout.
 
-The heartbeat tries `knob.local` first and a fixed IP second, because
-mDNS resolution from Node proved unreliable on this Mac. The first host to
-answer is remembered and tried first from then on, so a DHCP change costs one
-failed beat rather than a permanent outage. Override the list with
-`KNOB_HOSTS`.
+The heartbeat walks the `knob.hosts` list in `config.json`, most likely
+address first. Configure more than one — a `.local` name and a plain IP —
+because mDNS resolution from Node proved unreliable on this Mac. The first
+host to answer is remembered and tried first from then on, so a DHCP change
+costs one failed beat rather than a permanent outage. `KNOB_HOSTS` overrides
+the list. With no hosts configured, the heartbeat never starts.
 
 The link fails open in both directions. The knob treats "never heard from" as
 awake, and `deckd` never lets a missing display affect anything it does.
 
-That firmware lives in its own repository. It is genuine custom firmware for
-an ESP32 board — unlike the Neo, which needs none.
+That firmware lives in its own repository, and it is genuine custom firmware
+for an ESP32 board — unlike the Neo, which needs none. Its ancestor, an
+M5Stack Spotify display that shares the state model and Spotify client, is
+public at [m5-spotify-deck](https://github.com/wbuf81/m5-spotify-deck).
 
 ---
 
@@ -349,8 +355,11 @@ guessing a safe-looking value.
 
 ### Claude Code sessions and usage
 
-Session state comes from the `daisy-statusbar` plugin's state files, which
-`deckd` reads and never writes.
+Session state comes from
+[daisy-claude-status-bar](https://github.com/wbuf81/daisy-claude-status-bar),
+a separate Claude Code plugin. It writes one JSON file per session; `deckd`
+reads them and never writes to them. Without that plugin the session keys show
+`no session data` and the rest of the deck is unaffected.
 
 Rate limits are harder, because **no file on disk holds them**. Claude Code
 sends them to the statusline command on stdin and nowhere else. So the
@@ -446,6 +455,48 @@ The install does three things, and prints each one:
 
 `node dist/bin/deckd.js uninstall` reverses all three. It leaves the state
 directory alone, because that directory holds your Spotify token.
+
+---
+
+## Configure
+
+Four pages need to know something only you can tell them: which ZIP code to
+forecast, which symbols to watch, which two teams to follow, and where your
+companion display lives. All of it goes in one file, outside the repository:
+
+```
+~/.local/state/deckd/config.json
+```
+
+Copy [`config.example.json`](config.example.json) there, edit it, and restart
+the daemon. The file is mode 0600, because `deckd auth spotify` also writes
+your Spotify client id into it.
+
+| Section | Effect when absent |
+| --- | --- |
+| `weather.zip` | **The weather page is not added.** A five-digit US ZIP |
+| `stocks.symbols` | A generic default watchlist. Up to 8, one per key |
+| `football.top` / `football.bottom` | **The football page is not added.** Both are required |
+| `knob.hosts` | No heartbeat. Only useful if you own the companion display |
+| `spotify.clientId` | Key 0 shows `SIGN IN`. Written by `deckd auth spotify` |
+
+Two rules govern the whole file, and they are worth knowing before you debug
+it:
+
+- **A mistake disables one page, never the daemon.** Each section is validated
+  on its own, so a malformed `football` block cannot take the weather page
+  down with it. Every rejection is logged with the reason.
+- **An absent value is never guessed at.** There is no fallback ZIP code and
+  no fallback pair of teams, because someone else's town and someone else's
+  team are worse answers than no page at all. The watchlist is the one
+  exception: broad-market ETFs are a real answer rather than a guess about
+  you.
+
+So a deck with no config file at all runs five pages — Claude, Codex, Spotify,
+stocks, and system — and says in the log which two it left out and why.
+
+Finding an ESPN team id: open the team's page on espn.com and read it out of
+the URL. `league` is `nfl` or `college-football`.
 
 ---
 
@@ -572,9 +623,20 @@ The crab sprite art comes from
 [clawd-on-desk](https://github.com/rullerzhou-afk/clawd-on-desk) by
 rullerzhou-afk, used under the MIT license.
 
-The session state feed comes from the `daisy-statusbar` Claude Code plugin.
-This project reads its state files and writes nothing to them.
+The session state feed comes from
+[daisy-claude-status-bar](https://github.com/wbuf81/daisy-claude-status-bar),
+a Claude Code plugin. This project reads its state files and writes nothing to
+them.
 
 USB HID transport comes from
 [`@elgato-stream-deck/node`](https://github.com/Julusian/node-elgato-stream-deck).
 Everything drawn on the device is this project's own.
+
+---
+
+## License
+
+[MIT](LICENSE).
+
+The crab sprite art is MIT as well, from clawd-on-desk, and keeps its
+attribution above.

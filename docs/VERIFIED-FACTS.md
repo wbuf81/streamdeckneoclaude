@@ -9,7 +9,8 @@ contradict what the plan originally said, and each wrong assumption cost a fix r
 ## The device
 
 Stream Deck Neo. USB vendor `0x0FD9`, product `0x009A`. Library model id `neo`.
-Firmware `1.00.011`. Serial `REDACTED-SERIAL`.
+Firmware `1.00.011`. (The unit's serial was recorded here; removed, since it identifies one
+physical device and nothing in the code reads it.)
 
 | Control | Index | Detail |
 | --- | --- | --- |
@@ -315,10 +316,11 @@ Measured locally on 2026-08-13:
 
 ## Spotify
 
-- Client id `REDACTED-CLIENT-ID`, taken from the user's own
-  `~/Vibecoding/m5stackfirmware/src/config/secrets.h`. Provisioned to
-  `~/.local/state/deckd/config.json`, mode 0600, **outside the repo** so no credential is
-  in git.
+- The client id is the author's own Spotify app, reused from an earlier project on the
+  same desk. It lives ONLY in `~/.local/state/deckd/config.json`, mode 0600, **outside the
+  repo** — no credential is in git, and the literal value is deliberately not recorded here
+  either. A PKCE client id is public by design (it travels in the browser redirect), but
+  publishing one still lets a stranger's consent screen carry your app's name.
 - Redirect URI **`http://127.0.0.1:8888/callback`** — the URI that app already registers.
   Spotify docs, quoted: *"Use HTTPS for your redirect URI, unless you are using a loopback
   address, when HTTP is permitted"* and *"localhost is not allowed as redirect URI."*
@@ -442,7 +444,8 @@ boundaries produce no gap at the pre/regular/post handover.
 
 US National Weather Service, **no API key**. **Rejects requests without a `User-Agent`.**
 
-1. `https://api.zippopotam.us/us/10001` → Brooklyn, FL at `40.7484, -73.9967`.
+1. `https://api.zippopotam.us/us/<ZIP>` → `places[0]`, carrying `place name`, `state
+   abbreviation`, `latitude`, and `longitude`. The configured ZIP is not recorded here.
 2. `https://api.weather.gov/points/<lat>,<lon>` → `properties.forecast` (a URL). Office `OKX`.
 3. GET that URL → `properties.periods`, ~14 entries alternating day and night.
 
@@ -506,9 +509,9 @@ currently enforced in code.
 ### Zippopotam's `latitude`/`longitude` are JSON strings, not numbers
 
 `parseZipBody` requires `typeof p.latitude === 'string'` (and the same for
-`longitude`) before calling `Number.parseFloat` — a numeric `40.7484` in the
-body would fail that check and return `null`. This file already recorded the
-resolved values (`40.7484, -73.9967`) but not their JSON type. If the service
+`longitude`) before calling `Number.parseFloat` — a bare numeric latitude in the
+body would fail that check and return `null`. Measured live: both arrive as
+quoted strings, for every ZIP tried. If the service
 ever returned numbers instead of strings, `resolveZip` would return `null`
 forever, `coords` would never cache, and the weather page would stay
 permanently `empty` — recorded here so that failure mode is traceable to this

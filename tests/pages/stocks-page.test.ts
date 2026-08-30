@@ -415,7 +415,7 @@ describe('StocksPage detail view layout', () => {
 
   it('key 0 shows the symbol, then the price', () => {
     const key = detailKeys()[0]!
-    expect(key.lines).toEqual(['TSLA', '327.51'])
+    expect(key.lines).toEqual([SYMBOLS[0], '327.51'])
   })
 
   it('key 1 shows the change percent with the down arrow, then the change amount, both trend-red', () => {
@@ -1197,7 +1197,7 @@ describe('StocksPage detail view strip', () => {
     expect(strip.right).toBe('offline')
     // Both text lines stay in place — offline does not blank out the
     // company name or the market-state line, it only adds the marker.
-    expect(strip.lines[0]).toBe('TSLA')
+    expect(strip.lines[0]).toBe(SYMBOLS[0])
     expect(strip.lines[1]).toBe('MARKET CLOSED · 11:46 AM EDT')
   })
 

@@ -12,7 +12,7 @@ function fileFor(overrides: Record<string, unknown> = {}): string {
     label: 'Running command',
     tool: 'Bash',
     project: 'streamdeckneoclaude',
-    cwd: '/Users/you/Vibecoding/streamdeckneoclaude',
+    cwd: '/Users/you/projects/streamdeckneoclaude',
     sessionId: 'aaaa',
     transcript: '/tmp/t.jsonl',
     entrypoint: 'cli',

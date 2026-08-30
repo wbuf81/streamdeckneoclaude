@@ -344,11 +344,12 @@ function weatherPage(): Page {
     windSpeed: '8 mph', temperature: 91, shortForecast: 'Thunderstorms',
   }
   return new WeatherPage({
+    getZip: () => '10001',
     getDays: () => days,
     getConditions: () => conditions,
     getStatus: () => 'ok',
     getLastUpdatedAt: () => NOW,
-    getPlace: () => 'Brooklyn FL',
+    getPlace: () => 'Brooklyn NY',
     isStale: () => false,
     setVisible: () => {},
   } as unknown as WeatherReader)
@@ -386,6 +387,9 @@ function footballPage(): Page {
     jaguars: [0, 103, 120],
   }
   return new FootballPage({
+    getTeams: () => ['gators', 'jaguars'] as const,
+    getLabel: (team: string) => (team === 'gators' ? 'GATORS' : 'JAGUARS'),
+    getShort: (team: string) => (team === 'gators' ? 'UF' : 'JAX'),
     getSchedule: (team: Team) => (team === 'gators' ? gators : jaguars),
     getRecord: (team: Team) => records[team],
     getStatus: () => 'ok',

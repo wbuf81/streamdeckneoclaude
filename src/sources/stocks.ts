@@ -1,17 +1,17 @@
 import { EventEmitter } from 'node:events'
 import { log } from '../log.js'
+import { DEFAULT_SYMBOLS } from '../config.js'
 
-/** The eight tickers, in the order they fill the deck's eight keys. */
-export const SYMBOLS: readonly string[] = [
-  'TSLA',
-  'MSFT',
-  'NVDA',
-  'NOW',
-  'SOFI',
-  'HIMS',
-  'SPCX',
-  'AMZN',
-] as const
+/**
+ * The tickers the deck shows, in the order they fill its eight keys.
+ *
+ * This was the author's own watchlist, compiled in. It is configuration now
+ * (`stocks.symbols` in `config.json`); this re-export is the DEFAULT the
+ * config falls back to, and it is deliberately generic — broad-market ETFs
+ * and the largest listed names, which say nothing about whoever installed
+ * the deck.
+ */
+export { DEFAULT_SYMBOLS as SYMBOLS } from '../config.js'
 
 /**
  * `'unknown'` per finding I1 and docs/LESSONS.md lesson 18: an absent or
@@ -303,7 +303,7 @@ export class StockSource extends EventEmitter {
   private watchedSymbol: string | null = null
 
   constructor(
-    private readonly symbols: readonly string[] = SYMBOLS,
+    private readonly symbols: readonly string[] = DEFAULT_SYMBOLS,
     private fetchFn: FetchLike = fetch as unknown as FetchLike,
     private readonly now: () => number = () => Math.floor(Date.now() / 1000),
   ) {

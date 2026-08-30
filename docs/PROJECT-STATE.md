@@ -38,8 +38,8 @@ rendering change shows up in them on the next run.
 
 | Path | Note |
 | --- | --- |
+| `~/.local/state/deckd/config.json` | ZIP, watchlist, teams, knob hosts, Spotify client id. See `config.example.json` |
 | `~/.local/state/deckd/spotify.json` | refresh token, mode 0600. **Never read or print.** Backup `.pre-rescope` |
-| `~/.local/state/deckd/config.json` | Spotify client id, mode 0600, outside the repo |
 | `~/.local/state/deckd/usage.json` | rate limits, written by the statusline wrapper |
 | `~/.local/state/deckd/deckd.log` | contains a `SENTINEL do not delete` line — a tripwire proving tests do not write here |
 | `~/.claude/settings.json.deckd-backup` | install's backup |
@@ -337,15 +337,22 @@ Definition of done:
 - Tests inject process, file, and command readers. They do not touch the live device or home
   directory.
 
-#### P1 — Add validated user configuration
+#### P1 — Add validated user configuration — PARTLY DONE
 
-Move product choices out of source constants and into `config.json`, while keeping current
-behavior as the default.
+**Landed** (`src/config.ts`, `tests/config.test.ts`, `config.example.json`): weather ZIP
+code, stock symbols, the two football teams, and the knob display's hosts. Each section is
+validated on its own, so one bad section disables only its own page. An absent section is
+never filled from someone else's answer — no ZIP and no teams switch those pages off, and
+`bin/deckd.ts` adds a page only when its configuration exists. Unknown fields are preserved,
+because nothing rewrites the file except `deckd auth spotify`, which merges. Changes apply on
+restart. Only the watchlist has a fallback, and it is deliberately generic.
 
-Start with weather ZIP code, stock symbols, brightness, polling intervals, and page enablement
-and order. Reject invalid values with clear messages. Preserve unknown config fields. Do not
-put secrets in the same validation output. A restart may apply changes in the first version;
-live reload is optional.
+**Still to do:** brightness, polling intervals, and page enablement and order. Page order is
+still the `pages.add` order in `bin/deckd.ts`.
+
+The trigger for the landed half was making the repository publishable: the ZIP code, the
+watchlist, the teams, and a LAN address were all compiled in, which put one person's home
+town in the source tree and made the daemon useless to anyone else.
 
 #### P2 — Improve task navigation
 
@@ -401,7 +408,7 @@ Window targeting is built and Accessibility **is now granted**, so it is the liv
 Claude Code sets the terminal title to a **task summary**, not the directory, so a title
 carries no trace of the cwd, the path, or the project for any window running Claude Code.
 Measured: title `⠐ Build Elgato Stream Deck custom control software` against cwd
-`/Users/you/Vibecoding/streamdeckneoclaude`. Nothing matches, so it correctly falls back to
+`~/projects/streamdeckneoclaude`. Nothing matches, so it correctly falls back to
 app-level `activate` and logs once. A Claude window versus a plain shell switches correctly;
 **two Claude windows still only raise the app.** The fix is upstream in the title itself.
 

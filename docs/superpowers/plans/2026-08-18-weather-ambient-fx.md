@@ -1440,7 +1440,7 @@ npm run build
 - [ ] **Step 3: Find the exact running process**
 
 ```bash
-pgrep -fl '/Users/you/Vibecoding/streamdeckneoclaude/dist/bin/deckd.js start'
+pgrep -fl '/Users/you/projects/streamdeckneoclaude/dist/bin/deckd.js start'
 ```
 
 - [ ] **Step 4: Stop only that PID and let launchd restart it**
@@ -1454,7 +1454,7 @@ Wait about three seconds. Never use a broad process pattern when an exact PID is
 - [ ] **Step 5: Confirm a new PID and a clean log**
 
 ```bash
-pgrep -fl '/Users/you/Vibecoding/streamdeckneoclaude/dist/bin/deckd.js start'
+pgrep -fl '/Users/you/projects/streamdeckneoclaude/dist/bin/deckd.js start'
 tail -n 40 ~/.local/state/deckd/deckd.log
 ```
 

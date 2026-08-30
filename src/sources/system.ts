@@ -62,9 +62,10 @@ const DATA_VOLUME = '/System/Volumes/Data'
  * The interface this page reports on. Measured on this Mac
  * (docs/VERIFIED-FACTS.md): `en0` carries the real traffic, and `netstat -ib`
  * lists it on more than one row (a `<Link#>` row and an `fe80:` inet6 row)
- * with identical cumulative counters — this is a fixed constant, the same
- * way `ZIP` and `SYMBOLS` are fixed elsewhere in this project, rather than a
- * guess at "the primary interface" on a machine that was never measured.
+ * with identical cumulative counters — this is a fixed constant, measured,
+ * rather than a guess at "the primary interface" on a machine that was never
+ * measured. Unlike the ZIP code and the watchlist, it is not configuration:
+ * `en0` is the built-in interface name on every Mac this can run on.
  */
 export const PRIMARY_INTERFACE = 'en0'
 

@@ -149,7 +149,10 @@ async function main(): Promise<void> {
   let y = TITLE_H
   for (const sit of SITUATIONS) {
     const reader = {
-      getSchedule: (t: Team) => sit.schedules[t] ?? [],
+      getTeams: () => ['gators', 'jaguars'] as const,
+    getLabel: (team: string) => (team === 'gators' ? 'GATORS' : 'JAGUARS'),
+    getShort: (team: string) => (team === 'gators' ? 'UF' : 'JAX'),
+    getSchedule: (t: Team) => sit.schedules[t] ?? [],
       getRecord: (t: Team) => sit.records[t] ?? null,
       getStatus: () => 'ok',
       getLastUpdatedAt: () => NOW_S,

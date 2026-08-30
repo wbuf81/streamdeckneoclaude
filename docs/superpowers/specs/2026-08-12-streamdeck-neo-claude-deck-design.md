@@ -49,7 +49,7 @@ assumptions.
 | USB vendor | `0x0FD9` (4057) |
 | USB product | `0x009A` (154) |
 | Firmware | `1.00.011` |
-| Serial | `REDACTED-SERIAL` |
+| Serial | *(removed: identifies one physical unit; no code reads it)* |
 | Library model id | `neo` |
 
 Controls:

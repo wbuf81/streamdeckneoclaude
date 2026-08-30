@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "Copy this to ~/.local/state/deckd/config.json and edit it, then restart deckd.",
+    "Every section is optional and validated on its own: a mistake in one",
+    "disables only the page it belongs to, and says so in the log.",
+    "The real file is mode 0600 because it holds your Spotify client id.",
+    "'deckd auth spotify --client-id <ID>' writes the spotify section for you."
+  ],
+
+  "spotify": {
+    "clientId": "your-spotify-app-client-id"
+  },
+
+  "weather": {
+    "_comment": "A five-digit US ZIP code. Omit the section to turn the weather page off.",
+    "zip": "10001"
+  },
+
+  "stocks": {
+    "_comment": "Up to 8 symbols, one per key. Omit for a generic default watchlist.",
+    "symbols": ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
+  },
+
+  "football": {
+    "_comment": [
+      "Two teams, top row and bottom row. Both are required, or the page is off.",
+      "espnId is ESPN's own numeric team id. Find it in the URL of the team's",
+      "page on espn.com. league is 'nfl' or 'college-football'.",
+      "fullName must match ESPN's own name string exactly; it is how the",
+      "opponent is pulled out of 'Away Team at Home Team' without an extra",
+      "request per game."
+    ],
+    "top": {
+      "id": "gators",
+      "label": "GATORS",
+      "short": "UF",
+      "league": "college-football",
+      "espnId": "57",
+      "fullName": "Florida Gators",
+      "logoUrl": "https://a.espncdn.com/i/teamlogos/ncaa/500/57.png"
+    },
+    "bottom": {
+      "id": "jaguars",
+      "label": "JAGUARS",
+      "short": "JAX",
+      "league": "nfl",
+      "espnId": "30",
+      "fullName": "Jacksonville Jaguars",
+      "logoUrl": "https://a.espncdn.com/i/teamlogos/nfl/500/jax.png"
+    }
+  },
+
+  "knob": {
+    "_comment": [
+      "Optional companion display that sleeps with this Mac. Most likely",
+      "address first; the first one to answer is remembered. Omit the section",
+      "unless you have one - there is no default, and no heartbeat without it."
+    ],
+    "hosts": ["knob.local", "192.168.1.50"]
+  }
+}

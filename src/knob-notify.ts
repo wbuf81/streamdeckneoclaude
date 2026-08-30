@@ -1,20 +1,26 @@
 import { log, type Logger } from './log.js'
 
 /**
- * Where to look for the knob display, in order. It advertises `_http._tcp` and
- * answers `/awake` and `/locked` with 204.
+ * How the knob display is addressed.
  *
- * More than one candidate because mDNS alone was not reliable enough. Measured
- * on this Mac: `ping knob.local` resolves, but resolution from Node
- * repeatedly failed or took longer than any sane request timeout, so the
- * heartbeat never arrived and the device sat on a stale state. The IP is the
- * fallback, and the first candidate that answers is remembered and tried first
- * from then on - so a DHCP change costs one failed beat, not a permanent
- * outage.
+ * There is NO default any more. The list used to hold the author's own
+ * hostname and LAN address, which is nobody else's device and does not belong
+ * in a public source tree. An empty list disables the heartbeat entirely, and
+ * that is the correct behaviour for anyone who does not own one of these.
  *
- * Override with KNOB_HOSTS as a comma-separated list.
+ * Configure it under `knob.hosts` in `config.json`, or override with the
+ * `KNOB_HOSTS` environment variable as a comma-separated list. Order matters:
+ * put the most likely address first. More than one entry is worth having
+ * because mDNS alone was not reliable enough — measured on the author's Mac,
+ * `ping <name>.local` resolves, but resolution from Node repeatedly failed or
+ * took longer than any sane request timeout, so the heartbeat never arrived
+ * and the device sat on a stale state. A plain IP is the fallback, and the
+ * first candidate that answers is remembered and tried first from then on, so
+ * a DHCP change costs one failed beat rather than a permanent outage.
+ *
+ * The device advertises `_http._tcp` and answers `/awake` and `/locked` with
+ * 204.
  */
-const DEFAULT_HOSTS = ['knob.local', '192.168.1.50']
 
 /**
  * How often the state is repeated. The device treats silence as sleep, so this
@@ -38,11 +44,15 @@ const LOG_UNREACHABLE = 'knob-notify-unreachable'
 
 export type KnobFetcher = (url: string, init: { signal: AbortSignal }) => Promise<{ ok: boolean; status: number }>
 
-function envHosts(): readonly string[] {
+/** `KNOB_HOSTS`, split and trimmed, or null when it is unset or holds nothing
+ * usable. Null means "the environment said nothing", which lets the caller's
+ * configured list through — distinct from an empty list, which means
+ * "configured off". */
+export function envHosts(): readonly string[] | null {
   const raw = process.env['KNOB_HOSTS']
-  if (!raw) return DEFAULT_HOSTS
+  if (!raw) return null
   const parsed = raw.split(',').map((h) => h.trim()).filter((h) => h.length > 0)
-  return parsed.length > 0 ? parsed : DEFAULT_HOSTS
+  return parsed.length > 0 ? parsed : null
 }
 
 const realFetcher: KnobFetcher = async (url, init) => {
@@ -77,14 +87,23 @@ export class KnobNotifier {
   private preferred = 0
 
   constructor(
-    private readonly hosts: readonly string[] = envHosts(),
+    private readonly hosts: readonly string[] = envHosts() ?? [],
     private readonly intervalMs: number = DEFAULT_INTERVAL_MS,
     private readonly fetcher: KnobFetcher = realFetcher,
     private readonly logger: Logger = log,
   ) {}
 
-  /** Sends at once, then repeats on the heartbeat interval. */
+  /** True when a display is configured. `start` is a no-op without one, so
+   * an unconfigured deck never opens a socket or logs an outage for a device
+   * that was never claimed to exist. */
+  isConfigured(): boolean {
+    return this.hosts.length > 0
+  }
+
+  /** Sends at once, then repeats on the heartbeat interval. Does nothing when
+   * no host is configured. */
   start(locked: boolean): void {
+    if (!this.isConfigured()) return
     this.stopped = false
     this.locked = locked
     void this.send()
@@ -96,6 +115,7 @@ export class KnobNotifier {
 
   /** Called when the lock state changes, so the device reacts within a second. */
   setLocked(locked: boolean): void {
+    if (!this.isConfigured()) return
     this.locked = locked
     void this.send()
   }

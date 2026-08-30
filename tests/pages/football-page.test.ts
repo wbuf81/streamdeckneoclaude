@@ -18,6 +18,13 @@ import type { KeySpec, Rgb } from '../../src/render/specs.js'
 import type { FootballStatus, Game, Team, TeamRecord } from '../../src/sources/football.js'
 
 const NOW_S = 1755000000 // arbitrary fixed clock, seconds
+
+/** The two teams this suite configures, in ROW order: top row first. The page
+ * takes these from its source now instead of naming teams itself, so the
+ * suite states them here. */
+const TEAM_ORDER: readonly [Team, Team] = ['gators', 'jaguars']
+const TEAM_LABELS: Record<string, string> = { gators: 'GATORS', jaguars: 'JAGUARS' }
+const TEAM_SHORT: Record<string, string> = { gators: 'UF', jaguars: 'JAX' }
 /** Stands in for a decoded crest. Spec-level only: it draws nothing, which is
  * fine for tests that read KeySpec fields rather than pixels. */
 const FAKE_LOGO = { width: 200, height: 200 } as unknown as Image
@@ -60,6 +67,9 @@ function build(over: Partial<Fakes> = {}) {
   }
   const calls: string[] = []
   const source = {
+    getTeams: () => TEAM_ORDER,
+    getLabel: (team: Team) => TEAM_LABELS[team] ?? '',
+    getShort: (team: Team) => TEAM_SHORT[team] ?? '',
     getSchedule: (team: Team) => f.schedules[team] ?? [],
     getRecord: (team: Team) => f.records[team] ?? null,
     getStatus: () => f.status,

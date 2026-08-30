@@ -1856,7 +1856,7 @@ function fileFor(overrides: Record<string, unknown> = {}): string {
     label: 'Running command',
     tool: 'Bash',
     project: 'streamdeckneoclaude',
-    cwd: '/Users/you/Vibecoding/streamdeckneoclaude',
+    cwd: '/Users/you/projects/streamdeckneoclaude',
     sessionId: 'aaaa',
     transcript: '/tmp/t.jsonl',
     entrypoint: 'cli',
@@ -2620,7 +2620,7 @@ const PAYLOAD = JSON.stringify({
     five_hour: { used_percentage: 62, resets_at: 1786557420 },
     seven_day: { used_percentage: 34, resets_at: 1786895160 },
   },
-  workspace: { project_dir: '/Users/you/Vibecoding/streamdeckneoclaude' },
+  workspace: { project_dir: '/Users/you/projects/streamdeckneoclaude' },
 })
 
 describe('statusline-wrapper.sh', () => {

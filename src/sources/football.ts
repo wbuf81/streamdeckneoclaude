@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
 import { log } from '../log.js'
+import type { League, TeamConfig, TeamPair } from '../config.js'
 import { theme } from '../render/theme.js'
 import { dominantColor } from '../render/canvas.js'
 import type { Rgb } from '../render/specs.js'
@@ -25,45 +26,18 @@ import type { Rgb } from '../render/specs.js'
  * far cheaper endpoint (see `parseRecord`).
  */
 
-export type Team = 'jaguars' | 'gators'
-type League = 'nfl' | 'college-football'
+/**
+ * A configured team's id, taken from `config.json`.
+ *
+ * This was a `'jaguars' | 'gators'` union while the two teams were compiled
+ * in. The teams are configuration now, so an id is an opaque string and the
+ * source carries each team's own `TeamConfig`. Nothing downstream ever
+ * enumerated the union — the page asks the source which two teams exist, in
+ * row order — so widening it costs no type safety that was being used.
+ */
+export type Team = string
 
-interface TeamConfig {
-  readonly espnId: string
-  readonly league: League
-  /** The exact string ESPN's own `name` field uses for this team — the key
-   * that lets `splitEventName` pull the OPPONENT's name out of "Away Team at
-   * Home Team" without an extra request per game. Measured live: this exact
-   * string appears at one end of `name` in every event fetched for this
-   * team (32/32 across both teams' full seasons, task 42 report). */
-  readonly fullName: string
-  readonly logoUrl: string
-}
-
-export const JAGUARS_ESPN_ID = '30'
-export const GATORS_ESPN_ID = '57'
-
-const TEAM_CONFIG: Readonly<Record<Team, TeamConfig>> = {
-  jaguars: {
-    espnId: JAGUARS_ESPN_ID,
-    league: 'nfl',
-    fullName: 'Jacksonville Jaguars',
-    logoUrl: 'https://a.espncdn.com/i/teamlogos/nfl/500/jax.png',
-  },
-  gators: {
-    espnId: GATORS_ESPN_ID,
-    league: 'college-football',
-    fullName: 'Florida Gators',
-    logoUrl: 'https://a.espncdn.com/i/teamlogos/ncaa/500/57.png',
-  },
-}
-
-/** ESPN's logo CDN, measured OPEN (200, real PNGs) — a separate host from
- * the blocked one, same as the previous version of this source recorded. */
-export const LOGO_URLS: Readonly<Record<Team, string>> = {
-  jaguars: TEAM_CONFIG.jaguars.logoUrl,
-  gators: TEAM_CONFIG.gators.logoUrl,
-}
+export type { League, TeamConfig, TeamPair } from '../config.js'
 
 /**
  * The season this source reads. Measured live 2026-08-14:
@@ -441,9 +415,10 @@ export async function compositeLogo(
 }
 
 /**
- * Reads the Jacksonville Jaguars' and Florida Gators' full schedules and
- * season records from ESPN's open `sports.core.api.espn.com` host, plus
- * their ESPN CDN logos. Polls only while the page is visible, at 6 hours,
+ * Reads two configured teams' full schedules and season records from ESPN's
+ * open `sports.core.api.espn.com` host, plus their ESPN CDN logos. Which two
+ * teams is configuration (`football` in `config.json`); this source never
+ * names one. Polls only while the page is visible, at 6 hours,
  * and never wipes known-good data on a failure — it reports `offline` and
  * keeps showing what it had.
  *
@@ -474,13 +449,40 @@ export class FootballSource extends EventEmitter {
   private logoPending = new Set<Team>()
   private logoRetryAt = new Map<Team, number>()
 
+  /** Each configured team, by id. */
+  private readonly teamConfigs: ReadonlyMap<Team, TeamConfig>
+  /** The two team ids in ROW order: top row first, bottom row second. The
+   * page draws them in this order, so it is part of the configuration and
+   * not an incidental map iteration order. */
+  private readonly teamOrder: readonly [Team, Team]
+
   constructor(
+    teams: TeamPair,
     private fetchFn: FetchLike = fetch as unknown as FetchLike,
     private readonly now: () => number = () => Math.floor(Date.now() / 1000),
     private readonly loadImageFn: (b: Buffer) => Promise<Image> = loadImage,
     private readonly compositeLogoFn: (raw: Image, loadImageFn: (b: Buffer) => Promise<Image>) => Promise<Image> = compositeLogo,
   ) {
     super()
+    this.teamConfigs = new Map(teams.map((t) => [t.id, t]))
+    this.teamOrder = [teams[0].id, teams[1].id]
+  }
+
+  /** The configured teams, in row order. The page reads this instead of
+   * naming teams itself. */
+  getTeams(): readonly [Team, Team] {
+    return this.teamOrder
+  }
+
+  /** The team's key label, for example `GATORS`. Empty for an unknown id,
+   * which cannot happen through `getTeams` but can through a stale press. */
+  getLabel(team: Team): string {
+    return this.teamConfigs.get(team)?.label ?? ''
+  }
+
+  /** The team's short code for the schedule tape, for example `UF`. */
+  getShort(team: Team): string {
+    return this.teamConfigs.get(team)?.short ?? ''
   }
 
   /** Test helper. Swaps the fetch implementation mid-test. */
@@ -548,7 +550,8 @@ export class FootballSource extends EventEmitter {
    * itself failed — an individual event ref failing keeps that one game's
    * previous value via `oldById`, rather than failing the whole team. */
   private async refreshSchedule(team: Team): Promise<{ ok: boolean; games: Game[] | null }> {
-    const config = TEAM_CONFIG[team]
+    const config = this.teamConfigs.get(team)
+    if (!config) return { ok: false, games: null }
     const listUrl = eventsListUrl(config.league, config.espnId)
     const logKey = `football-events-${team}`
     if (this.blockedUrls.has(listUrl)) return { ok: false, games: null }
@@ -619,7 +622,8 @@ export class FootballSource extends EventEmitter {
   }
 
   private async refreshRecord(team: Team): Promise<{ ok: boolean; record: TeamRecord | null }> {
-    const config = TEAM_CONFIG[team]
+    const config = this.teamConfigs.get(team)
+    if (!config) return { ok: false, record: null }
     const url = recordUrl(config.league, config.espnId)
     const logKey = `football-record-${team}`
     if (this.blockedUrls.has(url)) return { ok: false, record: null }
@@ -667,28 +671,23 @@ export class FootballSource extends EventEmitter {
   /** Emits `change` only when the whole snapshot actually differs from the
    * last one (docs/LESSONS.md #7). */
   private async doRefresh(): Promise<void> {
-    const [jagSchedule, gatSchedule, jagRecord, gatRecord] = await Promise.all([
-      this.refreshSchedule('jaguars'),
-      this.refreshSchedule('gators'),
-      this.refreshRecord('jaguars'),
-      this.refreshRecord('gators'),
+    const [first, second] = this.teamOrder
+    const [firstSchedule, secondSchedule, firstRecord, secondRecord] = await Promise.all([
+      this.refreshSchedule(first),
+      this.refreshSchedule(second),
+      this.refreshRecord(first),
+      this.refreshRecord(second),
     ])
 
     let anySuccess = false
-    if (jagSchedule.ok) {
-      this.schedules.set('jaguars', jagSchedule.games ?? [])
+    for (const [team, result] of [[first, firstSchedule], [second, secondSchedule]] as const) {
+      if (!result.ok) continue
+      this.schedules.set(team, result.games ?? [])
       anySuccess = true
     }
-    if (gatSchedule.ok) {
-      this.schedules.set('gators', gatSchedule.games ?? [])
-      anySuccess = true
-    }
-    if (jagRecord.ok) {
-      this.records.set('jaguars', jagRecord.record)
-      anySuccess = true
-    }
-    if (gatRecord.ok) {
-      this.records.set('gators', gatRecord.record)
+    for (const [team, result] of [[first, firstRecord], [second, secondRecord]] as const) {
+      if (!result.ok) continue
+      this.records.set(team, result.record)
       anySuccess = true
     }
 
@@ -724,7 +723,8 @@ export class FootballSource extends EventEmitter {
     const cached = this.logoCache.get(team)
     if (cached) return cached
     if (this.logoPending.has(team)) return null
-    const url = LOGO_URLS[team]
+    const url = this.teamConfigs.get(team)?.logoUrl
+    if (!url) return null
     if (this.blockedUrls.has(url)) return null
     const retryAt = this.logoRetryAt.get(team)
     if (retryAt !== undefined && this.now() < retryAt) return null

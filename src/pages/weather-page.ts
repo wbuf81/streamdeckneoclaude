@@ -4,7 +4,6 @@ import { theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
 import type { Conditions, DayForecast, PeriodDetail, WeatherStatus } from '../sources/weather.js'
-import { ZIP } from '../sources/weather.js'
 
 /** Measured limit for one strip line. See `render/canvas.ts`. */
 const STRIP_CHARS = 30
@@ -177,6 +176,9 @@ export function heatColor(high: number | null, low: number | null): Rgb {
 
 /** The part of `WeatherSource` this page needs. */
 export interface WeatherReader {
+  /** The configured ZIP code, printed on the conditions tile. Read from the
+   * source rather than a module constant, because it is configuration. */
+  getZip(): string
   getDays(): DayForecast[]
   getConditions(): Conditions | null
   getStatus(): WeatherStatus
@@ -275,7 +277,7 @@ function formatUpdated(epochSeconds: number): string {
 
 /**
  * Seven day tiles plus a conditions tile, for the National Weather Service
- * forecast at a fixed ZIP code. A key dims when the shared forecast is stale
+ * forecast at the configured ZIP code. A key dims when the shared forecast is stale
  * or when no data has arrived yet for that slot, so a stale or missing
  * forecast never presents as current. Pressing a day tile enters a detail
  * mode for that one day, spread across all eight keys, with BACK on key 7 —
@@ -443,7 +445,7 @@ export class WeatherPage implements Page {
 
     const key: KeySpec = {
       kind: 'gauge',
-      lines: ['WIND', wind, ZIP, place],
+      lines: ['WIND', wind, this.source.getZip(), place],
       // Only the label and the ZIP line get a bigger, unmeasured size — ZIP
       // is always exactly 5 digits, and "WIND" never changes. Per M3: a
       // plain `number` here is drawn AS GIVEN, with no measuring at all (see
@@ -652,7 +654,7 @@ export class WeatherPage implements Page {
     if (status === 'empty') {
       line1 = 'weather: no forecast yet'
     } else {
-      const parts = [place || `ZIP ${ZIP}`, conditions?.shortForecast].filter(Boolean)
+      const parts = [place || `ZIP ${this.source.getZip()}`, conditions?.shortForecast].filter(Boolean)
       line1 = parts.join(' · ')
     }
 

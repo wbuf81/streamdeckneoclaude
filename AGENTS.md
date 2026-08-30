@@ -30,6 +30,11 @@ To diagnose a live complaint ("it stopped working"), start with `docs/DEPLOYMENT
 - `vi.useFakeTimers()` mocks `Date.now` too, so code under test needs no injected clock to be
   time-controllable — inject one only when a test must set an absolute time.
 - Treat absent platform signals as unknown. Do not infer a safe state from missing data.
+- Never hardcode a value that belongs to one person — a ZIP code, a watchlist, a team, a
+  hostname on someone's LAN. It goes in `config.json` through `src/config.ts`, validated
+  per section, and an absent section switches its page off rather than falling back to
+  somebody else's answer. Only a genuinely generic default (the broad-market watchlist)
+  earns a fallback.
 - Put private external schemas behind one source boundary. A schema change must not stop the
   daemon or unrelated pages.
 

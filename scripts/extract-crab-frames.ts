@@ -13,8 +13,7 @@
  */
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createCanvas } from '@napi-rs/canvas'
 import { GifReader } from 'omggif'
@@ -107,7 +106,24 @@ const STATE_GIFS: Record<string, string> = {
   unknown: 'clawd-idle.gif',
 }
 
-const GIF_DIR = join(homedir(), 'Vibecoding', 'clawd-on-desk', 'assets', 'gif')
+/**
+ * Where the source GIFs live. This is a one-off authoring tool, not part of
+ * the daemon: it re-extracts `assets/crab/` from a checkout of
+ * clawd-on-desk, which is NOT vendored here — only the extracted PNGs are.
+ *
+ * Pass the directory as the first argument, or set `CLAWD_GIF_DIR`. The
+ * default points at a sibling checkout, so the common case needs neither:
+ *
+ *   git clone https://github.com/rullerzhou-afk/clawd-on-desk ../clawd-on-desk
+ *   npm run extract:crabs
+ */
+function gifDir(): string {
+  const fromArg = process.argv[2]
+  if (fromArg) return resolve(fromArg)
+  const fromEnv = process.env['CLAWD_GIF_DIR']
+  if (fromEnv) return resolve(fromEnv)
+  return join(findRepoRoot(), '..', 'clawd-on-desk', 'assets', 'gif')
+}
 
 /**
  * Walks up from this file to find the repository root. This module runs
@@ -248,8 +264,8 @@ function renderFramePng(rgba: Uint8Array, width: number, height: number, box: Bo
   return dest.toBuffer('image/png')
 }
 
-async function extractState(state: string, gifName: string): Promise<void> {
-  const gifPath = join(GIF_DIR, gifName)
+async function extractState(state: string, gifName: string, dir: string): Promise<void> {
+  const gifPath = join(dir, gifName)
   if (!existsSync(gifPath)) {
     console.log(`[${state}] MISSING source GIF: ${gifPath}`)
     return
@@ -296,8 +312,19 @@ async function extractState(state: string, gifName: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const dir = gifDir()
+  if (!existsSync(dir)) {
+    console.error(
+      `No GIF directory at ${dir}.\n` +
+        `Clone clawd-on-desk next to this repository, or pass the directory:\n` +
+        `  npm run extract:crabs -- /path/to/clawd-on-desk/assets/gif`,
+    )
+    process.exitCode = 1
+    return
+  }
+  console.log(`source GIFs: ${dir}`)
   for (const [state, gifName] of Object.entries(STATE_GIFS)) {
-    await extractState(state, gifName)
+    await extractState(state, gifName, dir)
   }
 }
 

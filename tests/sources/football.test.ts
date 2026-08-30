@@ -8,15 +8,43 @@ import {
   splitEventName,
   splitShortName,
   compositeLogo,
-  JAGUARS_ESPN_ID,
-  GATORS_ESPN_ID,
-  LOGO_URLS,
   LOGO_ART_FRACTION,
 } from '../../src/sources/football.js'
+import type { TeamPair } from '../../src/config.js'
 import { theme } from '../../src/render/theme.js'
 import { log, setDefaultSink } from '../../src/log.js'
 
 const NOW = 1_755_000_000 // 2025-08-12T12:00:00Z-ish, an arbitrary fixed clock
+
+/**
+ * The teams this suite drives the source with.
+ *
+ * These used to be imported from the source itself, back when two teams were
+ * compiled in. They are configuration now, so the suite owns its own fixture
+ * pair — which is the right shape anyway: a test should state the input it
+ * expects rather than inherit whatever the shipping default happens to be.
+ *
+ * The ESPN ids and league values are real, measured live on 2026-08-14
+ * against `sports.core.api.espn.com`. Keeping real ones matters: every
+ * response fixture below was captured for these ids, and `parseEvent` matches
+ * a competitor by id, so an invented id would make the fixtures parse as
+ * "not my team" and quietly assert nothing.
+ */
+const JAGUARS_ESPN_ID = '30'
+const GATORS_ESPN_ID = '57'
+const JAGUARS_LOGO = 'https://a.espncdn.com/i/teamlogos/nfl/500/jax.png'
+const GATORS_LOGO = 'https://a.espncdn.com/i/teamlogos/ncaa/500/57.png'
+
+const TEST_TEAMS: TeamPair = [
+  {
+    id: 'gators', label: 'GATORS', short: 'UF', league: 'college-football',
+    espnId: GATORS_ESPN_ID, fullName: 'Florida Gators', logoUrl: GATORS_LOGO,
+  },
+  {
+    id: 'jaguars', label: 'JAGUARS', short: 'JAX', league: 'nfl',
+    espnId: JAGUARS_ESPN_ID, fullName: 'Jacksonville Jaguars', logoUrl: JAGUARS_LOGO,
+  },
+]
 
 /**
  * Test quality: a source's fetch parameter must never fall back to the real
@@ -428,7 +456,7 @@ describe('FootballSource.refresh', () => {
       if (url === gatRecordUrl) return okJson(recordNotStartedFixture())
       throw new Error(`unexpected url ${url}`)
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     await src.refresh()
 
@@ -448,7 +476,7 @@ describe('FootballSource.refresh', () => {
   })
 
   it('reports empty before any successful fetch, with an empty schedule and no record', () => {
-    const src = new FootballSource(neverFetch as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, neverFetch as never, () => NOW)
     expect(src.getStatus()).toBe('empty')
     expect(src.getSchedule('jaguars')).toEqual([])
     expect(src.getRecord('jaguars')).toBeNull()
@@ -463,7 +491,7 @@ describe('FootballSource.refresh', () => {
       if (url === jagRecordUrl) return okJson(recordNotStartedFixture())
       return okJson(eventsListFixture([]))
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     await src.refresh()
     expect(src.getStatus()).toBe('ok')
@@ -485,7 +513,7 @@ describe('FootballSource.refresh', () => {
       if (url === jagRecordUrl) return okJson(recordNotStartedFixture())
       return okJson(eventsListFixture([]))
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     await src.refresh()
     expect(src.getSchedule('jaguars')).toHaveLength(2)
@@ -508,7 +536,7 @@ describe('FootballSource.refresh', () => {
       if (url === gatRecordUrl) return okJson(recordStartedFixture())
       throw new Error(`unexpected ${url}`)
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
     await src.refresh()
 
     expect(src.getSchedule('jaguars')).toEqual([])
@@ -525,7 +553,7 @@ describe('FootballSource.refresh', () => {
       if (url === jagRecordUrl) return okJson(recordNotStartedFixture())
       return okJson(eventsListFixture([]))
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
     const changes: number[] = []
     src.on('change', () => changes.push(1))
 
@@ -545,7 +573,7 @@ describe('FootballSource.refresh', () => {
       }
       return okJson(eventsListFixture([]))
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     await src.refresh()
     await src.refresh()
@@ -563,7 +591,7 @@ describe('FootballSource.refresh', () => {
       if (url === jagRecordUrl) return okJson(recordNotStartedFixture())
       return okJson(eventsListFixture([]))
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
     await src.refresh()
 
     const g = src.getSchedule('jaguars')[0]!
@@ -589,7 +617,7 @@ describe('FootballSource.refresh', () => {
       // only measures the fetch concurrency, not the parse outcome.
       return okJson({})
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
     await src.refresh()
 
     // Break the fix (call Promise.all over every ref with no concurrency
@@ -604,14 +632,14 @@ describe('FootballSource.refresh', () => {
 
 describe('FootballSource.isStale', () => {
   it('is false before the first success', () => {
-    const src = new FootballSource(neverFetch as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, neverFetch as never, () => NOW)
     expect(src.isStale()).toBe(false)
   })
 
   it('is true once the last success is older than 24 hours', async () => {
     let clock = NOW
     const fetchFn = vi.fn(async () => okJson(eventsListFixture([])))
-    const src = new FootballSource(fetchFn as never, () => clock)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => clock)
     await src.refresh()
     clock = NOW + 24 * 60 * 60 + 1
     expect(src.isStale()).toBe(true)
@@ -626,7 +654,7 @@ describe('FootballSource visibility and polling', () => {
   it('refreshes immediately on setVisible(true), and again after the 6-hour poll interval', async () => {
     vi.useFakeTimers()
     const fetchFn = vi.fn(async () => okJson(eventsListFixture([])))
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     src.setVisible(true)
     await vi.advanceTimersByTimeAsync(0)
@@ -642,7 +670,7 @@ describe('FootballSource visibility and polling', () => {
   it('does not poll while invisible', async () => {
     vi.useFakeTimers()
     const fetchFn = vi.fn(async () => okJson(eventsListFixture([])))
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     src.setVisible(true)
     await vi.advanceTimersByTimeAsync(0)
@@ -662,7 +690,7 @@ describe('FootballSource visibility and polling', () => {
       resolveFetch = resolve
     })
     const fetchFn = vi.fn(() => fetchPromise)
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     src.setVisible(true)
     await Promise.resolve()
@@ -684,7 +712,7 @@ describe('FootballSource visibility and polling', () => {
   it('stopped is a one-way latch: setVisible(true) after stop() does not restart polling', async () => {
     vi.useFakeTimers()
     const fetchFn = vi.fn(async () => okJson(eventsListFixture([])))
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     src.setVisible(true)
     await vi.advanceTimersByTimeAsync(0)
@@ -716,14 +744,14 @@ describe('FootballSource.getTeamColor (task 45)', () => {
       arrayBuffer: async () =>
         bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
     }))
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
     src.getLogo('jaguars')
     await new Promise((resolve) => setTimeout(resolve, 50))
     return src
   }
 
   it('is null before the crest has loaded, and never starts work of its own', () => {
-    const src = new FootballSource(neverFetch as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, neverFetch as never, () => NOW)
     expect(src.getTeamColor('jaguars')).toBeNull()
     expect(src.getTeamColor('gators')).toBeNull()
   })
@@ -796,10 +824,10 @@ describe('FootballSource.getLogo', () => {
     const bytes = raw.toBuffer('image/png')
 
     const fetchFn = vi.fn(async (url: string) => {
-      expect(url).toBe(LOGO_URLS.jaguars)
+      expect(url).toBe(JAGUARS_LOGO)
       return { ok: true, status: 200, json: async () => ({}), arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) }
     })
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     expect(src.getLogo('jaguars')).toBeNull()
     // The real decode/composite/re-encode/re-decode pipeline goes through
@@ -821,7 +849,7 @@ describe('FootballSource.getLogo', () => {
           resolveFetch = resolve
         }),
     )
-    const src = new FootballSource(fetchFn as never, () => NOW)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => NOW)
 
     src.getLogo('jaguars')
     src.getLogo('jaguars')
@@ -839,7 +867,7 @@ describe('FootballSource.getLogo', () => {
       calls++
       return httpError(500)
     })
-    const src = new FootballSource(fetchFn as never, () => clock)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => clock)
 
     src.getLogo('jaguars')
     await Promise.resolve()
@@ -865,7 +893,7 @@ describe('FootballSource.getLogo', () => {
       calls++
       return httpError(403)
     })
-    const src = new FootballSource(fetchFn as never, () => clock)
+    const src = new FootballSource(TEST_TEAMS, fetchFn as never, () => clock)
 
     src.getLogo('jaguars')
     await Promise.resolve()
@@ -934,9 +962,38 @@ describe('compositeLogo', () => {
   })
 })
 
-describe('team ids', () => {
-  it('are the ESPN core-API ids measured live on 2026-08-14, not the old TheSportsDB ones', () => {
-    expect(JAGUARS_ESPN_ID).toBe('30')
-    expect(GATORS_ESPN_ID).toBe('57')
+describe('team configuration', () => {
+  it('drives every request from the configured pair, not a compiled-in team', async () => {
+    const urls: string[] = []
+    const fetchFn = vi.fn(async (url: string) => {
+      urls.push(url)
+      return { ok: true, status: 200, json: async () => ({ items: [] }), arrayBuffer: async () => new ArrayBuffer(0) }
+    })
+    const src = new FootballSource(
+      [
+        { ...TEST_TEAMS[0], id: 'a', espnId: '111', league: 'nfl' },
+        { ...TEST_TEAMS[1], id: 'b', espnId: '222', league: 'college-football' },
+      ],
+      fetchFn as never,
+      () => NOW,
+    )
+    await src.refresh()
+
+    expect(src.getTeams()).toEqual(['a', 'b'])
+    // Both configured ids appear, and neither shipping default does.
+    expect(urls.some((u) => u.includes('/teams/111/'))).toBe(true)
+    expect(urls.some((u) => u.includes('/teams/222/'))).toBe(true)
+    expect(urls.some((u) => u.includes(`/teams/${JAGUARS_ESPN_ID}/`))).toBe(false)
+    expect(urls.some((u) => u.includes(`/teams/${GATORS_ESPN_ID}/`))).toBe(false)
+    await src.stop()
+  })
+
+  it('reports each team label and short code from the configuration', () => {
+    const src = new FootballSource(TEST_TEAMS, neverFetch as never, () => NOW)
+    expect(src.getLabel('gators')).toBe('GATORS')
+    expect(src.getShort('jaguars')).toBe('JAX')
+    // An id that was never configured is an empty string, never a guess.
+    expect(src.getLabel('nobody')).toBe('')
+    expect(src.getShort('nobody')).toBe('')
   })
 })

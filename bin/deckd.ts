@@ -21,6 +21,7 @@ import { SystemSource } from '../src/sources/system.js'
 import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
+import { loadConfig } from '../src/config.js'
 import { log } from '../src/log.js'
 import { LockState } from '../src/lock-state.js'
 import { KnobNotifier } from '../src/knob-notify.js'
@@ -63,23 +64,36 @@ async function start(): Promise<void> {
   // decode, so a missing call here means the crab never appears.
   await loadSprites()
 
+  // Everything a person has to choose for themselves — the ZIP code, the
+  // watchlist, the two teams, the knob display's address — comes from here.
+  // A section that is absent switches its page off rather than falling back
+  // to somebody else's answer.
+  const config = loadConfig()
+
   const claude = new ClaudeSource()
   const usage = new UsageSource()
   const codex = new CodexSource()
   const clientId = readClientId()
   const spotify = new SpotifySource(clientId)
-  const stocks = new StockSource()
-  const weather = new WeatherSource()
-  const football = new FootballSource()
+  const stocks = new StockSource(config.symbols)
+  const weather = config.zip === null ? null : new WeatherSource(config.zip)
+  const football = config.teams === null ? null : new FootballSource(config.teams)
   const system = new SystemSource()
   await claude.start()
   await usage.start()
   await codex.start()
   await spotify.start()
   await stocks.start()
-  await weather.start()
-  await football.start()
+  await weather?.start()
+  await football?.start()
   await system.start()
+
+  if (!weather) {
+    log.info('no weather.zip in config.json; the weather page is off')
+  }
+  if (!football) {
+    log.info('no football teams in config.json; the football page is off')
+  }
 
   // The last rung of the device-health ladder. `Device` recycles a handle
   // whose writes fail, and retries; when that stops helping it calls this,
@@ -91,14 +105,17 @@ async function start(): Promise<void> {
   pages.add(new CodexPage(codex))
   pages.add(new SpotifyPage(spotify))
   pages.add(new StocksPage(stocks))
-  pages.add(new WeatherPage(weather))
-  pages.add(new FootballPage(football))
+  if (weather) pages.add(new WeatherPage(weather))
+  if (football) pages.add(new FootballPage(football))
   pages.add(new SystemPage(system))
 
-  // Only now, with all seven pages present, may a saved page be restored.
-  // `PageManager.setIndex` silently ignores an index outside the current
-  // page count, so restoring before every page exists would strand the deck
-  // on an earlier page with no error and no log line.
+  // Only now, with every page that this configuration enables present, may a
+  // saved page be restored. `PageManager.setIndex` silently ignores an index
+  // outside the current page count, so restoring before every page exists
+  // would strand the deck on an earlier page with no error and no log line.
+  // The count is no longer fixed at seven: an unconfigured ZIP or team pair
+  // removes a page, which is exactly why the restore must happen here rather
+  // than against a constant.
   restorePage(pages)
 
   const lockState = new LockState()
@@ -107,7 +124,7 @@ async function start(): Promise<void> {
   // it. Best-effort in both directions: the device fails open if it never hears
   // anything, and every send here is caught, so a display that is unplugged or
   // absent cannot affect the deck.
-  const knob = new KnobNotifier()
+  const knob = new KnobNotifier(config.knobHosts)
   const daemon = new Daemon(device, pages, undefined, undefined, lockState)
   try {
     await daemon.start()
@@ -126,8 +143,8 @@ async function start(): Promise<void> {
   codex.on('change', onChange)
   spotify.on('change', onChange)
   stocks.on('change', onChange)
-  weather.on('change', onChange)
-  football.on('change', onChange)
+  weather?.on('change', onChange)
+  football?.on('change', onChange)
   system.on('change', onChange)
 
   knob.start(lockState.isLocked())
@@ -151,8 +168,8 @@ async function start(): Promise<void> {
     await codex.stop()
     await spotify.stop()
     await stocks.stop()
-    await weather.stop()
-    await football.stop()
+    await weather?.stop()
+    await football?.stop()
     await system.stop()
     await device.disconnect()
     process.exit(0)
