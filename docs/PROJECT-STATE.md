@@ -352,9 +352,9 @@ still the `pages.add` order in `bin/deckd.ts`.
 
 **Removed rather than configured:** the knob display's hosts. `KnobNotifier` spoke
 `GET /awake`, an endpoint the knob's firmware deleted as a security fix — it was an
-unauthenticated write that outranked the device's token-checked channel. A proper Mac-side
-helper (`the knob helper`) speaks the replacement `POST /beat` and reports far more,
-so deckd's client was both obsolete and redundant. It had been answering 404 on every beat,
+unauthenticated write that outranked the device's token-checked channel. That device's own
+Mac-side helper agent speaks the replacement `POST /beat` and reports far more, so deckd's
+client was both obsolete and redundant. It had been answering 404 on every beat,
 hidden by `log.once`.
 
 The trigger for the landed half was making the repository publishable: the ZIP code, the

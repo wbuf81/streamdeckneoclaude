@@ -329,8 +329,8 @@ piece of state that can black out its screen, and it checked that reported state
 token-authenticated channel, so anything on the LAN could darken the display and outrank the
 real sender.
 
-`KnobNotifier` is deleted rather than ported. The knob has its own Mac-side helper,
-`the knob helper`, which speaks `POST /beat` and already sends lock state plus the
+`KnobNotifier` is deleted rather than ported. The knob has its own Mac-side helper agent,
+installed with the firmware, which speaks `POST /beat` and already sends lock state plus the
 computer name, output volume, mute, and playback. deckd had nothing to add.
 
 **The lesson is the detection, not the endpoint.** `log.once` collapsed the repeat, so weeks
