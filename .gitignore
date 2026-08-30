@@ -8,6 +8,19 @@ state/
 *.local.json
 spotify.json
 
+# The REAL user configuration. It lives at ~/.local/state/deckd/config.json,
+# outside this repository, and nothing here reads a copy inside it -- these
+# rules exist only so that a copy taken for editing or debugging cannot be
+# committed. It holds the Spotify client id, the home ZIP code, and the
+# address of a device on a private network.
+#
+# `config.example.json` is deliberately NOT matched: the leading slash pins
+# these to the repository root and to that exact name, so the committed
+# example stays tracked.
+/config.json
+/config.*.json
+!/config.example.json
+
 .DS_Store
 .vscode/
 .idea/
