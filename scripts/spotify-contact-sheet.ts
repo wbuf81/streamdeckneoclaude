@@ -12,6 +12,11 @@
  * - a cover with text hard against the top and bottom edges, which is exactly
  *   what the central 3:2 crop sacrifices.
  *
+ * The glow-up adds the progress glow round the art block (shown at three
+ * positions on the colourful cover) and the two album colours on the round
+ * buttons: dominant left, contrasting accent right. The swatches beside each
+ * label are the two extracted colours.
+ *
  * Run with: `npm run spotify:contact-sheet -- [output-path]`. Defaults to
  * `spotify-page.png` in the repository root. A preview, not a deliverable.
  */
@@ -26,6 +31,8 @@ import {
 import { theme } from '../src/render/theme.js'
 import { SpotifyPage, type PlayerReader } from '../src/pages/spotify-page.js'
 import type { PlayerState } from '../src/sources/spotify.js'
+import { contrastAccent, sampleCover } from '../src/sources/spotify-palette.js'
+import type { Rgb } from '../src/render/specs.js'
 
 function findRepoRoot(): string {
   let dir = dirname(fileURLToPath(import.meta.url))
@@ -110,12 +117,15 @@ function playerState(over: Partial<PlayerState> = {}): PlayerState {
   }
 }
 
-function pageFor(art: Image | null, colour: readonly number[] | null, state: PlayerState | null): SpotifyPage {
+function pageFor(
+  art: Image | null, colour: Rgb | null, state: PlayerState | null, accent: Rgb | null = null,
+): SpotifyPage {
   const reader = {
     interpolate: () => state,
     getStatus: () => 'ok',
     getArt: () => art,
     getArtColor: () => colour,
+    getArtAccent: () => accent,
     play: async () => true,
     pause: async () => true,
     next: async () => true,
@@ -132,31 +142,45 @@ const TITLE_H = 28
 async function main(): Promise<void> {
   const outPath = resolve(process.argv[2] ?? join(REPO_ROOT, 'spotify-page.png'))
 
-  const rows: { label: string; page: SpotifyPage; nowMs: number; swatch: readonly number[] | null }[] = []
+  const rows: { label: string; page: SpotifyPage; nowMs: number; swatch: Rgb | null; swatch2: Rgb | null }[] = []
 
   for (const cover of COVERS) {
     const canvas = createCanvas(COVER, COVER)
     cover.paint(canvas.getContext('2d'))
     const art = await loadImage(canvas.toBuffer('image/png'))
     const colour = dominantColor(art)
+    const pixels = colour ? sampleCover(art) : null
+    const accent = colour && pixels ? contrastAccent(pixels, colour) : null
     rows.push({
-      label: `${cover.name} · playing`,
-      page: pageFor(art, colour, playerState()),
-      nowMs: 1_000,
+      label: `${cover.name} · playing 38%`,
+      page: pageFor(art, colour, playerState(), accent),
+      // The top of the buttons' breath, so the swatches and lights compare.
+      nowMs: 0,
       swatch: colour,
+      swatch2: accent,
     })
     if (cover.name === 'colourful') {
+      for (const pct of [8, 72]) {
+        rows.push({
+          label: `${cover.name} · playing ${pct}%`,
+          page: pageFor(art, colour, playerState({ positionMs: 2_500 * pct }), accent),
+          nowMs: 2_500,
+          swatch: colour,
+          swatch2: accent,
+        })
+      }
       rows.push({
-        label: `${cover.name} · PAUSED`,
-        page: pageFor(art, colour, playerState({ isPlaying: false })),
+        label: `${cover.name} · PAUSED 38%`,
+        page: pageFor(art, colour, playerState({ isPlaying: false }), accent),
         nowMs: 1_000,
         swatch: colour,
+        swatch2: accent,
       })
     }
   }
   // Nothing playing: the matrix rain, now across six keys.
-  rows.push({ label: 'idle · matrix rain', page: pageFor(null, null, null), nowMs: 1_000, swatch: null })
-  rows.push({ label: 'idle · +400ms', page: pageFor(null, null, null), nowMs: 1_400, swatch: null })
+  rows.push({ label: 'idle · matrix rain', page: pageFor(null, null, null), nowMs: 1_000, swatch: null, swatch2: null })
+  rows.push({ label: 'idle · +400ms', page: pageFor(null, null, null), nowMs: 1_400, swatch: null, swatch2: null })
 
   const rowH = KEY_SIZE + STRIP_HEIGHT + 18
   const width = M * 2 + LABEL_W + 4 * (KEY_SIZE + GAP) + 40
@@ -180,6 +204,14 @@ async function main(): Promise<void> {
     if (row.swatch) {
       ctx.fillStyle = `rgb(${row.swatch.join(',')})`
       ctx.fillRect(M, y + 20, 28, 12)
+      if (row.swatch2) {
+        ctx.fillStyle = `rgb(${row.swatch2.join(',')})`
+        ctx.fillRect(M + 32, y + 20, 28, 12)
+      } else {
+        ctx.fillStyle = `rgb(${theme.textDim.join(',')})`
+        ctx.font = '9px Menlo'
+        ctx.fillText('no 2nd', M + 32, y + 21)
+      }
     } else {
       ctx.fillStyle = `rgb(${theme.textDim.join(',')})`
       ctx.font = '9px Menlo'

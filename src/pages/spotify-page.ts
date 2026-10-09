@@ -1,4 +1,7 @@
-import type { DeckFrame, KeySpec, Rgb, StripSpec, ImageCrop, IdleSpec, IdleVariant } from '../render/specs.js'
+import type {
+  DeckFrame, KeySpec, Rgb, StripSpec, ImageCrop, IdleSpec, IdleVariant,
+} from '../render/specs.js'
+import { blockPerimeterProgress, breathe } from '../render/motion.js'
 import { blankKey } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatClock, formatEasternTime } from '../render/text.js'
@@ -127,6 +130,71 @@ const ART_SLICE_TOP = 1 / 6
 /** Each key's source rect, square by construction. */
 const ART_CELL = 1 / 3
 
+/**
+ * The progress glow: a thin warm line round the OUTSIDE of the art block,
+ * clockwise from the top-left corner, as long as the track is far through.
+ *
+ * Cost. The perimeter is ten key edges, 960 px. `keyHash` snaps a run to half a
+ * pixel, so an unquantised fraction would rewrite the leading key up to 1920
+ * times per track — on a two-minute track that is 16 steps a second, more than
+ * the 100 ms tick, so the leading key would be rewritten on every tick. So the page snaps the fraction itself, to steps
+ * of at least `GLOW_MIN_STEP_MS` of track time and at least one whole pixel.
+ * Each step rewrites the one key the line is growing along (two at a key
+ * corner), so the glow costs about two key-writes a second at most.
+ */
+const GLOW_MIN_STEP_MS = 500
+/** Ten 96 px key edges: three along the top, two down the right, three along
+ * the bottom and two up the left. */
+const GLOW_PERIMETER_PX = 2 * (3 + 2) * 96
+
+/**
+ * How the two round buttons breathe while a track plays. Gentle: they dim to
+ * 75 percent and back over five seconds, and the right one runs half a cycle
+ * behind the left, so the pair alternates rather than pulsing as one. The clock
+ * is snapped to `BUTTON_QUANTUM_MS` before `breathe` sees it, so the two
+ * backlights cost at most ten writes a second together.
+ */
+const BUTTON_BREATHE_PERIOD_MS = 5000
+const BUTTON_BREATHE_DEPTH = 0.25
+const BUTTON_QUANTUM_MS = 200
+
+/**
+ * The progress fraction the glow draws, snapped so it changes at most once per
+ * `GLOW_MIN_STEP_MS` of track time and never by less than one pixel. A zero,
+ * negative or non-finite duration draws no glow.
+ */
+export function glowFraction(positionMs: number, durationMs: number): number {
+  if (!Number.isFinite(positionMs) || !Number.isFinite(durationMs) || durationMs <= 0) return 0
+  const fraction = Math.min(1, Math.max(0, positionMs / durationMs))
+  const steps = Math.max(1, Math.min(GLOW_PERIMETER_PX, Math.floor(durationMs / GLOW_MIN_STEP_MS)))
+  return Math.floor(fraction * steps) / steps
+}
+
+/**
+ * The two round buttons' colours.
+ *
+ * The left wears the cover's dominant colour and the right its contrasting
+ * accent. A cover with no contrasting colour shows the dominant on both, and a
+ * cover with no colour at all shows the theme on both — the colours the page
+ * showed before it had two. While `breathing`, each dims gently on a slow
+ * cycle; otherwise both are steady, so a paused or stale page stays still.
+ */
+export function buttonColors(
+  dominant: Rgb | null,
+  accent: Rgb | null,
+  breathing: boolean,
+  nowMs: number,
+): [Rgb, Rgb] {
+  const left = dominant ?? theme.gray
+  const right = dominant ? (accent ?? dominant) : theme.gray
+  if (!breathing) return [left, right]
+  const t = Number.isFinite(nowMs) ? Math.floor(nowMs / BUTTON_QUANTUM_MS) * BUTTON_QUANTUM_MS : 0
+  return [
+    breathe(left, t, BUTTON_BREATHE_PERIOD_MS, BUTTON_BREATHE_DEPTH),
+    breathe(right, t + BUTTON_BREATHE_PERIOD_MS / 2, BUTTON_BREATHE_PERIOD_MS, BUTTON_BREATHE_DEPTH),
+  ]
+}
+
 /** The crop for one cell of the art block. Exported so a test can prove the six
  * cells tile the slice exactly, with no gap, no overlap and no distortion. */
 export function artCrop(col: number, row: number): ImageCrop {
@@ -146,6 +214,10 @@ export interface PlayerReader {
   /** The current cover's accent colour, or null when it has none. Computed once
    * per track when the art is decoded — never on the render path. */
   getArtColor(trackId: string): Rgb | null
+  /** The cover's second, contrasting colour, for the right round button, or
+   * null when it has none. Computed once per track like `getArtColor`. Optional,
+   * so a reader without it reads as "no accent", never as a guessed one. */
+  getArtAccent?(trackId: string): Rgb | null
   play(): Promise<boolean>
   pause(): Promise<boolean>
   next(): Promise<boolean>
@@ -197,8 +269,8 @@ export class SpotifyPage implements Page {
     // genuinely empty one.
     if (!state) return IDLE_TICK_MS
     // A track IS loaded, so something moves unless the data is stale: playing
-    // breathes on the play/pause glyph, and paused drifts a layer under all six
-    // art cells.
+    // breathes on the play/pause glyph and the round buttons and grows the
+    // progress glow, and paused drifts a layer under all six art cells.
     //
     // Reads the SAME `isStale` predicate every dimmed element reads, rather than
     // re-deriving it from `status` — which is how M5's case (a failed transport
@@ -244,23 +316,41 @@ export class SpotifyPage implements Page {
     const stale = isStale(status, state)
     const art = state ? this.source.getArt(state.trackId, state.artUrl) : null
 
-    // The cover's own accent colour, or the theme when it has none. It borders
-    // the two control keys, fills the strip's progress bar, and lights both
-    // round buttons, so the whole deck takes on each album.
-    const accent = (state ? this.source.getArtColor(state.trackId) : null) ?? theme.gray
     // Paused, with a track loaded, is its own visual state: the art dims and an
     // ambient layer shows THROUGH it. That works only because `renderKey` draws
     // the background, then `fx`, then the image — and `dim` applies to the image
     // through `globalAlpha`, so a 45-percent-opaque cover reveals the layer
     // beneath. No renderer change was needed for this at all.
     const paused = state !== null && !state.isPlaying && !stale
+    // The cover's own dominant colour, or the theme when it has none. It borders
+    // the two control keys, fills the strip's progress bar, and lights the left
+    // round button, so the whole deck takes on each album. The contrasting
+    // `second` colour lights the right round button.
+    const dominant = state ? this.source.getArtColor(state.trackId) : null
+    const accent = dominant ?? theme.gray
+    const second = state && dominant ? (this.source.getArtAccent?.(state.trackId) ?? null) : null
+
+    // The progress glow, only round real art: it is the art block's own edge.
+    // A paused or stale track keeps its glow where it stopped, and the key's
+    // `dim` dims it with the cover, so a paused page stays still and calm.
+    const glow = state && art
+      ? blockPerimeterProgress(ART_COLS, ART_ROWS, glowFraction(state.positionMs, state.durationMs))
+      : null
+    // `glow[row][col]` maps onto keys [[0, 1, 2], [4, 5, 6]]: `cell` below reads
+    // the SAME (col, row) for the crop and for the glow, so the two cannot be
+    // assigned to different keys.
+    const cell = (col: 0 | 1 | 2, row: 0 | 1): KeySpec => {
+      const key = col === 0 && row === 0
+        ? this.primaryArtKey(state, status, art, stale, artCrop(0, 0), nowMs, paused)
+        : this.spanArtKey(state, status, art, stale, artCrop(col, row), nowMs, col, row, paused)
+      const edge = glow?.[row]?.[col]
+      return edge && key.kind === 'image' ? { ...key, edgeProgress: edge } : key
+    }
 
     return {
       keys: [
         // Row 0: three art cells, then play/pause.
-        this.primaryArtKey(state, status, art, stale, artCrop(0, 0), nowMs, paused),
-        this.spanArtKey(state, status, art, stale, artCrop(1, 0), nowMs, 1, 0, paused),
-        this.spanArtKey(state, status, art, stale, artCrop(2, 0), nowMs, 2, 0, paused),
+        cell(0, 0), cell(1, 0), cell(2, 0),
         {
           kind: 'control',
           glyph: state?.isPlaying ? PAUSE_GLYPH : PLAY_GLYPH,
@@ -275,9 +365,7 @@ export class SpotifyPage implements Page {
           dim: stale,
         },
         // Row 1: three art cells, then next.
-        this.spanArtKey(state, status, art, stale, artCrop(0, 1), nowMs, 0, 1, paused),
-        this.spanArtKey(state, status, art, stale, artCrop(1, 1), nowMs, 1, 1, paused),
-        this.spanArtKey(state, status, art, stale, artCrop(2, 1), nowMs, 2, 1, paused),
+        cell(0, 1), cell(1, 1), cell(2, 1),
         {
           kind: 'control',
           glyph: NEXT_GLYPH,
@@ -288,7 +376,9 @@ export class SpotifyPage implements Page {
         },
       ],
       strip: this.strip(state, status, stale, nowMs, accent),
-      buttons: [accent, accent],
+      // Dominant left, contrasting accent right. They breathe only while a track
+      // is genuinely playing; paused, stale and idle are steady.
+      buttons: buttonColors(dominant, second, state?.isPlaying === true && !stale, nowMs),
     }
   }
 
@@ -437,11 +527,6 @@ function isStale(status: SpotifyStatus, state: PlayerState | null): boolean {
   return status === 'no-device' || status === 'unauthorized' || status === 'offline' || !state
 }
 
-
-/**
- * Phase for the volume key's "thump", the same `nowMs`-driven pattern
- * `idleSpec` below uses for the idle animation: never `Date.now()`, so two
- * calls with the same `nowMs` always agree, and the phase actually advances
 
 /** The control keys' background: the album's accent, heavily darkened. */
 export function controlWash(accent: Rgb): Rgb {
