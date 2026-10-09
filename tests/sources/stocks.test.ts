@@ -285,6 +285,18 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+/**
+ * Fake timers that also move the source's clock. The poll loop compares the
+ * WALL clock with the time a fetch is due, so a frozen `() => NOW` never
+ * reaches a due time. `vi.useFakeTimers()` mocks `Date.now`, and this clock
+ * reads it.
+ */
+function fakeClockAt(epochSeconds: number): () => number {
+  vi.useFakeTimers()
+  vi.setSystemTime(epochSeconds * 1000)
+  return () => Math.floor(Date.now() / 1000)
+}
+
 describe('StockSource', () => {
   it('reports empty before the first successful refresh', () => {
     const src = new StockSource(SYMS, neverFetch as never, () => NOW)
@@ -417,7 +429,7 @@ describe('StockSource', () => {
   })
 
   it('derives the poll interval from the market state: open polls faster than closed', async () => {
-    vi.useFakeTimers()
+    const clock = fakeClockAt(NOW)
     const openBody = chartBody({}, { symbol: 'AAA' })
     const closedPeriod = {
       pre: { start: NOW - 100000, end: NOW - 90000 },
@@ -430,7 +442,7 @@ describe('StockSource', () => {
     )
 
     const { fetchFn: fetchOpen } = build({ AAA: openBody, BBB: openBody })
-    const openSrc = new StockSource(SYMS, fetchOpen as never, () => NOW)
+    const openSrc = new StockSource(SYMS, fetchOpen as never, clock)
     openSrc.setVisible(true)
     await vi.advanceTimersByTimeAsync(0)
     expect(openSrc.getMarketState()).toBe('open')
@@ -440,7 +452,7 @@ describe('StockSource', () => {
     await openSrc.stop()
 
     const { fetchFn: fetchClosed } = build({ AAA: closedBody, BBB: closedBody })
-    const closedSrc = new StockSource(SYMS, fetchClosed as never, () => NOW)
+    const closedSrc = new StockSource(SYMS, fetchClosed as never, clock)
     closedSrc.setVisible(true)
     await vi.advanceTimersByTimeAsync(0)
     expect(closedSrc.getMarketState()).toBe('closed')
@@ -453,10 +465,10 @@ describe('StockSource', () => {
   })
 
   it('polls only while visible', async () => {
-    vi.useFakeTimers()
+    const clock = fakeClockAt(NOW)
     const body = chartBody({}, { symbol: 'AAA' })
     const { fetchFn } = build({ AAA: body, BBB: body })
-    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    const src = new StockSource(SYMS, fetchFn as never, clock)
     src.setVisible(true)
     await vi.advanceTimersByTimeAsync(0)
     const afterFirst = fetchFn.mock.calls.length
@@ -471,10 +483,10 @@ describe('StockSource', () => {
   // the fix (restore `this.stopped = false` inside the `visible` branch) and
   // this fails.
   it('does not restart polling when setVisible(true) is called after stop()', async () => {
-    vi.useFakeTimers()
+    const clock = fakeClockAt(NOW)
     const body = chartBody({}, { symbol: 'AAA' })
     const { fetchFn } = build({ AAA: body, BBB: body })
-    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    const src = new StockSource(SYMS, fetchFn as never, clock)
     src.setVisible(true)
     await vi.advanceTimersByTimeAsync(0)
     const callsBeforeStop = fetchFn.mock.calls.length
@@ -617,10 +629,10 @@ describe('StockSource', () => {
   // `setInterval`. Break the fix (revert to the bare `.then` chain) and
   // this fails — polling stops permanently after the injected rejection.
   it('keeps polling after a refresh rejects unexpectedly', async () => {
-    vi.useFakeTimers()
+    const clock = fakeClockAt(NOW)
     const body = chartBody({}, { symbol: 'AAA' })
     const { fetchFn } = build({ AAA: body, BBB: body })
-    const src = new StockSource(SYMS, fetchFn as never, () => NOW)
+    const src = new StockSource(SYMS, fetchFn as never, clock)
     try {
       src.setVisible(true)
       await vi.advanceTimersByTimeAsync(0)
