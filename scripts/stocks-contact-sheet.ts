@@ -1,37 +1,28 @@
 /**
- * Renders the stocks board (task 43) into contact sheets, so a human can judge
- * the glance value before it reaches the deck. Only the user can see the real
- * device — see the working agreements in `docs/PROJECT-STATE.md`.
+ * Renders the stocks page into contact sheets, so a human can judge the glow
+ * before it reaches the deck. Only the user can see the real device.
  *
- * It renders TWO distributions on purpose, because one hides defects. That
- * lesson came from task 42: a preview with one tile per weather condition looked
- * perfect and approved, and then a real week of nothing but storms exposed four
- * defects at once. So this sheet shows:
+ * Every scene drives the REAL `StocksPage` through the real `renderKey` and
+ * `renderStrip`, with a fixed clock — including the moments that need a
+ * watched transition (the bells, a +2 % crossing), which it reaches by
+ * rendering the frame before and the frame after.
  *
- * - a LIVE-like board, from real measured change percentages, and
- * - a FLAT board, every symbol inside ±0.4 percent, which is the case an
- *   absolute heat scale flatters least.
- *
- * Each is drawn at every market state, since the state sets the mood.
- *
- * Run with: `npm run stocks:contact-sheet -- [output-path]`. Defaults to
- * `stocks-board.png` in the repository root. A preview, not a deliverable — it
- * is not committed.
+ * Run with: `npm run stocks:contact-sheet -- [output-path]`. Writes the deck
+ * sheet there and `-tape.png` beside it. A preview, not a deliverable.
  */
 import { existsSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createCanvas, type Canvas } from '@napi-rs/canvas'
-import { renderKey, renderStrip, tapeLoopWidthPx, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../src/render/canvas.js'
+import { createCanvas, type Canvas, type SKRSContext2D } from '@napi-rs/canvas'
+import { renderKey, renderStrip, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../src/render/canvas.js'
 import { theme } from '../src/render/theme.js'
-import { StocksPage, type StockReader } from '../src/pages/stocks-page.js'
-import { SYMBOLS } from '../src/sources/stocks.js'
-import type { MarketState, Quote, YearlyState } from '../src/sources/stocks.js'
+import type { DeckFrame } from '../src/render/specs.js'
+import { StocksPage } from '../src/pages/stocks-page.js'
+import type { MarketBoundary, MarketState } from '../src/sources/stocks.js'
+import { DEFAULT_SYMBOLS } from '../src/config.js'
+import { fixtureQuote, fixtureQuotes, fixtureReader, FIXTURE_SYMBOLS } from './stocks-fixture.js'
 
-/** Walks up to the repository root. This runs both from `scripts/` and from
- * `dist/scripts/`, so a fixed number of `..` segments is wrong for one of them
- * (lesson 2), and `process.cwd()` is wrong under launchd (lesson 3). */
 function findRepoRoot(): string {
   let dir = dirname(fileURLToPath(import.meta.url))
   for (let i = 0; i < 6; i++) {
@@ -44,214 +35,187 @@ function findRepoRoot(): string {
 }
 const REPO_ROOT = findRepoRoot()
 
-/** Measured live from Yahoo's keyless chart endpoint on 2026-08-18. */
-const LIVE: readonly number[] = [-1.10, 0.19, -2.49, 2.33, -1.80, -1.22, -3.47, -0.11]
-/** A deliberately dull day: every symbol inside ±0.4 percent. */
-const FLAT: readonly number[] = [0.12, -0.08, 0.31, -0.22, 0.04, -0.35, 0.19, -0.14]
+/** 2026-08-12 11:46 AM EDT, a Wednesday mid-session. */
+const NOW = 1786549560
+const NOW_MS = NOW * 1000
+/** 9:30 AM and 4:00 PM EDT on the same day. */
+const OPEN_MS = NOW_MS - (2 * 60 + 16) * 60_000
+const CLOSE_MS = OPEN_MS + 390 * 60_000
 
-const STATES: readonly MarketState[] = ['open', 'pre', 'post', 'closed', 'unknown']
-
-/** Mirrors `TAPE_PX_PER_SEC` in the page. Kept local because that constant is a
- * page-internal tuning value, and this preview only needs it to label seconds. */
-const TAPE_PX_PER_SEC_PREVIEW = 60
-
-function rgbaToCanvas(buf: Buffer, w: number, h: number): Canvas {
+function toCanvas(buf: Buffer, w: number, h: number): Canvas {
   const canvas = createCanvas(w, h)
   const ctx = canvas.getContext('2d')
-  const imageData = ctx.createImageData(w, h)
-  imageData.data.set(buf)
-  ctx.putImageData(imageData, 0, 0)
+  const img = ctx.createImageData(w, h)
+  img.data.set(buf)
+  ctx.putImageData(img, 0, 0)
   return canvas
 }
 
-function quoteFor(symbol: string, changePercent: number): Quote {
-  const price = 100 + changePercent * 7
-  // A gently sloping intraday series, so the sparkline is not flat.
-  const spark = Array.from({ length: 24 }, (_, i) => price - changePercent * (1 - i / 23))
-  return {
-    symbol, name: symbol, price, previousClose: price / (1 + changePercent / 100),
-    changePercent, spark, currency: 'USD', asOf: 1786549560,
-    dayHigh: price * 1.01, dayLow: price * 0.99,
-    week52High: price * 1.4, week52Low: price * 0.7, volume: 1_000_000,
-  } as unknown as Quote
-}
-
-function pageFor(changes: readonly number[], marketState: MarketState): StocksPage {
-  const quotes = new Map<string, Quote>()
-  SYMBOLS.forEach((sym, i) => quotes.set(sym, quoteFor(sym, changes[i] ?? 0)))
-  const reader: StockReader = {
-    getSymbols: () => SYMBOLS,
-    getQuotes: () => quotes,
-    getStatus: () => 'ok',
-    getMarketState: () => marketState,
-    isSymbolStale: () => false,
-    getYearlyState: () => ({ status: 'ok', values: [], updatedAt: 0 } as unknown as YearlyState),
-    setWatchedSymbol: () => {},
-    setVisible: () => {},
-  }
-  return new StocksPage(reader)
-}
-
-const M = 16
-const LABEL_W = 96
-const TITLE_H = 30
-const ROW_LABEL_H = 14
 const GAP = 6
-const BUTTON_R = 11
+const DECK_W = 4 * KEY_SIZE + 3 * GAP
+const DECK_H = 2 * KEY_SIZE + GAP + 10 + STRIP_HEIGHT
+const BUTTON_R = 12
+
+/** One deck: 4 x 2 keys, then the two round buttons either side of the
+ * strip, as the Neo lays them out. */
+function drawDeck(ctx: SKRSContext2D, frame: DeckFrame, x: number, y: number): void {
+  frame.keys.slice(0, 8).forEach((key, i) => {
+    const kx = x + (i % 4) * (KEY_SIZE + GAP)
+    const ky = y + Math.floor(i / 4) * (KEY_SIZE + GAP)
+    ctx.drawImage(toCanvas(renderKey(key), KEY_SIZE, KEY_SIZE), kx, ky)
+  })
+  const sy = y + 2 * KEY_SIZE + GAP + 10
+  const sx = x + (DECK_W - STRIP_WIDTH) / 2
+  ctx.drawImage(toCanvas(renderStrip(frame.strip), STRIP_WIDTH, STRIP_HEIGHT), sx, sy)
+  frame.buttons.forEach((rgb, i) => {
+    ctx.fillStyle = `rgb(${rgb.join(',')})`
+    ctx.beginPath()
+    const bx = i === 0 ? x + 34 : x + DECK_W - 34
+    ctx.arc(bx, sy + STRIP_HEIGHT / 2, BUTTON_R, 0, Math.PI * 2)
+    ctx.fill()
+  })
+}
+
+interface Scene { label: string; frame: DeckFrame }
+
+function boundary(kind: MarketBoundary['kind'], atMs: number, next: MarketState): MarketBoundary {
+  return { kind, atMs, next }
+}
+
+function scenes(): Scene[] {
+  const out: Scene[] = []
+  const closeB = boundary('close', CLOSE_MS, 'post')
+
+  // The board, three rotating facts.
+  for (const [i, label] of ['open · fact 1 (countdown)', 'open · fact 2 (breadth)', 'open · fact 3 (clock)'].entries()) {
+    const page = new StocksPage(fixtureReader({ asOf: NOW, boundary: closeB }))
+    const t = Math.floor(NOW_MS / 24_000) * 24_000 + i * 8000 + 200
+    out.push({ label, frame: page.render(Math.floor(t / 1000), t) })
+  }
+
+  // A peek, and the detail view (two presses).
+  {
+    const page = new StocksPage(fixtureReader({ asOf: NOW, boundary: closeB }))
+    page.render(NOW, NOW_MS)
+    page.onKeyPress(2)
+    out.push({ label: 'peek on key 3 (first press)', frame: page.render(NOW, NOW_MS + 40) })
+    page.onKeyPress(4)
+    out.push({ label: 'peek with no volume (key 5)', frame: page.render(NOW, NOW_MS + 80) })
+    page.onKeyPress(2)
+    out.push({ label: 'detail (second press)', frame: page.render(NOW, NOW_MS + 120) })
+    page.onKeyPress(5)
+    out.push({ label: 'detail · chart press → 52 WK', frame: page.render(NOW, NOW_MS + 160) })
+  }
+
+  // The opening bell, watched across 9:30.
+  for (const dt of [150, 450, 1200]) {
+    let state: MarketState = 'pre'
+    const page = new StocksPage(fixtureReader({
+      asOf: NOW, marketState: () => state,
+      boundary: () => (state === 'pre' ? boundary('open', OPEN_MS, 'open') : closeB),
+    }))
+    page.render(0, OPEN_MS - 1000)
+    state = 'open'
+    page.render(0, OPEN_MS)
+    out.push({ label: `opening bell +${dt} ms`, frame: page.render(0, OPEN_MS + dt) })
+  }
+
+  // A big move each way: SPY crosses −2 %, AAPL crosses +2 %.
+  for (const dt of [250, 600]) {
+    const quotes = fixtureQuotes(NOW, [-1.9, 0.42, 1.95, 1.07, -0.38, 0.88])
+    const page = new StocksPage(fixtureReader({ asOf: NOW, quotes, boundary: closeB }))
+    page.render(NOW, NOW_MS)
+    const sym = FIXTURE_SYMBOLS
+    quotes.set(sym[0]!, fixtureQuote(sym[0]!, -2.14, 241.18, 0, NOW))
+    quotes.set(sym[2]!, fixtureQuote(sym[2]!, 2.07, 188.92, 2, NOW))
+    page.render(NOW, NOW_MS + 1000)
+    out.push({ label: `big moves +${dt} ms`, frame: page.render(NOW, NOW_MS + 1000 + dt) })
+  }
+
+  // The closing bell, then the summary.
+  for (const [dt, label] of [[300, 'closing bell +300 ms'], [5 * 60_000, 'closed summary +5 min'], [5 * 60_000 + 4000, 'closed summary +5 min 4 s']] as const) {
+    let state: MarketState = 'open'
+    const page = new StocksPage(fixtureReader({
+      asOf: NOW, marketState: () => state,
+      boundary: () => (state === 'open' ? closeB : boundary('post-end', CLOSE_MS + 4 * 3600_000, 'closed')),
+    }))
+    page.render(0, CLOSE_MS - 1000)
+    state = 'post'
+    page.render(0, CLOSE_MS)
+    // Keep the watch continuous up to the sampled instant.
+    for (let t = CLOSE_MS; t < CLOSE_MS + dt; t += 4000) page.render(0, t)
+    out.push({ label, frame: page.render(0, CLOSE_MS + dt) })
+  }
+
+  // Quiet and edge boards.
+  {
+    const quotes = fixtureQuotes(NOW, [0.12, -0.08, 0.31, -0.22, 0.04, -0.35])
+    out.push({ label: 'flat day (±0.35 %)', frame: new StocksPage(fixtureReader({ asOf: NOW, quotes, boundary: closeB })).render(NOW, NOW_MS) })
+  }
+  {
+    const quotes = fixtureQuotes(NOW, [-1.2, -0.4, -2.6, 0.3, -0.9, -1.1])
+    const frame = new StocksPage(fixtureReader({ asOf: NOW, quotes, marketState: 'closed' })).render(NOW, NOW_MS)
+    out.push({ label: 'red day, closed (bear)', frame })
+  }
+  {
+    const syms = DEFAULT_SYMBOLS.slice(0, 7)
+    const quotes = fixtureQuotes(NOW)
+    quotes.set(syms[6]!, fixtureQuote(syms[6]!, 0.6, 180.4, 6, NOW))
+    out.push({ label: '7 symbols: mascot only', frame: new StocksPage(fixtureReader({ asOf: NOW, quotes, symbols: syms, boundary: closeB })).render(NOW, NOW_MS) })
+  }
+  {
+    const syms = DEFAULT_SYMBOLS.slice(0, 8)
+    const quotes = fixtureQuotes(NOW)
+    quotes.set(syms[6]!, fixtureQuote(syms[6]!, 0.6, 180.4, 6, NOW))
+    quotes.set(syms[7]!, fixtureQuote(syms[7]!, -12.34, 1234.56, 7, NOW))
+    out.push({ label: '8 symbols, −12.34 % hero', frame: new StocksPage(fixtureReader({ asOf: NOW, quotes, symbols: syms, boundary: closeB })).render(NOW, NOW_MS) })
+  }
+  return out
+}
 
 async function main(): Promise<void> {
   const outPath = resolve(process.argv[2] ?? join(REPO_ROOT, 'stocks-board.png'))
-
-  const boards: readonly { name: string; changes: readonly number[] }[] = [
-    { name: 'LIVE (real)', changes: LIVE },
-    { name: 'FLAT day', changes: FLAT },
-  ]
-
-  const rowH = KEY_SIZE + ROW_LABEL_H + GAP
-  const boardH = STATES.length * rowH + STRIP_HEIGHT + 30
-  const width = M * 2 + LABEL_W + 8 * (KEY_SIZE + GAP) + BUTTON_R * 3
-  const height = TITLE_H + boards.length * (boardH + 24) + M
-
-  const sheet = createCanvas(width, height)
+  const list = scenes()
+  const cols = 3
+  const cellW = DECK_W + 40
+  const cellH = DECK_H + 34
+  const rows = Math.ceil(list.length / cols)
+  const sheet = createCanvas(cols * cellW + 20, rows * cellH + 20)
   const ctx = sheet.getContext('2d')
   ctx.fillStyle = 'rgb(24, 24, 28)'
-  ctx.fillRect(0, 0, width, height)
+  ctx.fillRect(0, 0, sheet.width, sheet.height)
   ctx.textBaseline = 'top'
-
-  ctx.fillStyle = `rgb(${theme.text.join(',')})`
-  ctx.font = '15px Menlo'
-  ctx.fillText('Stocks board — real StocksPage, real renderKey. Two distributions.', M, 10)
-
-  let y = TITLE_H
-
-  for (const board of boards) {
+  list.forEach((scene, i) => {
+    const x = 20 + (i % cols) * cellW
+    const y = 10 + Math.floor(i / cols) * cellH
     ctx.fillStyle = `rgb(${theme.amber.join(',')})`
     ctx.font = '13px Menlo'
-    const spread = `${Math.min(...board.changes).toFixed(2)}% to +${Math.max(...board.changes).toFixed(2)}%`
-    ctx.fillText(`${board.name} — ${spread}`, M, y)
-    y += 20
-
-    for (const state of STATES) {
-      const page = pageFor(board.changes, state)
-      const frame = page.render(1786549560)
-
-      ctx.fillStyle = `rgb(${theme.textDim.join(',')})`
-      ctx.font = '10px Menlo'
-      ctx.fillText(state, M, y + KEY_SIZE / 2)
-
-      frame.keys.forEach((key, i) => {
-        const x = M + LABEL_W + i * (KEY_SIZE + GAP)
-        ctx.drawImage(rgbaToCanvas(renderKey(key), KEY_SIZE, KEY_SIZE), x, y)
-      })
-
-      // The two round buttons, drawn as the lights they are.
-      const bx = M + LABEL_W + 8 * (KEY_SIZE + GAP) + BUTTON_R
-      frame.buttons.forEach((rgb, i) => {
-        ctx.fillStyle = `rgb(${rgb.join(',')})`
-        ctx.beginPath()
-        ctx.arc(bx, y + BUTTON_R + i * (BUTTON_R * 2 + 6), BUTTON_R, 0, Math.PI * 2)
-        ctx.fill()
-      })
-
-      y += rowH
-    }
-
-    // One strip, from the open-market board, so the up/down text is visible.
-    const openFrame = pageFor(board.changes, 'open').render(1786549560)
-    ctx.drawImage(
-      rgbaToCanvas(renderStrip(openFrame.strip), STRIP_WIDTH, STRIP_HEIGHT),
-      M + LABEL_W, y,
-    )
-    y += STRIP_HEIGHT + 30
-  }
-
+    ctx.fillText(scene.label, x, y)
+    drawDeck(ctx, scene.frame, x, y + 20)
+  })
   await writeFile(outPath, sheet.toBuffer('image/png'))
   process.stdout.write(`wrote ${outPath}\n`)
 
-  // A second sheet for the ticker tape: the same strip at points across one full
-  // loop, so the scroll speed and the wrap seam can both be judged. The loop
-  // width comes from the renderer, never from a character count.
-  const tapePage = pageFor(LIVE, 'open')
-  const probeStrip = tapePage.render(1786549560, 0).strip
-  const loopPx = tapeLoopWidthPx(probeStrip.tape?.segments ?? [])
-  const loopSeconds = loopPx / TAPE_PX_PER_SEC_PREVIEW
-  const SAMPLES = 10
-  const tapeH = 26 + SAMPLES * (STRIP_HEIGHT + 16) + 20
-  const tapeSheet = createCanvas(STRIP_WIDTH + M * 2 + 120, tapeH)
-  const tctx = tapeSheet.getContext('2d')
+  // The tape across two of its live cycles, every 200 ms: the hold should
+  // show a whole quote at the left edge, the scroll a short eased glide.
+  const page = new StocksPage(fixtureReader({ asOf: NOW, boundary: boundary('close', CLOSE_MS, 'post') }))
+  const base = Math.floor(NOW_MS / 15_600) * 15_600
+  const samples = Array.from({ length: 27 }, (_, k) => k * 200)
+  const tape = createCanvas(STRIP_WIDTH + 140, samples.length * (STRIP_HEIGHT + 6) + 20)
+  const tctx = tape.getContext('2d')
   tctx.fillStyle = 'rgb(24, 24, 28)'
-  tctx.fillRect(0, 0, tapeSheet.width, tapeH)
+  tctx.fillRect(0, 0, tape.width, tape.height)
   tctx.textBaseline = 'top'
-  tctx.fillStyle = `rgb(${theme.text.join(',')})`
-  tctx.font = '13px Menlo'
-  tctx.fillText(
-    `Ticker tape — ${Math.round(loopPx)} px loop, ${loopSeconds.toFixed(1)} s to pass`,
-    M, 8,
-  )
-  for (let i = 0; i < SAMPLES; i++) {
-    const seconds = (loopSeconds * i) / SAMPLES
-    const y = 26 + i * (STRIP_HEIGHT + 16)
-    const frame = tapePage.render(1786549560, seconds * 1000)
-    tctx.drawImage(
-      rgbaToCanvas(renderStrip(frame.strip), STRIP_WIDTH, STRIP_HEIGHT),
-      M, y,
-    )
+  samples.forEach((dt, k) => {
+    const frame = page.render(0, base + dt)
+    tctx.drawImage(toCanvas(renderStrip(frame.strip), STRIP_WIDTH, STRIP_HEIGHT), 10, 10 + k * (STRIP_HEIGHT + 6))
     tctx.fillStyle = `rgb(${theme.textDim.join(',')})`
-    tctx.font = '10px Menlo'
-    tctx.fillText(`t+${seconds.toFixed(1)}s`, M + STRIP_WIDTH + 8, y + STRIP_HEIGHT / 2)
-  }
+    tctx.font = '11px Menlo'
+    tctx.fillText(`+${dt} ms  off ${frame.strip.tape?.offsetPx ?? '-'}`, STRIP_WIDTH + 18, 30 + k * (STRIP_HEIGHT + 6))
+  })
   const tapePath = outPath.replace(/\.png$/, '-tape.png')
-  await writeFile(tapePath, tapeSheet.toBuffer('image/png'))
+  await writeFile(tapePath, tape.toBuffer('image/png'))
   process.stdout.write(`wrote ${tapePath}\n`)
-
-  // A third sheet for the directional drift: the live board at several instants,
-  // so the rising and sinking motion can be judged side by side, plus the flat
-  // board and a closed market — the two cases drift is least flattering to.
-  const DRIFT_INSTANTS = [0, 250, 500, 750, 1000, 1250]
-  const rows: readonly { label: string; changes: readonly number[]; state: MarketState }[] = [
-    { label: 'LIVE open', changes: LIVE, state: 'open' },
-    { label: 'FLAT open', changes: FLAT, state: 'open' },
-    { label: 'LIVE closed', changes: LIVE, state: 'closed' },
-  ]
-  const dLabelW = 92
-  const dRowH = KEY_SIZE + 20
-  const dW = M * 2 + dLabelW + DRIFT_INSTANTS.length * (KEY_SIZE + GAP)
-  const dH = 30 + rows.length * 2 * dRowH + M
-  const dSheet = createCanvas(dW, dH)
-  const dctx = dSheet.getContext('2d')
-  dctx.fillStyle = 'rgb(24, 24, 28)'
-  dctx.fillRect(0, 0, dW, dH)
-  dctx.textBaseline = 'top'
-  dctx.fillStyle = `rgb(${theme.text.join(',')})`
-  dctx.font = '14px Menlo'
-  dctx.fillText('Directional drift — rising on gainers, sinking on losers', M, 8)
-
-  let dy = 30
-  for (const row of rows) {
-    const page = pageFor(row.changes, row.state)
-    // Two representative tiles per row: the strongest riser and the strongest
-    // faller, so the two directions sit next to each other.
-    const sorted = row.changes.map((c, i) => ({ c, i })).sort((a, b) => b.c - a.c)
-    const picks = [sorted[0]!, sorted[sorted.length - 1]!]
-    for (const pick of picks) {
-      dctx.fillStyle = `rgb(${theme.textDim.join(',')})`
-      dctx.font = '10px Menlo'
-      dctx.fillText(`${row.label}`, M, dy + 4)
-      dctx.fillText(`${pick.c > 0 ? '+' : ''}${pick.c.toFixed(2)}%`, M, dy + 18)
-      DRIFT_INSTANTS.forEach((ms, col) => {
-        const frame = page.render(Math.floor(ms / 1000), ms)
-        const key = frame.keys[pick.i]!
-        dctx.drawImage(
-          rgbaToCanvas(renderKey(key), KEY_SIZE, KEY_SIZE),
-          M + dLabelW + col * (KEY_SIZE + GAP), dy,
-        )
-      })
-      dy += dRowH
-    }
-  }
-  const driftPath = outPath.replace(/\.png$/, '-drift.png')
-  await writeFile(driftPath, dSheet.toBuffer('image/png'))
-  process.stdout.write(`wrote ${driftPath}\n`)
 }
 
 await main()
