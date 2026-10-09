@@ -21,6 +21,14 @@
     "symbols": ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
   },
 
+  "pages": {
+    "_comment": [
+      "Pages to switch off. A hidden page's source never starts.",
+      "Names: claude, codex, spotify, stocks, weather, football, system."
+    ],
+    "hide": []
+  },
+
   "football": {
     "_comment": [
       "Two teams, top row and bottom row. Both are required, or the page is off.",

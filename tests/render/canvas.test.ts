@@ -3067,6 +3067,29 @@ describe('FxSpec.color and the pulse variant (task 46)', () => {
     expect(r).toBeGreaterThan(g)
   })
 
+  it('centres the sun on the icon band, not behind the digits', () => {
+    // The first sun glowed from the tile centre, so its light radiated from
+    // behind the temperature line and the icon sat off to one side of it.
+    // The icon's ink spans y 17 to 48; the digits start at y 55.
+    const buf = renderKey({
+      kind: 'gauge', bg: BG, fx: { variant: 'sun', nowMs: 0, intensity: 1, seed: 2 },
+    })
+    const regionRed = (y0: number, y1: number): number => {
+      let sum = 0
+      let n = 0
+      for (let y = y0; y < y1; y++) {
+        for (let x = 24; x < KEY_SIZE - 24; x++) {
+          sum += probe(buf, x, y)[0]!
+          n++
+        }
+      }
+      return sum / n
+    }
+    const icon = regionRed(20, 44)
+    const digits = regionRed(60, 84)
+    expect(icon - BG[0]).toBeGreaterThan(2 * (digits - BG[0]))
+  })
+
   it.each(['sun', 'storm'] as const)('ignores color for %s, whose palette is semantic', (variant) => {
     // The sun is amber because it IS the sun; lightning is white because it IS
     // lightning. Tinting either would make the variant mean something else.

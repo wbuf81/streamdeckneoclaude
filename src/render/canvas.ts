@@ -1352,19 +1352,34 @@ function drawFxWind(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
 
 const FX_SUN_RAYS = 12
 const FX_SUN_ROTATE_PERIOD_MS = 26000
-const FX_SUN_GLOW_R = 52
-const FX_SUN_RAY_HALF_ANGLE = 0.05
 const FX_SUN_PULSE_PERIOD_MS = 5400
 const FX_SUN_PULSE_AMPLITUDE = 0.12
+/**
+ * The centre of the sun's ink, not of the tile. The weather emoji paints
+ * between `y 17` and `y 48` (see `EMOJI_Y`), so its visual centre is about
+ * `y 32`. The first version centred the glow and rays on the TILE, so they
+ * radiated from behind the temperature digits and the sun icon sat off to
+ * one side of its own light. The user called it weird, and it was.
+ */
+const FX_SUN_CY = 32
+/** The halo's reach. Large enough to warm the upper tile, small enough to
+ * fade out before the precipitation line at the bottom. */
+const FX_SUN_HALO_R = 40
+/** The corona: short rays in a ring around the icon, never from its centre,
+ * so no ray crosses the digits as a long spoke. */
+const FX_SUN_RAY_INNER = 19
+const FX_SUN_RAY_OUTER = 31
+const FX_SUN_RAY_HALF_ANGLE = 0.09
 
 /**
- * A warm central glow with slowly turning rays. Both breathe on one slow
- * pulse, so a clear-sky tile still moves without anything crossing it — a
- * falling or drifting particle would contradict what the tile reports.
+ * A soft halo and a slowly turning corona, both centred on the sun icon.
+ * Both breathe on one slow pulse, so a clear-sky tile still moves without
+ * anything crossing it — a falling or drifting particle would contradict
+ * what the tile reports.
  */
 function drawFxSun(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   const cx = KEY_SIZE / 2
-  const cy = KEY_SIZE / 2
+  const cy = FX_SUN_CY
   // Per-key phase offsets. Without these the sun was the ONE variant that
   // ignored `seed`, so a whole week of clear days pulsed and turned in perfect
   // lockstep — read as one throbbing block rather than seven tiles. Every
@@ -1377,21 +1392,30 @@ function drawFxSun(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
     1 +
     FX_SUN_PULSE_AMPLITUDE *
       Math.sin((fx.nowMs / FX_SUN_PULSE_PERIOD_MS) * 2 * Math.PI + phase)
-  const r = FX_SUN_GLOW_R * pulse
 
-  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-  grad.addColorStop(0, fxCss(theme.amber, intensity * 0.72))
-  grad.addColorStop(1, fxCss(theme.amber, 0))
-  ctx.fillStyle = grad
+  const r = FX_SUN_HALO_R * pulse
+  const halo = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
+  halo.addColorStop(0, fxCss(theme.amber, intensity * 0.8))
+  halo.addColorStop(0.45, fxCss(theme.amber, intensity * 0.35))
+  halo.addColorStop(1, fxCss(theme.amber, 0))
+  ctx.fillStyle = halo
   ctx.fillRect(0, 0, KEY_SIZE, KEY_SIZE)
 
+  // Each ray fades outward, so the corona has no hard outer edge.
+  const inner = FX_SUN_RAY_INNER * pulse
+  const outer = FX_SUN_RAY_OUTER * pulse
+  const corona = ctx.createRadialGradient(cx, cy, inner, cx, cy, outer)
+  corona.addColorStop(0, fxCss(theme.amber, intensity * 0.9))
+  corona.addColorStop(1, fxCss(theme.amber, 0))
+  ctx.fillStyle = corona
   const spin = (fx.nowMs / FX_SUN_ROTATE_PERIOD_MS) * 2 * Math.PI + spinPhase
-  ctx.fillStyle = fxCss(theme.amber, intensity * 0.32)
   for (let i = 0; i < FX_SUN_RAYS; i++) {
     const a = spin + (i / FX_SUN_RAYS) * 2 * Math.PI
+    // Alternate long and short rays, the classic sunburst rhythm.
+    const tip = i % 2 === 0 ? outer : inner + (outer - inner) * 0.6
     ctx.beginPath()
-    ctx.moveTo(cx, cy)
-    ctx.arc(cx, cy, r * 1.15, a - FX_SUN_RAY_HALF_ANGLE, a + FX_SUN_RAY_HALF_ANGLE)
+    ctx.arc(cx, cy, inner, a - FX_SUN_RAY_HALF_ANGLE, a + FX_SUN_RAY_HALF_ANGLE)
+    ctx.lineTo(cx + Math.cos(a) * tip, cy + Math.sin(a) * tip)
     ctx.closePath()
     ctx.fill()
   }

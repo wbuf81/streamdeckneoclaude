@@ -104,6 +104,22 @@ export type LockStateReader = Pick<LockState, 'start' | 'stop' | 'isLocked' | 'r
  * The dirty-key hash keeps this safe: a fast tick over unchanged content
  * writes nothing at all.
  */
+/**
+ * Pads a page's frame to every key on the deck with blank keys.
+ *
+ * A page may return fewer keys than the deck has. The stocks page does, for a
+ * watchlist shorter than eight. Unpadded, `writeFrame` skipped the missing
+ * keys, so they kept the previous page's pixels. `overlayFlashes` also skipped
+ * them, so a press there drew no ring. Padding here, once, closes both holes
+ * for every page.
+ */
+export function padKeys(frame: DeckFrame): DeckFrame {
+  if (frame.keys.length >= NEO_KEY_COUNT) return frame
+  const keys = frame.keys.slice()
+  while (keys.length < NEO_KEY_COUNT) keys.push({ kind: 'blank' })
+  return { ...frame, keys }
+}
+
 export class Daemon {
   private lastKeys: (string | null)[] = new Array(NEO_KEY_COUNT).fill(null)
   private lastStrip: string | null = null
@@ -544,7 +560,7 @@ export class Daemon {
     const task = (async () => {
       const page = this.pages.current()
       const frame = page.render(now, nowMs)
-      await this.writeFrame(this.overlayFlashes(frame, nowMs, page.name))
+      await this.writeFrame(this.overlayFlashes(padKeys(frame), nowMs, page.name))
     })()
     this.activeRender = task
     try {

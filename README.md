@@ -487,6 +487,7 @@ your Spotify client id into it.
 | `stocks.symbols` | A generic default watchlist. Up to 8, one per key |
 | `football.top` / `football.bottom` | **The football page is not added.** Both are required |
 | `spotify.clientId` | Key 0 shows `SIGN IN`. Written by `deckd auth spotify` |
+| `pages.hide` | Every page is shown. List page names to switch them off and stop their polling |
 
 Two rules govern the whole file, and they are worth knowing before you debug
 it:

@@ -8,6 +8,7 @@ import {
   DEFAULT_SYMBOLS,
   MAX_SYMBOLS,
   EMPTY_CONFIG,
+  PAGE_NAMES,
 } from '../src/config.js'
 
 /** Collects the warnings a parse produced, so a test can assert that a
@@ -149,6 +150,40 @@ describe('parseConfig — the teams', () => {
     const { warn, messages } = collect()
     expect(parseConfig({ football: { top: TEAM, bottom: { ...OTHER, id: TEAM.id } } }, warn).teams).toBeNull()
     expect(messages.join(' ')).toContain('share the id')
+  })
+})
+
+describe('parseConfig — hidden pages', () => {
+  it('hides nothing when the section is absent', () => {
+    const { warn, messages } = collect()
+    expect(parseConfig({}, warn).hiddenPages).toEqual([])
+    expect(messages).toEqual([])
+  })
+
+  it('hides the named pages, case-insensitively and once each', () => {
+    const { warn, messages } = collect()
+    const got = parseConfig({ pages: { hide: ['Codex', 'system', 'codex'] } }, warn)
+    expect(got.hiddenPages).toEqual(['codex', 'system'])
+    expect(messages).toEqual([])
+  })
+
+  it('reports and skips an unknown name, keeping the rest', () => {
+    const { warn, messages } = collect()
+    const got = parseConfig({ pages: { hide: ['sytem', 'codex'] } }, warn)
+    expect(got.hiddenPages).toEqual(['codex'])
+    expect(messages.some((m) => m.includes('sytem'))).toBe(true)
+  })
+
+  it('reports a non-array and hides nothing', () => {
+    const { warn, messages } = collect()
+    expect(parseConfig({ pages: { hide: 'codex' } }, warn).hiddenPages).toEqual([])
+    expect(messages).toHaveLength(1)
+  })
+
+  it('refuses to hide every page', () => {
+    const { warn, messages } = collect()
+    expect(parseConfig({ pages: { hide: [...PAGE_NAMES] } }, warn).hiddenPages).toEqual([])
+    expect(messages).toHaveLength(1)
   })
 })
 

@@ -21,7 +21,7 @@ import { SystemSource } from '../src/sources/system.js'
 import { focusWindow } from '../src/focus-window.js'
 import { loadSprites } from '../src/render/sprites.js'
 import { ensureStateDir, paths } from '../src/paths.js'
-import { loadConfig } from '../src/config.js'
+import { loadConfig, PAGE_NAMES, type PageName } from '../src/config.js'
 import { log } from '../src/log.js'
 import { LockState } from '../src/lock-state.js'
 import { reportUnrecoverable } from '../src/unrecoverable.js'
@@ -69,28 +69,43 @@ async function start(): Promise<void> {
   // to somebody else's answer.
   const config = loadConfig()
 
-  const claude = new ClaudeSource()
-  const usage = new UsageSource()
-  const codex = new CodexSource()
+  // `pages.hide` switches a page off entirely: its source never starts, so a
+  // hidden page costs no polling. Weather and football are also off when
+  // their section is absent. If that would leave no page at all, every
+  // configured page is shown instead, because an empty deck cannot even be
+  // flipped to a page that would explain why.
+  const configured = (name: PageName): boolean =>
+    (name !== 'weather' || config.zip !== null) && (name !== 'football' || config.teams !== null)
+  const anyVisible = PAGE_NAMES.some((n) => configured(n) && !config.hiddenPages.includes(n))
+  if (!anyVisible) log.warn('pages.hide leaves no page to show. Showing every page.')
+  const shown = (name: PageName): boolean =>
+    configured(name) && (!anyVisible || !config.hiddenPages.includes(name))
+  for (const name of config.hiddenPages) {
+    if (configured(name) && !shown(name)) log.info(`pages.hide in config.json; the ${name} page is off`)
+  }
+
+  const claude = shown('claude') ? new ClaudeSource() : null
+  const usage = shown('claude') ? new UsageSource() : null
+  const codex = shown('codex') ? new CodexSource() : null
   const clientId = readClientId()
-  const spotify = new SpotifySource(clientId)
-  const stocks = new StockSource(config.symbols)
-  const weather = config.zip === null ? null : new WeatherSource(config.zip)
-  const football = config.teams === null ? null : new FootballSource(config.teams)
-  const system = new SystemSource()
-  await claude.start()
-  await usage.start()
-  await codex.start()
-  await spotify.start()
-  await stocks.start()
+  const spotify = shown('spotify') ? new SpotifySource(clientId) : null
+  const stocks = shown('stocks') ? new StockSource(config.symbols) : null
+  const weather = shown('weather') ? new WeatherSource(config.zip!) : null
+  const football = shown('football') ? new FootballSource(config.teams!) : null
+  const system = shown('system') ? new SystemSource() : null
+  await claude?.start()
+  await usage?.start()
+  await codex?.start()
+  await spotify?.start()
+  await stocks?.start()
   await weather?.start()
   await football?.start()
-  await system.start()
+  await system?.start()
 
-  if (!weather) {
+  if (config.zip === null) {
     log.info('no weather.zip in config.json; the weather page is off')
   }
-  if (!football) {
+  if (config.teams === null) {
     log.info('no football teams in config.json; the football page is off')
   }
 
@@ -100,13 +115,13 @@ async function start(): Promise<void> {
   // `src/unrecoverable.ts` and `Device`'s health docblock.
   const device = new Device(undefined, { onUnrecoverable: reportUnrecoverable })
   const pages = new PageManager()
-  pages.add(new ClaudePage(claude, usage, focusWindow))
-  pages.add(new CodexPage(codex))
-  pages.add(new SpotifyPage(spotify))
-  pages.add(new StocksPage(stocks))
+  if (claude && usage) pages.add(new ClaudePage(claude, usage, focusWindow))
+  if (codex) pages.add(new CodexPage(codex))
+  if (spotify) pages.add(new SpotifyPage(spotify))
+  if (stocks) pages.add(new StocksPage(stocks))
   if (weather) pages.add(new WeatherPage(weather))
   if (football) pages.add(new FootballPage(football))
-  pages.add(new SystemPage(system))
+  if (system) pages.add(new SystemPage(system))
 
   // Only now, with every page that this configuration enables present, may a
   // saved page be restored. `PageManager.setIndex` silently ignores an index
@@ -131,14 +146,14 @@ async function start(): Promise<void> {
 
   // A source change redraws at once, rather than at the next tick.
   const onChange = makeChangeHandler(daemon)
-  claude.on('change', onChange)
-  usage.on('change', onChange)
-  codex.on('change', onChange)
-  spotify.on('change', onChange)
-  stocks.on('change', onChange)
+  claude?.on('change', onChange)
+  usage?.on('change', onChange)
+  codex?.on('change', onChange)
+  spotify?.on('change', onChange)
+  stocks?.on('change', onChange)
   weather?.on('change', onChange)
   football?.on('change', onChange)
-  system.on('change', onChange)
+  system?.on('change', onChange)
 
   const shutdown = async () => {
     log.info('deckd stopping')
@@ -152,14 +167,14 @@ async function start(): Promise<void> {
     // `shutdownBlank` is best-effort and never throws, so it cannot block
     // the rest of shutdown even if the device is already gone.
     await daemon.shutdownBlank()
-    await claude.stop()
-    await usage.stop()
-    await codex.stop()
-    await spotify.stop()
-    await stocks.stop()
+    await claude?.stop()
+    await usage?.stop()
+    await codex?.stop()
+    await spotify?.stop()
+    await stocks?.stop()
     await weather?.stop()
     await football?.stop()
-    await system.stop()
+    await system?.stop()
     await device.disconnect()
     process.exit(0)
   }

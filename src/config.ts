@@ -32,6 +32,10 @@ export const DEFAULT_SYMBOLS: readonly string[] = [
 /** The stocks page draws one symbol per key, and the deck has eight keys. */
 export const MAX_SYMBOLS = 8
 
+/** Every page the deck can show, by its `Page.name`, in deck order. */
+export const PAGE_NAMES = ['claude', 'codex', 'spotify', 'stocks', 'weather', 'football', 'system'] as const
+export type PageName = (typeof PAGE_NAMES)[number]
+
 export type League = 'nfl' | 'college-football'
 
 /** One configured team. `id` is this team's key everywhere else in the code,
@@ -67,6 +71,8 @@ export interface DeckConfig {
   readonly symbols: readonly string[]
   /** Null omits the football page. */
   readonly teams: TeamPair | null
+  /** Pages the user switched off with `pages.hide`. Never holds every page. */
+  readonly hiddenPages: readonly PageName[]
 }
 
 /** What a completely absent or unreadable config file yields. */
@@ -75,6 +81,7 @@ export const EMPTY_CONFIG: DeckConfig = {
   zip: null,
   symbols: DEFAULT_SYMBOLS,
   teams: null,
+  hiddenPages: [],
 }
 
 type Raw = Record<string, unknown>
@@ -186,6 +193,36 @@ function parseTeams(raw: Raw, warn: (m: string) => void): TeamPair | null {
   return [top, bottom]
 }
 
+/**
+ * Pages the user does not want. An unknown name is reported and skipped, so
+ * a typo cannot hide the wrong page. Hiding every page is refused as a whole,
+ * because a deck with no page has nothing to draw and nothing to flip to.
+ */
+function parseHiddenPages(raw: Raw, warn: (m: string) => void): readonly PageName[] {
+  const section = asRecord(raw['pages'])
+  if (!section || section['hide'] === undefined) return []
+  const names = asStringArray(section['hide'])
+  if (names === null) {
+    warn('pages.hide must be an array of page names. Showing every page.')
+    return []
+  }
+  const hidden: PageName[] = []
+  for (const name of names) {
+    const lower = name.toLowerCase()
+    const known = PAGE_NAMES.find((p) => p === lower)
+    if (!known) {
+      warn(`pages.hide names an unknown page ${JSON.stringify(name)}. Known pages: ${PAGE_NAMES.join(', ')}.`)
+      continue
+    }
+    if (!hidden.includes(known)) hidden.push(known)
+  }
+  if (hidden.length === PAGE_NAMES.length) {
+    warn('pages.hide names every page. Showing every page.')
+    return []
+  }
+  return hidden
+}
+
 function parseSpotifyClientId(raw: Raw): string {
   const section = asRecord(raw['spotify'])
   if (!section) return ''
@@ -213,6 +250,7 @@ export function parseConfig(value: unknown, warn: (m: string) => void = (m) => l
     zip: parseZip(raw, warn),
     symbols: parseSymbols(raw, warn),
     teams: parseTeams(raw, warn),
+    hiddenPages: parseHiddenPages(raw, warn),
   }
 }
 

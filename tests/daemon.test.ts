@@ -34,14 +34,18 @@ class ControlPage implements Page {
    * unchanged, and the flash-focused tests below can override one key at a
    * time. */
   outcomes = new Map<number, PressOutcome>()
+  /** How many keys `render` returns. A real page may return fewer than 8. */
+  keyCount = 8
+  /** Draws text on every key, not only key 0, so a stale key is visible. */
+  allLit = false
 
   constructor(name = 'test') {
     this.name = name
   }
 
   render(): DeckFrame {
-    const keys: KeySpec[] = Array.from({ length: 8 }, (_, i) =>
-      i === 0 ? { kind: 'gauge', lines: this.lines } : { kind: 'blank' })
+    const keys: KeySpec[] = Array.from({ length: this.keyCount }, (_, i) =>
+      i === 0 || this.allLit ? { kind: 'gauge', lines: this.lines } : { kind: 'blank' })
     return {
       keys,
       strip: { lines: [this.stripText] },
@@ -236,6 +240,46 @@ describe('Daemon', () => {
     device.setKeyImage = async () => { throw new Error('usb gone') }
     await expect(daemon.renderOnce(2, 2000)).resolves.not.toThrow()
     device.setKeyImage = original
+    await daemon.stop()
+  })
+})
+
+describe('Daemon with a page that returns fewer than 8 keys', () => {
+  function buildShort() {
+    const device = new FakeDevice()
+    const full = new ControlPage('full')
+    full.lines = ['FULL']
+    full.allLit = true
+    const short = new ControlPage('short')
+    short.keyCount = 6
+    const manager = new PageManager()
+    manager.add(full)
+    manager.add(short)
+    const daemon = new Daemon(device, manager)
+    return { device, manager, daemon }
+  }
+
+  it('blanks the missing keys instead of leaving the last page on them', async () => {
+    const { device, manager, daemon } = buildShort()
+    await daemon.start()
+    device.reset()
+    manager.next()
+    await daemon.renderOnce(1, 1000)
+    const written = device.keyWrites.map((w) => (typeof w === 'number' ? w : w.index))
+    expect(written).toEqual(expect.arrayContaining([6, 7]))
+    await daemon.stop()
+  })
+
+  it('draws the press ring on a missing key', async () => {
+    const { device, manager, daemon } = buildShort()
+    manager.next()
+    await daemon.start()
+    device.reset()
+    device.simulatePress(7)
+    await new Promise((r) => setTimeout(r, 0))
+    await daemon.renderOnce(1, Date.now())
+    const written = device.keyWrites.map((w) => (typeof w === 'number' ? w : w.index))
+    expect(written).toContain(7)
     await daemon.stop()
   })
 })
