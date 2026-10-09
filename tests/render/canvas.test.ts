@@ -774,29 +774,13 @@ describe('renderKey spark', () => {
     })
   })
 
-  // The regression guard the task brief demands: the grid's single-key
-  // sparkline (no `slice`) must render byte-identically to the hash captured
-  // BEFORE `slice` support was added to `drawSpark`, the same way Task 23
-  // proved `lineSizes` did not disturb the pages that never set it.
-  it('renders a single-key spark byte-identically to the pre-slice snapshot (8 points)', () => {
-    const buf = renderKey({
-      kind: 'gauge',
-      spark: { values: [1, 5, 2, 8, 3, 6, 9, 4], color: theme.green },
-    })
-    expect(sha256(buf)).toBe(
-      'c1790257f8b27077f656deff392c0c31afb6a864ebc7ed884109f0b73a2cc748',
-    )
-  })
-
-  it('renders a single-key spark byte-identically to the pre-slice snapshot (12 points)', () => {
-    const buf = renderKey({
-      kind: 'gauge',
-      spark: { values: [1, 5, 2, 8, 3, 6, 9, 4, 7, 2, 5, 1], color: theme.red },
-    })
-    expect(sha256(buf)).toBe(
-      'e412e112d97f631eb7217b7300a232dcdb9d0edefc41d5624fee776f58515605',
-    )
-  })
+  // RETIRED, deliberately: two golden sha256 hashes of an 8-point and a
+  // 12-point bar spark lived here. They proved, at the time, that `slice`
+  // changed no single-key pixels — and they did their job. The glow-up then
+  // changed those pixels on purpose: the lowest bar used to map to height 0
+  // and vanish, and `SPARK_BAR_MIN_H` now draws it. A point-in-time proof
+  // retires when its change lands (AGENTS.md). The bar geometry is now
+  // covered by region probes in `tests/render/glowup.test.ts`.
 
   it('dims the spark like every other element', () => {
     const bright = renderKey({

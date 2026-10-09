@@ -1,16 +1,15 @@
 import { createCanvas, type Canvas, type SKRSContext2D, type Image } from '@napi-rs/canvas'
 import type { KeySpec, StripSpec, Rgb, BarSpec, SparkSpec, ImageCrop, IdleSpec, FxSpec, TapeSpec, TapeSegment } from './specs.js'
 import { theme } from './theme.js'
+import { canonicalKeySpec, canonicalStripSpec, linePopScale } from './motion.js'
+import { drawEffects, drawEdgeProgress, drawIcon, drawRange, effectsShakePx } from './overlays.js'
+import { drawMascot, drawStripSprite } from './mascots.js'
+import {
+  KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT, FONT, EMOJI_FONT, PAD, BORDER, DIM_FACTOR,
+  css, cssAlpha, clamp01, finiteOr, pseudoRandom,
+} from './paint.js'
 
-export const KEY_SIZE = 96
-export const STRIP_WIDTH = 248
-export const STRIP_HEIGHT = 58
-
-/** Exported so `text.ts` can measure with the exact same font the renderer
- * uses. Two different font names would make a measurement meaningless. */
-export const FONT = 'Menlo'
-const PAD = 6
-const BORDER = 3
+export { KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT, FONT } from './paint.js'
 const BAR_Y = 66
 const BAR_H = 8
 const SPARK_Y = 48
@@ -65,9 +64,6 @@ const STRIP_TEXT_MAX_WIDTH = STRIP_WIDTH - PAD * 2
  * crowded in exactly the way lesson 14 warns against.
  */
 const STRIP_RIGHT_GAP = 6
-/** Dims a colour, or a colour emoji's `globalAlpha`, to this fraction. One
- * constant so text, border and emoji all dim by the same amount. */
-const DIM_FACTOR = 0.45
 /**
  * Geometry of the press-feedback flash ring (task 36's `KeySpec.flashRing`).
  *
@@ -103,11 +99,6 @@ export const FLASH_RING_THICKNESS = 4
  * every weather emoji's ink between `y 17` and `y 48` — clear of the label
  * (ends by `y 12`) above and the temperature line (starts at `y 55`) below.
  */
-/** The one colour-emoji font this file draws with, for both the standalone
- * `emoji` field (the weather page) and `glyph` in `'emoji'` mode (the
- * Spotify page, task 38). One named constant so the two paths cannot drift
- * to two different font strings. */
-const EMOJI_FONT = 'Apple Color Emoji'
 const EMOJI_SIZE = 32
 const EMOJI_Y = 38
 /**
@@ -178,31 +169,6 @@ const EMOJI_GLYPH_Y = 30
  * motion once it was on-screen at 4x scale.
  */
 const GLYPH_PULSE_AMPLITUDE = 0.1
-
-function css(c: Rgb, dim = false): string {
-  const f = dim ? DIM_FACTOR : 1
-  return `rgb(${Math.round(c[0] * f)},${Math.round(c[1] * f)},${Math.round(c[2] * f)})`
-}
-
-/** Same colour rule as `css`, but with an explicit alpha channel — used by
- * the idle animations for translucent scanlines and fading trails, where a
- * fully opaque fill would be too heavy for a background decoration. */
-function cssAlpha(c: Rgb, alpha: number, dim = false): string {
-  const f = dim ? DIM_FACTOR : 1
-  return `rgba(${Math.round(c[0] * f)},${Math.round(c[1] * f)},${Math.round(c[2] * f)},${alpha})`
-}
-
-function clamp01(n: number): number {
-  if (!Number.isFinite(n)) return 0
-  return Math.min(1, Math.max(0, n))
-}
-
-/** Returns `n` when it is a finite number, otherwise `fallback`. `NaN` and
- * `+/-Infinity` are both valid `number`s at the type level, so this is a
- * runtime check, not something the type system can rule out for us. */
-function finiteOr(n: number, fallback: number): number {
-  return Number.isFinite(n) ? n : fallback
-}
 
 /**
  * The one boundary a hostile `KeySpec` passes through before any drawing
@@ -286,6 +252,71 @@ function sanitizeKeySpec(spec: KeySpec): KeySpec {
       direction: out.fx.direction === 'down' ? 'down' : 'up',
     }
   }
+  if (out.spark) {
+    // A non-finite baseline or half-range reads as absent, never as a
+    // coordinate.
+    const sp = { ...out.spark }
+    if (sp.baseline !== undefined && !Number.isFinite(sp.baseline)) delete sp.baseline
+    if (sp.minHalfRange !== undefined && !Number.isFinite(sp.minHalfRange)) delete sp.minHalfRange
+    out.spark = sp
+  }
+  if (out.range) {
+    out.range = {
+      ...out.range,
+      lo: finiteOr(out.range.lo, 0),
+      hi: finiteOr(out.range.hi, 0),
+      value: finiteOr(out.range.value, 0),
+      y: Math.max(0, Math.min(KEY_SIZE, finiteOr(out.range.y ?? 44, 44))),
+      height: Math.max(2, Math.min(24, finiteOr(out.range.height ?? 8, 8))),
+    }
+  }
+  if (out.icon) {
+    // `ctx.arc` (the compass ring) and `rotate` need finite input; `arc`
+    // panics in Rust on a non-finite argument (C1).
+    out.icon = out.icon.kind === 'compass'
+      ? { ...out.icon, bearingDeg: finiteOr(out.icon.bearingDeg, 0) }
+      : { ...out.icon, kind: 'fog' }
+    if (out.icon.nowMs !== undefined) out.icon.nowMs = finiteOr(out.icon.nowMs, 0)
+  }
+  if (out.mascot) {
+    out.mascot = {
+      kind: out.mascot.kind === 'bear' ? 'bear' : 'bull',
+      nowMs: finiteOr(out.mascot.nowMs, 0),
+    }
+  }
+  if (out.imageTransform) {
+    out.imageTransform = {
+      dy: Math.max(-KEY_SIZE, Math.min(KEY_SIZE, finiteOr(out.imageTransform.dy ?? 0, 0))),
+      rotateDeg: finiteOr(out.imageTransform.rotateDeg ?? 0, 0) % 360,
+      scale: Math.max(0.25, Math.min(3, finiteOr(out.imageTransform.scale ?? 1, 1))),
+    }
+  }
+  if (out.effects) {
+    // Clocks are judged by `canonicalKeySpec` (a non-finite clock is simply
+    // not running). Every other number reaches `arc`, `translate` or a
+    // loop bound, so it is made finite and bounded here.
+    // A non-finite optional number reads as ABSENT, so the variant's own
+    // default applies; a finite one is bounded.
+    const bound = (n: number | undefined, lo: number, hi: number): number | undefined =>
+      n === undefined || !Number.isFinite(n) ? undefined : Math.max(lo, Math.min(hi, n))
+    out.effects = (Array.isArray(out.effects) ? out.effects : []).map((fx) => {
+      const clean = { ...fx }
+      const fields = {
+        x: bound(fx.x, -KEY_SIZE, 2 * KEY_SIZE),
+        y: bound(fx.y, -KEY_SIZE, 2 * KEY_SIZE),
+        count: bound(fx.count, 0, 1000),
+        seed: bound(fx.seed, -1e9, 1e9),
+      }
+      for (const [k, v] of Object.entries(fields) as [keyof typeof fields, number | undefined][]) {
+        if (v === undefined) delete clean[k]
+        else clean[k] = v
+      }
+      return clean
+    })
+  }
+  if (out.linePop) {
+    out.linePop = { ...out.linePop, line: Math.floor(finiteOr(out.linePop.line, -1)) }
+  }
   return out
 }
 
@@ -299,20 +330,24 @@ function sanitizeStripSpec(spec: StripSpec): StripSpec {
     // ones that panic in Rust.
     out.tape = { ...out.tape, offsetPx: finiteOr(out.tape.offsetPx, 0) }
   }
+  if (out.banner) {
+    out.banner = {
+      ...out.banner,
+      text: String(out.banner.text ?? ''),
+      size: finiteOr(out.banner.size ?? 20, 20),
+    }
+  }
+  if (out.sprite) {
+    // A sprite far off either edge draws nothing; bounding it keeps a huge
+    // finite x from reaching the drawing code at all.
+    out.sprite = {
+      ...out.sprite,
+      x: Math.max(-200, Math.min(STRIP_WIDTH + 200, finiteOr(out.sprite.x, -200))),
+      dy: Math.max(-20, Math.min(20, finiteOr(out.sprite.dy ?? 0, 0))),
+      frame: out.sprite.frame === 1 ? 1 : 0,
+    }
+  }
   return out
-}
-
-/**
- * Deterministic pseudo-random value in [0, 1) from an integer seed. No
- * internal state and never `Math.random()` — the same seed always returns
- * the same value, which is what lets two renders at the same `nowMs`
- * produce byte-identical frames (lesson 11 in docs/LESSONS.md). Used by the
- * idle animations to pick stable-looking "random" positions and characters
- * from plain arithmetic on `nowMs`, a column index, or a key's position.
- */
-function pseudoRandom(seed: number): number {
-  const x = Math.sin(seed * 12.9898) * 43758.5453
-  return x - Math.floor(x)
 }
 
 function drawBar(
@@ -334,32 +369,82 @@ function drawBar(
 }
 
 /**
- * Draws one series as vertical bars, one per value, filling the width from
- * `BORDER + PAD` to `KEY_SIZE - PAD`. Normalises between the series minimum
- * and maximum. A flat series (`range === 0`) draws every bar at half height,
- * which reads as a centred horizontal line, rather than dividing by zero.
- * Fewer than 2 values draws nothing at all.
+ * The smallest height a bar spark draws a bar at, in px.
+ *
+ * The first bar spark mapped the series minimum to height 0 and skipped it,
+ * so the lowest bar of every chart was simply missing — a hole in the chart
+ * exactly where the day's low was. The class is "a real value maps to an
+ * invisible mark", so the floor applies to every bar, not just the minimum:
+ * heights map onto `SPARK_BAR_MIN_H .. bandH`, and every value draws.
+ */
+export const SPARK_BAR_MIN_H = 2
+
+/**
+ * The vertical scale of a spark: the value at the band's floor (`lo`) and at
+ * its top (`hi`). Exported so a test proves the scale rule directly.
+ *
+ * Starts from the series min and max. A finite `baseline` is always inside
+ * the scale. A positive `minHalfRange` widens the scale to at least that
+ * half-range around `baseline` (or the series midpoint), so a tiny move
+ * reads as tiny instead of filling the band.
+ */
+export function sparkScale(
+  values: readonly number[], baseline?: number, minHalfRange?: number,
+): { lo: number; hi: number } {
+  if (values.length === 0) return { lo: 0, hi: 0 }
+  // A loop, not `Math.min(...values)`: argument spread has an engine
+  // call-stack limit (measured: throws past ~125,000 points, I4).
+  let min = values[0]!
+  let max = values[0]!
+  for (let i = 1; i < values.length; i++) {
+    const v = values[i]!
+    if (v < min) min = v
+    if (v > max) max = v
+  }
+  let lo = min
+  let hi = max
+  const hasBase = typeof baseline === 'number' && Number.isFinite(baseline)
+  if (hasBase) {
+    lo = Math.min(lo, baseline)
+    hi = Math.max(hi, baseline)
+  }
+  if (typeof minHalfRange === 'number' && Number.isFinite(minHalfRange) && minHalfRange > 0) {
+    const centre = hasBase ? baseline : (min + max) / 2
+    lo = Math.min(lo, centre - minHalfRange)
+    hi = Math.max(hi, centre + minHalfRange)
+  }
+  return { lo, hi }
+}
+
+/** The line style's stroke, dot and fill. Taken from the approved mockup. */
+const SPARK_LINE_WIDTH = 1.8
+const SPARK_DOT_R = 2.4
+const SPARK_HALO_R = 5
+const SPARK_HALO_ALPHA = 0.25
+const SPARK_AREA_ALPHA = 0.35
+const SPARK_BASELINE_ALPHA = 0.28
+/** The line keeps this far inside its band, so the stroke and the dot are
+ * never cut by the band edge. */
+const SPARK_LINE_INSET = 3
+
+/**
+ * Draws one series, as bars (the default) or as a line (`style: 'line'`),
+ * filling the width from `BORDER + PAD` to `KEY_SIZE - PAD`. The vertical
+ * scale comes from `sparkScale`. A flat series (`lo === hi`) draws at half
+ * height rather than dividing by zero. Fewer than 2 values draws nothing.
  *
  * With `slice`, the series lays out across `slice.count` key widths instead
  * of one, and this call draws only the portion belonging to `slice.index`.
- * The min and max still come from the WHOLE series (never just the visible
- * slice), so the three keys of one chart share one scale and a bar's height
- * means the same thing on every one of them. A bar that straddles a slice
- * boundary is clipped to this key's own margin rather than bleeding into the
- * border — the physical gap between two real keys already loses that sliver,
- * this only keeps the maths from painting over the padding.
- *
- * Absent `slice`, `sliceStart` is 0 and `virtualWidth` equals the plain
- * single-key `width`, so every computed position matches the pre-`slice`
- * code exactly — the grid's single-key sparkline depends on that being
- * byte-identical.
+ * The scale still comes from the WHOLE series (never just the visible
+ * slice), so the keys of one chart share one scale. A bar that straddles a
+ * slice boundary is clipped to this key's own margin; the line is clipped to
+ * the same margin.
  *
  * `labelBand` (only meaningful with `fullHeight`) reserves `SPARK_LABEL_BAND_H`
  * px at the top of THIS key's band, so a `label` drawn there never touches a
  * bar. It must be set the same on every key of a `slice` group even when
- * only one of them carries `label` text — otherwise the bars on the
- * labelled key would use a shorter band than its neighbours and visibly step
- * at the seam between keys.
+ * only one of them carries `label` text — otherwise the band would differ
+ * and the chart would visibly step at the seam between keys.
  */
 function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
   const { values, color, slice, fullHeight, labelBand, label } = spark
@@ -375,66 +460,153 @@ function drawSpark(ctx: SKRSContext2D, spark: SparkSpec, dim: boolean): void {
   const count = slice && slice.count > 0 ? slice.count : 1
   const index = slice?.index ?? 0
   const virtualWidth = width * count
-  const barW = virtualWidth / values.length
   const sliceStart = index * width
   const sliceEnd = sliceStart + width
 
-  // A loop, not `Math.min(...values)`/`Math.max(...values)`: argument spread
-  // has an engine call-stack limit (measured: throws past ~125,000 points,
-  // I4) and `sanitizeKeySpec` already guarantees every entry here is finite,
-  // so no `NaN`-poisoning behaviour needs preserving.
-  let min = values[0]!
-  let max = values[0]!
-  for (let i = 1; i < values.length; i++) {
-    const v = values[i]!
-    if (v < min) min = v
-    if (v > max) max = v
-  }
-  const range = max - min
+  const { lo, hi } = sparkScale(values, spark.baseline, spark.minHalfRange)
+  const range = hi - lo
+  const fracOf = (v: number): number => (range === 0 ? 0.5 : (v - lo) / range)
+  const hasBase = typeof spark.baseline === 'number' && Number.isFinite(spark.baseline)
 
-  ctx.fillStyle = css(color, dim)
-  for (let i = 0; i < values.length; i++) {
-    const virtualX = i * barW
-    // Entirely outside this slice's span: nothing of this bar lands here.
-    if (virtualX + barW <= sliceStart || virtualX >= sliceEnd) continue
+  if (spark.style === 'line') {
+    drawSparkLine(ctx, spark, dim, {
+      x0, x1, bandY, bandH, virtualWidth, sliceStart, fracOf, hasBase,
+    })
+  } else {
+    const barW = virtualWidth / values.length
+    ctx.fillStyle = css(color, dim)
+    for (let i = 0; i < values.length; i++) {
+      const virtualX = i * barW
+      // Entirely outside this slice's span: nothing of this bar lands here.
+      if (virtualX + barW <= sliceStart || virtualX >= sliceEnd) continue
+      const h = SPARK_BAR_MIN_H + fracOf(values[i]!) * (bandH - SPARK_BAR_MIN_H)
 
-    const v = values[i]!
-    const frac = range === 0 ? 0.5 : (v - min) / range
-    const h = frac * bandH
-    if (h <= 0) continue
-
-    let x = x0 + (virtualX - sliceStart)
-    let w = Math.max(1, barW - 1)
-    if (x < x0) {
-      w -= x0 - x
-      x = x0
+      let x = x0 + (virtualX - sliceStart)
+      let w = Math.max(1, barW - 1)
+      if (x < x0) {
+        w -= x0 - x
+        x = x0
+      }
+      if (w <= 0) continue
+      if (x >= x1) continue
+      // Clip a bar that runs past this key's own margin — but never below
+      // the 1 px floor above. Above 81 values `barW < 1`, so a strict clip
+      // would shrink the last bar to a sub-pixel sliver that renders as
+      // nothing. A visible bar beats an invisible one.
+      if (x + w > x1) {
+        const clipped = x1 - x
+        if (clipped >= 1) w = clipped
+      }
+      ctx.fillRect(x, bandY + (bandH - h), w, h)
     }
-    if (w <= 0) continue
-    if (x >= x1) continue
-    // Clip a bar that runs past this key's own margin — but never below the
-    // 1 px floor above. Above 81 values `barW < 1`, so a strict clip would
-    // shrink the last bar to a sub-pixel sliver that renders as nothing,
-    // where the pre-slice code always drew at least 1 px. A few values run
-    // slightly into the padding instead: a visible bar beats an invisible
-    // one, and the padding itself has nothing else drawn in it.
-    if (x + w > x1) {
-      const clipped = x1 - x
-      if (clipped >= 1) w = clipped
+    if (hasBase) {
+      drawSparkBaseline(ctx, x0, x1, bandY + bandH - fracOf(spark.baseline!) * bandH, sliceStart)
     }
-
-    const y = bandY + (bandH - h)
-    ctx.fillRect(x, y, w, h)
   }
 
   // Drawn last, so it sits on top of any bar that (despite the reserved
-  // band above) painted this far up — it never should, but text winning a
-  // pixel fight beats a silently lost caption.
+  // band above) painted this far up — text winning a pixel fight beats a
+  // silently lost caption.
   if (label) {
     ctx.fillStyle = css(theme.text, dim)
     ctx.font = `11px ${FONT}`
     ctx.textAlign = 'left'
     ctx.textBaseline = 'top'
     ctx.fillText(label, x0, fullHeight ? SPARK_FULL_Y : SPARK_Y)
+  }
+}
+
+/** The dotted reference rule. `phase` keeps the dash pattern continuous
+ * across the keys of one `slice` group. */
+function drawSparkBaseline(
+  ctx: SKRSContext2D, x0: number, x1: number, y: number, phase: number,
+): void {
+  ctx.save()
+  try {
+    ctx.setLineDash([2, 3])
+    ctx.lineDashOffset = phase
+    ctx.strokeStyle = cssAlpha(theme.white, SPARK_BASELINE_ALPHA)
+    ctx.lineWidth = 1
+    const yy = Math.round(y) + 0.5
+    ctx.beginPath()
+    ctx.moveTo(x0, yy)
+    ctx.lineTo(x1, yy)
+    ctx.stroke()
+  } finally {
+    ctx.restore()
+  }
+}
+
+function drawSparkLine(
+  ctx: SKRSContext2D,
+  spark: SparkSpec,
+  dim: boolean,
+  g: {
+    x0: number; x1: number; bandY: number; bandH: number
+    virtualWidth: number; sliceStart: number
+    fracOf: (v: number) => number; hasBase: boolean
+  },
+): void {
+  const { values, color } = spark
+  const n = values.length
+  const top = g.bandY + SPARK_LINE_INSET
+  const usable = g.bandH - SPARK_LINE_INSET * 2
+  const Y = (v: number): number => top + usable - g.fracOf(v) * usable
+  const X = (k: number): number => g.x0 + (k / (n - 1)) * g.virtualWidth - g.sliceStart
+
+  ctx.save()
+  try {
+    ctx.beginPath()
+    ctx.rect(g.x0, 0, g.x1 - g.x0, KEY_SIZE)
+    ctx.clip()
+
+    const baseY = g.hasBase ? Y(spark.baseline!) : g.bandY + g.bandH
+    if (g.hasBase) drawSparkBaseline(ctx, g.x0, g.x1, baseY, g.sliceStart)
+
+    // The soft area: the line's own path, closed down (or up) to the
+    // baseline, filled with a vertical fade from 35 percent to nothing.
+    const grad = ctx.createLinearGradient(0, g.bandY, 0, g.bandY + g.bandH)
+    grad.addColorStop(0, cssAlpha(color, SPARK_AREA_ALPHA, dim))
+    grad.addColorStop(1, cssAlpha(color, 0, dim))
+    ctx.beginPath()
+    ctx.moveTo(X(0), Y(values[0]!))
+    for (let k = 1; k < n; k++) ctx.lineTo(X(k), Y(values[k]!))
+    ctx.lineTo(X(n - 1), baseY)
+    ctx.lineTo(X(0), baseY)
+    ctx.closePath()
+    ctx.fillStyle = grad
+    ctx.fill()
+
+    ctx.beginPath()
+    ctx.moveTo(X(0), Y(values[0]!))
+    for (let k = 1; k < n; k++) ctx.lineTo(X(k), Y(values[k]!))
+    ctx.strokeStyle = css(color, dim)
+    ctx.lineWidth = SPARK_LINE_WIDTH
+    ctx.lineJoin = 'round'
+    ctx.lineCap = 'round'
+    ctx.stroke()
+
+    // Only the key that carries the last point draws the dot: on every
+    // other slice of the group the last point lies past this key's margin.
+    const lastX = X(n - 1)
+    if (spark.endDot !== false && lastX >= g.x0 && lastX <= g.x1 + 0.5) {
+      // Pulled in by the halo's radius, so the dot is whole on the key that
+      // carries the last point instead of being cut by the margin.
+      const ex = Math.min(lastX, g.x1 - SPARK_DOT_R - 0.5)
+      const ey = Y(values[n - 1]!)
+      ctx.restore()
+      ctx.save()
+      ctx.fillStyle = cssAlpha(color, SPARK_HALO_ALPHA, dim)
+      ctx.beginPath()
+      ctx.arc(ex, ey, SPARK_HALO_R, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.fillStyle = css(color, dim)
+      ctx.beginPath()
+      ctx.arc(ex, ey, SPARK_DOT_R, 0, Math.PI * 2)
+      ctx.fill()
+    }
+  } finally {
+    ctx.restore()
   }
 }
 
@@ -1421,35 +1593,80 @@ function drawFxSun(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
   }
 }
 
-const FX_CLOUD_BLOBS = 3
-const FX_CLOUD_RADII = [23, 16, 28] as const
+const FX_CLOUD_PUFFS = 3
+/** Each puff's main lobe radius, before its per-seed variation. */
+const FX_CLOUD_RADII = [15, 12, 17] as const
 const FX_CLOUD_PERIOD_BASE_MS = 14000
 const FX_CLOUD_PERIOD_VAR_MS = 9000
+/** A side lobe's radius and offset, as fractions of the main lobe's. */
+const FX_CLOUD_SIDE_R = 0.72
+const FX_CLOUD_SIDE_DX = 0.8
 
 /**
- * Slow drifting blobs, wrapping horizontally, each drawn twice so the wrap
- * seam never shows. `⛅` uses this same variant at a lower intensity rather
- * than a variant of its own — partly cloudy IS cloudy, with less of it.
+ * One soft lobe of one cloud puff: a radial gradient centred at (x, y) that
+ * fades to nothing at radius `r`, at peak opacity `alpha` (before the layer
+ * cap).
+ */
+export interface FxCloudLobe {
+  x: number
+  y: number
+  r: number
+  alpha: number
+}
+
+/**
+ * Every lobe the `cloud` variant draws at `nowMs`. Exported so a test proves
+ * the property the redesign exists for: every lobe lies wholly inside the
+ * tile, so no puff is ever cut by the tile edge.
+ *
+ * The first `cloud` drew solid discs that wrapped across the tile, so a disc
+ * spent much of its loop sliced by an edge — a hard grey arc on the glass.
+ * These puffs instead sway back and forth on a slow raised cosine, inside a
+ * span chosen so the whole cluster (main lobe plus two side lobes) stays
+ * within the tile, and each lobe fades to zero at its own rim.
+ */
+export function fxCloudLobes(seed: number, nowMs: number, intensity: number): FxCloudLobe[] {
+  const lobes: FxCloudLobe[] = []
+  const puffs = intensity < 0.5 ? FX_CLOUD_PUFFS - 1 : FX_CLOUD_PUFFS
+  for (let b = 0; b < puffs; b++) {
+    const s = seed * 617 + b * 53
+    const r = (FX_CLOUD_RADII[b] ?? FX_CLOUD_RADII[0]) * (0.85 + 0.3 * pseudoRandom(s))
+    const halfW = r * (FX_CLOUD_SIDE_DX + FX_CLOUD_SIDE_R)
+    const xLo = halfW
+    const xHi = KEY_SIZE - halfW
+    // Puffs spread down the tile in bands, so two rarely sit on each other.
+    const yLo = r
+    const yHi = KEY_SIZE - r
+    const band = (b + 0.5) / FX_CLOUD_PUFFS
+    const y = yLo + (yHi - yLo) * Math.min(1, Math.max(0, band + (pseudoRandom(s + 1) - 0.5) * 0.3))
+    const period = FX_CLOUD_PERIOD_BASE_MS + pseudoRandom(s + 2) * FX_CLOUD_PERIOD_VAR_MS
+    const phase = pseudoRandom(s + 3) * 2 * Math.PI
+    const sway = 0.5 - 0.5 * Math.cos((nowMs / period) * 2 * Math.PI + phase)
+    const x = xLo + (xHi - xLo) * sway
+    const alpha = intensity * (0.6 + 0.25 * pseudoRandom(s + 4))
+    const side = r * FX_CLOUD_SIDE_R
+    const sideY = y + r * 0.25
+    lobes.push({ x, y, r, alpha })
+    lobes.push({ x: x - r * FX_CLOUD_SIDE_DX, y: Math.min(KEY_SIZE - side, sideY), r: side, alpha: alpha * 0.85 })
+    lobes.push({ x: x + r * FX_CLOUD_SIDE_DX, y: Math.min(KEY_SIZE - side, sideY), r: side, alpha: alpha * 0.85 })
+  }
+  return lobes
+}
+
+/**
+ * Soft cloud puffs swaying slowly inside the tile. `⛅` uses this same
+ * variant at a lower intensity — partly cloudy IS cloudy, with less of it,
+ * and a lower intensity also drops one puff.
  */
 function drawFxCloud(ctx: SKRSContext2D, fx: FxSpec, intensity: number): void {
-  for (let b = 0; b < FX_CLOUD_BLOBS; b++) {
-    const s = fx.seed * 617 + b * 53
-    const r = (FX_CLOUD_RADII[b] ?? FX_CLOUD_RADII[0]) * (0.8 + 0.4 * pseudoRandom(s))
-    const y = pseudoRandom(s + 1) * KEY_SIZE
-    const period = FX_CLOUD_PERIOD_BASE_MS + pseudoRandom(s + 2) * FX_CLOUD_PERIOD_VAR_MS
-    const t = ((fx.nowMs + pseudoRandom(s + 3) * period) % period) / period
-    const span = KEY_SIZE + 2 * r
-    const x = -r + t * span
-    // Measured against the contact sheet: at the original 0.5-to-0.9 range over
-    // the neutral overcast tint, the blobs were very nearly invisible — a
-    // grey layer over a grey wash. These are brighter so overcast reads as
-    // moving cloud rather than as a still key.
-    ctx.fillStyle = fxCss(fxHue(fx, theme.white), intensity * (0.28 + 0.22 * pseudoRandom(s + 4)))
-    for (const ox of [x, x - span]) {
-      ctx.beginPath()
-      ctx.arc(ox, y, r, 0, Math.PI * 2)
-      ctx.fill()
-    }
+  const hue = fxHue(fx, theme.white)
+  for (const lobe of fxCloudLobes(fx.seed, fx.nowMs, intensity)) {
+    const g = ctx.createRadialGradient(lobe.x, lobe.y, 0, lobe.x, lobe.y, lobe.r)
+    g.addColorStop(0, fxCss(hue, lobe.alpha))
+    g.addColorStop(0.55, fxCss(hue, lobe.alpha * 0.6))
+    g.addColorStop(1, fxCss(hue, 0))
+    ctx.fillStyle = g
+    ctx.fillRect(lobe.x - lobe.r, lobe.y - lobe.r, lobe.r * 2, lobe.r * 2)
   }
 }
 
@@ -1630,11 +1847,18 @@ function sameSizeCandidates(a: number[], b: number[]): boolean {
  * 11, with no measuring at all — byte-identical to before this function
  * existed, for the pages that have never set it.
  */
+/** The font string for one text line. Regular keeps the exact legacy string,
+ * so a key that never sets `lineWeights` renders byte-identically. */
+function lineFont(size: number, bold: boolean): string {
+  return bold ? `bold ${size}px ${FONT}` : `${size}px ${FONT}`
+}
+
 function resolveLineSpecs(
   ctx: SKRSContext2D,
   lines: string[],
   lineSizes: (number | number[])[] | undefined,
   maxWidth: number,
+  bold: (i: number) => boolean = () => false,
 ): { size: number; text: string }[] {
   if (!lineSizes) return lines.map((text) => ({ size: 11, text }))
 
@@ -1649,19 +1873,23 @@ function resolveLineSpecs(
         if (!Array.isArray(next) || !sameSizeCandidates(next, spec)) break
         j++
       }
-      const groupTexts = lines.slice(i, j)
       const sorted = [...spec].sort((a, b) => b - a)
       let chosen: number | null = null
       for (const size of sorted) {
-        ctx.font = `${size}px ${FONT}`
-        if (groupTexts.every((t) => ctx.measureText(t).width <= maxWidth)) {
+        let fits = true
+        for (let k = i; k < j && fits; k++) {
+          // Each line measures in its OWN weight: bold Menlo can be wider.
+          ctx.font = lineFont(size, bold(k))
+          fits = ctx.measureText(lines[k]!).width <= maxWidth
+        }
+        if (fits) {
           chosen = size
           break
         }
       }
       const size = chosen ?? sorted[sorted.length - 1] ?? 11
-      ctx.font = `${size}px ${FONT}`
       for (let k = i; k < j; k++) {
+        ctx.font = lineFont(size, bold(k))
         out.push({ size, text: shrinkToFit(ctx, lines[k]!, maxWidth) })
       }
       i = j
@@ -1752,7 +1980,10 @@ function toRgba(ctx: SKRSContext2D, w: number, h: number): Buffer {
 
 /** Renders one 96 by 96 key. The result is a raw RGBA buffer. */
 export function renderKey(rawSpec: KeySpec): Buffer {
-  const spec = sanitizeKeySpec(rawSpec)
+  // Sanitised, then canonical: the SAME canonical form `keyHash` reads, so
+  // a finished one-shot draws nothing here exactly when it stops changing
+  // the hash, and two specs with equal hashes draw equal pixels.
+  const spec = canonicalKeySpec(sanitizeKeySpec(rawSpec))
   const canvas = createCanvas(KEY_SIZE, KEY_SIZE)
   const ctx = canvas.getContext('2d')
   const dim = spec.dim === true
@@ -1764,6 +1995,13 @@ export function renderKey(rawSpec: KeySpec): Buffer {
   // then the key's own content on top. Opt-in — absent `fx`, this whole path
   // is skipped and the render is byte-identical to before the field existed.
   if (spec.fx) drawFx(ctx, spec.fx, dim)
+
+  // A running `brick` rattles the key's own content sideways. Everything
+  // from here to the bar draws inside this translation; the overlays after
+  // it do not. With no brick, `shake` is 0 and nothing moves.
+  const shake = effectsShakePx(spec.effects)
+  ctx.save()
+  if (shake !== 0) ctx.translate(shake, 0)
 
   if (spec.image) {
     // The producer already decoded this. With no crop, it scales to the key,
@@ -1779,9 +2017,25 @@ export function renderKey(rawSpec: KeySpec): Buffer {
     // dimmed image and the dimmed text beside it darken by equal amounts.
     const prevAlpha = ctx.globalAlpha
     if (dim) ctx.globalAlpha = prevAlpha * DIM_FACTOR
-    drawCroppedImage(ctx, spec.image, spec.imageCrop)
+    const tf = spec.imageTransform
+    if (tf) {
+      // About the key centre, so a spin turns the crab in place and a hop
+      // lifts it straight up. The canvas's own bounds clip the result.
+      ctx.save()
+      ctx.translate(KEY_SIZE / 2, KEY_SIZE / 2 + (tf.dy ?? 0))
+      ctx.rotate(((tf.rotateDeg ?? 0) * Math.PI) / 180)
+      const k = tf.scale ?? 1
+      ctx.scale(k, k)
+      ctx.translate(-KEY_SIZE / 2, -KEY_SIZE / 2)
+      drawCroppedImage(ctx, spec.image, spec.imageCrop)
+      ctx.restore()
+    } else {
+      drawCroppedImage(ctx, spec.image, spec.imageCrop)
+    }
     ctx.globalAlpha = prevAlpha
   }
+
+  if (spec.mascot) drawMascot(ctx, spec.mascot, dim)
 
   if (spec.border) {
     const on = spec.pulseOn !== false
@@ -1853,6 +2107,8 @@ export function renderKey(rawSpec: KeySpec): Buffer {
     }
   }
 
+  if (spec.icon) drawIcon(ctx, spec.icon, dim)
+
   if (spec.lines?.length) {
     const centered = spec.align === 'center'
     ctx.textAlign = centered ? 'center' : 'left'
@@ -1861,7 +2117,9 @@ export function renderKey(rawSpec: KeySpec): Buffer {
     // Resolved once, up front: a candidate-array entry may need to look at
     // OTHER lines in its group (see `resolveLineSpecs`), which the
     // line-by-line draw loop below cannot do after it has already moved on.
-    const resolved = resolveLineSpecs(ctx, spec.lines, spec.lineSizes, TEXT_MAX_WIDTH)
+    const isBold = (i: number): boolean => spec.lineWeights?.[i] === 'bold'
+    const resolved = resolveLineSpecs(ctx, spec.lines, spec.lineSizes, TEXT_MAX_WIDTH, isBold)
+    const pop = spec.linePop
     let y = PAD
     for (let i = 0; i < resolved.length; i++) {
       const { size, text } = resolved[i]!
@@ -1872,14 +2130,42 @@ export function renderKey(rawSpec: KeySpec): Buffer {
       // size-driven spacing, because a 28 px line needs more room below it
       // than an 11 px one — a fixed advance would let two lines overlap.
       const advance = spec.lineSizes ? size + 4 : 14
-      ctx.font = `${size}px ${FONT}`
+      ctx.font = lineFont(size, isBold(i))
       const color = spec.lineColors?.[i] ?? theme.text
       ctx.fillStyle = css(color, dim)
       // `lineY` is opt-in per line, same pattern as `lineSizes`. Its absence
       // (the case for every page except the new weather layout) keeps the
       // running automatic position, so nothing else changes.
       const drawY = spec.lineY?.[i] ?? y
-      ctx.fillText(text, x, drawY)
+      // `lineAligns` overrides `align` for one line. Absent, the legacy
+      // `x` and `textAlign` set above stand, byte-identically.
+      const own = spec.lineAligns?.[i]
+      let lineX = x
+      if (own) {
+        ctx.textAlign = own
+        lineX = own === 'center' ? KEY_SIZE / 2 : own === 'right' ? KEY_SIZE - PAD : BORDER + PAD
+      } else {
+        ctx.textAlign = centered ? 'center' : 'left'
+      }
+      const popScale = pop && pop.line === i ? linePopScale(pop.nowMs - pop.startedAtMs) : 1
+      const w = popScale !== 1 ? ctx.measureText(text).width : 0
+      // The swell never grows the line past the key's own edges: a wide
+      // hero number pops less rather than being cut off by the glass.
+      const scale = popScale !== 1 ? Math.max(1, Math.min(popScale, (KEY_SIZE - 4) / Math.max(1, w))) : 1
+      if (scale !== 1) {
+        // Scaled about the line's own visual centre, so it swells in place.
+        const align = own ?? (centered ? 'center' : 'left')
+        const cx = align === 'center' ? lineX : align === 'right' ? lineX - w / 2 : lineX + w / 2
+        const cy = drawY + size / 2
+        ctx.save()
+        ctx.translate(cx, cy)
+        ctx.scale(scale, scale)
+        ctx.translate(-cx, -cy)
+        ctx.fillText(text, lineX, drawY)
+        ctx.restore()
+      } else {
+        ctx.fillText(text, lineX, drawY)
+      }
       y = drawY + advance
     }
   }
@@ -1895,6 +2181,15 @@ export function renderKey(rawSpec: KeySpec): Buffer {
   if (spec.bar) {
     drawBar(ctx, spec.bar, BORDER + PAD, BAR_Y, KEY_SIZE - BORDER - PAD * 2, BAR_H, dim)
   }
+
+  if (spec.range) drawRange(ctx, spec.range, dim)
+
+  ctx.restore()
+
+  // Over the content, unshaken (a brick carries its own shake). Absent,
+  // nothing here draws.
+  if (spec.effects) drawEffects(ctx, spec.effects, shake, dim)
+  if (spec.edgeProgress) drawEdgeProgress(ctx, spec.edgeProgress, dim)
 
   // Drawn LAST and unconditionally at full strength (never `dim`): the flash
   // is a fresh, real-time signal about a press that just happened, not part
@@ -2104,8 +2399,62 @@ function drawTape(ctx: SKRSContext2D, tape: TapeSpec, dim: boolean, rightWidth: 
   }
 }
 
+/** The banner's size floor, before it falls back to truncation. */
+const BANNER_MIN_SIZE = 11
+
+/**
+ * Draws the strip's one large centred line, shrinking a px at a time until
+ * it MEASURES inside the strip's 236 px (lesson 17), and below that
+ * truncating. Bold Menlo with the colour-emoji font as a fallback family, so
+ * a leading `🔔` renders instead of a `.notdef` box.
+ */
+function drawBanner(
+  ctx: SKRSContext2D, banner: NonNullable<StripSpec['banner']>, dim: boolean, hasBar: boolean,
+): void {
+  const start = Math.max(BANNER_MIN_SIZE, Math.min(40, Math.round(banner.size ?? 20)))
+  const fontAt = (n: number): string => `bold ${n}px ${FONT}, "${EMOJI_FONT}"`
+  let size = start
+  ctx.font = fontAt(size)
+  while (size > BANNER_MIN_SIZE && ctx.measureText(banner.text).width > STRIP_TEXT_MAX_WIDTH) {
+    size--
+    ctx.font = fontAt(size)
+  }
+  const text = shrinkToFit(ctx, banner.text, STRIP_TEXT_MAX_WIDTH)
+  const cx = STRIP_WIDTH / 2
+  const cy = banner.sub ? 20 : hasBar ? 23 : STRIP_HEIGHT / 2
+  const scale = banner.pop ? linePopScale(banner.pop.nowMs - banner.pop.startedAtMs) : 1
+
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.save()
+  try {
+    // The pop is clipped to the strip like everything else, so a swell
+    // never reaches past the glass.
+    ctx.beginPath()
+    ctx.rect(0, 0, STRIP_WIDTH, STRIP_HEIGHT)
+    ctx.clip()
+    if (scale !== 1) {
+      ctx.translate(cx, cy)
+      ctx.scale(scale, scale)
+      ctx.translate(-cx, -cy)
+    }
+    ctx.fillStyle = css(banner.color ?? theme.text, dim)
+    ctx.fillText(text, cx, cy)
+  } finally {
+    ctx.restore()
+  }
+
+  if (banner.sub) {
+    ctx.font = `12px ${FONT}`
+    ctx.fillStyle = css(banner.subColor ?? theme.textDim, dim)
+    ctx.fillText(shrinkToFit(ctx, banner.sub, STRIP_TEXT_MAX_WIDTH), cx, 40)
+  }
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'top'
+}
+
 export function renderStrip(rawSpec: StripSpec): Buffer {
-  const spec = sanitizeStripSpec(rawSpec)
+  const spec = canonicalStripSpec(sanitizeStripSpec(rawSpec))
   const canvas = createCanvas(STRIP_WIDTH, STRIP_HEIGHT)
   const ctx = canvas.getContext('2d')
   const dim = spec.dim === true
@@ -2134,7 +2483,11 @@ export function renderStrip(rawSpec: StripSpec): Buffer {
   // budget), so this never shrinks a real one.
   let rightWidth = 0
   let right: string | undefined
-  if (spec.right) {
+  // A banner owns the text area: `lines`, `right` and `tape` stand down.
+  if (spec.banner) {
+    drawBanner(ctx, spec.banner, dim, spec.bar !== undefined)
+  }
+  if (!spec.banner && spec.right) {
     right = shrinkToFit(ctx, spec.right, STRIP_TEXT_MAX_WIDTH)
     rightWidth = ctx.measureText(right).width
   }
@@ -2142,7 +2495,7 @@ export function renderStrip(rawSpec: StripSpec): Buffer {
   let y = 4
   // A tape OWNS line 2's band, so line 2's own text is not drawn. Line 1 still
   // is, which is what lets a page keep a fixed title above a moving tape.
-  const lines = spec.lines.slice(0, spec.tape ? 1 : 2)
+  const lines = spec.banner ? [] : spec.lines.slice(0, spec.tape ? 1 : 2)
   for (let i = 0; i < lines.length; i++) {
     ctx.font = `13px ${FONT}`
     const maxWidth =
@@ -2166,13 +2519,16 @@ export function renderStrip(rawSpec: StripSpec): Buffer {
     ctx.textAlign = 'left'
   }
 
-  if (spec.tape) {
+  if (spec.tape && !spec.banner) {
     drawTape(ctx, spec.tape, dim, rightWidth)
   }
 
   if (spec.bar) {
     drawBar(ctx, spec.bar, PAD, 46, STRIP_WIDTH - PAD * 2, 6, dim)
   }
+
+  // Last, over everything: the sprite walks in front of the strip's text.
+  if (spec.sprite) drawStripSprite(ctx, spec.sprite, dim)
 
   return toRgba(ctx, STRIP_WIDTH, STRIP_HEIGHT)
 }
