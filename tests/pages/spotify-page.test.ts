@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { createCanvas, loadImage } from '@napi-rs/canvas'
 import { SpotifyPage, controlWash, controlGlyphColor, breathePhase } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
-import type { Rgb } from '../../src/render/specs.js'
+import type { KeySpec, Rgb } from '../../src/render/specs.js'
 import { renderKey, renderStrip, probe, FONT, STRIP_WIDTH, STRIP_HEIGHT } from '../../src/render/canvas.js'
 import { keyHash } from '../../src/render/specs.js'
 import { theme } from '../../src/render/theme.js'
@@ -191,15 +191,18 @@ describe('SpotifyPage layout', () => {
   // affects one. `now` (the playback position clock) is held FIXED between
   // the two renders — only `nowMs` (the animation clock) advances — so this
   // isolates the thump from anything position-driven.
-  it('changes ONLY the play/pause key when nowMs advances during playback', () => {
+  it('changes ONLY the play/pause key, apart from the border pulse, when nowMs advances during playback', () => {
     // The one thing that moves during playback is the play/pause glyph's breath,
     // so exactly one key is rewritten per frame — about ten key-writes a second
     // against a measured ceiling of 362. The six art cells and the next key must
     // stay byte-stable, or a still cover would be redrawn 10 times a second for
     // nothing.
+    // The border pulse is the one deliberate exception on the art keys: it
+    // rides on `edgeProgress` only, so with that stripped they stay stable.
     const { page } = build(player({ isPlaying: true }), 'ok', FAKE_ART)
-    const a = page.render(NOW, 1_000).keys.map(keyHash)
-    const b = page.render(NOW, 1_300).keys.map(keyHash)
+    const noBorder = (k: KeySpec): string => keyHash({ ...k, edgeProgress: undefined })
+    const a = page.render(NOW, 1_000).keys.map((k) => noBorder(k!))
+    const b = page.render(NOW, 1_300).keys.map((k) => noBorder(k!))
     expect(b[3]).not.toBe(a[3])
     for (const i of [0, 1, 2, 4, 5, 6, 7]) {
       expect(b[i], `key ${i} should be stable while playing`).toBe(a[i])

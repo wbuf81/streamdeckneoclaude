@@ -114,7 +114,21 @@ function canonicalEdges(spec: EdgeProgressSpec): EdgeProgressSpec | undefined {
     runs.push({ edge: run.edge, from, to })
   }
   if (runs.length === 0) return undefined
-  return spec.color ? { runs, color: spec.color } : { runs }
+  const out: EdgeProgressSpec = spec.color ? { runs, color: spec.color } : { runs }
+  const pulse = snapPulse(spec.pulse)
+  if (pulse > 0) out.pulse = pulse
+  return out
+}
+
+/** Steps between a resting and a peak edge pulse. Few steps keep a pulsing
+ * line cheap: each step is one rewrite of every key the line touches. */
+export const EDGE_PULSE_LEVELS = 4
+
+/** Snaps an edge pulse to one of `EDGE_PULSE_LEVELS` steps, 0 to 1. */
+export function snapPulse(pulse: number | undefined): number {
+  if (typeof pulse !== 'number' || !Number.isFinite(pulse)) return 0
+  const steps = EDGE_PULSE_LEVELS - 1
+  return Math.round(Math.min(1, Math.max(0, pulse)) * steps) / steps
 }
 
 /**

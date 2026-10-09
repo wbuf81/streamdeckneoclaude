@@ -71,6 +71,9 @@ const CRAWL_TICK_MS = CRAWL_PACE.quantumMs
 /** The buttons breathe while the market trades: one slow cycle, gentle. */
 const BUTTON_BREATHE_MS = 4000
 const BUTTON_BREATHE_DEPTH = 0.35
+/** The breath's clock step. A 4 s breath needs no more than ten colours a
+ * cycle, so each button writes 2.5 times a second, not 10. */
+const BUTTON_BREATHE_QUANTUM_MS = 400
 /** A button for a side with no symbols on it still glows this faintly, so a
  * lit deck never looks unplugged. */
 const BUTTON_FLOOR = 0.08
@@ -200,8 +203,9 @@ export function breadthButtons(
   let left = scaleRgb(theme.green, level(up / counted))
   let right = scaleRgb(theme.red, level(down / counted))
   if (marketState === 'open') {
-    left = breathe(left, nowMs, BUTTON_BREATHE_MS, BUTTON_BREATHE_DEPTH)
-    right = breathe(right, nowMs, BUTTON_BREATHE_MS, BUTTON_BREATHE_DEPTH)
+    const t = Number.isFinite(nowMs) ? Math.floor(nowMs / BUTTON_BREATHE_QUANTUM_MS) * BUTTON_BREATHE_QUANTUM_MS : 0
+    left = breathe(left, t, BUTTON_BREATHE_MS, BUTTON_BREATHE_DEPTH)
+    right = breathe(right, t, BUTTON_BREATHE_MS, BUTTON_BREATHE_DEPTH)
   }
   return [left, right]
 }

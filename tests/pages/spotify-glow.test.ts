@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
-import { SpotifyPage, glowFraction, buttonColors } from '../../src/pages/spotify-page.js'
+import { SpotifyPage, glowFraction, glowPulse, buttonColors } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
 import type { DeckFrame, Rgb } from '../../src/render/specs.js'
 import { keyHash } from '../../src/render/specs.js'
@@ -182,7 +182,9 @@ describe('Spotify progress glow: quantisation and write rate', () => {
    * the fractional case is the worst case, and the one the page's own
    * quantisation must hold by itself.
    */
-  function writesOverTrack(durationMs: number, subSecond: boolean): { total: number; worstSecond: number } {
+  /** Counts art-key rewrites over a whole track. `withPulse: false` strips the
+   * border pulse first, so the progress line's own cost stays measurable. */
+  function writesOverTrack(durationMs: number, subSecond: boolean, withPulse = false): { total: number; worstSecond: number } {
     const startMs = NOW * 1000
     const p = page({
       state: (now) => player({ positionMs: Math.min(durationMs, now * 1000 - startMs), durationMs }),
@@ -194,7 +196,10 @@ describe('Spotify progress glow: quantisation and write rate', () => {
       const ms = startMs + t
       const frame = p.render(subSecond ? ms / 1000 : Math.floor(ms / 1000), ms)
       ART_KEYS.forEach((k, j) => {
-        const h = keyHash(frame.keys[k]!)
+        const key = frame.keys[k]!
+        const h = keyHash(!withPulse && key.edgeProgress
+          ? { ...key, edgeProgress: { ...key.edgeProgress, pulse: 0 } }
+          : key)
         if (last[j] !== null && h !== last[j]) {
           total++
           const s = Math.floor(t / 1000)
@@ -216,10 +221,50 @@ describe('Spotify progress glow: quantisation and write rate', () => {
     expect(total).toBeGreaterThanOrEqual(115)
   })
 
+  it('keeps the pulse inside a write budget: about five steps a second on at most six lit keys', () => {
+    // Up to 6 lit keys x 6 level steps in the worst second, plus the progress
+    // line's own 4. Unquantised, it would be 6 keys x 10 ticks = 60.
+    const { worstSecond } = writesOverTrack(60_000, true, true)
+    expect(worstSecond).toBeLessThanOrEqual(40)
+  })
+
   it('costs about one art-key write a second at the daemon\'s whole-second clock', () => {
     const { total, worstSecond } = writesOverTrack(240_000, false)
     expect(worstSecond).toBeLessThanOrEqual(2)
     expect(total / 240).toBeLessThanOrEqual(1.1)
+  })
+})
+
+describe('Spotify border pulse', () => {
+  it('throbs with a fast rise and a slower fall, and rests when not playing', () => {
+    const levels = Array.from({ length: 8 }, (_, i) => glowPulse(i * 100, true))
+    expect(Math.max(...levels)).toBeGreaterThan(0.8)
+    expect(Math.min(...levels)).toBeLessThan(0.1)
+    expect(glowPulse(100, false)).toBe(0)
+    expect(glowPulse(Number.NaN, true)).toBe(0)
+  })
+
+  it('widens and brightens the glow at the peak (region probe inside the key edge)', () => {
+    const edge = { runs: [{ edge: 'top' as const, from: 0, to: 1 }] }
+    const glowInk = (pulse: number): number => {
+      const buf = renderKey({ kind: 'gauge', bg: [0, 0, 0], edgeProgress: { ...edge, pulse } })
+      let sum = 0
+      for (let y = 4; y < 14; y++) for (let x = 10; x < 86; x++) sum += buf[(y * KEY_SIZE + x) * 4]!
+      return sum
+    }
+    expect(glowInk(1)).toBeGreaterThan(glowInk(0) * 1.5)
+  })
+
+  it('pulses only while playing', () => {
+    const paused = page({ state: (now) => player({ isPlaying: false, positionMs: 200_000, durationMs: 240_000 }) })
+    for (const ms of [100, 200, 300, 400]) {
+      for (const key of paused.render(NOW, NOW * 1000 + ms).keys) {
+        expect(key?.edgeProgress?.pulse ?? 0).toBe(0)
+      }
+    }
+    const playing = page({ state: () => player({ positionMs: 200_000, durationMs: 240_000 }) })
+    const peaks = [0, 100, 200, 300].map((ms) => Math.max(...playing.render(NOW, NOW * 1000 + ms).keys.map((k) => k?.edgeProgress?.pulse ?? 0)))
+    expect(Math.max(...peaks)).toBeGreaterThan(0.5)
   })
 })
 

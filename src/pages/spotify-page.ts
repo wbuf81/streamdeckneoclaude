@@ -156,7 +156,26 @@ const GLOW_PERIMETER_PX = 2 * (3 + 2) * 96
  */
 const BUTTON_BREATHE_PERIOD_MS = 5000
 const BUTTON_BREATHE_DEPTH = 0.25
-const BUTTON_QUANTUM_MS = 200
+const BUTTON_QUANTUM_MS = 400
+
+/** One beat of the border pulse. Spotify gives apps no beat data, so the
+ * pulse keeps its own steady rhythm: about 75 beats a minute. */
+export const GLOW_PULSE_PERIOD_MS = 800
+/** The pulse clock's step. Ten steps a second is enough for a smooth thump,
+ * and the level itself only has `EDGE_PULSE_LEVELS` steps. */
+const GLOW_PULSE_QUANTUM_MS = 100
+
+/**
+ * How hard the progress border throbs at `nowMs`, 0 to 1: a fast rise, then
+ * a slower fall, like a kick drum. Zero when not playing, so a paused or
+ * stale track rests.
+ */
+export function glowPulse(nowMs: number, playing: boolean): number {
+  if (!playing || !Number.isFinite(nowMs)) return 0
+  const t = Math.floor(nowMs / GLOW_PULSE_QUANTUM_MS) * GLOW_PULSE_QUANTUM_MS
+  const phase = (((t % GLOW_PULSE_PERIOD_MS) + GLOW_PULSE_PERIOD_MS) % GLOW_PULSE_PERIOD_MS) / GLOW_PULSE_PERIOD_MS
+  return phase < 0.15 ? phase / 0.15 : Math.exp(-(phase - 0.15) * 5)
+}
 
 /**
  * The progress fraction the glow draws, snapped so it changes at most once per
@@ -336,6 +355,7 @@ export class SpotifyPage implements Page {
     const glow = state && art
       ? blockPerimeterProgress(ART_COLS, ART_ROWS, glowFraction(state.positionMs, state.durationMs))
       : null
+    const pulse = glowPulse(nowMs, state !== null && state.isPlaying && !stale)
     // `glow[row][col]` maps onto keys [[0, 1, 2], [4, 5, 6]]: `cell` below reads
     // the SAME (col, row) for the crop and for the glow, so the two cannot be
     // assigned to different keys.
@@ -344,7 +364,7 @@ export class SpotifyPage implements Page {
         ? this.primaryArtKey(state, status, art, stale, artCrop(0, 0), nowMs, paused)
         : this.spanArtKey(state, status, art, stale, artCrop(col, row), nowMs, col, row, paused)
       const edge = glow?.[row]?.[col]
-      return edge && key.kind === 'image' ? { ...key, edgeProgress: edge } : key
+      return edge && key.kind === 'image' ? { ...key, edgeProgress: { ...edge, pulse } } : key
     }
 
     return {

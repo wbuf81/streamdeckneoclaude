@@ -298,6 +298,14 @@ export interface EdgeRun {
  */
 export interface EdgeProgressSpec {
   runs: readonly EdgeRun[]
+  /**
+   * How hard the line throbs right now, 0 (resting) to 1 (peak). It widens
+   * the glow, raises its strength, thickens the core line, and warms it toward
+   * white. Quantised to `EDGE_PULSE_LEVELS` steps by both `keyHash` and the
+   * renderer, so a pulsing line rewrites its keys only when the level steps.
+   * Absent, zero or non-finite is a resting line.
+   */
+  pulse?: number
   /** Default `[255,217,196]`, a warm white. */
   color?: Rgb
 }
