@@ -1,5 +1,7 @@
 import type { Image } from '@napi-rs/canvas'
-import type { DeckFrame, FxSpec, FxVariant, KeySpec, StripSpec, Rgb, TapeSegment } from '../render/specs.js'
+import type {
+  DeckFrame, FxSpec, FxVariant, ImageTransform, KeySpec, OneShotSpec, StripSpec, Rgb, TapeSegment,
+} from '../render/specs.js'
 import { blankKey } from '../render/specs.js'
 import { theme, stateColor, stateLabel, barColor, blend } from '../render/theme.js'
 import type { SessionStateName } from '../render/theme.js'
@@ -11,6 +13,7 @@ import type { UsageSnapshot, SessionMeta } from '../sources/usage.js'
 import { computePace, elapsedPercent } from '../sources/usage.js'
 import { KeyAssigner, SESSION_SLOTS } from './key-assigner.js'
 import { tapeOffsetPx } from '../render/canvas.js'
+import { breathe, ONE_SHOT_DURATION_MS, ONE_SHOT_QUANTUM_MS } from '../render/motion.js'
 
 export const PROJECT_CHARS = 10
 const FIVE_HOURS = 5 * 3600
@@ -164,14 +167,89 @@ export type FocusFn = (
  * horizontal streaks. Two intensities of the same motion are not tellable apart at
  * a glance, which is the whole point of the feature.
  *
- * `permission` pulses the WHOLE tile, because it is the one state that means the
- * user is the bottleneck. `idle` and `done` are genuinely static, and `unknown`
- * stays still because an absent signal is not a state (lesson 18).
+ * `permission` has no particle motion. It breathes its whole BACKGROUND amber
+ * instead (see `permissionBg`), because it is the one state that means the user
+ * is the bottleneck. The glow-up replaced task 46's 1.15 s `pulse` fx with that
+ * slow breath: the pulse drew the eye by flashing, and the breath draws it
+ * without flashing. Keeping both would put two rhythms on one tile, which reads
+ * as noise. `idle` and `done` are genuinely static, and `unknown` stays still
+ * because an absent signal is not a state (lesson 18).
  */
 const STATE_FX: Partial<Record<SessionStateName, { variant: FxVariant; intensity: number }>> = {
   thinking: { variant: 'drift', intensity: 0.55 },
   tool: { variant: 'wind', intensity: 0.7 },
-  permission: { variant: 'pulse', intensity: 1 },
+}
+
+/** One full in-and-out breath of a permission tile's background. Slow on
+ * purpose: about 2.8 s, the mockup's `sin(t * 2.2)`. */
+export const PERMIT_BREATHE_PERIOD_MS = 2800
+/** How much amber the background carries at the bottom and at the top of the
+ * breath. Never zero, so the tile always reads as "waiting", and never above a
+ * quarter, so the white text on it stays crisp. */
+export const PERMIT_BG_MIN = 0.08
+export const PERMIT_BG_MAX = 0.24
+
+/**
+ * A permission tile's background at `nowMs`: amber, blended over the key
+ * background by an amount that breathes between `PERMIT_BG_MIN` and
+ * `PERMIT_BG_MAX`.
+ *
+ * The level comes from `breathe` (render/motion.ts) on pure white, so it is
+ * quantised to 100 ms there: the tile changes at most 10 times a second. The
+ * page does not keep a second clock of its own.
+ */
+export function permissionBg(nowMs: number): Rgb {
+  // breathe(white, ..., depth 1) runs 255 at the top of the cycle down to 0.
+  const level = breathe([255, 255, 255], nowMs, PERMIT_BREATHE_PERIOD_MS, 1)[0] / 255
+  return blend(theme.bg, theme.amber, PERMIT_BG_MIN + (PERMIT_BG_MAX - PERMIT_BG_MIN) * level)
+}
+
+/** How long a pet's hop lasts, and how high it goes. */
+export const PET_HOP_MS = 500
+export const PET_HOP_PX = 16
+/** How long one spin lasts. */
+export const PET_SPIN_MS = 600
+/** This many presses inside `PET_SPIN_WINDOW_MS` turn the latest one into a
+ * spin rather than a plain hop. */
+export const PET_SPIN_PRESSES = 3
+export const PET_SPIN_WINDOW_MS = 1200
+/** How long strip line 2 says thank you. Also how long a pet's heart floats,
+ * so the two end together. */
+export const PET_THANKS_MS = ONE_SHOT_DURATION_MS.hearts
+export const PET_THANKS_TEXT = '♥ crab: thank you'
+/** Upper bound on stamped pets kept at once. A finger cannot press 8 times in
+ * 1.5 s and still see each heart, and the bound keeps the hash small. */
+const PET_HISTORY = 8
+
+/** One stamped pet: when its first render saw it, and whether it spins. */
+export interface Pet {
+  atMs: number
+  spin: boolean
+}
+
+/**
+ * The crab's image transform `elapsedMs` after a pet, or null once the motion
+ * has ended (or before it has started).
+ *
+ * The clock is quantised to `ONE_SHOT_QUANTUM_MS` (40 ms) and the offsets are
+ * whole pixels and whole degrees, so the key rewrites at most 25 times a
+ * second during a hop and never after it. Pure and exported so a test can
+ * prove the arc without rasterising anything.
+ */
+export function petMotion(elapsedMs: number, spin: boolean): ImageTransform | null {
+  const end = spin ? Math.max(PET_HOP_MS, PET_SPIN_MS) : PET_HOP_MS
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs >= end) return null
+  const e = Math.floor(elapsedMs / ONE_SHOT_QUANTUM_MS) * ONE_SHOT_QUANTUM_MS
+  const out: ImageTransform = {}
+  if (e < PET_HOP_MS) {
+    const dy = -Math.round(Math.sin((e / PET_HOP_MS) * Math.PI) * PET_HOP_PX)
+    if (dy !== 0) out.dy = dy
+  }
+  if (spin && e < PET_SPIN_MS) {
+    const deg = Math.round((e / PET_SPIN_MS) * 360)
+    if (deg !== 0) out.rotateDeg = deg
+  }
+  return out
 }
 
 /** How strongly a cap tile's background carries its own percentage. Kept low for
@@ -272,6 +350,17 @@ export class ClaudePage implements Page {
   // `activeQuote`/`activeDay`, computed fresh rather than cached on `this`.
   private assigner = new KeyAssigner()
 
+  /**
+   * Crab presses not yet stamped with a time. `onKeyPress` has no clock and a
+   * page must never read the wall clock, so a press is only counted here; the
+   * next `render(nowMs)` stamps it with that frame's own time. The hop
+   * therefore starts on the first frame after the press, which is the
+   * earliest frame that could show it anyway.
+   */
+  private pendingPets = 0
+  /** Stamped pets, oldest first, still inside `PET_THANKS_MS`. */
+  private pets: Pet[] = []
+
   constructor(
     private readonly sessions: SessionReader,
     private readonly usage: UsageReader,
@@ -279,6 +368,7 @@ export class ClaudePage implements Page {
   ) {}
 
   render(now: number, nowMs: number = now * 1000): DeckFrame {
+    this.stampPets(nowMs)
     const live = this.sessions.getSessions()
     const { slots, overflow } = this.assigner.assign(live)
 
@@ -314,6 +404,31 @@ export class ClaudePage implements Page {
     }
   }
 
+  /**
+   * Gives every pending crab press this frame's time, and forgets pets whose
+   * heart and thank-you have both ended.
+   *
+   * A press is a spin when it is at least the `PET_SPIN_PRESSES`th inside
+   * `PET_SPIN_WINDOW_MS`, counting itself. A non-finite clock stamps nothing
+   * and leaves the presses pending for a frame with a real time.
+   */
+  private stampPets(nowMs: number): void {
+    if (!Number.isFinite(nowMs)) return
+    // A clock that went backwards past a pet makes its elapsed time negative;
+    // that pet would never finish, so drop it with the expired ones.
+    this.pets = this.pets.filter((p) => nowMs - p.atMs >= 0 && nowMs - p.atMs < PET_THANKS_MS)
+    for (; this.pendingPets > 0; this.pendingPets--) {
+      const recent = this.pets.filter((p) => nowMs - p.atMs < PET_SPIN_WINDOW_MS).length
+      this.pets.push({ atMs: nowMs, spin: recent + 1 >= PET_SPIN_PRESSES })
+    }
+    if (this.pets.length > PET_HISTORY) this.pets = this.pets.slice(-PET_HISTORY)
+  }
+
+  /** True while strip line 2 should thank the user for a pet. */
+  private thanking(nowMs: number): boolean {
+    return this.pets.some((p) => nowMs - p.atMs >= 0 && nowMs - p.atMs < PET_THANKS_MS)
+  }
+
   private sessionKey(s: Session, now: number, nowMs: number, seed: number): KeySpec {
     const lines = [stateLabel(s.state), truncate(s.project, PROJECT_CHARS)]
     // I1 — this array used to be handed to `KeySpec` with NO `lineSizes` at
@@ -347,6 +462,9 @@ export class ClaudePage implements Page {
     // read as noise rather than as urgency.
     const fx = sessionFx(s.state, nowMs, seed)
     if (fx) key.fx = fx
+    // The one state that waits on the user breathes its background amber. No
+    // seed offset: two waiting sessions breathe together, as one request.
+    if (s.state === 'permission') key.bg = permissionBg(nowMs)
 
     // No crab here, on purpose: task 22 drew the crab full-key, underneath
     // all three text lines, and measured 41% ink coverage in the text band
@@ -362,6 +480,14 @@ export class ClaudePage implements Page {
    * even with several sessions in different states.
    */
   private crabKey(live: Session[], nowMs: number): KeySpec {
+    // A pet: the newest one drives the hop or spin. The crab keeps drawing
+    // the most urgent state's own frames while it moves, so a pet can never
+    // hide a real `permission` alert: the "!" hops with it. (Swapping to the
+    // calm `idle` frames was tried and rejected on the preview: the idle
+    // extraction is drawn about twice the size of every other state, so the
+    // crab visibly jumped in size at the start and end of each hop.)
+    const latest = this.pets[this.pets.length - 1]
+    const motion = latest ? petMotion(nowMs - latest.atMs, latest.spin) : null
     const state = mostUrgentCrabState(live)
     const key: KeySpec = { kind: 'image' }
     const crab = crabFrame(state, nowMs)
@@ -369,6 +495,19 @@ export class ClaudePage implements Page {
       key.image = crab.image
       key.imageKey = crab.imageKey
     }
+    if (motion && (motion.dy !== undefined || motion.rotateDeg !== undefined)) {
+      key.imageTransform = motion
+    }
+    // One heart per pet, three for a spin. Finished hearts drop out of
+    // `keyHash` on their own, but expired pets are pruned anyway.
+    const hearts: OneShotSpec[] = this.pets.map((p, i) => ({
+      variant: 'hearts',
+      startedAtMs: p.atMs,
+      nowMs,
+      count: p.spin ? 3 : 1,
+      seed: i,
+    }))
+    if (hearts.length > 0) key.effects = hearts
     return key
   }
 
@@ -559,6 +698,21 @@ export class ClaudePage implements Page {
     now: number,
     nowMs: number,
   ): StripSpec {
+    const base = this.baseStrip(live, key0, overflow, now, nowMs)
+    if (!this.thanking(nowMs)) return base
+    // A pet takes line 2 for `PET_THANKS_MS`. The tape stands down so the
+    // thanks is readable, and the dim treatment lifts so it reads as a reply.
+    const { tape: _tape, dim: _dim, ...rest } = base
+    return { ...rest, lines: [base.lines[0] ?? 'claude', PET_THANKS_TEXT] }
+  }
+
+  private baseStrip(
+    live: Session[],
+    key0: Session | null,
+    overflow: number,
+    now: number,
+    nowMs: number,
+  ): StripSpec {
     if (!this.sessions.directoryExists()) {
       return { lines: ['claude', 'no session data'], dim: true }
     }
@@ -574,6 +728,16 @@ export class ClaudePage implements Page {
     // never shifts an already-held session down into a lower slot.
     const described = key0 ?? live[0]!
     const elapsed = described.startedAt ? formatDuration(now - described.startedAt) : ''
+
+    // One session: line 1 and the tape would say the same thing twice. Line 1
+    // keeps what it is doing, and line 2 says how long it has run, on which
+    // model, and how full its context is. No tape: there is nothing else to
+    // scroll to.
+    if (live.length === 1) {
+      const doing = [described.project, described.tool || described.label].filter(Boolean)
+      const facts = singleSessionFacts(elapsed, this.usage.getMeta(described.sessionId))
+      return { lines: [doing.join(' · '), facts || '1 active'] }
+    }
     const parts = [described.project, described.tool || described.label, elapsed].filter(Boolean)
     const second = overflow > 0 ? `+${overflow} more` : `${live.length} active`
 
@@ -605,12 +769,18 @@ export class ClaudePage implements Page {
 
   /**
    * Key 0 to 2 focus the session in that slot, when one is bound and focus
-   * succeeds. Key 3 (the crab mascot tile) and keys 4 to 7 (the gauges) are
-   * always `ignored` — nothing is bound to them. The daemon, not this page,
+   * succeeds. Key 3 pets the crab and is always `handled`: the crab hops, a
+   * heart floats up, and the strip says thank you. Keys 4 to 7 (the gauges)
+   * are always `ignored` — nothing is bound to them. The daemon, not this page,
    * draws the on-device feedback for every outcome; see `PressOutcome`.
    */
   async onKeyPress(index: number): Promise<PressOutcome> {
     if (index < 0 || index >= KEY_COUNT) return 'ignored'
+    if (index === CRAB_KEY_INDEX) {
+      // Pet the crab. Stamped on the next render; see `pendingPets`.
+      this.pendingPets = Math.min(this.pendingPets + 1, PET_HISTORY)
+      return 'handled'
+    }
     if (index >= SESSION_SLOTS) return 'ignored'
 
     // M9 — computed fresh, the same call `render` makes, rather than read
@@ -625,6 +795,27 @@ export class ClaudePage implements Page {
     const ok = await this.focus(session.pid, session.termProgram, session.cwd, session.project)
     return ok ? 'handled' : 'failed'
   }
+
+  /** A pet still pending when the page leaves would hop on re-entry, long
+   * after the press. Forget it, and any pet in flight. */
+  onLeave(): void {
+    this.pendingPets = 0
+    this.pets = []
+  }
+}
+
+/**
+ * Strip line 2 for a single session: `running 21m · opus · ctx 41%`. Each
+ * part appears only when its source knows it; an empty string means nothing
+ * is known, and the caller falls back.
+ */
+export function singleSessionFacts(elapsed: string, meta: SessionMeta | null): string {
+  const parts: string[] = []
+  if (elapsed) parts.push(`running ${elapsed}`)
+  if (meta?.model) parts.push(meta.model)
+  const ctx = meta?.ctxPct
+  if (typeof ctx === 'number' && Number.isFinite(ctx)) parts.push(`ctx ${Math.round(ctx)}%`)
+  return parts.join(' · ')
 }
 
 /**

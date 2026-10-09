@@ -12,6 +12,10 @@
  * `crab-frames.png` in the repository root. That file is a preview, not a
  * deliverable — it is not committed.
  *
+ * It also writes `<output>-pet.png` beside it: the real `ClaudePage` key 3
+ * and strip through one pet (hop and heart), a triple-press spin, and one
+ * breath of a permission tile, one column per time step.
+ *
  * This script changes nothing under `src/`. It only reads the PNGs that
  * `extract-crab-frames.ts` already wrote and reads `renderKey` read-only.
  */
@@ -20,8 +24,11 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createCanvas, loadImage, type Canvas, type Image } from '@napi-rs/canvas'
-import { renderKey, KEY_SIZE } from '../src/render/canvas.js'
+import { renderKey, renderStrip, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../src/render/canvas.js'
 import { theme, stateColor, type SessionStateName } from '../src/render/theme.js'
+import { loadCrabFrames } from '../src/render/sprites.js'
+import { ClaudePage, PERMIT_BREATHE_PERIOD_MS } from '../src/pages/claude-page.js'
+import type { Session } from '../src/sources/claude.js'
 
 /**
  * Walks up from this file to find the repository root. This module runs
@@ -138,6 +145,80 @@ async function buildContactSheet(rows: StateRow[]): Promise<Buffer> {
   return canvas.toBuffer('image/png')
 }
 
+const PET_NOW = 1786549560
+const PET_T = PET_NOW * 1000
+
+function petPage(state: SessionStateName): ClaudePage {
+  const sessions: Session[] = [{
+    sessionId: 'a', state, label: 'Needs approval', tool: 'Bash', project: 'knob-fw',
+    cwd: '/x', termProgram: 'ghostty', pid: 1, startedAt: PET_NOW - 1260, ts: PET_NOW,
+  }]
+  return new ClaudePage(
+    { getSessions: () => sessions, directoryExists: () => true },
+    {
+      getUsage: () => null,
+      isStale: () => false,
+      getMeta: () => ({ model: 'opus', ctxPct: 41, costUsd: 3.12, ts: PET_NOW }),
+    },
+    async () => true,
+  )
+}
+
+/**
+ * One row per scenario; each cell is the key (and, for the pet rows, the
+ * strip under it) at `PET_T + dt`. Presses go in through `onKeyPress`, and
+ * the page stamps them on its next render, exactly as on the deck.
+ */
+async function buildPetSheet(): Promise<Buffer> {
+  await loadCrabFrames(join(REPO_ROOT, 'assets'), ['idle', 'permission'])
+  const steps = [0, 80, 160, 240, 320, 400, 520, 700, 1000, 1500]
+  const breathSteps = steps.map((_, i) => Math.round((i * PERMIT_BREATHE_PERIOD_MS) / steps.length))
+  const cellW = STRIP_WIDTH / 2 + 8
+  const rowH = KEY_SIZE + STRIP_HEIGHT / 2 + 30
+  const canvas = createCanvas(MARGIN * 2 + LABEL_W + steps.length * cellW, MARGIN * 2 + TITLE_H + 3 * rowH)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = 'rgb(18,18,20)'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  ctx.fillStyle = 'rgb(230,230,230)'
+  ctx.font = '16px Menlo'
+  ctx.textBaseline = 'top'
+  ctx.fillText('Pet the crab — key 3 and the strip at each ms after the press', MARGIN, MARGIN)
+
+  const rows: { label: string; page: ClaudePage; presses: number[]; key: number; at: number[] }[] = [
+    { label: 'pet (alert crab)', page: petPage('permission'), presses: [0], key: 3, at: steps },
+    { label: 'triple press: spin', page: petPage('permission'), presses: [-600, -300, 0], key: 3, at: steps },
+    { label: 'permission breath', page: petPage('permission'), presses: [], key: 0, at: breathSteps },
+  ]
+  let y = MARGIN + TITLE_H
+  for (const row of rows) {
+    ctx.fillStyle = 'rgb(200,200,205)'
+    ctx.font = '12px Menlo'
+    ctx.fillText(row.label, MARGIN, y + 40)
+    // Presses before 0 are stamped on renders at those times.
+    for (const p of row.presses) {
+      await row.page.onKeyPress(3)
+      row.page.render(PET_NOW, PET_T + p)
+    }
+    let x = MARGIN + LABEL_W
+    for (const dt of row.at) {
+      const frame = row.page.render(PET_NOW, PET_T + dt)
+      ctx.drawImage(rgbaToCanvas(renderKey(frame.keys[row.key]!), KEY_SIZE, KEY_SIZE), x, y)
+      if (row.key === 3) {
+        ctx.drawImage(
+          rgbaToCanvas(renderStrip(frame.strip), STRIP_WIDTH, STRIP_HEIGHT),
+          x, y + KEY_SIZE + 4, STRIP_WIDTH / 2, STRIP_HEIGHT / 2,
+        )
+      }
+      ctx.fillStyle = 'rgb(150,150,155)'
+      ctx.font = '10px Menlo'
+      ctx.fillText(`+${dt} ms`, x, y + KEY_SIZE + STRIP_HEIGHT / 2 + 8)
+      x += cellW
+    }
+    y += rowH
+  }
+  return canvas.toBuffer('image/png')
+}
+
 async function main(): Promise<void> {
   const rows: StateRow[] = []
   for (const state of STATES) {
@@ -161,6 +242,10 @@ async function main(): Promise<void> {
   const png = await buildContactSheet(rows)
   await writeFile(outPath, png)
   console.log(`Wrote contact sheet: ${outPath}`)
+
+  const petPath = outPath.replace(/(\.png)?$/, '-pet.png')
+  await writeFile(petPath, await buildPetSheet())
+  console.log(`Wrote pet sheet: ${petPath}`)
   console.log(`Reference: ${theme.bg.join(',')} is the key background colour.`)
 }
 

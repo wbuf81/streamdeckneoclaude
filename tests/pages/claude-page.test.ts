@@ -135,26 +135,17 @@ describe('ClaudePage layout', () => {
     expect(page.render(NOW).keys[0]!.border).toEqual(theme.blue)
   })
 
-  it('pulses the WHOLE permission tile, in the permission colour', () => {
-    // Task 46 replaced the old `pulseOn` border blink with a whole-tile pulse. The
-    // blink toggled the border on whole-second boundaries; this brightens the
-    // entire tile smoothly, which is strictly more visible for the one state that
-    // means the user is the bottleneck. Keeping both would have set a 1 Hz border
-    // blink against a 0.87 Hz tile pulse — two rhythms read as noise, not urgency.
+  it('breathes the permission tile BACKGROUND amber, with no pulse and no blink', () => {
+    // The glow-up replaced task 46's 1.15 s `pulse` fx (which flashed) with a
+    // slow amber breath on the background. Only one rhythm per tile: no fx, and
+    // no `pulseOn` border blink either. The full proof of the breath is in
+    // claude-glowup.test.ts.
     const { page } = build({ sessions: [session({ state: 'permission' })] })
     const key = page.render(NOW, NOW * 1000).keys[0]!
     expect(key.border).toEqual(theme.amber)
-    expect(key.fx?.variant).toBe('pulse')
-    // The motion carries the SAME hue the border does, so they cannot disagree.
-    expect(key.fx?.color).toEqual(theme.amber)
+    expect(key.fx).toBeUndefined()
+    expect(key.bg).toBeDefined()
     expect(key.pulseOn).toBeUndefined()
-  })
-
-  it('moves the permission pulse as the millisecond clock advances', () => {
-    const { page } = build({ sessions: [session({ state: 'permission' })] })
-    const a = page.render(NOW, NOW * 1000).keys[0]!
-    const b = page.render(NOW, NOW * 1000 + 300).keys[0]!
-    expect(b.fx!.nowMs).toBeGreaterThan(a.fx!.nowMs)
   })
 
   it('gives a tool session horizontal motion, on a different AXIS from thinking', () => {
@@ -786,10 +777,12 @@ describe('ClaudePage presses report the real outcome, keys 0 to 7', () => {
     expect(await page.onKeyPress(2)).toBe('ignored')
   })
 
-  it('reports ignored for the crab tile, key 3', async () => {
+  it('reports handled for the crab tile, key 3: a press pets the crab', async () => {
+    // The glow-up made the crab pettable. claude-glowup.test.ts proves the hop,
+    // the heart and the thanks that make this `handled` true.
     const { page } = build({ sessions: [session()], usage: freshUsage() })
     page.render(NOW)
-    expect(await page.onKeyPress(3)).toBe('ignored')
+    expect(await page.onKeyPress(3)).toBe('handled')
   })
 
   it('reports ignored for every gauge key, 4 to 7', async () => {
@@ -999,18 +992,15 @@ describe('ClaudePage renders the crab through the page, not just the helper', ()
     expect(first.imageKey).toBe(second.imageKey)
   })
 
-  it('drives the permission pulse from the MILLISECOND clock, not whole seconds', () => {
-    // The inverse of what this test used to assert. The old `pulseOn` blink was
-    // deliberately quantised to whole seconds, so this once proved that a 10 fps
-    // tick did not disturb it. The pulse it replaced that with is continuous, so
-    // the property worth protecting flipped: sub-second renders MUST differ, or
-    // the pulse would step once a second and read as a blink again.
+  it('drives the permission breath from the MILLISECOND clock, not whole seconds', () => {
+    // Sub-second renders MUST differ, or the breath would step once a second
+    // and read as a blink again.
     //
-    // No crab frames loaded here on purpose, so this isolates the pulse.
+    // No crab frames loaded here on purpose, so this isolates the breath.
     const { page } = build({ sessions: [session({ state: 'permission' })] })
     const a = page.render(NOW, NOW * 1000).keys[0]!
     const b = page.render(NOW, NOW * 1000 + 400).keys[0]!
-    expect(b.fx!.nowMs).not.toBe(a.fx!.nowMs)
+    expect(b.bg).not.toEqual(a.bg)
     // And the same instant renders identically, so a frame is reproducible.
     const c = page.render(NOW, NOW * 1000).keys[0]!
     expect(keyHash(c)).toBe(keyHash(a))
@@ -1059,7 +1049,8 @@ describe('ClaudePage session tile legibility with motion (task 46)', () => {
     // failing if the cap were meaningfully raised.
     const { page } = build({ sessions: [session({ state, project: 'deckd', tool: 'Edit' })] })
     const key = page.render(NOW, NOW * 1000).keys[0]!
-    expect(key.fx).toBeDefined()
+    // `permission` moves through its background, the others through `fx`.
+    expect(key.fx ?? key.bg).toBeDefined()
 
     const buf = renderKey(key)
     let peakText = 0
@@ -1069,17 +1060,18 @@ describe('ClaudePage session tile legibility with motion (task 46)', () => {
     expect(peakText, `${state}: text must win`).toBeGreaterThan(peakLayer(key) * 2.5)
   })
 
-  it('keeps the permission pulse itself under an absolute brightness bound', () => {
+  it('keeps the permission breath itself under an absolute brightness bound', () => {
     // Swept across the whole cycle rather than sampled at a guessed instant, since
-    // the pulse covers the entire tile and its peak is the hardest moment.
+    // the breath covers the entire tile and its peak is the hardest moment.
     //
-    // The bound is a MEASUREMENT (142 at the brightest frame), not a value derived
-    // from `FX_MAX_ALPHA` — a ceiling computed from the constant it polices cannot
+    // The bound is a MEASUREMENT (127 at the brightest frame of the breath; the
+    // old pulse measured 142), not a value derived from `PERMIT_BG_MAX` — a ceiling computed from the constant it polices cannot
     // fail, which is a trap this suite has already fallen into once.
     const PERMISSION_LAYER_CEILING = 200
     const { page } = build({ sessions: [session({ state: 'permission' })] })
     let peak = 0
-    for (let ms = 0; ms < 1300; ms += 25) {
+    // One whole breath (2800 ms), so the brightest frame is in the sweep.
+    for (let ms = 0; ms < 2900; ms += 25) {
       peak = Math.max(peak, peakLayer(page.render(NOW, ms).keys[0]!))
     }
     expect(peak).toBeGreaterThan(0)
