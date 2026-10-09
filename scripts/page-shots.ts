@@ -29,12 +29,12 @@ import type { Page } from '../src/pages/types.js'
 import { ClaudePage } from '../src/pages/claude-page.js'
 import { CodexPage } from '../src/pages/codex-page.js'
 import { SpotifyPage, type PlayerReader } from '../src/pages/spotify-page.js'
-import { StocksPage, type StockReader } from '../src/pages/stocks-page.js'
+import { StocksPage } from '../src/pages/stocks-page.js'
+import { fixtureReader } from './stocks-fixture.js'
 import { WeatherPage, type WeatherReader } from '../src/pages/weather-page.js'
 import { FootballPage } from '../src/pages/football-page.js'
 import { SystemPage, type SystemReader } from '../src/pages/system-page.js'
-import { SYMBOLS } from '../src/sources/stocks.js'
-import type { MarketState, Quote, YearlyState } from '../src/sources/stocks.js'
+import type { MarketState } from '../src/sources/stocks.js'
 import type { Session } from '../src/sources/claude.js'
 import type { UsageSnapshot } from '../src/sources/usage.js'
 import type { CodexSnapshot } from '../src/sources/codex.js'
@@ -292,35 +292,17 @@ async function spotifyPage(): Promise<Page> {
   } as unknown as PlayerReader)
 }
 
-/** Measured live from Yahoo's keyless chart endpoint on 2026-08-18 — the same
- * distribution `stocks-contact-sheet.ts` calls LIVE, reused so the two
- * previews cannot disagree about what a normal day looks like. */
-const STOCK_CHANGES: readonly number[] = [-1.10, 0.19, -2.49, 2.33, -1.80, -1.22, -3.47, -0.11]
-
-function quoteFor(symbol: string, changePercent: number): Quote {
-  const price = 100 + changePercent * 7
-  const spark = Array.from({ length: 24 }, (_, i) => price - changePercent * (1 - i / 23))
-  return {
-    symbol, name: symbol, price, previousClose: price / (1 + changePercent / 100),
-    changePercent, spark, currency: 'USD', asOf: NOW,
-    dayHigh: price * 1.01, dayLow: price * 0.99,
-    week52High: price * 1.4, week52Low: price * 0.7, volume: 1_000_000,
-  } as unknown as Quote
-}
-
-function stocksPage(marketState: MarketState = 'open'): StocksPage {
-  const quotes = new Map<string, Quote>()
-  SYMBOLS.forEach((sym, i) => quotes.set(sym, quoteFor(sym, STOCK_CHANGES[i] ?? 0)))
-  return new StocksPage({
-    getSymbols: () => SYMBOLS,
-    getQuotes: () => quotes,
-    getStatus: () => 'ok',
-    getMarketState: () => marketState,
-    isSymbolStale: () => false,
-    getYearlyState: () => ({ status: 'ok', values: [], updatedAt: 0 } as unknown as YearlyState),
-    setWatchedSymbol: () => {},
-    setVisible: () => {},
-  } satisfies StockReader)
+/** The shared preview board: six generic symbols, the user's watchlist size,
+ * so the breadth and mascot keys show. `prePress` flips a tile first, so the
+ * shot's own press is the SECOND one and opens the detail view. */
+function stocksPage(marketState: MarketState = 'open', prePress?: number): StocksPage {
+  const page = new StocksPage(fixtureReader({
+    asOf: NOW,
+    marketState,
+    boundary: { kind: 'close', atMs: NOW_MS + (2 * 60 + 14) * 60_000, next: 'post' },
+  }))
+  if (prePress !== undefined) page.onKeyPress(prePress)
+  return page
 }
 
 function day(
@@ -485,7 +467,8 @@ async function main(): Promise<void> {
     { file: 'page-codex.png', page: codexPage() },
     { file: 'page-spotify.png', page: await spotifyPage() },
     { file: 'page-stocks.png', page: stocksPage() },
-    { file: 'page-stocks-detail.png', page: stocksPage(), press: 0 },
+    { file: 'page-stocks-peek.png', page: stocksPage(), press: 2 },
+    { file: 'page-stocks-detail.png', page: stocksPage('open', 2), press: 2 },
     { file: 'page-weather.png', page: weatherPage() },
     { file: 'page-football.png', page: footballPage() },
     { file: 'page-football-live.png', page: footballPage('live') },

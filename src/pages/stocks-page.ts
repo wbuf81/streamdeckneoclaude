@@ -1,177 +1,112 @@
-import type { DeckFrame, FxSpec, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
+import type { DeckFrame, KeySpec, OneShotSpec, Rgb, StripBanner, StripSpec, TapeSegment } from '../render/specs.js'
 import { theme, blend } from '../render/theme.js'
-import { tapeOffsetPx as sharedTapeOffsetPx } from '../render/canvas.js'
+import { breathe } from '../render/motion.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
-import type { MarketState, Quote, StockStatus, YearlyState } from '../sources/stocks.js'
+import type { MarketBoundary, MarketState, Quote, StockStatus, YearlyState } from '../sources/stocks.js'
 import { downsample, YEARLY_REFRESH_SECONDS } from '../sources/stocks.js'
+import {
+  type Trend, trendOf, trendColor, isFiniteNumber, formatPrice, formatShortPrice, formatSignedPct,
+  formatChangeValue, formatVolume, rangePercent, formatCountdown, scaleRgb,
+} from './stocks-format.js'
+import { snapTape, LIVE_PACE, CRAWL_PACE } from './stocks-tape.js'
+import {
+  StockMoments, BELL_BANNER_MS, BELL_PULSE_MS, BIG_MOVE_STRIP_MS, CLOSE_SUMMARY_MS,
+} from './stocks-moments.js'
 
-/** How many buckets the intraday series downsamples to for the tile. */
-const SPARK_BUCKETS = 12
+export { trendOf } from './stocks-format.js'
+
+/**
+ * How many points the tile's line spark keeps. A line needs more points than
+ * the old 12 bars to look like a day rather than a staircase; 48 is about two
+ * pixels per point across the 81 px band.
+ */
+const TILE_SPARK_POINTS = 48
+/** The detail chart spans three keys, about 250 px: two to three px a point. */
+const DETAIL_SPARK_POINTS = 96
 /** Measured limit for one strip line. See `render/canvas.ts`. */
 const STRIP_CHARS = 30
 /**
- * Candidate sizes for the detail view's numeric lines, largest first. 16 px
- * fits a 7-character price like `1234.56`; 13 and 11 extend the list
- * downward for the widest realistic case, a three-digit change percent like
- * `▲ 150.00%` (86.7 px at 16 px — the review's exact repro, past the 81 px
- * usable width). This page passes the array itself: it declares intent, and
- * `renderKey` measures with a real canvas and picks the size that actually
- * fits — see `KeySpec.lineSizes`'s doc comment. That keeps this page pure
- * (no canvas import, not even transitively) and lets the renderer shrink
- * further than any single fixed candidate ever could.
+ * The tile spark's smallest half-range, as a fraction of the previous close.
+ * A 0.1 percent day drawn against a ±1 percent scale looks nearly flat,
+ * which is the truth; without it every wiggle stretches to fill the band
+ * and a quiet stock looks as steep as a crash.
  */
-const PRICE_SIZES = [24, 20, 16, 13, 11]
-/** Fixed size for the detail view's symbol and label lines. Every symbol is
- * at most 4 characters and every label ("DAY", "52 WK") is short, so these
- * never need fitting — a plain number, drawn as given. */
-const SYMBOL_SIZE = 24
-const LABEL_SIZE = 16
-const BACK_SIZE = 16
+const SPARK_MIN_HALF_RANGE = 0.01
+/** The hero change's candidate sizes, largest first. `−12.34%` is 7
+ * characters: 84 px at 20 px bold, past the 81 px usable width, so it
+ * steps down rather than clipping. */
+const HERO_SIZES = [20, 19, 17, 15, 13]
+/** Candidates for the detail view's hero lines. */
+const DETAIL_SYMBOL_SIZES = [20, 17, 15, 13]
+const DETAIL_NUMBER_SIZES = [15, 13, 11]
 /** How many of the detail view's tiles the intraday chart spans. */
 const CHART_SPAN = 3
-/**
- * Fewer than this many points cannot be sliced sensibly across `CHART_SPAN`
- * keys (I4): `render/canvas.ts`'s `drawSpark` divides the series into
- * `CHART_SPAN` virtual-width slices, and with 2 or 3 points that geometry
- * puts the whole chart's bars on the wrong key, or draws none at all on the
- * first one — measured: a 2-point rising series draws zero bars on key 4 and
- * the caption ends up sitting alone over an empty tile. Below this count,
- * `chartKey` draws the WHOLE (tiny) series, un-sliced, on the first key only
- * — the same "no slice" mode the grid ticker's own sparkline already uses —
- * rather than asking the renderer to spread 2 or 3 points across 3 keys.
- */
+/** Below this many points a 3-key slice puts the chart on the wrong key
+ * (I4, measured); the series draws whole on the first chart key instead. */
 const MIN_SLICE_POINTS = 4
+
+/** How long the first press on a tile shows its peek face. */
+export const PEEK_MS = 3000
+/** How long a breadth press shows the leaders on line 1. */
+export const LEADERS_MS = 4000
+/** How long one strip fact stays before the next one rotates in. */
+export const FACT_ROTATE_MS = 8000
+/** The mascot's heart pop. */
+const HEARTS_MS = 1500
+/** The opening-bell cascade: each key's sweep starts this much later. */
+export const SWEEP_STAGGER_MS = 90
+const SWEEP_MS = 500
+/** The burst on a big up move runs this long. */
+const BURST_MS = 1500
+
+/** Render rates. 40 ms keeps a scroll or a one-shot smooth; 100 ms is the
+ * mascot's own clock quantum; 200 ms is the closed-market crawl's step
+ * (`CRAWL_PACE.quantumMs`), so a tick never renders a frame that cannot
+ * have changed. */
+const FAST_TICK_MS = 40
+const MASCOT_TICK_MS = 100
+const CRAWL_TICK_MS = CRAWL_PACE.quantumMs
+
+/** The buttons breathe while the market trades: one slow cycle, gentle. */
+const BUTTON_BREATHE_MS = 4000
+const BUTTON_BREATHE_DEPTH = 0.35
+/** A button for a side with no symbols on it still glows this faintly, so a
+ * lit deck never looks unplugged. */
+const BUTTON_FLOOR = 0.08
+
+/** The peek face's background: a cool dark blue-grey, so a flipped tile
+ * reads as "the other side of the card" at a glance. */
+const PEEK_BG: Rgb = [16, 18, 25]
 
 const STATE_LABELS: Record<MarketState, string> = {
   open: 'MARKET OPEN',
   pre: 'PRE-MARKET',
   post: 'AFTER HOURS',
   closed: 'MARKET CLOSED',
-  // Per I1: a market state that was never measured (no symbol has ever
-  // carried a usable `currentTradingPeriod`) must say so, not claim
-  // "closed" — lesson 18, an absent signal is unknown, not a fact.
+  // Per I1: never claim "closed" for a state that was never measured.
   unknown: 'MARKET UNKNOWN',
 }
 
-type Trend = 'up' | 'down' | 'flat' | 'unknown'
-
-function trendOf(changePercent: number | null): Trend {
-  if (typeof changePercent !== 'number' || !Number.isFinite(changePercent)) return 'unknown'
-  if (changePercent > 0) return 'up'
-  if (changePercent < 0) return 'down'
-  return 'flat'
-}
-
-function trendColor(trend: Trend): Rgb {
-  if (trend === 'up') return theme.green
-  if (trend === 'down') return theme.red
-  return theme.gray
-}
-
-function trendArrow(trend: Trend): string {
-  if (trend === 'up') return '▲'
-  if (trend === 'down') return '▼'
-  if (trend === 'flat') return '·'
-  return ''
+/** The states in which something is trading, so motion is honest. */
+function isLive(state: MarketState): boolean {
+  return state === 'open' || state === 'pre' || state === 'post'
 }
 
 /**
- * The move size at which a tile's heat wash reaches full strength, in percent.
- *
- * The scale is ABSOLUTE, deliberately, not normalised against the board's
- * biggest mover. A relative scale would always look contrasty, but it would
- * paint a 0.3 percent nudge exactly as brightly as a 5 percent crash — and this
- * page never misrepresents its data. A flat day is allowed to look calm,
- * because it IS calm.
- *
- * Measured live on 2026-08-18: the eight real symbols spanned -3.47 to +2.33
- * percent, with two of them inside ±0.2. So 3 percent puts a real board across
- * most of the range and still leaves headroom above it.
+ * The move size at which a tile's heat wash reaches full strength, in
+ * percent. ABSOLUTE, so a calm day is allowed to look calm. Measured live on
+ * 2026-08-18: eight real symbols spanned −3.47 to +2.33 percent.
  */
 const HEAT_SATURATION_PCT = 3
-
-/**
- * How fast the ticker tape crawls, in pixels per second, and how often the page
- * renders while it does.
- *
- * The strip was measured at 1218 writes per second (docs/VERIFIED-FACTS.md), so
- * it is nowhere near the constraint; 50 ms is 20 strip writes per second.
- *
- * Both were tuned against a rendered preview, not guessed.
- *
- * The real loop measures 1448 px at 13 px Menlo — more than the 1130 px first
- * estimated, because eight `SYMBOL price ▲change%` segments plus separators run
- * wider than a character count suggests (lesson 17 again: measure, do not
- * reason). At the first speed, 32 px per second, the whole board took **45
- * seconds** to pass, so waiting for one particular ticker meant most of a
- * minute. 60 px per second brings that to about 24 seconds.
- *
- * The tick then has to keep the motion smooth at that speed: 60 px per second at
- * 40 ms is 2.4 px per frame. The strip was measured at 1218 writes per second,
- * so 25 frames per second costs nothing.
- *
- * If the tape ever needs to be faster still, the PRICE comes out of each segment
- * before the speed goes up again — an unreadable tape is worse than a slow one.
- */
-const TAPE_PX_PER_SEC = 60
-const TAPE_TICK_MS = 40
-
-/**
- * The granularity of the DRIFT's own clock, in milliseconds.
- *
- * The page renders every 40 ms so the tape stays smooth. The tiles do not need
- * that: a drifting particle crosses the key in one to four seconds, so it looks
- * the same at 12 frames per second as at 25.
- *
- * This matters because of how the daemon writes the device. It writes a key only
- * when that key's `keyHash` changes, and `fx.nowMs` is part of the hash — so an
- * unquantised clock makes all EIGHT keys rewrite on every single frame. Measured
- * on the real deck: 200 key-writes per second, against a measured USB ceiling of
- * 362, and the daemon sat at 35 to 40 percent of a core. Rendering was not the
- * cost; the writes were. The render path itself measures 0.99 ms per frame,
- * which is 2.5 percent at this tick.
- *
- * Quantising the drift clock lets the dirty-key check do its job: the tiles now
- * change twice in five frames instead of five, and the tape still updates every
- * frame because its offset is NOT quantised.
- */
-const DRIFT_QUANTUM_MS = 80
-
-/**
- * The smallest share of the wash any real, non-zero move gets, so a small move
- * is a faint hint rather than rounding away to nothing.
- *
- * Kept LOW on purpose. At the first value, 0.22, a 0.05 percent nudge — no real
- * movement at all — already drew 23 percent of the full wash, and a rendered
- * flat day (every symbol inside ±0.35 percent) was almost indistinguishable
- * from a real mixed day. That directly contradicted this feature's own design
- * decision to keep the scale absolute and let a calm day look calm.
- *
- * Measured on 2026-08-18: at 0.22 the strength ratio between a 0.12 percent
- * nudge and a saturating 3 percent move was only 4.0x. At this value it is
- * about 10x, so a real mover stands out and a quiet day stays quiet.
- */
+/** The smallest share of the wash a real, non-zero move gets. */
 const HEAT_FLOOR = 0.06
-
-/**
- * The largest share of the trend colour a wash may ever blend in. The key's
- * white text has to stay crisp on top of it, which is the same constraint the
- * weather page's condition tints live under — see `conditionTint` there, where
- * every value is hand-picked dark. Here the values are computed, so the ceiling
- * has to be explicit and tested.
- */
+/** The largest share of the trend colour a wash may blend in, so white text
+ * stays crisp on top of it. */
 const HEAT_MAX_BLEND = 0.3
 
-/**
- * How strongly the board presents, by market state. One multiplier, applied to
- * both the heat wash and the breadth buttons, so the whole page shares one mood.
- *
- * `unknown` shares `closed`'s multiplier but NOT its meaning. We do not know the
- * market is live, so it must not LOOK live — but claiming it is closed would be
- * a lie, and `STATE_LABELS` already refuses to (lesson 18: an absent signal is
- * unknown, not a fact). The strip is what states it, in words.
- */
+/** How strongly the board presents, by market state. `unknown` is as quiet
+ * as `closed` without claiming the market IS closed. */
 const MOOD_BY_STATE: Record<MarketState, number> = {
   open: 1,
   pre: 0.55,
@@ -180,63 +115,68 @@ const MOOD_BY_STATE: Record<MarketState, number> = {
   unknown: 0.3,
 }
 
-/** How many symbols are up and how many are down.
- *
- * ONE function, read by both the strip's "5 up · 3 down" text and the round
- * buttons' colour. Two callers counting this separately would eventually
- * disagree, and then the lights would contradict the words on the same frame
- * (lesson 21: one decision, one function).
+/**
+ * How many symbols are up and down, and how many carry any known change at
+ * all. ONE function for the breadth key, the strip text and the buttons, so
+ * the lights can never contradict the words on one frame.
  */
-export function breadth(quotes: Iterable<Quote>): { up: number; down: number } {
+export function breadth(quotes: Iterable<Quote | undefined>): { up: number; down: number; counted: number } {
   let up = 0
   let down = 0
+  let counted = 0
   for (const q of quotes) {
-    const trend = trendOf(q.changePercent)
+    const trend = trendOf(q?.changePercent)
+    if (trend === 'unknown') continue
+    counted++
     if (trend === 'up') up++
     else if (trend === 'down') down++
   }
-  return { up, down }
+  return { up, down, counted }
 }
 
-/**
- * Blends the plain key background toward `target` by `fraction`, capped at
- * `HEAT_MAX_BLEND`. Exported so a test can prove the cap and the contrast
- * without going through a whole rendered frame.
- */
+/** The average change across the watchlist, or null when none is known. */
+export function averageChange(quotes: Iterable<Quote | undefined>): number | null {
+  let sum = 0
+  let n = 0
+  for (const q of quotes) {
+    if (q && isFiniteNumber(q.changePercent)) {
+      sum += q.changePercent
+      n++
+    }
+  }
+  return n > 0 ? sum / n : null
+}
+
+/** The best and worst mover, or null when nothing is known. */
+export function leaders(
+  symbols: readonly string[], quotes: ReadonlyMap<string, Quote>,
+): { best: Quote; worst: Quote } | null {
+  let best: Quote | null = null
+  let worst: Quote | null = null
+  for (const s of symbols) {
+    const q = quotes.get(s)
+    if (!q || !isFiniteNumber(q.changePercent)) continue
+    if (!best || q.changePercent > best.changePercent!) best = q
+    if (!worst || q.changePercent < worst.changePercent!) worst = q
+  }
+  return best && worst ? { best, worst } : null
+}
+
 export function blendToward(target: Rgb, fraction: number): Rgb {
-  // The blend arithmetic itself lives in `render/theme.ts`, shared with the
-  // football page's record wash — two copies would eventually disagree about
-  // what "half way to green" means. This function keeps the stocks-specific
-  // part: the cap, and blending from the key background.
   return blend(theme.bg, target, Math.min(HEAT_MAX_BLEND, fraction))
 }
 
-/**
- * The background wash for one ticker tile, or undefined for a tile that must
- * keep the plain background.
- *
- * An unknown change (null, or non-finite) and a real flat 0.00 percent both get
- * undefined. Those two cases mean different things — "we do not know" against
- * "it did not move" — but neither is a direction, and inventing a colour for
- * either would be a fabricated reading.
- */
-/**
- * How big a move is, on a 0-to-1 absolute scale saturating at
- * `HEAT_SATURATION_PCT`.
- *
- * ONE function, read by both the heat wash and the directional drift. Two
- * functions grading the same number would eventually disagree, and then a tile's
- * colour and its motion would tell different stories about the same stock
- * (lesson 21: one decision, one function).
- */
+/** How big a move is, on a 0-to-1 absolute scale. */
 export function moveMagnitude(changePercent: number | null): number {
-  if (typeof changePercent !== 'number' || !Number.isFinite(changePercent)) return 0
+  if (!isFiniteNumber(changePercent)) return 0
   return Math.min(1, Math.abs(changePercent) / HEAT_SATURATION_PCT)
 }
 
-export function heatWash(
-  changePercent: number | null, marketState: MarketState,
-): Rgb | undefined {
+/**
+ * The background wash for one tile, or undefined for the plain background.
+ * Unknown and a real flat 0.00 percent both get none: neither is a direction.
+ */
+export function heatWash(changePercent: number | null, marketState: MarketState): Rgb | undefined {
   const trend = trendOf(changePercent)
   if (trend === 'unknown' || trend === 'flat') return undefined
   const scaled = HEAT_FLOOR + (1 - HEAT_FLOOR) * moveMagnitude(changePercent)
@@ -244,181 +184,35 @@ export function heatWash(
 }
 
 /**
- * How lively the drift is by market state. Distinct from `MOOD_BY_STATE`, which
- * scales a COLOUR: a closed market gets no drift at all rather than faint drift,
- * because showing flow when nothing is trading would be a claim the data does
- * not support. `unknown` shares that, while the strip keeps saying MARKET
- * UNKNOWN.
+ * The two round buttons: left glows green by the SHARE of symbols up, right
+ * glows red by the share down. Grey when offline or when nothing could be
+ * counted — never a colour the data does not support. While the market is
+ * open they breathe gently; otherwise they hold steady.
  */
-const DRIFT_BY_STATE: Record<MarketState, number> = {
-  open: 1,
-  pre: 0.6,
-  post: 0.6,
-  closed: 0,
-  unknown: 0,
-}
-
-/** The floor for a drift that runs at all, so a small real move still shows a
- * trickle rather than a single lonely particle. */
-const DRIFT_INTENSITY_MIN = 0.3
-
-/**
- * The drifting-particle effect for one ticker tile, or undefined when the tile
- * must stay still.
- *
- * Drift is DECORATION: it carries nothing the still tile does not already say,
- * so unlike the ticker tape it stops whenever the data is not live. That split
- * is deliberate — see the two design notes in docs/superpowers/specs/.
- */
-export function driftFx(
-  changePercent: number | null,
-  marketState: MarketState,
-  stale: boolean,
-  nowMs: number,
-  seed: number,
-): FxSpec | undefined {
-  if (stale) return undefined
-  const liveliness = DRIFT_BY_STATE[marketState]
-  if (liveliness === 0) return undefined
-  const trend = trendOf(changePercent)
-  if (trend === 'unknown' || trend === 'flat') return undefined
-  const magnitude = moveMagnitude(changePercent)
-  const intensity =
-    (DRIFT_INTENSITY_MIN + (1 - DRIFT_INTENSITY_MIN) * magnitude) * liveliness
-  return {
-    variant: 'drift',
-    nowMs,
-    intensity,
-    seed,
-    direction: trend === 'up' ? 'up' : 'down',
-  }
-}
-
-/**
- * The colour both round buttons take on the grid. Grey whenever nothing was
- * counted or the source is offline — never a colour the data does not support.
- */
-export function breadthColor(
-  quotes: Iterable<Quote>, marketState: MarketState, status: StockStatus,
-): Rgb {
-  if (status === 'offline') return theme.gray
-  const { up, down } = breadth(quotes)
-  if (up === 0 && down === 0) return theme.gray
-  const target = up > down ? theme.green : down > up ? theme.red : theme.amber
-  // The same mood multiplier the wash uses, so a closed market's lights are as
-  // quiet as its tiles.
+export function breadthButtons(
+  quotes: Iterable<Quote | undefined>, marketState: MarketState, status: StockStatus, nowMs: number,
+): [Rgb, Rgb] {
+  if (status === 'offline') return [theme.gray, theme.gray]
+  const { up, down, counted } = breadth(quotes)
+  if (counted === 0) return [theme.gray, theme.gray]
   const mood = MOOD_BY_STATE[marketState]
-  return [
-    Math.round(target[0] * mood),
-    Math.round(target[1] * mood),
-    Math.round(target[2] * mood),
-  ]
-}
-
-/** `123.5` becomes `123.50`. Never NaN, because it checks finiteness first. */
-function formatPrice(price: number | null): string {
-  return typeof price === 'number' && Number.isFinite(price) ? price.toFixed(2) : '--'
-}
-
-/** `-1.586` becomes `▼ 1.59%`. `null` and non-finite values become `--`. */
-function formatChange(changePercent: number | null, trend: Trend): string {
-  if (typeof changePercent !== 'number' || !Number.isFinite(changePercent)) return '--'
-  return `${trendArrow(trend)} ${Math.abs(changePercent).toFixed(2)}%`
-}
-
-/** `price - previousClose` as a signed currency string: `-5.30`, `5.30`
- * (flat needs no sign), `12.00`. `null` when either side is unknown. */
-function formatChangeValue(price: number | null, previousClose: number | null): string {
-  if (typeof price !== 'number' || typeof previousClose !== 'number') return '--'
-  if (!Number.isFinite(price) || !Number.isFinite(previousClose)) return '--'
-  const diff = price - previousClose
-  const magnitude = Math.abs(diff).toFixed(2)
-  // M8 — the sign comes from the ROUNDED magnitude, not the raw diff: a diff
-  // in (-0.005, 0) has a negative raw sign but rounds its magnitude to
-  // `0.00`, and printing that combination gave `-0.00` — a "loss" of
-  // nothing, self-contradictory the same way `STALE 0m` was for I3.
-  const sign = diff < 0 && magnitude !== '0.00' ? '-' : ''
-  return `${sign}${magnitude}`
-}
-
-/** The newest `asOf` across all quotes, or null when none is known yet. */
-function latestAsOf(quotes: Map<string, Quote>): number | null {
-  let max: number | null = null
-  for (const q of quotes.values()) {
-    if (q.asOf > 0 && (max === null || q.asOf > max)) max = q.asOf
+  const level = (share: number): number => mood * (BUTTON_FLOOR + (1 - BUTTON_FLOOR) * share)
+  let left = scaleRgb(theme.green, level(up / counted))
+  let right = scaleRgb(theme.red, level(down / counted))
+  if (marketState === 'open') {
+    left = breathe(left, nowMs, BUTTON_BREATHE_MS, BUTTON_BREATHE_DEPTH)
+    right = breathe(right, nowMs, BUTTON_BREATHE_MS, BUTTON_BREATHE_DEPTH)
   }
-  return max
-}
-
-/** `4:20 PM EDT` — the exchange trades US Eastern hours, which is also the
- * project's one timestamp zone, per `AGENTS.md`'s "Product conventions".
- * Measured at 211.3 px for the widest case, `MARKET CLOSED · 4:05 PM EDT`,
- * well inside the strip's 236 px usable width, so the zone abbreviation
- * stays on. */
-function formatAsOf(epochSeconds: number): string {
-  return formatEasternTime(epochSeconds * 1000)
+  return [left, right]
 }
 
 /**
- * `asOf`, formatted, or `--` when unknown. Per I1: `asOf` is 0 when a
- * quote's `regularMarketTime` never arrived, and both strips used to
- * substitute the RENDER clock there — a page must never do that (never
- * `Date.now()`, and never the `now` it is handed either, standing in for a
- * measurement that was never taken). `--` is the same honesty convention
- * every other unknown value on this page already uses.
- */
-function formatAsOfOrUnknown(asOf: number | null): string {
-  return asOf !== null && asOf > 0 ? formatAsOf(asOf) : '--'
-}
-
-/** The part of `StockSource` this page needs. */
-export interface StockReader {
-  /** The watchlist, in key order. The page draws one tile per entry and must
-   * never assume a default: the source owns this list, because the source is
-   * what fetches it. */
-  getSymbols(): readonly string[]
-  getQuotes(): Map<string, Quote>
-  getStatus(): StockStatus
-  getMarketState(): MarketState
-  /** True when THIS symbol's own quote has gone stale. Drives dimming for
-   * both the grid tile and the detail view, so one lagging ticker dims on
-   * its own instead of the whole board dimming for it. */
-  isSymbolStale(symbol: string): boolean
-  setVisible(visible: boolean): void
-  /** Read-only. Never triggers a fetch — see `setWatchedSymbol`. */
-  getYearlyState(symbol: string): YearlyState
-  /**
-   * Tells the source which symbol's detail view is open (or `null` when
-   * none is). Per M1, this is the ONLY way this page ever asks for a yearly
-   * fetch — `render()` must stay pure, so the source itself is what
-   * re-checks freshness on its own poll while a symbol stays watched. The
-   * page calls this from `onKeyPress` alone, on selection and on leaving
-   * detail mode — never from `render`.
-   */
-  setWatchedSymbol(symbol: string | null): void
-}
-
-/**
- * How far this page's tape has scrolled at `nowMs`.
- *
- * The arithmetic lives in `render/canvas.ts`, shared with the football page's
- * schedule tape; this wrapper binds it to THIS page's speed, which is a page
- * decision. Exported so a test can prove the motion without rasterising.
- */
-export function tapeOffsetPx(nowMs: number, pxPerSec: number = TAPE_PX_PER_SEC): number {
-  return sharedTapeOffsetPx(nowMs, pxPerSec)
-}
-
-/**
- * One tape segment per symbol: `SYMBOL price ▲change%`, coloured by the SAME
- * `trendOf` call the tile's border, its change line and its heat wash use — so
- * all four agree about direction.
- *
- * A per-symbol stale quote takes the dim colour for its own segment only. One
- * lagging ticker never dims the whole tape, matching how the tiles behave.
+ * One tape segment per priced symbol: `NVDA 188.92 +3.41%`, coloured by the
+ * same `trendOf` the tile uses. A stale symbol dims its own segment only.
+ * Every character is one 13 px Menlo advance; see `stocks-tape.ts`.
  */
 export function tapeSegments(
-  quotes: Map<string, Quote>,
+  quotes: ReadonlyMap<string, Quote>,
   isStale: (symbol: string) => boolean,
   symbols: readonly string[],
 ): TapeSegment[] {
@@ -426,29 +220,95 @@ export function tapeSegments(
   for (const symbol of symbols) {
     const quote = quotes.get(symbol)
     if (!quote || quote.price === null) continue
-    const trend = trendOf(quote.changePercent)
-    const text = `${symbol} ${formatPrice(quote.price)} ${formatChange(quote.changePercent, trend)}`
     segments.push({
-      text,
-      color: isStale(symbol) ? theme.textDim : trendColor(trend),
+      text: `${symbol} ${formatPrice(quote.price)} ${formatSignedPct(quote.changePercent)}`,
+      color: isStale(symbol) ? theme.textDim : trendColor(trendOf(quote.changePercent)),
     })
   }
   return segments
 }
 
+/** What one grid key is. ONE function, read by `render` and `onKeyPress`, so
+ * a key can never draw as one thing and answer a press as another. */
+export type GridRole =
+  | { kind: 'tile'; symbol: string }
+  | { kind: 'breadth' }
+  | { kind: 'mascot' }
+  | { kind: 'empty' }
+
 /**
- * One ticker per key, eight keys, eight symbols, no empty key and no
- * overflow. Pressing a ticker enters a detail mode for that one symbol,
- * spread across all eight keys, with BACK on key 7. A key dims when ITS OWN
- * symbol's quote has gone stale, so one lagging ticker never dims tiles that
- * are still fresh.
+ * With six or fewer symbols the last two keys are free: key 7 (index 6)
+ * shows breadth and key 8 (index 7) the mood mascot. With seven, only the
+ * mascot fits. With eight, neither.
+ */
+export function gridRole(index: number, symbols: readonly string[]): GridRole {
+  const n = Math.min(8, symbols.length)
+  if (index < 0 || index > 7) return { kind: 'empty' }
+  if (index < n) return { kind: 'tile', symbol: symbols[index]! }
+  if (index === 6 && n <= 6) return { kind: 'breadth' }
+  if (index === 7 && n <= 7) return { kind: 'mascot' }
+  return { kind: 'empty' }
+}
+
+/** The part of `StockSource` this page needs. */
+export interface StockReader {
+  /** The watchlist, in key order. The page must never assume a default. */
+  getSymbols(): readonly string[]
+  getQuotes(): Map<string, Quote>
+  getStatus(): StockStatus
+  getMarketState(): MarketState
+  /** The next session edge the upstream reported, or null when unknown. */
+  getNextBoundary(): MarketBoundary | null
+  /** True when THIS symbol's own quote has gone stale. */
+  isSymbolStale(symbol: string): boolean
+  setVisible(visible: boolean): void
+  /** Read-only. Never triggers a fetch — see `setWatchedSymbol`. */
+  getYearlyState(symbol: string): YearlyState
+  /** Tells the source which symbol's detail view is open, or null. Called
+   * from `onKeyPress` and `onLeave` only, never from `render`. */
+  setWatchedSymbol(symbol: string | null): void
+}
+
+type ChartMode = '1d' | '52wk'
+
+interface ChartSeries {
+  values: number[]
+  label: string
+  stale: boolean
+  color: Rgb
+  baseline?: number
+  minHalfRange?: number
+}
+
+/**
+ * The board the user leaves on all day. One tile per symbol with the day's
+ * change as the hero; breadth and a mood mascot on free keys; a strip that
+ * rotates useful facts above a tape that rests on each quote; buttons that
+ * glow by breadth; and a few rare moments — the bells and the first ±2 %
+ * crossing of a day.
+ *
+ * Presses carry no clock, so a press only records intent (a pending peek,
+ * a pending heart). The next `render`, which the daemon runs straight after
+ * every press, stamps it with its own `nowMs`. That keeps every animation
+ * on the injected clock.
  */
 export class StocksPage implements Page {
   readonly name = 'stocks'
 
-  /** The symbol shown in detail mode, or null on the grid. `onLeave` always
-   * clears this, so the page reopens on the grid every time. */
+  /** The symbol shown in detail mode, or null on the grid. */
   private selected: string | null = null
+  private chartMode: ChartMode = '1d'
+  /** Symbol to the `nowMs` its peek started. Pruned on every render, so at
+   * most one entry per symbol and only for 3 s. */
+  private peeks = new Map<string, number>()
+  private pendingPeeks = new Set<string>()
+  private pendingHearts = false
+  private heartsAtMs: number | null = null
+  private pendingLeaders = false
+  private leadersAtMs: number | null = null
+  /** The clock of the last render, for press decisions and `tickMs`. */
+  private lastRenderMs: number | null = null
+  private readonly moments = new StockMoments()
 
   constructor(private readonly source: StockReader) {}
 
@@ -458,279 +318,509 @@ export class StocksPage implements Page {
 
   onLeave(): void {
     this.selected = null
+    this.chartMode = '1d'
+    this.peeks.clear()
+    this.pendingPeeks.clear()
+    this.pendingHearts = false
+    this.pendingLeaders = false
+    this.heartsAtMs = null
+    this.leadersAtMs = null
     this.source.setWatchedSymbol(null)
     this.source.setVisible(false)
+    // `moments` keeps its once-a-day keys across a leave, so coming back
+    // never rings a bell twice. Its observation clock also goes stale while
+    // hidden, which is what stops a transition that happened while nobody
+    // watched from firing on return.
   }
 
-  /** The quote `this.selected` names, or null when nothing is selected OR
-   * the selected symbol has no quote (this should not happen — quotes are
-   * only ever added, never removed — but a page must never throw). Computed
-   * fresh from `quotes` every call rather than cached, so `render` never
-   * needs to mutate `this.selected` to fall back to the grid (M3: a page
-   * must not mutate its own state inside `render`) — `onKeyPress` calls
-   * this too, so the two stay consistent about whether a symbol is really
-   * selected. */
   private activeQuote(quotes: Map<string, Quote>): Quote | null {
     if (this.selected === null) return null
     return quotes.get(this.selected) ?? null
   }
 
   render(now: number, nowMs?: number): DeckFrame {
-    const quotes = this.source.getQuotes()
-    // A page never reads the wall clock. The daemon injects both, and the
-    // seconds value is the documented fallback for the millisecond one.
     const ms = nowMs ?? now * 1000
+    const quotes = this.source.getQuotes()
+    const symbols = this.source.getSymbols()
+    const marketState = this.source.getMarketState()
+
+    this.stampPending(ms)
+    this.moments.observe({
+      nowMs: ms,
+      state: marketState,
+      boundary: this.source.getNextBoundary(),
+      quotes,
+      symbols,
+      isStale: (s) => this.source.isSymbolStale(s),
+    })
+    this.lastRenderMs = ms
 
     const quote = this.activeQuote(quotes)
-    if (quote) return this.detailFrame(this.selected!, quote, now)
+    if (quote) return this.detailFrame(this.selected!, quote, now, marketState)
+    return this.gridFrame(quotes, symbols, marketState, ms)
+  }
 
-    const marketState = this.source.getMarketState()
-    // The drift's clock is quantised so the daemon's dirty-key check can skip
-    // most key writes. The TAPE's clock below is not, so it stays smooth.
-    const driftMs = Math.floor(ms / DRIFT_QUANTUM_MS) * DRIFT_QUANTUM_MS
-    const keys = this.source.getSymbols().map((symbol, i) =>
-      // `i` is the seed: each tile drifts on its own phase, so eight tiles moving
-      // the same way still read as eight tiles rather than one sheet.
-      this.tickerKey(quotes.get(symbol), symbol, marketState, driftMs, i),
-    )
-    // Both buttons take ONE colour. They are page navigation, so two different
-    // colours would read as two different controls; one board-level signal is
-    // what this surface can honestly carry.
-    const board = breadthColor(quotes.values(), marketState, this.source.getStatus())
-    return {
-      keys,
-      strip: this.strip(quotes, ms),
-      buttons: [board, board],
+  /** Gives every press recorded since the last render this render's clock,
+   * and drops peeks and pops that have finished. */
+  private stampPending(ms: number): void {
+    for (const s of this.pendingPeeks) this.peeks.set(s, ms)
+    this.pendingPeeks.clear()
+    if (this.pendingHearts) this.heartsAtMs = ms
+    if (this.pendingLeaders) this.leadersAtMs = ms
+    this.pendingHearts = false
+    this.pendingLeaders = false
+    for (const [s, at] of this.peeks) {
+      if (!(ms - at < PEEK_MS) || ms < at) this.peeks.delete(s)
     }
   }
 
-  private tickerKey(
-    quote: Quote | undefined, symbol: string, marketState: MarketState,
-    nowMs: number, seed: number,
-  ): KeySpec {
-    const trend = trendOf(quote?.changePercent ?? null)
-    const unknown = !quote || quote.price === null
-    const stale = this.source.isSymbolStale(symbol)
+  /** A peek counts as showing while it is pending or in `peeks`; every
+   * render prunes `peeks` at 3 s, so the map alone is the answer as of the
+   * last frame the user saw. */
+  private peekActive(symbol: string): boolean {
+    return this.pendingPeeks.has(symbol) || this.peeks.has(symbol)
+  }
 
+  // ---------------------------------------------------------------- grid
+
+  private gridFrame(
+    quotes: Map<string, Quote>, symbols: readonly string[], marketState: MarketState, ms: number,
+  ): DeckFrame {
+    const watch = symbols.slice(0, 8).map((s) => quotes.get(s))
+    const keys: KeySpec[] = []
+    for (let i = 0; i < 8; i++) {
+      const role = gridRole(i, symbols)
+      if (role.kind === 'tile') {
+        const at = this.peeks.get(role.symbol)
+        keys.push(at !== undefined && ms >= at && ms - at < PEEK_MS
+          ? this.peekKey(role.symbol, quotes.get(role.symbol))
+          : this.tileKey(role.symbol, quotes.get(role.symbol), marketState, ms))
+      } else if (role.kind === 'breadth') {
+        keys.push(this.breadthKey(watch))
+      } else if (role.kind === 'mascot') {
+        keys.push(this.mascotKey(watch, marketState, ms))
+      } else {
+        keys.push({ kind: 'blank' })
+      }
+    }
+
+    // The opening bell: a mint sweep cascades left to right, 90 ms apart.
+    const bell = this.moments.bell
+    if (bell && bell.kind === 'open' && ms - bell.atMs < SWEEP_MS + 8 * SWEEP_STAGGER_MS) {
+      keys.forEach((key, i) => {
+        if (key.kind === 'blank') return
+        key.effects = [
+          ...(key.effects ?? []),
+          { variant: 'sweep', startedAtMs: bell.atMs + i * SWEEP_STAGGER_MS, nowMs: ms },
+        ]
+      })
+    }
+
+    let buttons = breadthButtons(watch, marketState, this.source.getStatus(), ms)
+    if (bell && bell.kind === 'open' && ms >= bell.atMs && ms - bell.atMs < BELL_PULSE_MS) {
+      const pulse = breathe(theme.green, ms - bell.atMs, 500, 0.75)
+      buttons = [pulse, pulse]
+    }
+
+    return { keys, strip: this.gridStrip(quotes, symbols, marketState, ms), buttons }
+  }
+
+  private tileKey(symbol: string, quote: Quote | undefined, marketState: MarketState, ms: number): KeySpec {
+    const cp = quote?.changePercent ?? null
+    const trend = trendOf(cp)
+    const color = trendColor(trend)
+    const unknown = !quote || quote.price === null
     const key: KeySpec = {
       kind: 'gauge',
-      lines: [symbol, formatPrice(quote?.price ?? null), formatChange(quote?.changePercent ?? null, trend)],
-      // Only the border and the change line carry the trend colour. The
-      // price stays in the default text colour so it always reads clean.
-      lineColors: [undefined, undefined, trendColor(trend)],
-      border: trendColor(trend),
+      lines: [symbol, formatShortPrice(quote?.price), formatSignedPct(cp)],
+      lineSizes: [11, 11, HERO_SIZES],
+      lineY: [6, 6, 22],
+      lineAligns: ['left', 'right', 'center'],
+      lineWeights: ['bold', undefined, 'bold'],
+      lineColors: [theme.textDim, theme.textDim, color],
     }
-
-    // The wash comes from the SAME `trendOf` result the border and the change
-    // line use, so the three cannot disagree about direction.
-    const wash = heatWash(quote?.changePercent ?? null, marketState)
+    const wash = heatWash(cp, marketState)
     if (wash) key.bg = wash
 
-    // And the drift reads the same direction and the same magnitude function, so
-    // the tile's colour and its motion always tell one story.
-    const drift = driftFx(quote?.changePercent ?? null, marketState, stale || unknown, nowMs, seed)
-    if (drift) key.fx = drift
-
-    const spark = downsample(quote?.spark ?? [], SPARK_BUCKETS)
-    if (spark.length >= 2) {
-      key.spark = { values: spark, color: trendColor(trend) }
+    const values = downsample(quote?.spark ?? [], TILE_SPARK_POINTS)
+    if (values.length >= 2) {
+      const prev = quote?.previousClose
+      key.spark = { values, color, style: 'line' }
+      if (isFiniteNumber(prev) && prev > 0) {
+        key.spark.baseline = prev
+        key.spark.minHalfRange = prev * SPARK_MIN_HALF_RANGE
+      } else if (isFiniteNumber(quote?.price) && quote.price > 0) {
+        key.spark.minHalfRange = quote.price * SPARK_MIN_HALF_RANGE
+      }
     }
 
-    if (stale || unknown) key.dim = true
+    // The first crossing of ±2 % today: confetti and a pop up, a brick down.
+    const effects: OneShotSpec[] = []
+    for (const m of this.moments.recentMoves) {
+      if (m.symbol !== symbol) continue
+      if (m.kind === 'up') {
+        effects.push({ variant: 'burst', startedAtMs: m.atMs, nowMs: ms, seed: symbol.length })
+        key.linePop = { line: 2, startedAtMs: m.atMs, nowMs: ms }
+      } else {
+        effects.push({ variant: 'brick', startedAtMs: m.atMs, nowMs: ms })
+      }
+    }
+    if (effects.length > 0) key.effects = effects
 
+    if (this.source.isSymbolStale(symbol) || unknown) key.dim = true
     return key
   }
 
+  /** The back of a tile: the day's range as a gauge, then the volume. */
+  private peekKey(symbol: string, quote: Quote | undefined): KeySpec {
+    const lo = quote?.dayLow ?? null
+    const hi = quote?.dayHigh ?? null
+    const price = quote?.price ?? null
+    const pct = rangePercent(lo, hi, price)
+    const lines = [symbol, formatShortPrice(price), 'DAY RANGE', formatShortPrice(lo), formatShortPrice(hi)]
+    const sizes: (number | number[])[] = [11, 11, 10, 10, 10]
+    const ys = [6, 6, 22, 52, 52]
+    const aligns: ('left' | 'center' | 'right' | undefined)[] = ['left', 'right', 'left', 'left', 'right']
+    const weights: ('normal' | 'bold' | undefined)[] = ['bold', undefined, 'bold', undefined, undefined]
+    const colors: (Rgb | undefined)[] = [theme.text, theme.textDim, theme.textDim, theme.textDim, theme.textDim]
+
+    // Volume only when the quote carries it. The source has no average
+    // volume, so this is the raw day volume; unknown omits the line rather
+    // than printing a 0 nobody measured.
+    const volume = quote?.volume ?? null
+    if (isFiniteNumber(volume) && volume >= 0) {
+      lines.push('VOLUME', formatVolume(volume))
+      sizes.push(10, [13, 11])
+      ys.push(66, 78)
+      aligns.push('left', 'left')
+      weights.push('bold', 'bold')
+      colors.push(theme.textDim, theme.text)
+    } else if (pct !== null) {
+      lines.push(`${pct}% of range`)
+      sizes.push(10)
+      ys.push(72)
+      aligns.push('left')
+      weights.push(undefined)
+      colors.push(theme.text)
+    }
+
+    const key: KeySpec = {
+      kind: 'gauge',
+      bg: PEEK_BG,
+      lines,
+      lineSizes: sizes,
+      lineY: ys,
+      lineAligns: aligns,
+      lineWeights: weights,
+      lineColors: colors,
+    }
+    if (isFiniteNumber(lo) && isFiniteNumber(hi) && isFiniteNumber(price) && hi > lo) {
+      key.range = {
+        lo, hi, value: price, y: 39, height: 6,
+        gradient: [theme.red, theme.green], marker: 'tick', color: theme.white,
+      }
+    }
+    if (this.source.isSymbolStale(symbol)) key.dim = true
+    return key
+  }
+
+  /** Free key 7: how many are up and down, their share, and the average. */
+  private breadthKey(watch: readonly (Quote | undefined)[]): KeySpec {
+    const { up, down, counted } = breadth(watch)
+    const avg = averageChange(watch)
+    if (counted === 0 || avg === null) {
+      return {
+        kind: 'gauge',
+        lines: ['BREADTH', '--'],
+        lineSizes: [10, 20],
+        lineY: [6, 34],
+        align: 'center',
+        lineWeights: ['bold', 'bold'],
+        lineColors: [theme.textDim, theme.textDim],
+      }
+    }
+    const avgTrend = trendOf(avg)
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: ['BREADTH', `▲${up}`, `▼${down}`, `avg ${formatSignedPct(avg)}`],
+      lineSizes: [10, 20, 20, 10],
+      lineY: [6, 26, 26, 80],
+      lineAligns: ['center', 'left', 'right', 'center'],
+      lineWeights: ['bold', 'bold', 'bold', undefined],
+      lineColors: [theme.textDim, theme.green, theme.red, trendColor(avgTrend)],
+    }
+    // The share up as one two-tone bar: green for up, red for the rest that
+    // moved. A board with nothing up or down (all flat) leaves it grey.
+    if (up + down > 0) {
+      key.bar = { value: up / (up + down), color: theme.green, bg: scaleRgb(theme.red, 0.55) }
+    } else {
+      key.bar = { value: 0, color: theme.gray, bg: theme.barTrack }
+    }
+    if (this.source.getStatus() === 'offline') key.dim = true
+    return key
+  }
+
+  /** Free key 8: a bull on a green average day, a bear on a red one. It
+   * only moves while something trades; a pressed mascot pops hearts. */
+  private mascotKey(watch: readonly (Quote | undefined)[], marketState: MarketState, ms: number): KeySpec {
+    const avg = averageChange(watch)
+    if (avg === null) return { kind: 'blank' }
+    const bull = avg >= 0
+    const key: KeySpec = {
+      kind: 'gauge',
+      mascot: { kind: bull ? 'bull' : 'bear', nowMs: isLive(marketState) ? ms : 0 },
+      lines: [bull ? 'BULLISH' : 'BEARISH'],
+      lineSizes: [9],
+      lineY: [84],
+      align: 'center',
+      lineWeights: ['bold'],
+      lineColors: [bull ? theme.green : theme.red],
+    }
+    if (this.heartsAtMs !== null && ms - this.heartsAtMs < HEARTS_MS && ms >= this.heartsAtMs) {
+      key.effects = [{ variant: 'hearts', startedAtMs: this.heartsAtMs, nowMs: ms, count: 6, y: 40 }]
+    }
+    if (this.source.getStatus() === 'offline') key.dim = true
+    return key
+  }
+
+  // --------------------------------------------------------------- strip
+
+  /** Whether the grid strip carries a tape. Read by `gridStrip` and
+   * `tickMs`, so the render rate never disagrees with the motion. */
+  private hasTape(quotes: Map<string, Quote>): boolean {
+    if (this.source.getStatus() === 'offline') return false
+    return tapeSegments(quotes, (s) => this.source.isSymbolStale(s), this.source.getSymbols()).length > 0
+  }
+
+  private gridStrip(
+    quotes: Map<string, Quote>, symbols: readonly string[], marketState: MarketState, ms: number,
+  ): StripSpec {
+    const bell = this.moments.bell
+    if (bell && ms >= bell.atMs && ms - bell.atMs < BELL_BANNER_MS) {
+      const open = bell.kind === 'open'
+      const banner: StripBanner = {
+        text: open ? '🔔 OPENING BELL' : '🔔 CLOSING BELL',
+        color: open ? theme.green : theme.amber,
+        sub: formatEasternTime(bell.labelMs),
+        pop: { startedAtMs: bell.atMs, nowMs: ms },
+      }
+      return { lines: [], banner }
+    }
+
+    // A fresh big move. A banner, not line 1: plain strip lines draw in
+    // Menlo alone, and measured, `🚀` renders there as a tofu box. The
+    // banner carries the colour-emoji fallback, and it is louder, which a
+    // once-a-day event earns.
+    const moves = this.moments.recentMoves.filter((m) => ms - m.atMs < BIG_MOVE_STRIP_MS && ms >= m.atMs)
+    const latest = moves[moves.length - 1]
+    if (latest) {
+      const q = quotes.get(latest.symbol)
+      const up = latest.kind === 'up'
+      const banner: StripBanner = {
+        text: up ? `🚀 ${latest.symbol} crossed +2%` : `🧱 ${latest.symbol} crossed −2%`,
+        color: up ? theme.green : theme.red,
+        size: 17,
+        sub: `${formatPrice(q?.price)} · ${formatSignedPct(q?.changePercent)} today`,
+      }
+      return { lines: [], banner }
+    }
+
+    const status = this.source.getStatus()
+    const watch = symbols.slice(0, 8).map((s) => quotes.get(s))
+    const line1 = truncate(this.line1(quotes, symbols, watch, marketState, ms), STRIP_CHARS)
+    const { up, down } = breadth(watch)
+    const line2 = status === 'offline' ? 'offline' : `${up} up · ${down} down`
+    const spec: StripSpec = { lines: [line1, truncate(line2, STRIP_CHARS)] }
+    if (this.hasTape(quotes)) {
+      const segments = tapeSegments(quotes, (s) => this.source.isSymbolStale(s), symbols)
+      spec.tape = snapTape(segments, ms, isLive(marketState) ? LIVE_PACE : CRAWL_PACE)
+    }
+    return spec
+  }
+
   /**
-   * The detail view for one symbol, spread across all eight keys. Every data
-   * tile (0 to 6) shares one border colour — the symbol's trend — so BACK's
-   * fixed gray border reads as visibly different, not as more data.
+   * Line 1, by priority: the leaders a breadth press
+   * asked for, then the closing summary, then the rotating facts.
    */
-  private detailFrame(symbol: string, quote: Quote, now: number): DeckFrame {
+  private line1(
+    quotes: Map<string, Quote>, symbols: readonly string[], watch: readonly (Quote | undefined)[],
+    marketState: MarketState, ms: number,
+  ): string {
+    const lead = leaders(symbols, quotes)
+    if (lead && this.leadersAtMs !== null && ms >= this.leadersAtMs && ms - this.leadersAtMs < LEADERS_MS) {
+      return `▲ ${lead.best.symbol} ${formatSignedPct(lead.best.changePercent)}  ▼ ${lead.worst.symbol} ${formatSignedPct(lead.worst.changePercent)}`
+    }
+
+    const closedAt = this.moments.closedAtMs
+    if (lead && closedAt !== null && ms >= closedAt && ms - closedAt < CLOSE_SUMMARY_MS) {
+      // Alternates every 4 s: one line holds BEST or WORST at a readable size,
+      // where both together would shrink to unreadable.
+      const worst = Math.floor((ms - closedAt) / 4000) % 2 === 1
+      const q = worst ? lead.worst : lead.best
+      return `CLOSED · ${worst ? 'WORST' : 'BEST'} ${q.symbol} ${formatSignedPct(q.changePercent)}`
+    }
+
+    const facts: string[] = []
+    const countdown = this.countdownFact(ms)
+    if (countdown) facts.push(countdown)
+    const { up, down, counted } = breadth(watch)
+    if (counted > 0 && lead) {
+      facts.push(`▲${up} ▼${down} · BEST ${lead.best.symbol} ${formatSignedPct(lead.best.changePercent)}`)
+    }
+    facts.push(`${STATE_LABELS[marketState]} · ${formatEasternTime(ms)}`)
+    const index = Math.floor(ms / FACT_ROTATE_MS)
+    return facts[((index % facts.length) + facts.length) % facts.length]!
+  }
+
+  /** `CLOSES IN 2h14m`, from the boundary the upstream reported. Null when
+   * there is none — never a countdown to a guessed time. */
+  private countdownFact(ms: number): string | null {
+    const b = this.source.getNextBoundary()
+    if (!b || !isFiniteNumber(b.atMs) || b.atMs <= ms) return null
+    const verb: Record<MarketBoundary['kind'], string> = {
+      'pre-start': 'PRE-MARKET IN',
+      'pre-end': 'OPENS IN',
+      open: 'OPENS IN',
+      close: 'CLOSES IN',
+      'post-start': 'AFTER HOURS IN',
+      'post-end': 'AFTER HOURS ENDS IN',
+    }
+    return `${verb[b.kind]} ${formatCountdown(b.atMs - ms)}`
+  }
+
+  // -------------------------------------------------------------- detail
+
+  /**
+   * The detail view for one symbol: the hero, the day range, the volume,
+   * the 52-week range, one chart across three keys, and BACK.
+   */
+  private detailFrame(symbol: string, quote: Quote, now: number, marketState: MarketState): DeckFrame {
     const trend = trendOf(quote.changePercent)
-    const border = trendColor(trend)
+    const color = trendColor(trend)
     const dim = this.source.isSymbolStale(symbol) || quote.price === null
-    const chart = this.chartSeries(symbol, quote, now)
-    // I5: the chart itself dims when its OWN yearly series has gone stale,
-    // even while the intraday quote (keys 0-3) is perfectly fresh — a
-    // detail view left open for days must not keep drawing old closes as
-    // if they were just fetched.
+    const chart = this.chartSeries(symbol, quote, now, color)
     const chartDim = dim || chart.stale
 
     const keys: KeySpec[] = [
-      this.priceKey(quote, border, dim),
-      this.changeKey(quote, trend, border, dim),
-      this.rangeKey('DAY', quote.dayHigh, quote.dayLow, border, dim),
-      this.rangeKey('52 WK', quote.week52High, quote.week52Low, border, dim),
-      this.chartKey(chart, trend, border, chartDim, 0),
-      this.chartKey(chart, trend, border, chartDim, 1),
-      this.chartKey(chart, trend, border, chartDim, 2),
+      this.heroKey(quote, trend, marketState, dim),
+      this.gaugeKey('DAY RANGE', quote.dayLow, quote.dayHigh, quote.price, dim),
+      this.volumeKey(quote, dim),
+      this.gaugeKey('52 WEEKS', quote.week52Low, quote.week52High, quote.price, dim),
+      this.chartKey(chart, chartDim, 0),
+      this.chartKey(chart, chartDim, 1),
+      this.chartKey(chart, chartDim, 2),
       this.backKey(),
     ]
 
-    // The whole frame is about ONE symbol, so the buttons carry that symbol's
-    // trend rather than the board's breadth.
-    const mood = MOOD_BY_STATE[this.source.getMarketState()]
-    const lights: Rgb = [
-      Math.round(border[0] * mood),
-      Math.round(border[1] * mood),
-      Math.round(border[2] * mood),
-    ]
-
-    return {
-      keys,
-      strip: this.detailStrip(quote),
-      buttons: [lights, lights],
-    }
+    const lights = scaleRgb(color, MOOD_BY_STATE[marketState])
+    return { keys, strip: this.detailStrip(quote, marketState), buttons: [lights, lights] }
   }
 
-  /**
-   * Picks what the wide chart (keys 4, 5 and 6) draws: the 52-week daily
-   * series once it has loaded, or the intraday series — clearly labelled
-   * either way — while that fetch is still loading, has never succeeded for
-   * this symbol, or the symbol simply has no yearly data yet. Never hands
-   * back the intraday series under the `52 WK` label: the label always
-   * matches the values it goes with, so a still-loading or failed yearly
-   * fetch shows the grid's own honest range instead of silently
-   * mislabelling a day as a year.
-   *
-   * Per I5, only READS the yearly state — per M1, it triggers no fetch of
-   * its own: `render()` must stay pure (AGENTS.md's "does not access ...
-   * the network"). `setWatchedSymbol` (called from `onKeyPress`, never from
-   * `render`) is what asks the source to keep this symbol's yearly series
-   * fresh on the source's own poll, so a detail view left open past the
-   * 6-hour refresh interval still gets a fresh copy without this method
-   * doing any I/O itself. `stale` still tells the caller the age it can
-   * see, purely for dimming.
-   */
-  private chartSeries(symbol: string, quote: Quote, now: number): { values: number[]; label: string; stale: boolean } {
-    const yearly = this.source.getYearlyState(symbol)
-    if (yearly.status === 'ok' && yearly.values.length >= 2) {
-      const stale = now - yearly.updatedAt > YEARLY_REFRESH_SECONDS
-      return { values: yearly.values, label: '52 WK', stale }
+  private chartSeries(symbol: string, quote: Quote, now: number, color: Rgb): ChartSeries {
+    if (this.chartMode === '52wk') {
+      const yearly = this.source.getYearlyState(symbol)
+      if (yearly.status === 'ok' && yearly.values.length >= 2) {
+        const first = yearly.values[0]!
+        const last = yearly.values[yearly.values.length - 1]!
+        return {
+          values: yearly.values,
+          label: '52 WK',
+          stale: now - yearly.updatedAt > YEARLY_REFRESH_SECONDS,
+          color: last > first ? theme.green : last < first ? theme.red : theme.gray,
+        }
+      }
     }
-    return { values: quote.spark, label: '1D', stale: false }
+    const series: ChartSeries = {
+      values: downsample(quote.spark, DETAIL_SPARK_POINTS),
+      label: '1D',
+      stale: false,
+      color,
+    }
+    if (isFiniteNumber(quote.previousClose) && quote.previousClose > 0) {
+      series.baseline = quote.previousClose
+      series.minHalfRange = quote.previousClose * SPARK_MIN_HALF_RANGE
+    }
+    return series
   }
 
-  /** Key 0: the symbol, then the price sized to fit whatever width the
-   * actual digits need. The size candidates are declared here; `renderKey`
-   * measures and resolves them — per docs/LESSONS.md #17, and per the A3
-   * ruling that pages declare intent while the renderer does the canvas
-   * work. */
-  private priceKey(quote: Quote, border: Rgb, dim: boolean): KeySpec {
-    const priceText = formatPrice(quote.price)
-    const key: KeySpec = {
-      kind: 'gauge',
-      lines: [quote.symbol, priceText],
-      lineSizes: [SYMBOL_SIZE, PRICE_SIZES],
-      border,
-    }
-    if (dim) key.dim = true
-    return key
-  }
-
-  /** Key 1: the change percent (with the existing trend arrow), then the
-   * change amount. Both lines carry the trend colour. */
-  private changeKey(quote: Quote, trend: Trend, border: Rgb, dim: boolean): KeySpec {
-    const pctText = formatChange(quote.changePercent, trend)
-    const valText = formatChangeValue(quote.price, quote.previousClose)
+  /** Key 1: symbol, price, the change, and the change amount. */
+  private heroKey(quote: Quote, trend: Trend, marketState: MarketState, dim: boolean): KeySpec {
     const color = trendColor(trend)
     const key: KeySpec = {
       kind: 'gauge',
-      lines: [pctText, valText],
-      lineSizes: [PRICE_SIZES, PRICE_SIZES],
-      lineColors: [color, color],
-      border,
+      lines: [quote.symbol, formatPrice(quote.price), formatSignedPct(quote.changePercent),
+        formatChangeValue(quote.price, quote.previousClose)],
+      lineSizes: [DETAIL_SYMBOL_SIZES, DETAIL_NUMBER_SIZES, DETAIL_NUMBER_SIZES, 11],
+      lineY: [8, 36, 58, 80],
+      align: 'center',
+      lineWeights: ['bold', undefined, 'bold', undefined],
+      lineColors: [theme.text, theme.text, color, theme.textDim],
     }
+    const wash = heatWash(quote.changePercent, marketState)
+    if (wash) key.bg = wash
     if (dim) key.dim = true
     return key
   }
 
-  /**
-   * Keys 2 and 3: a label, then the high, then the low. Used for both the
-   * day range and the 52-week range — the only difference is the label and
-   * which two fields feed it.
-   *
-   * The high and low lines pass the SAME `PRICE_SIZES` array (by value), so
-   * `renderKey` sizes them as one group (M3) — otherwise fitting each line
-   * independently could render the low bigger than the high directly above
-   * it, which reads as two unrelated numbers instead of one range.
-   */
-  private rangeKey(label: string, high: number | null, low: number | null, border: Rgb, dim: boolean): KeySpec {
-    const highText = formatPrice(high)
-    const lowText = formatPrice(low)
+  /** Keys 2 and 4: a range gauge with the price marked, and where in the
+   * range the price sits. Unknown ends print `--` and draw no gauge. */
+  private gaugeKey(
+    label: string, lo: number | null, hi: number | null, value: number | null, dim: boolean,
+  ): KeySpec {
+    const pct = rangePercent(lo, hi, value)
     const key: KeySpec = {
       kind: 'gauge',
-      lines: [label, highText, lowText],
-      lineSizes: [LABEL_SIZE, PRICE_SIZES, PRICE_SIZES],
-      border,
+      lines: [label, formatShortPrice(lo), formatShortPrice(hi), pct === null ? '--' : `${pct}% of range`],
+      lineSizes: [10, 10, 10, 10],
+      lineY: [10, 58, 58, 78],
+      lineAligns: ['center', 'left', 'right', 'center'],
+      lineWeights: ['bold', undefined, undefined, undefined],
+      lineColors: [theme.textDim, theme.textDim, theme.textDim, theme.text],
+    }
+    if (isFiniteNumber(lo) && isFiniteNumber(hi) && isFiniteNumber(value) && hi > lo) {
+      key.range = { lo, hi, value, gradient: [theme.red, theme.green] }
     }
     if (dim) key.dim = true
     return key
   }
 
-  /**
-   * Keys 4, 5 and 6: one chart, spanning all three — the 52-week series
-   * (`chart.label` is `52 WK`) once it has loaded, otherwise the intraday
-   * series labelled `1D`, per `chartSeries`. Each key draws only its own
-   * slice of the SAME series, so the three stay in scale with each other —
-   * see `SparkSpec.slice` in `render/specs.ts`. These three keys carry no
-   * text lines, so the chart uses `fullHeight` (M4) to own most of the
-   * tile; `labelBand` reserves a strip at the top for the caption, applied
-   * identically on all three keys so the bars still line up at the seams,
-   * and `label` itself is set only on index 0 so the caption is not
-   * repeated three times.
-   *
-   * Per I4, this now handles every point count sensibly instead of just
-   * "4 or more":
-   * - 0 or 1 points: nothing to draw at all, but a chart slot must never go
-   *   blank with no explanation — key 4 alone still carries `chart.label` as
-   *   a plain text line, in the SAME spot `drawSpark`'s own caption would
-   *   occupy, so there is always a caption when a chart slot is shown.
-   * - 2 or 3 points: too few to slice across `CHART_SPAN` keys — measured,
-   *   `drawSpark`'s per-key virtual-width geometry puts the whole series on
-   *   the wrong key, or draws none at all on this one. Key 4 alone draws
-   *   the whole (tiny) series un-sliced instead, the same "no slice" mode
-   *   the grid ticker's own sparkline already uses; keys 5 and 6 stay
-   *   blank, since there is no meaningful "next third" of a 2- or 3-point
-   *   series to show them.
-   * - 4 or more points: the existing 3-key slice, unchanged.
-   */
-  private chartKey(
-    chart: { values: number[]; label: string },
-    trend: Trend,
-    border: Rgb,
-    dim: boolean,
-    index: number,
-  ): KeySpec {
-    const key: KeySpec = { kind: 'gauge', border }
-    const n = chart.values.length
+  /** Key 3: the day's volume. The source carries no average volume, so this
+   * is the raw count; unknown prints `--`, never 0. */
+  private volumeKey(quote: Quote, dim: boolean): KeySpec {
+    const known = isFiniteNumber(quote.volume) && quote.volume >= 0
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: ['VOLUME', formatVolume(quote.volume), known ? 'shares today' : 'not reported'],
+      lineSizes: [10, [24, 20, 17], 10],
+      lineY: [10, 36, 72],
+      align: 'center',
+      lineWeights: ['bold', 'bold', undefined],
+      lineColors: [theme.textDim, known ? theme.text : theme.textDim, theme.textDim],
+    }
+    if (dim) key.dim = true
+    return key
+  }
 
+  /** Keys 5 to 7: one line chart across three keys, the previous close
+   * dotted through it on the 1D view. Fewer than 4 points draws whole on
+   * key 5; fewer than 2 shows only the caption (I4). */
+  private chartKey(chart: ChartSeries, dim: boolean, index: number): KeySpec {
+    const key: KeySpec = { kind: 'gauge' }
+    const n = chart.values.length
+    const base = {
+      values: chart.values,
+      color: chart.color,
+      style: 'line' as const,
+      fullHeight: true,
+      labelBand: true,
+      ...(chart.baseline !== undefined ? { baseline: chart.baseline } : {}),
+      ...(chart.minHalfRange !== undefined ? { minHalfRange: chart.minHalfRange } : {}),
+    }
     if (n >= MIN_SLICE_POINTS) {
-      key.spark = {
-        values: chart.values,
-        color: trendColor(trend),
-        slice: { index, count: CHART_SPAN },
-        fullHeight: true,
-        labelBand: true,
-        label: index === 0 ? chart.label : undefined,
-      }
+      key.spark = { ...base, slice: { index, count: CHART_SPAN }, label: index === 0 ? chart.label : undefined }
     } else if (n >= 2) {
-      if (index === 0) {
-        key.spark = {
-          values: chart.values,
-          color: trendColor(trend),
-          fullHeight: true,
-          labelBand: true,
-          label: chart.label,
-        }
-      }
+      if (index === 0) key.spark = { ...base, label: chart.label }
     } else if (index === 0) {
-      // 0 or 1 points: no bars to draw, but the caption must still appear.
-      // Positioned to match exactly where `drawSpark`'s own `label` would
-      // land for a `fullHeight`/`labelBand` chart (`x0 = BORDER + PAD`,
-      // `y = SPARK_FULL_Y`), so a chart slot with a caption and one with
-      // real bars read as the same family of tile.
       key.lines = [chart.label]
       key.lineSizes = [11]
       key.lineY = [6]
@@ -739,134 +829,121 @@ export class StocksPage implements Page {
     return key
   }
 
-  /** Key 7: BACK. A gray border and no trend colour, on purpose, so it never
-   * reads as one more data tile. Centred vertically as well as
-   * horizontally (M4) — with no other line to share the tile, the label
-   * reads better in the middle than hugging the top edge. */
   private backKey(): KeySpec {
     return {
       kind: 'control',
-      lines: ['◀ BACK'],
-      lineSizes: [BACK_SIZE],
-      lineY: [40],
+      bg: [20, 22, 28],
+      lines: ['←', 'BACK'],
+      lineSizes: [26, 11],
+      lineY: [24, 60],
       align: 'center',
-      border: theme.gray,
+      lineWeights: [undefined, 'bold'],
+      lineColors: [theme.text, theme.textDim],
     }
   }
 
-  /**
-   * I4 — the grid strip's own `offline` honesty signal (see `strip` below)
-   * used to disappear entirely in detail mode: `MARKET CLOSED · 4:00 PM
-   * EDT` is the last TRADE time, not the last fetch, so a detail view left
-   * open for hours after the network dropped read as entirely normal, at
-   * full brightness, with nothing on the frame to say the daemon has not
-   * reached Yahoo since this morning. Both strip lines are already spoken
-   * for (the company name, the market state and trade time), so this
-   * mirrors weather's own fix for the identical shape (`weather-page.ts`'s
-   * `detailStrip`, its own M2): put the status in `right`, the field
-   * `StripSpec` reserves for exactly this, rather than dropping either line.
-   */
-  private detailStrip(quote: Quote): StripSpec {
-    const marketState = this.source.getMarketState()
+  /** Company name, then the market state and the last trade time. `right`
+   * carries `offline`, so a view left open across an outage says so (I4). */
+  private detailStrip(quote: Quote, marketState: MarketState): StripSpec {
     const line1 = truncate(quote.name, STRIP_CHARS)
-    const line2 = truncate(
-      `${STATE_LABELS[marketState]} · ${formatAsOfOrUnknown(quote.asOf > 0 ? quote.asOf : null)}`,
-      STRIP_CHARS,
-    )
+    const asOf = quote.asOf > 0 ? formatEasternTime(quote.asOf * 1000) : '--'
+    const line2 = truncate(`${STATE_LABELS[marketState]} · ${asOf}`, STRIP_CHARS)
     const right = this.source.getStatus() === 'offline' ? 'offline' : undefined
     return { lines: [line1, line2], right }
   }
 
-  /**
-   * Whether the grid strip would carry a scrolling tape right now. Read by both
-   * `strip` and `tickMs`, so the declared render rate can never disagree with
-   * whether anything is actually moving (lesson 21: one decision, one function).
-   */
-  private hasTape(quotes: Map<string, Quote>): boolean {
-    if (this.source.getStatus() === 'offline') return false
-    // A tape needs at least one real, priced quote. An empty board keeps its
-    // static line 2, so an offline or not-yet-loaded deck still says so.
-    return tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym), this.source.getSymbols()).length > 0
+  // ---------------------------------------------------------------- rate
+
+  /** True while a one-shot needs the fast tick, judged at the last render. */
+  private animating(): boolean {
+    if (this.pendingPeeks.size > 0 || this.pendingHearts || this.pendingLeaders) return true
+    const ms = this.lastRenderMs
+    if (ms === null) return false
+    const bell = this.moments.bell
+    if (bell && ms - bell.atMs < BELL_BANNER_MS) return true
+    if (this.moments.recentMoves.some((m) => ms - m.atMs < BURST_MS)) return true
+    if (this.heartsAtMs !== null && ms - this.heartsAtMs < HEARTS_MS) return true
+    return false
   }
 
   /**
-   * A fast tick ONLY while the tape is scrolling.
-   *
-   * Unlike the weather effects and the heat wash, this motion does not stop for
-   * stale data: the strip shows about 30 of the tape's ~145 characters, so
-   * freezing it would make seven of the eight symbols unreachable. The movement
-   * carries the content, not just liveliness. Staleness is expressed in each
-   * segment's colour and in line 1's timestamp instead. See the design note in
-   * docs/superpowers/specs/2026-08-18-stocks-ticker-tape-design.md.
+   * 40 ms while the tape moves at its live pace or a one-shot runs; 100 ms
+   * for a hopping mascot; 200 ms for the closed-market crawl; the default
+   * otherwise.
+   * Idle frames are byte-identical, so a fast tick writes nothing extra.
    */
   get tickMs(): number | undefined {
-    // A detail view has no tape, so it keeps the default rate.
     const quotes = this.source.getQuotes()
     if (this.activeQuote(quotes) !== null) return undefined
-    return this.hasTape(quotes) ? TAPE_TICK_MS : undefined
+    const live = isLive(this.source.getMarketState())
+    const tape = this.hasTape(quotes)
+    if ((tape && live) || this.animating()) return FAST_TICK_MS
+    if (live) return MASCOT_TICK_MS
+    if (tape) return CRAWL_TICK_MS
+    return undefined
   }
 
-  private strip(quotes: Map<string, Quote>, nowMs: number): StripSpec {
-    const status = this.source.getStatus()
-    const marketState = this.source.getMarketState()
-    const line1 = truncate(`${STATE_LABELS[marketState]} · ${formatAsOfOrUnknown(latestAsOf(quotes))}`, STRIP_CHARS)
-
-    let line2: string
-    if (status === 'offline') {
-      line2 = 'offline'
-    } else {
-      // The SAME count the round buttons' colour reads, so the lights and these
-      // words can never contradict each other on one frame.
-      const { up, down } = breadth(quotes.values())
-      line2 = `${up} up · ${down} down`
-    }
-
-    const spec: StripSpec = { lines: [line1, truncate(line2, STRIP_CHARS)] }
-
-    // The tape OWNS line 2's band when it is present, so `line2` above becomes
-    // the fallback the offline and not-yet-loaded cases keep.
-    if (this.hasTape(quotes)) {
-      spec.tape = {
-        segments: tapeSegments(quotes, (sym) => this.source.isSymbolStale(sym), this.source.getSymbols()),
-        offsetPx: tapeOffsetPx(nowMs),
-      }
-    }
-
-    return spec
-  }
+  // --------------------------------------------------------------- press
 
   onKeyPress(index: number): PressOutcome {
     const quotes = this.source.getQuotes()
-    if (this.activeQuote(quotes) === null) {
-      const symbol = this.source.getSymbols()[index]
-      if (!symbol) return 'ignored'
-      // No quote at all for this key yet, or a quote with no price at all
-      // (M1: a halted or non-trading instrument's `meta` can come back with
-      // every price field null) — either way there is nothing to show a
-      // detail view for, and a press that opens nothing must report
-      // `ignored`, not `handled`, so the on-device flash tells the truth
-      // (per AGENTS.md's "Press feedback" convention).
-      const quote = quotes.get(symbol)
+    if (this.activeQuote(quotes) !== null) return this.detailPress(index)
+
+    const symbols = this.source.getSymbols()
+    const role = gridRole(index, symbols)
+    if (role.kind === 'tile') {
+      const quote = quotes.get(role.symbol)
+      // Nothing to show for a symbol with no priced quote (M1): ignored.
       if (!quote || quote.price === null) return 'ignored'
-      this.selected = symbol
-      // Lazily kicks off the 52-week fetch for THIS symbol only, right at
-      // the moment its detail view opens — never for all eight symbols on
-      // every poll. `setWatchedSymbol` is a no-op fetch-wise when a fresh
-      // cache, an in-flight fetch, or a failure cooldown already covers it;
-      // it also tells the source to keep re-checking freshness on its own
-      // poll for as long as this symbol stays watched (see the finding
-      // about `render()` never doing network I/O itself).
-      this.source.setWatchedSymbol(symbol)
+      if (this.peekActive(role.symbol)) {
+        // A second press while the card is flipped opens the full view.
+        this.peeks.delete(role.symbol)
+        this.pendingPeeks.delete(role.symbol)
+        this.selected = role.symbol
+        this.chartMode = '1d'
+        this.source.setWatchedSymbol(role.symbol)
+        return 'handled'
+      }
+      this.pendingPeeks.add(role.symbol)
       return 'handled'
     }
 
+    const watch = symbols.slice(0, 8).map((s) => quotes.get(s))
+    if (role.kind === 'breadth') {
+      // Shows the day's best and worst on line 1 for 4 s. Nothing to show
+      // when nothing is counted, so that press is ignored.
+      if (breadth(watch).counted === 0) return 'ignored'
+      this.pendingLeaders = true
+      return 'handled'
+    }
+    if (role.kind === 'mascot') {
+      if (averageChange(watch) === null) return 'ignored'
+      this.pendingHearts = true
+      return 'handled'
+    }
+    return 'ignored'
+  }
+
+  private detailPress(index: number): PressOutcome {
     if (index === 7) {
       this.selected = null
+      this.chartMode = '1d'
       this.source.setWatchedSymbol(null)
       return 'handled'
     }
-    // Keys 0 to 6 do nothing while a symbol is selected. Read-only: no
-    // refresh-on-press, no browser.
+    if (index >= 4 && index <= 6 && this.selected !== null) {
+      // The chart keys switch between today and the year — but only when
+      // the year has loaded, or the press would change nothing.
+      if (this.chartMode === '52wk') {
+        this.chartMode = '1d'
+        return 'handled'
+      }
+      const yearly = this.source.getYearlyState(this.selected)
+      if (yearly.status === 'ok' && yearly.values.length >= 2) {
+        this.chartMode = '52wk'
+        return 'handled'
+      }
+    }
     return 'ignored'
   }
 }
