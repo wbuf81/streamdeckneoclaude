@@ -19,7 +19,8 @@ import { createCanvas, loadImage, type Canvas, type Image } from '@napi-rs/canva
 import { renderKey, renderStrip, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT } from '../src/render/canvas.js'
 import { theme } from '../src/render/theme.js'
 import { FootballPage, type FootballReader } from '../src/pages/football-page.js'
-import type { Game, GameResult, Team, TeamRecord } from '../src/sources/football.js'
+import type { Game, GameResult, LiveGame, ScoringEvent, Team, TeamRecord } from '../src/sources/football.js'
+import { nextKickoff } from '../src/sources/football.js'
 
 function findRepoRoot(): string {
   let dir = dirname(fileURLToPath(import.meta.url))
@@ -78,6 +79,63 @@ interface Situation {
   schedules: Partial<Record<Team, Game[]>>
   records: Partial<Record<Team, TeamRecord | null>>
   drillDown?: boolean
+  /** The live game per team at render time. */
+  live?: Partial<Record<Team, LiveGame>>
+  /** The live game per team one render EARLIER, so a score can be new. */
+  liveBefore?: Partial<Record<Team, LiveGame>>
+  /** How long after the score was first seen the shot is taken. */
+  sinceScoreMs?: number
+  stale?: boolean
+}
+
+/** The Gators game in the live situations below. */
+const LIVE_GAME_ID = 'live-uga'
+
+function liveGame(over: Partial<LiveGame> = {}): LiveGame {
+  return {
+    gameId: LIVE_GAME_ID,
+    kickoffEpochMs: NOW_MS - 2 * 60 * 60 * 1000,
+    state: 'in',
+    detail: '2:58 - 3rd',
+    period: 3,
+    clock: '2:58',
+    clockSeconds: 178,
+    myScore: 21,
+    opponentScore: 17,
+    possession: 'mine',
+    downDistance: '2nd & 6',
+    fieldPosition: 'UGA 24',
+    lastPlay: 'Johnson 7 Yd Run',
+    redZone: false,
+    lastScore: null,
+    updatedAtMs: NOW_MS - 5000,
+    stale: false,
+    ...over,
+  }
+}
+
+function score(over: Partial<ScoringEvent>): ScoringEvent {
+  return {
+    id: `${LIVE_GAME_ID}:1`, seq: 1, side: 'mine', points: 6, kind: 'touchdown',
+    atMs: NOW_MS - 1000, playId: null, myScore: 27, opponentScore: 17, ...over,
+  }
+}
+
+/** Schedules for the live situations: the Gators play Georgia now; the
+ * Jaguars play in two days, then again the week after. */
+const LIVE_SCHEDULES: Partial<Record<Team, Game[]>> = {
+  gators: [
+    game({ id: LIVE_GAME_ID, opponent: 'Georgia Bulldogs', opponentShort: 'UGA', kickoffEpochMs: NOW_MS - 2 * 60 * 60 * 1000 }),
+    game({ opponentShort: 'TEX', kickoffEpochMs: NOW_MS + 7 * DAY }),
+  ],
+  jaguars: [
+    game({ opponent: 'Houston Texans', opponentShort: 'HOU', isHome: true, kickoffEpochMs: NOW_MS + 2 * DAY + 3 * 60 * 60 * 1000 }),
+    game({ opponent: 'Tennessee Titans', opponentShort: 'TEN', kickoffEpochMs: NOW_MS + 9 * DAY }),
+  ],
+}
+const LIVE_RECORDS: Partial<Record<Team, TeamRecord | null>> = {
+  gators: { wins: 5, losses: 1, ties: 0, started: true },
+  jaguars: { wins: 4, losses: 4, ties: 0, started: true },
 }
 
 const SITUATIONS: readonly Situation[] = [
@@ -123,6 +181,78 @@ const SITUATIONS: readonly Situation[] = [
   },
 ]
 
+const LIVE_SITUATIONS: readonly Situation[] = [
+  {
+    label: 'live, Q3, our ball',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    live: { gators: liveGame() },
+  },
+  {
+    label: 'TOUCHDOWN, +450 ms',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    liveBefore: { gators: liveGame() },
+    live: { gators: liveGame({ myScore: 27, possession: null, downDistance: null, fieldPosition: null, lastPlay: 'Johnson 12 Yd Run', lastScore: score({}) }) },
+    sinceScoreMs: 450,
+  },
+  {
+    label: 'TOUCHDOWN, +1.2 s',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    liveBefore: { gators: liveGame() },
+    live: { gators: liveGame({ myScore: 27, possession: null, downDistance: null, fieldPosition: null, lastPlay: 'Johnson 12 Yd Run', lastScore: score({}) }) },
+    sinceScoreMs: 1200,
+  },
+  {
+    label: 'FIELD GOAL, +400 ms',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    liveBefore: { gators: liveGame() },
+    live: { gators: liveGame({ myScore: 24, possession: null, downDistance: null, fieldPosition: null, lastPlay: 'Mihalek 41 Yd FG', lastScore: score({ points: 3, kind: 'field-goal', myScore: 24 }) }) },
+    sinceScoreMs: 400,
+  },
+  {
+    label: 'they score: note only',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    liveBefore: { gators: liveGame() },
+    live: { gators: liveGame({ opponentScore: 24, possession: 'opponent', fieldPosition: 'UF 25', downDistance: '1st & 10', lastPlay: 'Kickoff, touchback', lastScore: score({ side: 'opponent', myScore: 21, opponentScore: 24 }) }) },
+    sinceScoreMs: 3000,
+  },
+  {
+    label: 'red zone, theirs',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    live: { gators: liveGame({ possession: 'opponent', fieldPosition: 'UF 12', downDistance: '3rd & 4', redZone: true, period: 4, clock: '0:41', lastPlay: 'Beck pass to Bowers for 9 yds' }) },
+  },
+  {
+    label: 'unknowns, stale',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    live: { gators: liveGame({ myScore: null, opponentScore: null, possession: null, downDistance: null, fieldPosition: null, clock: null, period: null, lastPlay: null, redZone: null, stale: true }) },
+  },
+  {
+    label: 'halftime',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    live: { gators: liveGame({ detail: 'Halftime', period: 2, clock: '0:00', possession: null, downDistance: null, fieldPosition: null, lastPlay: null }) },
+  },
+  {
+    label: 'pre, 12 min out',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    live: { gators: liveGame({ state: 'pre', kickoffEpochMs: NOW_MS + 12 * 60 * 1000, detail: '10/11 - 7:30 PM EDT', period: null, clock: null, clockSeconds: null, myScore: null, opponentScore: null, possession: null, downDistance: null, fieldPosition: null, lastPlay: null, redZone: null }) },
+  },
+  {
+    label: 'final',
+    schedules: LIVE_SCHEDULES, records: LIVE_RECORDS,
+    live: { gators: liveGame({ state: 'post', detail: 'Final/OT', period: null, clock: null, clockSeconds: null, myScore: 34, opponentScore: 31, possession: null, downDistance: null, fieldPosition: null, lastPlay: null, redZone: null }) },
+  },
+  {
+    label: 'other row TBD time',
+    schedules: {
+      ...LIVE_SCHEDULES,
+      jaguars: [game({ opponent: 'Houston Texans', opponentShort: 'HOU', isHome: true, kickoffEpochMs: NOW_MS + 4 * DAY, timeTbd: true })],
+    },
+    records: LIVE_RECORDS,
+    live: { gators: liveGame() },
+  },
+]
+
+const ALL_SITUATIONS: readonly Situation[] = [...SITUATIONS, ...LIVE_SITUATIONS]
+
 const M = 14
 const LABEL_W = 118
 const GAP = 6
@@ -135,7 +265,7 @@ async function main(): Promise<void> {
 
   const rowH = 2 * (KEY_SIZE + GAP) + STRIP_HEIGHT + 20
   const width = M * 2 + LABEL_W + 4 * (KEY_SIZE + GAP) + 40
-  const height = TITLE_H + SITUATIONS.length * rowH + M
+  const height = TITLE_H + ALL_SITUATIONS.length * rowH + M
 
   const sheet = createCanvas(width, height)
   const ctx = sheet.getContext('2d')
@@ -147,7 +277,8 @@ async function main(): Promise<void> {
   ctx.fillText('Football page — real FootballPage, real renderKey', M, 6)
 
   let y = TITLE_H
-  for (const sit of SITUATIONS) {
+  for (const sit of ALL_SITUATIONS) {
+    let live = sit.liveBefore ?? sit.live ?? {}
     const reader = {
       getTeams: () => ['gators', 'jaguars'] as const,
     getLabel: (team: string) => (team === 'gators' ? 'GATORS' : 'JAGUARS'),
@@ -156,7 +287,9 @@ async function main(): Promise<void> {
       getRecord: (t: Team) => sit.records[t] ?? null,
       getStatus: () => 'ok',
       getLastUpdatedAt: () => NOW_S,
-      isStale: () => false,
+      isStale: () => sit.stale === true,
+      getLive: (t: Team) => live[t] ?? null,
+      getNextKickoff: (t: Team, nowMs: number) => nextKickoff(sit.schedules[t] ?? [], nowMs),
       getLogo: (t: Team) => (t === 'gators' ? gatorCrest : jaguarCrest),
       getTeamColor: (t: Team) => (t === 'gators' ? GATORS : JAGUARS),
       setVisible: () => {},
@@ -166,7 +299,18 @@ async function main(): Promise<void> {
       page.render(NOW_S, NOW_MS)
       page.onKeyPress(0)
     }
-    const frame = page.render(NOW_S, NOW_MS)
+    let frame
+    if (sit.liveBefore) {
+      // The page records the score it sees first and celebrates only a NEW
+      // one, so the shot needs a render before the score and one at it.
+      const since = sit.sinceScoreMs ?? 0
+      page.render(NOW_S, NOW_MS - since - 20_000)
+      live = sit.live ?? {}
+      page.render(NOW_S, NOW_MS - since)
+      frame = page.render(NOW_S, NOW_MS)
+    } else {
+      frame = page.render(NOW_S, NOW_MS)
+    }
 
     ctx.fillStyle = `rgb(${theme.textDim.join(',')})`
     ctx.font = '10px Menlo'
