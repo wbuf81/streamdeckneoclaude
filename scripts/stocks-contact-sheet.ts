@@ -79,7 +79,8 @@ function quoteFor(symbol: string, changePercent: number): Quote {
 function pageFor(changes: readonly number[], marketState: MarketState): StocksPage {
   const quotes = new Map<string, Quote>()
   SYMBOLS.forEach((sym, i) => quotes.set(sym, quoteFor(sym, changes[i] ?? 0)))
-  const reader = {
+  const reader: StockReader = {
+    getSymbols: () => SYMBOLS,
     getQuotes: () => quotes,
     getStatus: () => 'ok',
     getMarketState: () => marketState,
@@ -87,7 +88,7 @@ function pageFor(changes: readonly number[], marketState: MarketState): StocksPa
     getYearlyState: () => ({ status: 'ok', values: [], updatedAt: 0 } as unknown as YearlyState),
     setWatchedSymbol: () => {},
     setVisible: () => {},
-  } as unknown as StockReader
+  }
   return new StocksPage(reader)
 }
 

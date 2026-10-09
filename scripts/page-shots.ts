@@ -56,7 +56,9 @@ function findRepoRoot(): string {
   throw new Error('could not find the repository root')
 }
 const REPO_ROOT = findRepoRoot()
-const OUT_DIR = join(REPO_ROOT, 'docs', 'images')
+/** `docs/images` by default, which the README embeds. Pass a folder to preview
+ * elsewhere without touching the committed images. */
+const OUT_DIR = resolve(process.argv[2] ?? join(REPO_ROOT, 'docs', 'images'))
 
 /** A fixed clock, so re-running this produces the same frames. Any animated
  * page is sampled at this instant rather than at whatever time the build
@@ -306,6 +308,7 @@ function stocksPage(marketState: MarketState = 'open'): StocksPage {
   const quotes = new Map<string, Quote>()
   SYMBOLS.forEach((sym, i) => quotes.set(sym, quoteFor(sym, STOCK_CHANGES[i] ?? 0)))
   return new StocksPage({
+    getSymbols: () => SYMBOLS,
     getQuotes: () => quotes,
     getStatus: () => 'ok',
     getMarketState: () => marketState,
@@ -313,7 +316,7 @@ function stocksPage(marketState: MarketState = 'open'): StocksPage {
     getYearlyState: () => ({ status: 'ok', values: [], updatedAt: 0 } as unknown as YearlyState),
     setWatchedSymbol: () => {},
     setVisible: () => {},
-  } as unknown as StockReader)
+  } satisfies StockReader)
 }
 
 function day(
