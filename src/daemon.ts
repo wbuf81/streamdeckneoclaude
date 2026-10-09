@@ -2,7 +2,8 @@ import type { DeckDevice } from './device.js'
 import { BUTTON_LEFT, BUTTON_RIGHT, NEO_KEY_COUNT } from './device.js'
 import type { PageManager } from './page-manager.js'
 import { renderKey, renderStrip } from './render/canvas.js'
-import { keyHash, stripHash, type DeckFrame, type KeySpec, type Rgb, type StripSpec } from './render/specs.js'
+import { keyHash, stripHash, type DeckFrame, type KeySpec, type Rgb, type StripSpec, type StripSprite } from './render/specs.js'
+import { STRIP_WIDTH } from './render/paint.js'
 import { theme } from './render/theme.js'
 import { log } from './log.js'
 import type { LockState } from './lock-state.js'
@@ -97,26 +98,37 @@ export const ACK_OK_RGB: Rgb = [255, 255, 255]
  */
 export const ACK_REJECT_RGB: Rgb = [220, 40, 40]
 
-/** Monospaced character columns that fit across the strip's text area at
- * its 13 px Menlo: 236 px of usable width / 7.83 px per character, measured
- * with `@napi-rs/canvas` on this Mac. */
-const STRIP_TEXT_COLUMNS = 30
-
 /**
  * The strip shown for `PAGE_NAME_MS` after a page change. This is the ONE
- * place that decides how a page's name looks there. Today `StripSpec` has
- * only 13 px left-aligned lines, so this upper-cases the name, letter-spaces
- * it when it fits, centres it with leading spaces (Menlo is monospaced), and
- * puts it on line 2, whose band (y 21 to 34) is the nearest to the strip's
- * vertical middle (29). When `StripSpec` gains a large centred line, change
- * only this function.
+ * place that decides how a page's name looks there: the strip's large,
+ * bold, centred banner line.
  */
 export function pageNameStrip(name: string): StripSpec {
-  const upper = name.toUpperCase()
-  const spaced = upper.split('').join(' ')
-  const text = spaced.length <= STRIP_TEXT_COLUMNS ? spaced : upper
-  const pad = Math.max(0, Math.round((STRIP_TEXT_COLUMNS - text.length) / 2))
-  return { lines: ['', ' '.repeat(pad) + text] }
+  return { lines: [], banner: { text: name.toUpperCase(), size: 20 } }
+}
+
+/** The crab walks across the strip once an hour, on the hour. */
+export const CAMEO_PERIOD_MS = 60 * 60 * 1000
+/** How long one walk takes, from entering on the left to leaving on the right. */
+export const CAMEO_MS = 4200
+/** How often the strip redraws during a walk. Ten strip writes a second for
+ * about four seconds, once an hour. */
+const CAMEO_STEP_MS = 100
+/** The crab sprite is 48 px wide; it starts and ends fully off the strip. */
+const CAMEO_SPRITE_W = 48
+
+/**
+ * Where the crab is `elapsedMs` into its walk. Pure, so a test can check any
+ * moment. It enters off the left edge, says hi near the middle, and leaves
+ * off the right edge.
+ */
+export function cameoSprite(elapsedMs: number): StripSprite {
+  const t = Math.min(1, Math.max(0, elapsedMs / CAMEO_MS))
+  const x = -CAMEO_SPRITE_W + t * (STRIP_WIDTH + CAMEO_SPRITE_W)
+  const frame: 0 | 1 = Math.floor(elapsedMs / 125) % 2 === 0 ? 0 : 1
+  const sprite: StripSprite = { kind: 'crab', x, frame, dy: frame === 1 ? -1 : 0 }
+  if (elapsedMs >= 1600 && elapsedMs < 2800) sprite.say = 'hi!'
+  return sprite
 }
 
 /** Mixes `base` toward `target` by `t` (0 is `base`, 1 is `target`), rounded
@@ -271,6 +283,10 @@ export class Daemon {
   private wipeTimer: NodeJS.Timeout | null = null
   /** The page whose name the strip shows, or `null`. See `PAGE_NAME_MS`. */
   private namePage: string | null = null
+  /** When the current crab walk started, or null when none is running. */
+  private cameoStartMs: number | null = null
+  private cameoTimer: NodeJS.Timeout | null = null
+  private cameoStepTimer: NodeJS.Timeout | null = null
   private nameTimer: NodeJS.Timeout | null = null
   /** One acknowledgement per round button: slot 0 is left, slot 1 right. */
   private acks: [Ack | null, Ack | null] = [null, null]
@@ -320,6 +336,45 @@ export class Daemon {
 
     this.lastTickAtMs = this.nowMs()
     if (!this.locked) this.armTimer()
+    this.scheduleCameo()
+  }
+
+  /** Arms the next hourly crab walk, on the next whole hour. Whole hours are
+   * whole hours in every US zone, so this is on the hour in Eastern time. */
+  private scheduleCameo(): void {
+    if (this.cameoTimer) clearTimeout(this.cameoTimer)
+    const delay = CAMEO_PERIOD_MS - (this.nowMs() % CAMEO_PERIOD_MS)
+    this.cameoTimer = setTimeout(() => {
+      this.cameoTimer = null
+      if (this.stopped) return
+      this.startCameo()
+      this.scheduleCameo()
+    }, delay)
+  }
+
+  /** Starts one crab walk across the strip. Skipped while locked: the
+   * privacy blank wins. */
+  startCameo(): void {
+    if (this.stopped || this.locked) return
+    this.cameoStartMs = this.nowMs()
+    this.scheduleCameoStep()
+  }
+
+  private scheduleCameoStep(): void {
+    if (this.cameoStepTimer) clearTimeout(this.cameoStepTimer)
+    this.cameoStepTimer = setTimeout(() => {
+      this.cameoStepTimer = null
+      if (this.stopped || this.cameoStartMs === null) return
+      if (this.nowMs() - this.cameoStartMs >= CAMEO_MS) this.cameoStartMs = null
+      else this.scheduleCameoStep()
+      void this.renderNow()
+    }, CAMEO_STEP_MS)
+  }
+
+  private endCameoWalk(): void {
+    if (this.cameoStepTimer) clearTimeout(this.cameoStepTimer)
+    this.cameoStepTimer = null
+    this.cameoStartMs = null
   }
 
   /**
@@ -518,6 +573,7 @@ export class Daemon {
     if (this.nameTimer) clearTimeout(this.nameTimer)
     this.nameTimer = null
     this.namePage = null
+    this.endCameoWalk()
     for (const slot of [0, 1] as const) {
       const timer = this.ackTimers[slot]
       if (timer) clearTimeout(timer)
@@ -549,7 +605,11 @@ export class Daemon {
   /** Overlays the name strip and the button acknowledgements on `frame`. The
    * name shows only while its page is still current. */
   private overlayTransitions(frame: DeckFrame, pageName: string): DeckFrame {
-    const strip = this.namePage === pageName ? pageNameStrip(pageName) : frame.strip
+    let strip = this.namePage === pageName ? pageNameStrip(pageName) : frame.strip
+    // The crab walks over the page's own strip, never over the page name.
+    if (this.cameoStartMs !== null && this.namePage !== pageName) {
+      strip = { ...strip, sprite: cameoSprite(this.nowMs() - this.cameoStartMs) }
+    }
     const button = (slot: 0 | 1): Rgb => {
       const ack = this.acks[slot]
       const level = ack ? ACK_LEVELS[ack.step] : undefined
@@ -1086,6 +1146,8 @@ export class Daemon {
     if (this.flashPumpTimer) clearTimeout(this.flashPumpTimer)
     this.flashPumpTimer = null
     this.endTransitions()
+    if (this.cameoTimer) clearTimeout(this.cameoTimer)
+    this.cameoTimer = null
     await this.lockState?.stop()
     await this.lockTransition
     // I1: a render already in flight when `stop()` was called must finish

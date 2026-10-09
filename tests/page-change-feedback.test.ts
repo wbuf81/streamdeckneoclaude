@@ -8,6 +8,9 @@ import {
   PAGE_NAME_MS,
   WIPE_STEP_MS,
   pageNameStrip,
+  cameoSprite,
+  CAMEO_MS,
+  CAMEO_PERIOD_MS,
   type LockStateReader,
 } from '../src/daemon.js'
 import { FakeDevice } from '../src/fake-device.js'
@@ -325,5 +328,47 @@ describe('round-button acknowledgement', () => {
     expect(first[0]).toBeGreaterThan(first[1] + 100) // visibly red
     expect(buttonLog.filter((w) => w.index === BUTTON_RIGHT)).toHaveLength(0)
     await daemon.stop()
+  })
+})
+
+describe('hourly crab cameo', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('walks the crab across the strip on the hour, then restores the strip', async () => {
+    const page = new NamedPage('stocks')
+    const { device, daemon } = await build([page])
+    const toHour = CAMEO_PERIOD_MS - (Date.now() % CAMEO_PERIOD_MS)
+    await vi.advanceTimersByTimeAsync(toHour - 1)
+    device.stripWrites = 0
+    await vi.advanceTimersByTimeAsync(CAMEO_MS / 2)
+    // Mid-walk: the strip shows the crab over the page's own strip.
+    expect(device.stripWrites).toBeGreaterThan(10)
+    expect(device.stripImage?.equals(renderStrip(page.render().strip))).toBe(false)
+    await vi.advanceTimersByTimeAsync(CAMEO_MS)
+    expect(device.stripImage?.equals(renderStrip(page.render().strip))).toBe(true)
+    const writes = device.stripWrites
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(device.stripWrites).toBe(writes)
+    await daemon.stop()
+  })
+
+  it('does not walk while the screen is locked', async () => {
+    const lock = new Lock()
+    const { device, daemon } = await build([new NamedPage('stocks')], lock)
+    lock.set(true)
+    await vi.advanceTimersByTimeAsync(10)
+    device.stripWrites = 0
+    const toHour = CAMEO_PERIOD_MS - (Date.now() % CAMEO_PERIOD_MS)
+    await vi.advanceTimersByTimeAsync(toHour + CAMEO_MS / 2)
+    expect(device.stripWrites).toBe(0)
+    await daemon.stop()
+  })
+
+  it('enters off the left edge, says hi mid-walk, and leaves off the right', () => {
+    expect(cameoSprite(0).x).toBeLessThanOrEqual(-48)
+    expect(cameoSprite(CAMEO_MS).x).toBeGreaterThanOrEqual(STRIP_WIDTH)
+    expect(cameoSprite(CAMEO_MS / 2).say).toBe('hi!')
+    expect(cameoSprite(200).say).toBeUndefined()
+    expect(cameoSprite(0).frame).not.toBe(cameoSprite(125).frame)
   })
 })
