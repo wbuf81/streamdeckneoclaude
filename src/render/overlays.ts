@@ -11,7 +11,7 @@ import type { SKRSContext2D } from '@napi-rs/canvas'
 import type { EdgeProgressSpec, IconSpec, OneShotSpec, RangeSpec, Rgb } from './specs.js'
 import { theme } from './theme.js'
 import { KEY_SIZE, FONT, css, cssAlpha, clamp01, pseudoRandom } from './paint.js'
-import { ONE_SHOT_DURATION_MS, snapPulse } from './motion.js'
+import { ONE_SHOT_DURATION_MS } from './motion.js'
 
 /* ---------------------------------------------------------------- range */
 
@@ -144,22 +144,14 @@ function edgeEnds(edge: 'top' | 'right' | 'bottom' | 'left'): [number, number, n
   }
 }
 
-/** How much wider and stronger the glow gets at a full pulse. */
-const EDGE_PULSE_GLOW_W = 14
-const EDGE_PULSE_GLOW_ALPHA = 0.45
-const EDGE_PULSE_LINE_W = 2
-
 export function drawEdgeProgress(ctx: SKRSContext2D, spec: EdgeProgressSpec, dim: boolean): void {
-  const p = snapPulse(spec.pulse)
-  const base = spec.color ?? EDGE_COLOR
-  // At the peak the core warms a third of the way toward white.
-  const color: Rgb = [0, 1, 2].map((i) => Math.round(base[i]! + (255 - base[i]!) * 0.35 * p)) as unknown as Rgb
+  const color = spec.color ?? EDGE_COLOR
   ctx.save()
   try {
     ctx.lineCap = 'butt'
     for (const pass of [0, 1] as const) {
-      ctx.lineWidth = pass === 0 ? EDGE_GLOW_W + EDGE_PULSE_GLOW_W * p : EDGE_LINE_W + EDGE_PULSE_LINE_W * p
-      ctx.strokeStyle = pass === 0 ? cssAlpha(color, 0.22 + EDGE_PULSE_GLOW_ALPHA * p, dim) : css(color, dim)
+      ctx.lineWidth = pass === 0 ? EDGE_GLOW_W : EDGE_LINE_W
+      ctx.strokeStyle = pass === 0 ? cssAlpha(color, 0.22, dim) : css(color, dim)
       for (const run of spec.runs) {
         const [ax, ay, bx, by] = edgeEnds(run.edge)
         ctx.beginPath()

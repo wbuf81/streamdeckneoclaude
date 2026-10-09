@@ -1,7 +1,7 @@
 import type {
   DeckFrame, KeySpec, Rgb, StripSpec, ImageCrop, IdleSpec, IdleVariant,
 } from '../render/specs.js'
-import { blockPerimeterProgress, breathe } from '../render/motion.js'
+import { breathe } from '../render/motion.js'
 import { blankKey } from '../render/specs.js'
 import { theme } from '../render/theme.js'
 import { truncate, formatClock, formatEasternTime } from '../render/text.js'
@@ -123,29 +123,10 @@ const ALBUM_FALLBACK_CHARS = 10
  * centre-weighted, so this is the right trade for a full-bleed image — but it can
  * clip a title printed hard against the top or bottom edge.
  */
-const ART_COLS = 3
-const ART_ROWS = 2
 /** Where the central 3:2 slice starts, as a fraction of the square source. */
 const ART_SLICE_TOP = 1 / 6
 /** Each key's source rect, square by construction. */
 const ART_CELL = 1 / 3
-
-/**
- * The progress glow: a thin warm line round the OUTSIDE of the art block,
- * clockwise from the top-left corner, as long as the track is far through.
- *
- * Cost. The perimeter is ten key edges, 960 px. `keyHash` snaps a run to half a
- * pixel, so an unquantised fraction would rewrite the leading key up to 1920
- * times per track — on a two-minute track that is 16 steps a second, more than
- * the 100 ms tick, so the leading key would be rewritten on every tick. So the page snaps the fraction itself, to steps
- * of at least `GLOW_MIN_STEP_MS` of track time and at least one whole pixel.
- * Each step rewrites the one key the line is growing along (two at a key
- * corner), so the glow costs about two key-writes a second at most.
- */
-const GLOW_MIN_STEP_MS = 500
-/** Ten 96 px key edges: three along the top, two down the right, three along
- * the bottom and two up the left. */
-const GLOW_PERIMETER_PX = 2 * (3 + 2) * 96
 
 /**
  * How the two round buttons breathe while a track plays. Gentle: they dim to
@@ -158,35 +139,21 @@ const BUTTON_BREATHE_PERIOD_MS = 5000
 const BUTTON_BREATHE_DEPTH = 0.25
 const BUTTON_QUANTUM_MS = 400
 
-/** One beat of the border pulse. Spotify gives apps no beat data, so the
- * pulse keeps its own steady rhythm: about 75 beats a minute. */
-export const GLOW_PULSE_PERIOD_MS = 800
-/** The pulse clock's step. Ten steps a second is enough for a smooth thump,
- * and the level itself only has `EDGE_PULSE_LEVELS` steps. */
-const GLOW_PULSE_QUANTUM_MS = 100
-
 /**
- * How hard the progress border throbs at `nowMs`, 0 to 1: a fast rise, then
- * a slower fall, like a kick drum. Zero when not playing, so a paused or
- * stale track rests.
+ * The strip's progress bar breathes faintly while a track plays: down to
+ * 65 percent and back over 2.4 s. It is the page's one "it's playing" pulse,
+ * kept off the artwork on purpose. Snapped to `BAR_PULSE_QUANTUM_MS`, so it
+ * costs about five strip writes a second, and a paused track holds still.
  */
-export function glowPulse(nowMs: number, playing: boolean): number {
-  if (!playing || !Number.isFinite(nowMs)) return 0
-  const t = Math.floor(nowMs / GLOW_PULSE_QUANTUM_MS) * GLOW_PULSE_QUANTUM_MS
-  const phase = (((t % GLOW_PULSE_PERIOD_MS) + GLOW_PULSE_PERIOD_MS) % GLOW_PULSE_PERIOD_MS) / GLOW_PULSE_PERIOD_MS
-  return phase < 0.15 ? phase / 0.15 : Math.exp(-(phase - 0.15) * 5)
-}
+const BAR_PULSE_PERIOD_MS = 2400
+const BAR_PULSE_DEPTH = 0.35
+const BAR_PULSE_QUANTUM_MS = 200
 
-/**
- * The progress fraction the glow draws, snapped so it changes at most once per
- * `GLOW_MIN_STEP_MS` of track time and never by less than one pixel. A zero,
- * negative or non-finite duration draws no glow.
- */
-export function glowFraction(positionMs: number, durationMs: number): number {
-  if (!Number.isFinite(positionMs) || !Number.isFinite(durationMs) || durationMs <= 0) return 0
-  const fraction = Math.min(1, Math.max(0, positionMs / durationMs))
-  const steps = Math.max(1, Math.min(GLOW_PERIMETER_PX, Math.floor(durationMs / GLOW_MIN_STEP_MS)))
-  return Math.floor(fraction * steps) / steps
+/** The progress bar's colour at `nowMs`: `color` itself unless playing. */
+export function barPulseColor(color: Rgb, nowMs: number, playing: boolean): Rgb {
+  if (!playing || !Number.isFinite(nowMs)) return color
+  const t = Math.floor(nowMs / BAR_PULSE_QUANTUM_MS) * BAR_PULSE_QUANTUM_MS
+  return breathe(color, t, BAR_PULSE_PERIOD_MS, BAR_PULSE_DEPTH)
 }
 
 /**
@@ -288,8 +255,8 @@ export class SpotifyPage implements Page {
     // genuinely empty one.
     if (!state) return IDLE_TICK_MS
     // A track IS loaded, so something moves unless the data is stale: playing
-    // breathes on the play/pause glyph and the round buttons and grows the
-    // progress glow, and paused drifts a layer under all six art cells.
+    // breathes on the play/pause glyph, the round buttons and the strip's
+    // progress bar, and paused drifts a layer under all six art cells.
     //
     // Reads the SAME `isStale` predicate every dimmed element reads, rather than
     // re-deriving it from `status` — which is how M5's case (a failed transport
@@ -349,23 +316,9 @@ export class SpotifyPage implements Page {
     const accent = dominant ?? theme.gray
     const second = state && dominant ? (this.source.getArtAccent?.(state.trackId) ?? null) : null
 
-    // The progress glow, only round real art: it is the art block's own edge.
-    // A paused or stale track keeps its glow where it stopped, and the key's
-    // `dim` dims it with the cover, so a paused page stays still and calm.
-    const glow = state && art
-      ? blockPerimeterProgress(ART_COLS, ART_ROWS, glowFraction(state.positionMs, state.durationMs))
-      : null
-    const pulse = glowPulse(nowMs, state !== null && state.isPlaying && !stale)
-    // `glow[row][col]` maps onto keys [[0, 1, 2], [4, 5, 6]]: `cell` below reads
-    // the SAME (col, row) for the crop and for the glow, so the two cannot be
-    // assigned to different keys.
-    const cell = (col: 0 | 1 | 2, row: 0 | 1): KeySpec => {
-      const key = col === 0 && row === 0
-        ? this.primaryArtKey(state, status, art, stale, artCrop(0, 0), nowMs, paused)
-        : this.spanArtKey(state, status, art, stale, artCrop(col, row), nowMs, col, row, paused)
-      const edge = glow?.[row]?.[col]
-      return edge && key.kind === 'image' ? { ...key, edgeProgress: { ...edge, pulse } } : key
-    }
+    const cell = (col: 0 | 1 | 2, row: 0 | 1): KeySpec => col === 0 && row === 0
+      ? this.primaryArtKey(state, status, art, stale, artCrop(0, 0), nowMs, paused)
+      : this.spanArtKey(state, status, art, stale, artCrop(col, row), nowMs, col, row, paused)
 
     return {
       keys: [
@@ -494,7 +447,8 @@ export class SpotifyPage implements Page {
       // The album's own accent colour, so the bar belongs to the cover above it.
       // Falls back to the theme when the cover has no usable colour — never a
       // fabricated hue.
-      bar: { value: fraction, color: accent },
+      // It breathes faintly while playing (see `barPulseColor`).
+      bar: { value: fraction, color: barPulseColor(accent, nowMs, state.isPlaying && !stale) },
       // I3: the SAME `stale` predicate the keys use, not a separate
       // `status === 'offline'` check — that check alone left the strip
       // bright on `'no-device'` while the transport glyphs already dimmed.

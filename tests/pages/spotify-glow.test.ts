@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { createCanvas, loadImage, type Image } from '@napi-rs/canvas'
-import { SpotifyPage, glowFraction, glowPulse, buttonColors } from '../../src/pages/spotify-page.js'
+import { SpotifyPage, barPulseColor, buttonColors } from '../../src/pages/spotify-page.js'
 import type { PlayerState, SpotifyStatus } from '../../src/sources/spotify.js'
 import type { DeckFrame, Rgb } from '../../src/render/specs.js'
 import { keyHash } from '../../src/render/specs.js'
@@ -91,180 +91,45 @@ function art(frame: DeckFrame, index: number): Buffer {
   return renderKey(frame.keys[index]!)
 }
 
-describe('Spotify progress glow: placement', () => {
-  it('lights the top row and the right column at half way, and nothing else', () => {
-    // 10 key edges; half way = the three tops plus both right edges.
-    const frame = page({ state: () => player() }).render(NOW, NOW * 1000)
-    for (const i of [0, 1, 2]) expect(glowIn(art(frame, i), TOP)).toBeGreaterThanOrEqual(280)
-    expect(glowIn(art(frame, 2), RIGHT)).toBeGreaterThan(250)
-    expect(glowIn(art(frame, 6), RIGHT)).toBeGreaterThan(250)
-    // The bottom row and the left column are still dark. (The bottom box stops
-    // short of the right column, where key 6's lit right edge ends.)
-    for (const i of [4, 5, 6]) expect(glowIn(art(frame, i), { ...BOTTOM, x1: KEY_SIZE - 4 })).toBe(0)
-    for (const i of [0, 4]) expect(glowIn(art(frame, i), LEFT)).toBe(0)
-  })
-
-  it('runs clockwise from the top-left: a quarter of the first key edge lights its LEFT end only', () => {
-    // 2.5 percent of the perimeter = a quarter of key 0's top edge.
-    const frame = page({ state: () => player({ positionMs: 6_250, durationMs: 250_000 }) })
-      .render(NOW, NOW * 1000)
-    const k0 = art(frame, 0)
-    expect(glowIn(k0, { x0: 0, y0: 0, x1: 20, y1: 4 })).toBeGreaterThan(40)
-    expect(glowIn(k0, { x0: 30, y0: 0, x1: KEY_SIZE, y1: 4 })).toBe(0)
-    for (const i of [1, 2, 4, 5, 6]) expect(glowIn(art(frame, i), { x0: 0, y0: 0, x1: KEY_SIZE, y1: KEY_SIZE })).toBe(0)
-  })
-
-  it('traces only the OUTER edge of the block at the very end — never the seams between art keys', () => {
-    const frame = page({ state: () => player({ positionMs: 250_000, durationMs: 250_000 }) })
-      .render(NOW, NOW * 1000)
-    // Every outside edge is lit...
-    for (const i of [0, 1, 2]) expect(glowIn(art(frame, i), TOP)).toBeGreaterThanOrEqual(280)
-    for (const i of [4, 5, 6]) expect(glowIn(art(frame, i), BOTTOM)).toBeGreaterThanOrEqual(280)
-    for (const i of [0, 4]) expect(glowIn(art(frame, i), LEFT)).toBeGreaterThan(250)
-    for (const i of [2, 6]) expect(glowIn(art(frame, i), RIGHT)).toBeGreaterThan(250)
-    // ...and the inner seams are not: key 1's bottom, key 5's top, key 0's right.
-    expect(glowIn(art(frame, 1), BOTTOM)).toBe(0)
-    expect(glowIn(art(frame, 5), TOP)).toBe(0)
-    expect(glowIn(art(frame, 0), RIGHT)).toBe(0)
-    expect(glowIn(art(frame, 5), LEFT)).toBe(0)
-  })
-
-  it('draws no glow without real art, while idle, or while unauthorized', () => {
-    const cases = [
-      page({ state: () => player(), art: null }),
-      page({ state: () => null }),
-      page({ state: () => null, status: 'unauthorized' }),
-    ]
-    for (const p of cases) {
-      const frame = p.render(NOW, NOW * 1000)
-      for (const i of ART_KEYS) expect(frame.keys[i]!.edgeProgress).toBeUndefined()
+describe('Spotify: no border on the art, a faint pulse on the strip bar', () => {
+  it('draws no progress line on any art key, playing or paused', () => {
+    for (const isPlaying of [true, false]) {
+      const frame = page({ state: () => player({ isPlaying }) }).render(NOW, NOW * 1000)
+      for (const k of ART_KEYS) expect(frame.keys[k]!.edgeProgress).toBeUndefined()
     }
   })
 
-  it('keeps a paused glow where it stopped, dimmed with the cover, and does not move it', () => {
-    const playing = page({ state: () => player() }).render(NOW, NOW * 1000)
-    const p = page({ state: () => player({ isPlaying: false }) })
-    const a = p.render(NOW, NOW * 1000)
-    const b = p.render(NOW + 30, (NOW + 30) * 1000)
-    for (const i of ART_KEYS) expect(a.keys[i]!.edgeProgress).toEqual(b.keys[i]!.edgeProgress)
-    // Still visible against the dimmed cover, but quieter than while playing.
-    const pausedTop = meanRed(art(a, 1), { x0: 0, y0: 0, x1: KEY_SIZE, y1: 3 })
-    const pausedBody = meanRed(art(a, 1), { x0: 20, y0: 30, x1: 76, y1: 70 })
-    const playingTop = meanRed(art(playing, 1), { x0: 0, y0: 0, x1: KEY_SIZE, y1: 3 })
-    expect(pausedTop).toBeGreaterThan(pausedBody + 40)
-    expect(pausedTop).toBeLessThan(playingTop - 60)
-  })
-})
-
-describe('Spotify progress glow: quantisation and write rate', () => {
-  it('snaps to at least half a second of track time, and never to less than a pixel', () => {
-    // 60 s track: 120 steps. 30 min track: capped at 960 steps (one pixel each).
-    expect(glowFraction(30_400, 60_000)).toBe(60 / 120)
-    expect(glowFraction(30_499, 60_000)).toBe(glowFraction(30_000, 60_000))
-    expect(glowFraction(30_500, 60_000)).toBeGreaterThan(glowFraction(30_499, 60_000))
-    const long = 30 * 60_000
-    const step = 1 / 960
-    expect(glowFraction(long / 2 + 1, long)).toBeCloseTo(0.5, 10)
-    expect(glowFraction(long / 2 + long * step - 1, long)).toBe(0.5)
-    for (const bad of [Number.NaN, 0, -5, Number.POSITIVE_INFINITY]) {
-      expect(glowFraction(1000, bad)).toBe(0)
-      expect(glowFraction(bad, 60_000)).toBe(0)
+  it('breathes the bar colour while playing, never brighter than the accent', () => {
+    const RED: Rgb = [200, 50, 40]
+    const p = page({ state: () => player(), color: RED })
+    const seen = new Set<string>()
+    for (let ms = 0; ms < 2400; ms += 200) {
+      const c = p.render(NOW, NOW * 1000 + ms).strip.bar!.color!
+      seen.add(c.join(','))
+      for (let i = 0; i < 3; i++) expect(c[i]!).toBeLessThanOrEqual(RED[i]!)
+      expect(c[0]!).toBeGreaterThanOrEqual(Math.floor(RED[0] * 0.6))
     }
-    expect(glowFraction(90_000, 60_000)).toBe(1)
+    expect(seen.size).toBeGreaterThan(3)
   })
 
-  /**
-   * Plays a whole track through the page at the daemon's 100 ms tick and counts
-   * how often any ART key's hash changes — each change is one USB key-write.
-   *
-   * `subSecond` feeds `interpolate` a fractional clock. Today the daemon hands
-   * the page whole seconds, which alone caps the glow near one write a second;
-   * the fractional case is the worst case, and the one the page's own
-   * quantisation must hold by itself.
-   */
-  /** Counts art-key rewrites over a whole track. `withPulse: false` strips the
-   * border pulse first, so the progress line's own cost stays measurable. */
-  function writesOverTrack(durationMs: number, subSecond: boolean, withPulse = false): { total: number; worstSecond: number } {
-    const startMs = NOW * 1000
-    const p = page({
-      state: (now) => player({ positionMs: Math.min(durationMs, now * 1000 - startMs), durationMs }),
-    })
-    const last: (string | null)[] = ART_KEYS.map(() => null)
-    const perSecond = new Map<number, number>()
-    let total = 0
-    for (let t = 0; t <= durationMs; t += 100) {
-      const ms = startMs + t
-      const frame = p.render(subSecond ? ms / 1000 : Math.floor(ms / 1000), ms)
-      ART_KEYS.forEach((k, j) => {
-        const key = frame.keys[k]!
-        const h = keyHash(!withPulse && key.edgeProgress
-          ? { ...key, edgeProgress: { ...key.edgeProgress, pulse: 0 } }
-          : key)
-        if (last[j] !== null && h !== last[j]) {
-          total++
-          const s = Math.floor(t / 1000)
-          perSecond.set(s, (perSecond.get(s) ?? 0) + 1)
-        }
-        last[j] = h
-      })
+  it('holds the bar still when paused, stale, or with a bad clock', () => {
+    const RED: Rgb = [200, 50, 40]
+    const paused = page({ state: () => player({ isPlaying: false }), color: RED })
+    expect(paused.render(NOW, NOW * 1000 + 600).strip.bar!.color).toEqual(RED)
+    expect(barPulseColor(RED, Number.NaN, true)).toEqual(RED)
+    expect(barPulseColor(RED, 1234, false)).toEqual(RED)
+  })
+
+  it('changes the bar at most five times a second', () => {
+    const p = page({ state: () => player() , color: [200, 50, 40] })
+    let changes = 0
+    let last = ''
+    for (let ms = 0; ms < 10_000; ms += 20) {
+      const c = p.render(NOW, NOW * 1000 + ms).strip.bar!.color!.join(',')
+      if (last && c !== last) changes++
+      last = c
     }
-    return { total, worstSecond: Math.max(0, ...perSecond.values()) }
-  }
-
-  it('costs at most a few art-key writes a second on a short track, even with a sub-second clock', () => {
-    // A 60 s track is the hard case: unquantised, its glow moves 1920 half-pixel
-    // steps in 60 s and would rewrite a key on every tick.
-    const { total, worstSecond } = writesOverTrack(60_000, true)
-    expect(worstSecond).toBeLessThanOrEqual(4)
-    expect(total / 60).toBeLessThanOrEqual(2.5)
-    // And it really does move: one step per half second, every one written.
-    expect(total).toBeGreaterThanOrEqual(115)
-  })
-
-  it('keeps the pulse inside a write budget: about five steps a second on at most six lit keys', () => {
-    // Up to 6 lit keys x 6 level steps in the worst second, plus the progress
-    // line's own 4. Unquantised, it would be 6 keys x 10 ticks = 60.
-    const { worstSecond } = writesOverTrack(60_000, true, true)
-    expect(worstSecond).toBeLessThanOrEqual(40)
-  })
-
-  it('costs about one art-key write a second at the daemon\'s whole-second clock', () => {
-    const { total, worstSecond } = writesOverTrack(240_000, false)
-    expect(worstSecond).toBeLessThanOrEqual(2)
-    expect(total / 240).toBeLessThanOrEqual(1.1)
-  })
-})
-
-describe('Spotify border pulse', () => {
-  it('throbs with a fast rise and a slower fall, and rests when not playing', () => {
-    const levels = Array.from({ length: 8 }, (_, i) => glowPulse(i * 100, true))
-    expect(Math.max(...levels)).toBeGreaterThan(0.8)
-    expect(Math.min(...levels)).toBeLessThan(0.1)
-    expect(glowPulse(100, false)).toBe(0)
-    expect(glowPulse(Number.NaN, true)).toBe(0)
-  })
-
-  it('widens and brightens the glow at the peak (region probe inside the key edge)', () => {
-    const edge = { runs: [{ edge: 'top' as const, from: 0, to: 1 }] }
-    const glowInk = (pulse: number): number => {
-      const buf = renderKey({ kind: 'gauge', bg: [0, 0, 0], edgeProgress: { ...edge, pulse } })
-      let sum = 0
-      for (let y = 4; y < 14; y++) for (let x = 10; x < 86; x++) sum += buf[(y * KEY_SIZE + x) * 4]!
-      return sum
-    }
-    expect(glowInk(1)).toBeGreaterThan(glowInk(0) * 1.5)
-  })
-
-  it('pulses only while playing', () => {
-    const paused = page({ state: (now) => player({ isPlaying: false, positionMs: 200_000, durationMs: 240_000 }) })
-    for (const ms of [100, 200, 300, 400]) {
-      for (const key of paused.render(NOW, NOW * 1000 + ms).keys) {
-        expect(key?.edgeProgress?.pulse ?? 0).toBe(0)
-      }
-    }
-    const playing = page({ state: () => player({ positionMs: 200_000, durationMs: 240_000 }) })
-    const peaks = [0, 100, 200, 300].map((ms) => Math.max(...playing.render(NOW, NOW * 1000 + ms).keys.map((k) => k?.edgeProgress?.pulse ?? 0)))
-    expect(Math.max(...peaks)).toBeGreaterThan(0.5)
+    expect(changes / 10).toBeLessThanOrEqual(5)
   })
 })
 

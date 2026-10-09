@@ -834,7 +834,9 @@ describe('SpotifyPage album-colour theming (task 44)', () => {
   })
 
   it('falls back to the theme when the cover has no usable colour, never a fabricated hue', () => {
-    const { page } = build(player(), 'ok', FAKE_ART, null)
+    // Paused, so the bar's faint breathing (a dimmed copy of the same grey)
+    // does not move it off the theme colour this test pins.
+    const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART, null)
     const frame = page.render(NOW, 1_000)
     expect(frame.keys[3]!.border).toEqual(theme.gray)
     expect(frame.strip.bar!.color).toEqual(theme.gray)
