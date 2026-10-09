@@ -5,6 +5,23 @@ import type { League, TeamConfig, TeamPair } from '../config.js'
 import { theme } from '../render/theme.js'
 import { dominantColor } from '../render/canvas.js'
 import type { Rgb } from '../render/specs.js'
+import {
+  applyLiveFailure,
+  applyLiveReading,
+  parseLiveRefs,
+  parsePlay,
+  parseScore,
+  parseSituation,
+  parseStatus,
+  toLiveGame,
+  type LiveEntry,
+  type LiveGame,
+  type LiveRefs,
+  type LiveSituation,
+  type PlaySnapshot,
+} from './football-live.js'
+
+export type { LiveGame, LiveState, ScoreKind, ScoringEvent, Side } from './football-live.js'
 
 /**
  * Data source note, measured 2026-08-14 (see docs/VERIFIED-FACTS.md, task 42).
@@ -66,6 +83,11 @@ function eventsListUrl(league: League, espnId: string): string {
   // limit=100 is generous headroom over the measured season sizes (20 NFL,
   // 12 college) so a normal season never needs a second page.
   return `${CORE_BASE}/${league}/seasons/${SEASON_YEAR}/teams/${espnId}/events?limit=100`
+}
+
+/** One event's own body, which links its live status, situation and scores. */
+function eventUrl(league: League, gameId: string): string {
+  return `${CORE_BASE}/${league}/events/${gameId}?lang=en&region=us`
 }
 
 function recordUrl(league: League, espnId: string): string {
@@ -370,6 +392,74 @@ function byKickoffAscending(a: Game, b: Game): number {
 }
 
 /**
+ * Live poll cadence. These are the only intervals the live loop uses.
+ *
+ * - `LIVE_POLL_MS` applies ONLY while the latest read of a game succeeded and
+ *   said `in`. Any other state — not yet read, a failed read, `pre` — uses
+ *   `WINDOW_POLL_MS`. An unknown state never polls fast.
+ * - The window opens `LIVE_LEAD_MS` before a KNOWN kickoff and closes
+ *   `LIVE_TAIL_MS` after it, or as soon as a read says `post`. A TBD kickoff
+ *   opens no window: an unknown time is not a reason to poll.
+ * - Outside every window the live loop makes no request at all. It sleeps
+ *   until the next window opens, at most `POLL_MS` ahead.
+ *
+ * A live read costs up to five requests (status, two scores, situation, last
+ * play) and the last play is fetched only when its ref changes. A `pre` read
+ * costs one.
+ */
+export const LIVE_POLL_MS = 20_000
+export const WINDOW_POLL_MS = 120_000
+export const LIVE_LEAD_MS = 15 * 60 * 1000
+/** Long enough for overtime and a weather delay. */
+export const LIVE_TAIL_MS = 6 * 60 * 60 * 1000
+
+/**
+ * The game whose live window contains `nowMs`, or null. `finishedIds` are
+ * games already read as `post`; they close their window early.
+ */
+export function liveWindowGame(schedule: readonly Game[], nowMs: number, finishedIds: ReadonlySet<string> = new Set()): Game | null {
+  for (const g of schedule) {
+    if (g.timeTbd || g.kickoffEpochMs === null) continue
+    if (finishedIds.has(g.id)) continue
+    if (nowMs >= g.kickoffEpochMs - LIVE_LEAD_MS && nowMs <= g.kickoffEpochMs + LIVE_TAIL_MS) return g
+  }
+  return null
+}
+
+/** When the next live window opens after `nowMs`, or null when no known
+ * kickoff lies ahead. */
+function nextWindowStartMs(schedule: readonly Game[], nowMs: number): number | null {
+  let best: number | null = null
+  for (const g of schedule) {
+    if (g.timeTbd || g.kickoffEpochMs === null) continue
+    const start = g.kickoffEpochMs - LIVE_LEAD_MS
+    if (start > nowMs && (best === null || start < best)) best = start
+  }
+  return best
+}
+
+/** The next game to kick off, for a countdown. See `nextKickoff`. */
+export interface NextKickoff extends Game {
+  kickoffEpochMs: number
+}
+
+/**
+ * The first game whose kickoff is after `nowMs`, or null. Pure.
+ *
+ * A game with `timeTbd: true` is returned too, because its DATE is real. A
+ * page must not count down to its time of day: ESPN's placeholder time is not
+ * a kickoff (see `Game.timeTbd`).
+ */
+export function nextKickoff(schedule: readonly Game[], nowMs: number): NextKickoff | null {
+  let best: Game | null = null
+  for (const g of schedule) {
+    if (g.kickoffEpochMs === null || g.kickoffEpochMs <= nowMs) continue
+    if (best === null || g.kickoffEpochMs < (best.kickoffEpochMs ?? Infinity)) best = g
+  }
+  return best ? { ...best, kickoffEpochMs: best.kickoffEpochMs as number } : null
+}
+
+/**
  * The fraction of the composited logo's height given to the actual crest
  * art; the rest is filled with the exact key background colour, reserved
  * for the page's own record text. Measured 2026-08-14 (task 42 report):
@@ -441,6 +531,16 @@ export class FootballSource extends EventEmitter {
    * fetched again this process. */
   private blockedUrls = new Set<string>()
 
+  /** The live state of each team's current game. See `getLive`. */
+  private live = new Map<Team, LiveEntry>()
+  /** Live links per game id, read once from the event body. */
+  private liveRefs = new Map<string, LiveRefs>()
+  /** The last play per game, keyed by its ref, so an unchanged ref costs no request. */
+  private lastPlays = new Map<string, { url: string; play: PlaySnapshot }>()
+  private liveTimer: NodeJS.Timeout | null = null
+  private liveInFlight: Promise<void> | null = null
+  private liveKey = ''
+
   private logoCache = new Map<Team, Image>()
   /** One accent colour per team, taken from the RAW crest. A `null` VALUE means
    * the crest has no usable accent; an absent key means the logo has not loaded
@@ -502,6 +602,25 @@ export class FootballSource extends EventEmitter {
     return r ? { ...r } : null
   }
 
+  /**
+   * The live state of the team's current game, or null when no game is in its
+   * window (15 min before a known kickoff to 6 h after it) or none has been
+   * read yet. A copy: mutating it cannot change this source.
+   */
+  getLive(team: Team): LiveGame | null {
+    const entry = this.live.get(team)
+    if (!entry) return null
+    const nowMs = this.now() * 1000
+    if (nowMs > entry.kickoffEpochMs + LIVE_TAIL_MS) return null
+    return toLiveGame(entry, nowMs)
+  }
+
+  /** The team's next kickoff after `nowMs`. A pure read of the cached
+   * schedule; it never fetches. See `nextKickoff`. */
+  getNextKickoff(team: Team, nowMs: number): NextKickoff | null {
+    return nextKickoff(this.schedules.get(team) ?? [], nowMs)
+  }
+
   getStatus(): FootballStatus {
     return this.status
   }
@@ -520,9 +639,11 @@ export class FootballSource extends EventEmitter {
     if (this.stopped) return
     if (visible) {
       void this.refreshAndSchedule()
-    } else if (this.timer) {
-      clearTimeout(this.timer)
+    } else {
+      if (this.timer) clearTimeout(this.timer)
       this.timer = null
+      if (this.liveTimer) clearTimeout(this.liveTimer)
+      this.liveTimer = null
     }
   }
 
@@ -534,6 +655,9 @@ export class FootballSource extends EventEmitter {
     } finally {
       this.schedule()
     }
+    // The schedule decides which games have a live window, so the live loop
+    // runs after every schedule refresh. It makes no request outside a window.
+    await this.pollLiveAndSchedule()
   }
 
   private schedule(): void {
@@ -791,5 +915,226 @@ export class FootballSource extends EventEmitter {
     this.stopped = true
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
+    if (this.liveTimer) clearTimeout(this.liveTimer)
+    this.liveTimer = null
+  }
+
+  // -------------------------------------------------------------------------
+  // Live games
+  // -------------------------------------------------------------------------
+
+  /** Games already read as `post`. Their window closes early. */
+  private finishedIds(): Set<string> {
+    const ids = new Set<string>()
+    for (const e of this.live.values()) if (e.state === 'post') ids.add(e.gameId)
+    return ids
+  }
+
+  /** The delay before the next live read, or null for none. See `LIVE_POLL_MS`. */
+  private liveDelayMs(nowMs: number): number | null {
+    const finished = this.finishedIds()
+    const delays: number[] = []
+    for (const team of this.teamOrder) {
+      const schedule = this.schedules.get(team) ?? []
+      const game = liveWindowGame(schedule, nowMs, finished)
+      if (game) {
+        const entry = this.live.get(team)
+        const confirmedLive = entry?.gameId === game.id && entry.state === 'in' && !entry.readFailed
+        delays.push(confirmedLive ? LIVE_POLL_MS : WINDOW_POLL_MS)
+        continue
+      }
+      const start = nextWindowStartMs(schedule, nowMs)
+      if (start !== null) delays.push(Math.min(start - nowMs, POLL_MS))
+    }
+    return delays.length === 0 ? null : Math.min(...delays)
+  }
+
+  private scheduleLive(): void {
+    if (this.stopped) return
+    if (this.liveTimer) clearTimeout(this.liveTimer)
+    this.liveTimer = null
+    if (!this.visible) return
+    const delay = this.liveDelayMs(this.now() * 1000)
+    if (delay === null) return
+    this.liveTimer = setTimeout(() => {
+      void this.pollLiveAndSchedule()
+    }, Math.max(0, delay))
+  }
+
+  private async pollLiveAndSchedule(): Promise<void> {
+    try {
+      await this.pollLive()
+    } catch (e) {
+      log.once('football-live-unexpected', `football live read failed unexpectedly: ${String(e)}`)
+    } finally {
+      this.scheduleLive()
+    }
+  }
+
+  /** Reads every team whose game is in its live window. Never throws for a
+   * network or schema failure: the old data stays and is marked stale. */
+  async pollLive(): Promise<void> {
+    if (this.liveInFlight) return this.liveInFlight
+    this.liveInFlight = this.doPollLive().finally(() => {
+      this.liveInFlight = null
+    })
+    return this.liveInFlight
+  }
+
+  private async doPollLive(): Promise<void> {
+    const nowMs = this.now() * 1000
+    const finished = this.finishedIds()
+    const work: Promise<void>[] = []
+    for (const team of this.teamOrder) {
+      const game = liveWindowGame(this.schedules.get(team) ?? [], nowMs, finished)
+      if (game) work.push(this.pollLiveTeam(team, game))
+    }
+    if (work.length === 0) return
+    await Promise.all(work)
+
+    // The whole snapshot, so any field change re-renders (docs/LESSONS.md #7).
+    const key = JSON.stringify([...this.live.entries()])
+    if (key === this.liveKey) return
+    this.liveKey = key
+    this.emit('change')
+  }
+
+  /**
+   * Fetches one JSON body for the live loop. Null on any failure, logged once
+   * per key and cleared on the next success. A 403 is never retried
+   * (docs/LESSONS.md #10).
+   */
+  private async fetchLiveJson(url: string, logKey: string, what: string): Promise<unknown> {
+    if (this.blockedUrls.has(url)) return null
+    let res
+    try {
+      res = await this.fetchFn(url)
+    } catch (e) {
+      log.once(logKey, `Football live ${what} failed: ${String(e)}`)
+      return null
+    }
+    if (res.status === 403) {
+      this.blockedUrls.add(url)
+      log.once(`${logKey}-403`, `Football live ${what} returned 403; will not retry this session.`)
+      return null
+    }
+    if (!res.ok) {
+      log.once(logKey, `Football live ${what} failed with status ${res.status}.`)
+      return null
+    }
+    try {
+      const body: unknown = await res.json()
+      log.clearOnce(logKey)
+      return body ?? null
+    } catch (e) {
+      log.once(logKey, `Football live ${what} is not valid JSON: ${String(e)}`)
+      return null
+    }
+  }
+
+  /** Keeps the last known values and marks them stale. */
+  private markLiveFailure(team: Team, game: Game, reason: string): void {
+    const prev = this.live.get(team)
+    if (prev && prev.gameId === game.id) this.live.set(team, applyLiveFailure(prev))
+    // Logged on the transition into failure; cleared by the next good read,
+    // which logs the recovery.
+    log.once(`football-live-${team}-failed`, `Football live data for ${team} is unavailable (${reason}); showing the last known values as stale.`)
+  }
+
+  private async pollLiveTeam(team: Team, game: Game): Promise<void> {
+    const config = this.teamConfigs.get(team)
+    if (!config || game.kickoffEpochMs === null) return
+    const keyBase = `football-live-${team}`
+
+    let refs = this.liveRefs.get(game.id)
+    if (!refs) {
+      const body = await this.fetchLiveJson(eventUrl(config.league, game.id), `${keyBase}-event`, `event for ${team}`)
+      const parsed = body === null ? null : parseLiveRefs(body, config.espnId)
+      if (!parsed) {
+        if (body !== null) log.once(`${keyBase}-event-schema`, `Football live event for ${team} has no usable status or score links.`)
+        this.markLiveFailure(team, game, 'event links')
+        return
+      }
+      log.clearOnce(`${keyBase}-event-schema`)
+      refs = parsed
+      this.liveRefs.set(game.id, refs)
+    }
+
+    const statusBody = await this.fetchLiveJson(refs.statusUrl, `${keyBase}-status`, `status for ${team}`)
+    const status = statusBody === null ? null : parseStatus(statusBody)
+    if (!status) {
+      if (statusBody !== null) log.once(`${keyBase}-status-schema`, `Football live status for ${team} has no known state.`)
+      this.markLiveFailure(team, game, 'status')
+      return
+    }
+    log.clearOnce(`${keyBase}-status-schema`)
+
+    let myScore: number | null = null
+    let opponentScore: number | null = null
+    let situation: LiveSituation | null = null
+    let play: PlaySnapshot | null = null
+    if (status.state !== 'pre') {
+      const [mine, theirs] = await Promise.all([
+        this.fetchLiveJson(refs.myScoreUrl, `${keyBase}-score`, `score for ${team}`),
+        this.fetchLiveJson(refs.opponentScoreUrl, `${keyBase}-opponent-score`, `opponent score for ${team}`),
+      ])
+      myScore = mine === null ? null : parseScore(mine)
+      opponentScore = theirs === null ? null : parseScore(theirs)
+      // The score is what the live row exists to show. A read without both
+      // scores is a failed read, never a read with zeros.
+      if (myScore === null || opponentScore === null) {
+        if (mine !== null && theirs !== null) log.once(`${keyBase}-score-schema`, `Football live score for ${team} has no readable value.`)
+        this.markLiveFailure(team, game, 'score')
+        return
+      }
+      log.clearOnce(`${keyBase}-score-schema`)
+    }
+
+    if (status.state === 'in' && refs.situationUrl) {
+      // Down, possession and last play are extras. Their failure makes them
+      // unknown and leaves the score row working.
+      const body = await this.fetchLiveJson(refs.situationUrl, `${keyBase}-situation`, `situation for ${team}`)
+      situation = body === null ? null : parseSituation(body)
+      const playUrl = situation?.lastPlayUrl ?? null
+      if (playUrl) {
+        const cached = this.lastPlays.get(game.id)
+        if (cached && cached.url === playUrl) {
+          play = cached.play
+        } else {
+          const pb = await this.fetchLiveJson(playUrl, `${keyBase}-play`, `last play for ${team}`)
+          play = pb === null ? null : parsePlay(pb)
+          if (play) this.lastPlays.set(game.id, { url: playUrl, play })
+        }
+      }
+    }
+
+    const prev = this.live.get(team) ?? null
+    const next = applyLiveReading(prev, {
+      gameId: game.id,
+      kickoffEpochMs: game.kickoffEpochMs,
+      myEspnId: config.espnId,
+      opponentEspnId: refs.opponentEspnId,
+      status,
+      myScore,
+      opponentScore,
+      situation,
+      play,
+    }, this.now() * 1000)
+    this.live.set(team, next)
+
+    const samePrev = prev && prev.gameId === game.id ? prev : null
+    if (samePrev?.readFailed) log.info(`Football live data for ${team} recovered.`)
+    log.clearOnce(`football-live-${team}-failed`)
+    const prevState = samePrev?.state ?? null
+    if (prevState !== next.state) {
+      const word = next.state === 'in' ? 'live' : next.state === 'post' ? 'over' : 'scheduled'
+      log.info(`Football ${team} game ${game.id} is ${word}.`)
+      // A game that ends while watched changes its result and the record.
+      // Refresh them now rather than up to six hours later. `post` is
+      // reached once per game, so this runs once per game.
+      if (next.state === 'post' && prevState !== null) {
+        this.refresh().catch((e: unknown) => log.once('football-refresh-unexpected', `football refresh failed unexpectedly: ${String(e)}`))
+      }
+    }
   }
 }

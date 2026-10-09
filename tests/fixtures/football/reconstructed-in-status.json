@@ -1,0 +1,16 @@
+{
+  "_provenance": "RECONSTRUCTED, not captured. No football game was live at capture time (2026-10-09 17:04 UTC). Shape copied from the real final-status.json of the same game (event 401872980). clock, displayClock and period are taken from the real play play-4018729803719.json (4th quarter, 5:35). state 'in' is the value ESPN uses on this host for a live game: measured on a live soccer event (live-status-soccer.json) and in docs/VERIFIED-FACTS.md (2026-08-18). The name and detail strings are ESPN's usual football wording and are not measured.",
+  "$ref": "http://sports.core.api.espn.com/v2/sports/football/leagues/nfl/events/401872980/competitions/401872980/status?lang=en&region=us",
+  "clock": 335.0,
+  "displayClock": "5:35",
+  "period": 4,
+  "type": {
+    "id": "2",
+    "name": "STATUS_IN_PROGRESS",
+    "state": "in",
+    "completed": false,
+    "description": "In Progress",
+    "detail": "5:35 - 4th Quarter",
+    "shortDetail": "5:35 - 4th"
+  }
+}

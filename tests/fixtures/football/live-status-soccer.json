@@ -1,0 +1,1 @@
+{"$ref":"http://sports.core.api.espn.com/v2/sports/soccer/leagues/ger.2/events/401885100/competitions/401885100/status?lang=en&region=us","clock":2100.0,"addedClock":0.0,"displayClock":"35'","period":1,"type":{"id":"25","name":"STATUS_FIRST_HALF","state":"in","completed":false,"description":"First Half","detail":"35'","shortDetail":"35'"}}
