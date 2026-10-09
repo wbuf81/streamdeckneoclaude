@@ -258,7 +258,18 @@ describe('parseForecast', () => {
     expect(days[1]!.high).toBe(95)
     expect(days[1]!.low).toBe(77)
     expect(days[6]!.label).toBe('TUE')
-    expect(conditions).toEqual({ windSpeed: '8 mph', temperature: 95, shortForecast: 'Showers And Thunderstorms' })
+    expect(conditions).toEqual({
+      windSpeed: '8 mph', windDirection: 'NE', temperature: 95, shortForecast: 'Showers And Thunderstorms',
+    })
+  })
+
+  it('reports the current wind direction as given, and empty (unknown) when the period has none', () => {
+    // The page draws a compass arrow only for a known direction, so an
+    // absent field must stay empty — never a default like "N".
+    const withDir = parseForecast(forecastBody([period({ windDirection: 'WNW' })]), NOW).conditions
+    expect(withDir!.windDirection).toBe('WNW')
+    const { windDirection: _drop, ...noDir } = period()
+    expect(parseForecast(forecastBody([noDir]), NOW).conditions!.windDirection).toBe('')
   })
 
   it('gives a null high and uses the temperature as the low when the first period is night', () => {

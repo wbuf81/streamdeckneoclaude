@@ -107,6 +107,9 @@ export interface PeriodDetail {
 export interface Conditions {
   /** From the current period. */
   windSpeed: string
+  /** The current period's `windDirection`, for example `"NE"` or `"WNW"`: the
+   * compass point the wind blows FROM. Empty when unknown, never fabricated. */
+  windDirection: string
   temperature: number | null
   shortForecast: string
 }
@@ -226,6 +229,7 @@ function extractPeriods(body: unknown): unknown[] {
 function extractConditions(period: unknown): Conditions {
   return {
     windSpeed: strOf(period, 'windSpeed'),
+    windDirection: strOf(period, 'windDirection'),
     temperature: tempOf(period),
     shortForecast: strOf(period, 'shortForecast'),
   }

@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { createCanvas } from '@napi-rs/canvas'
-import { WeatherPage, conditionTint, conditionFx, precipIntensity, heatColor, wrapText } from '../../src/pages/weather-page.js'
+import {
+  WeatherPage, conditionTint, conditionFx, precipIntensity, heatColor, wrapText, compassBearing, tempPair,
+} from '../../src/pages/weather-page.js'
 import { theme } from '../../src/render/theme.js'
 import { renderKey, renderStrip, probe, KEY_SIZE, STRIP_WIDTH, STRIP_HEIGHT, FONT, FX_INTENSITY_MIN } from '../../src/render/canvas.js'
 import { weatherEmoji } from '../../src/sources/weather.js'
@@ -35,7 +37,19 @@ function near3(actual: readonly number[], expected: readonly number[], tol = 12)
  * content and nothing else is.
  */
 function withoutContent(key: KeySpec): KeySpec {
-  return { ...key, lines: undefined, lineColors: undefined, emoji: undefined }
+  return { ...key, lines: undefined, lineColors: undefined, emoji: undefined, icon: undefined }
+}
+
+/** A day tile's temperature row as a reader sees it: the high and the low,
+ * padding stripped, joined `95°/77°`. A lone value reads `77°`. */
+function tempText(key: KeySpec): string {
+  return [key.lines![1]!, key.lines![2]!].map((t) => t.trim()).filter(Boolean).join('/')
+}
+
+/** A day tile's lines as a reader sees them: padding stripped, the empty
+ * second temperature slot dropped. */
+function visibleLines(key: KeySpec): string[] {
+  return key.lines!.map((t) => t.trim()).filter(Boolean)
 }
 
 /**
@@ -118,7 +132,7 @@ interface Fakes {
 function build(over: Partial<Fakes> = {}) {
   const f: Fakes = {
     days: sevenDays(),
-    conditions: { windSpeed: '8 mph', temperature: 91, shortForecast: 'Sunny' },
+    conditions: { windSpeed: '8 mph', windDirection: 'NE', temperature: 91, shortForecast: 'Sunny' },
     status: 'ok',
     place: 'Brooklyn NY',
     stale: false,
@@ -163,28 +177,28 @@ describe('WeatherPage layout', () => {
     const days = sevenDays()
     days[0] = day('NOW', { high: 95, low: 77 })
     const { page } = build({ days })
-    expect(page.render(NOW).keys[0]!.lines![1]).toBe('95°/77°')
+    expect(tempText(page.render(NOW).keys[0]!)).toBe('95°/77°')
   })
 
   it('shows only the low when the high is null', () => {
     const days = sevenDays()
     days[0] = day('NOW', { high: null, low: 77 })
     const { page } = build({ days })
-    expect(page.render(NOW).keys[0]!.lines![1]).toBe('77°')
+    expect(tempText(page.render(NOW).keys[0]!)).toBe('77°')
   })
 
   it('shows -- for the temperature line when both high and low are null', () => {
     const days = sevenDays()
     days[0] = day('NOW', { high: null, low: null })
     const { page } = build({ days })
-    expect(page.render(NOW).keys[0]!.lines![1]).toBe('--')
+    expect(tempText(page.render(NOW).keys[0]!)).toBe('--')
   })
 
   it('shows the precip percent', () => {
     const days = sevenDays()
     days[0] = day('NOW', { precipPercent: 96 })
     const { page } = build({ days })
-    expect(page.render(NOW).keys[0]!.lines![2]).toBe('96%')
+    expect(page.render(NOW).keys[0]!.lines![3]).toBe('96%')
   })
 
   it('shows -- for precip, never 0%, when the value is unknown', () => {
@@ -192,7 +206,7 @@ describe('WeatherPage layout', () => {
     days[0] = day('NOW', { precipPercent: null })
     const { page } = build({ days })
     const key = page.render(NOW).keys[0]!
-    expect(key.lines![2]).toBe('--')
+    expect(key.lines![3]).toBe('--')
     expect(key.lines!.join('')).not.toContain('0%')
   })
 
@@ -201,7 +215,7 @@ describe('WeatherPage layout', () => {
     days[0] = day('NOW', { precipPercent: 50 })
     const { page } = build({ days })
     const key = page.render(NOW).keys[0]!
-    expect(key.lineColors?.[2]).toEqual(theme.blue)
+    expect(key.lineColors?.[3]).toEqual(theme.blue)
   })
 
   it('colours the precip line dim just below the 50 percent threshold', () => {
@@ -209,23 +223,24 @@ describe('WeatherPage layout', () => {
     days[0] = day('NOW', { precipPercent: 49 })
     const { page } = build({ days })
     const key = page.render(NOW).keys[0]!
-    expect(key.lineColors?.[2]).toEqual(theme.textDim)
+    expect(key.lineColors?.[3]).toEqual(theme.textDim)
   })
 
-  it('colours the temperature line by heat, using the high when present', () => {
+  it('colours the high on the warm scale and the low quiet grey', () => {
     const days = sevenDays()
     days[0] = day('NOW', { high: 95, low: 40 })
     const { page } = build({ days })
     const key = page.render(NOW).keys[0]!
-    expect(key.lineColors?.[1]).toEqual(theme.red)
+    expect(key.lineColors?.[1]).toEqual(heatColor(95))
+    expect(key.lineColors?.[2]).toEqual(theme.textDim)
   })
 
-  it('colours the temperature line using the low when the high is null', () => {
+  it('keeps a lone low grey, so it still reads as a low', () => {
     const days = sevenDays()
     days[0] = day('NOW', { high: null, low: 55 })
     const { page } = build({ days })
     const key = page.render(NOW).keys[0]!
-    expect(key.lineColors?.[1]).toEqual(theme.blue)
+    expect(key.lineColors?.[1]).toEqual(theme.textDim)
   })
 
   it('gives a day slot with no data yet the SAME four-band layout as a populated tile', () => {
@@ -245,55 +260,87 @@ describe('WeatherPage layout', () => {
     expect(key.lines).toEqual(['--', '--', '--'])
   })
 
-  it('builds a conditions tile with wind speed, the ZIP, and the truncated place', () => {
+  it('turns the conditions tile into a wind compass with the speed, and drops the ZIP and the town', () => {
     const { page } = build()
     const key = page.render(NOW).keys[7]!
-    expect(key.lines).toContain('8 mph')
-    expect(key.lines).toContain(ZIP)
+    expect(key.lines).toEqual(['8 mph'])
+    expect(key.icon?.kind).toBe('compass')
+    expect(key.lines!.join(' ')).not.toContain(ZIP)
+    expect(key.lines!.join(' ')).not.toContain('Brooklyn')
   })
 
-  it('shows -- for wind speed when conditions are unknown', () => {
+  it('shows -- for wind speed, and no compass, when conditions are unknown', () => {
     const { page } = build({ conditions: null })
     const key = page.render(NOW).keys[7]!
-    expect(key.lines![1]).toBe('--')
+    expect(key.lines).toEqual(['WIND', '--'])
+    expect(key.icon).toBeUndefined()
   })
 })
 
-describe('heatColor', () => {
-  it('colours red at 90 and above', () => {
-    expect(heatColor(90, null)).toEqual(theme.red)
+describe('heatColor: the warm scale', () => {
+  it('is cool blue-white below 60°F', () => {
+    const [r, g, b] = heatColor(50)
+    expect(b).toBeGreaterThan(r)
+    expect(b).toBeGreaterThan(200)
+    expect(heatColor(50)).toEqual(heatColor(58))
   })
 
-  it('colours amber at 89', () => {
-    expect(heatColor(89, null)).toEqual(theme.amber)
+  it('is warm gold in the mid 70s', () => {
+    const [r, g, b] = heatColor(74)
+    expect(r).toBeGreaterThan(240)
+    expect(g).toBeGreaterThan(180)
+    expect(b).toBeLessThan(110)
   })
 
-  it('colours amber at 80', () => {
-    expect(heatColor(80, null)).toEqual(theme.amber)
+  it('is soft orange at 85°F and above, and holds it', () => {
+    const [r, g, b] = heatColor(88)
+    expect(r).toBeGreaterThan(240)
+    expect(g).toBeGreaterThan(120)
+    expect(g).toBeLessThan(170)
+    expect(b).toBeLessThan(100)
+    expect(heatColor(110)).toEqual(heatColor(88))
   })
 
-  it('colours neutral at 79', () => {
-    expect(heatColor(79, null)).toEqual(theme.text)
+  it('never returns the theme red, the colour this deck uses for a loss', () => {
+    // Every whole degree a forecast can plausibly print. A red high reads as
+    // an alarm: the green channel stays well above red's 60.
+    for (let t = -40; t <= 130; t++) {
+      const c = heatColor(t)
+      expect(c).not.toEqual(theme.red)
+      expect(c[1]).toBeGreaterThan(110)
+    }
   })
 
-  it('colours neutral at 70', () => {
-    expect(heatColor(70, null)).toEqual(theme.text)
+  it('changes only when the printed number does', () => {
+    expect(heatColor(80.4)).toEqual(heatColor(80))
   })
 
-  it('colours blue at 69', () => {
-    expect(heatColor(69, null)).toEqual(theme.blue)
+  it('stays neutral for an unknown temperature', () => {
+    expect(heatColor(null)).toEqual(theme.text)
+    expect(heatColor(Number.NaN)).toEqual(theme.text)
+  })
+})
+
+describe('compassBearing', () => {
+  it('maps the NWS compass points clockwise from north', () => {
+    expect(compassBearing('N')).toBe(0)
+    expect(compassBearing('NE')).toBe(45)
+    expect(compassBearing('E')).toBe(90)
+    expect(compassBearing('SW')).toBe(225)
+    expect(compassBearing('WNW')).toBe(292.5)
   })
 
-  it('stays neutral for a null temperature', () => {
-    expect(heatColor(null, null)).toEqual(theme.text)
+  it('returns null for an unknown direction, never a fake north', () => {
+    expect(compassBearing('')).toBeNull()
+    expect(compassBearing('Variable')).toBeNull()
+    expect(compassBearing('270')).toBeNull()
   })
+})
 
-  it('uses the high over the low when both are present', () => {
-    expect(heatColor(95, 40)).toEqual(theme.red)
-  })
-
-  it('falls back to the low when the high is null', () => {
-    expect(heatColor(null, 65)).toEqual(theme.blue)
+describe('tempPair', () => {
+  it('pads the high on the right and the low on the left, one more than each length', () => {
+    expect(tempPair(74, 61)).toEqual(['74°    ', '    61°'])
+    expect(tempPair(-10, -25)).toEqual(['-10°     ', '     -25°'])
   })
 })
 
@@ -406,13 +453,15 @@ describe('WeatherPage day tile layout details', () => {
   it('places the label, temperature and rain-chance lines in their own bands, skipping the emoji band', () => {
     const { page } = build()
     const key = page.render(NOW).keys[0]!
-    // Three explicit y positions, one per text line, none inside the emoji's
-    // own band (roughly y 17 to 48 — see render/canvas.ts).
-    expect(key.lineY).toHaveLength(3)
-    const [labelY, tempY, precipY] = key.lineY!
+    // Four explicit y positions — label, high, low, rain chance — none
+    // inside the emoji's own band (roughly y 17 to 48, see render/canvas.ts).
+    // The high and the low share one row.
+    expect(key.lineY).toHaveLength(4)
+    const [labelY, highY, lowY, precipY] = key.lineY!
     expect(labelY).toBeLessThan(17)
-    expect(tempY).toBeGreaterThan(48)
-    expect(precipY).toBeGreaterThan(tempY!)
+    expect(highY).toBeGreaterThan(48)
+    expect(lowY).toBeGreaterThan(48)
+    expect(precipY).toBeGreaterThan(Math.max(highY!, lowY!))
   })
 
   it('keeps a below-freezing high/low pair within the usable key width', () => {
@@ -435,31 +484,21 @@ describe('WeatherPage day tile layout details', () => {
     }
   })
 
-  it('gives the conditions tile a bigger size for the fixed-width ZIP line only', () => {
-    const { page } = build()
-    const key = page.render(NOW).keys[7]!
-    // Line 1 (the wind reading) can run to 12 variable-length characters, so
-    // it passes a one-candidate ARRAY (M3) — measured and shrunk if needed,
-    // never drawn unchecked — rather than a bare number. Line 2 (the ZIP
-    // code) is always exactly 5 digits, so it is safe to enlarge unmeasured.
-    expect(key.lineSizes?.[1]).toEqual([11])
-    expect(key.lineSizes?.[2]).toBeGreaterThan(11)
-  })
-
-  it('measures the WIND line rather than trusting it fits, for the widest real windSpeed value (M3)', () => {
-    // Measured (see docs/VERIFIED-FACTS.md's "Weather" section): "10 to 15
-    // mph" (12 characters) is 79.5 px at 11 px, inside the 81 px budget with
-    // only 1.5 px to spare. A `renderKey` pixel probe is what actually
-    // proves this, not the arithmetic, per docs/LESSONS.md #17 — and this
-    // string is deliberately right at the documented ceiling, not padded
-    // with slack, so a regression that removed the measuring path (M3)
-    // would show up here.
-    const { page } = build({ conditions: { windSpeed: '10 to 15 mph', temperature: 90, shortForecast: 'Sunny' } })
-    const key = page.render(NOW).keys[7]!
-    const buf = renderKey(key)
-    for (let y = 0; y < KEY_SIZE; y++) {
-      for (let x = 90; x < KEY_SIZE; x++) {
-        expect(near3(probe(buf, x, y), theme.bg)).toBe(true)
+  it('measures the wind speed rather than trusting it fits, for the widest real windSpeed value (M3)', () => {
+    // "10 to 15 mph" is the widest real shape (docs/VERIFIED-FACTS.md). The
+    // page compacts it to "10-15 mph"; the renderer still measures it, so no
+    // ink may reach the right margin, with or without a compass.
+    for (const windDirection of ['WNW', '']) {
+      const { page } = build({
+        conditions: { windSpeed: '10 to 15 mph', windDirection, temperature: 90, shortForecast: 'Sunny' },
+      })
+      const key = page.render(NOW).keys[7]!
+      expect(key.lines).toContain('10-15 mph')
+      const buf = renderKey({ ...key, icon: undefined })
+      for (let y = 0; y < KEY_SIZE; y++) {
+        for (let x = 90; x < KEY_SIZE; x++) {
+          expect(near3(probe(buf, x, y), theme.bg)).toBe(true)
+        }
       }
     }
   })
@@ -512,7 +551,8 @@ describe('WeatherPage day tile: rendered band geometry has no overlap, for every
     // must still land inside each band and stay clear of the gaps.
     expect(contentInkOnRow(key, 8)).toBe(true) // the '--' label
     expect(contentInkOnRow(key, 62)).toBe(true) // the '--' temperature
-    expect(contentInkOnRow(key, 85)).toBe(true) // the '--' precip
+    // The '--' precip: a thin dash, so probe its whole band, not one row.
+    expect(Array.from({ length: 16 }, (_, k) => contentInkOnRow(key, 77 + k)).some(Boolean)).toBe(true)
     expect(contentInkOnRow(key, 16)).toBe(false)
     expect(contentInkOnRow(key, 52)).toBe(false)
     expect(contentInkOnRow(key, 72)).toBe(false)
@@ -575,7 +615,7 @@ describe('WeatherPage strip', () => {
   })
 
   it('keeps both strip lines within 30 characters', () => {
-    const { page } = build({ place: 'A Very Long Place Name Indeed FL', conditions: { windSpeed: '8 mph', temperature: 90, shortForecast: 'Chance Showers And Thunderstorms Likely' } })
+    const { page } = build({ place: 'A Very Long Place Name Indeed FL', conditions: { windSpeed: '8 mph', windDirection: 'NE', temperature: 90, shortForecast: 'Chance Showers And Thunderstorms Likely' } })
     const strip = page.render(NOW).strip
     expect(strip.lines[0]!.length).toBeLessThanOrEqual(30)
     expect(strip.lines[1]!.length).toBeLessThanOrEqual(30)
@@ -599,7 +639,7 @@ describe('WeatherPage strip', () => {
     // proof available from this page's own public surface.
     const { page } = build({
       place: 'A Very Long Place Name Indeed FL',
-      conditions: { windSpeed: '8 mph', temperature: 90, shortForecast: 'Chance Showers And Thunderstorms Likely' },
+      conditions: { windSpeed: '8 mph', windDirection: 'NE', temperature: 90, shortForecast: 'Chance Showers And Thunderstorms Likely' },
     })
     const buffer = renderStrip(page.render(NOW).strip)
     for (let y = 0; y < STRIP_HEIGHT; y++) {
@@ -740,8 +780,8 @@ describe('WeatherPage identity (I1 / lesson 19): selection follows the day, neve
       day('SUN', { id: '2026-08-16:day', high: 88, low: 74 }),
     ]
     const key0 = page.render(NOW).keys[0]!
-    expect(key0.lines![1]).toBe('90°/75°') // still the originally-selected day
-    expect(key0.lines![1]).not.toBe('88°/74°') // never SUN's data
+    expect(tempText(key0)).toBe('90°/75°') // still the originally-selected day
+    expect(tempText(key0)).not.toBe('88°/74°') // never SUN's data
   })
 
   it('falls back to the grid, honestly, once the selected day is truly gone — never shows another day under the old heading', () => {
@@ -782,7 +822,7 @@ describe('WeatherPage identity (I1 / lesson 19): selection follows the day, neve
     expect(page.onKeyPress(1)).toBe('handled')
     const key0 = page.render(NOW).keys[0]!
     // Opens THU's own data, not NOW's overnight tile.
-    expect(key0.lines).toEqual(['THU', '95°/70°', '10%'])
+    expect(visibleLines(key0)).toEqual(['THU', '95°', '70°', '10%'])
   })
 
   it('C1: a day tile with no usable startTime (empty id) can never be selected, and pressing it is ignored', () => {
@@ -805,7 +845,7 @@ describe('WeatherPage detail view layout', () => {
 
   it('key 0 shows the same day tile as the grid: label, emoji, combined high/low, combined rain chance', () => {
     const key = detailKeys()[0]!
-    expect(key.lines).toEqual([LABELS[2], '95°/77°', '40%'])
+    expect(visibleLines(key)).toEqual([LABELS[2], '95°', '77°', '40%'])
     expect(key.emoji).toBe('⛈')
   })
 
@@ -1413,7 +1453,9 @@ describe('WeatherPage condition effects: legibility on the real tiles', () => {
       days[0] = day('NOW', { emoji, high: 95, low: 77, precipPercent: 100 })
       const { page } = build({ days })
       const keyA = page.render(NOW, FX_NOW_MS).keys[0]!
-      const keyB = page.render(NOW, FX_NOW_MS + 3000).keys[0]!
+      // A drawn icon (fog) drifts on purpose: it is content that moves, not
+      // a layer. Hold it at the first clock so only the layer differs.
+      const keyB = { ...page.render(NOW, FX_NOW_MS + 3000).keys[0]!, icon: keyA.icon }
       // The two frames must really differ underneath, or this proves nothing.
       expect(keyA.fx!.nowMs).not.toBe(keyB.fx!.nowMs)
 
@@ -1435,5 +1477,186 @@ describe('WeatherPage condition effects: legibility on the real tiles', () => {
       }
       expect(compared).toBeGreaterThan(MIN_OPAQUE_PIXELS)
     }
+  })
+})
+
+/**
+ * Content pixels of `key` inside a region: every pixel where the real key
+ * differs from the same key with its content stripped (see `withoutContent`).
+ * The ambient layer is identical in both renders, so what remains is text,
+ * emoji and icon ink only. A region, never a single column.
+ */
+function contentPixels(
+  key: KeySpec, x0: number, x1: number, y0: number, y1: number,
+): { x: number; y: number; rgb: readonly number[] }[] {
+  const withContent = renderKey(key)
+  const layerOnly = renderKey(withoutContent(key))
+  const out: { x: number; y: number; rgb: readonly number[] }[] = []
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const rgb = probe(withContent, x, y)
+      if (!near3(rgb, probe(layerOnly, x, y), 1)) out.push({ x, y, rgb })
+    }
+  }
+  return out
+}
+
+/** Ink extent along one axis, in pixels. */
+function span(px: { x: number; y: number }[], axis: 'x' | 'y'): number {
+  const v = px.map((p) => p[axis])
+  return Math.max(...v) - Math.min(...v) + 1
+}
+
+describe('WeatherPage glow-up: the temperature row, rendered', () => {
+  function hotTile(): KeySpec {
+    const days = sevenDays()
+    days[0] = day('NOW', { emoji: '☁️', high: 95, low: 77 })
+    const { page } = build({ days })
+    return page.render(NOW, FX_NOW_MS).keys[0]!
+  }
+
+  it('draws a hot high in warm orange, with no red ink at all', () => {
+    // Break the fix (colour the high theme.red at 90+, as before): the red
+    // count rises above zero and this fails.
+    const left = contentPixels(hotTile(), 9, 48, 52, 74)
+    expect(left.length).toBeGreaterThan(20)
+    expect(left.filter((p) => near3(p.rgb, theme.red, 40)).length).toBe(0)
+    expect(left.filter((p) => near3(p.rgb, heatColor(95), 30)).length).toBeGreaterThan(10)
+  })
+
+  it('draws the low to the right of the high, smaller and in quiet grey', () => {
+    // Break the fix (low in the high's size or colour): the span or the
+    // brightness check fails.
+    const key = hotTile()
+    // Rows 52..77: the whole row band, above the rain chance's ink.
+    const hi = contentPixels(key, 9, 48, 52, 78)
+    const lo = contentPixels(key, 49, 90, 52, 78)
+    expect(lo.length).toBeGreaterThan(10)
+    // Both are three characters (`95°`, `77°`), so a smaller font is a
+    // narrower and shorter run of ink.
+    expect(span(lo, 'x')).toBeLessThan(span(hi, 'x') - 3)
+    expect(span(lo, 'y')).toBeLessThan(span(hi, 'y'))
+    // Grey: no channel of any low pixel is brighter than the grey itself.
+    for (const p of lo) expect(Math.max(...p.rgb)).toBeLessThanOrEqual(Math.max(...theme.textDim) + 12)
+  })
+})
+
+describe('WeatherPage glow-up: fog is a drawn icon', () => {
+  it('draws the fog icon, never the 🌫 emoji, on a grid tile and on a detail half', () => {
+    // Break the fix (pass the emoji through for fog): `emoji` is set again.
+    const days = sevenDays()
+    days[1] = fullDay('THU', { emoji: '🌫', day: periodDetail({ emoji: '🌫' }) })
+    const { page } = build({ days })
+    const grid = page.render(NOW, FX_NOW_MS).keys[1]!
+    expect(grid.emoji).toBeUndefined()
+    expect(grid.icon).toEqual({ kind: 'fog', nowMs: FX_NOW_MS })
+    // The bars land in the emoji band (y 23..48), and only there.
+    expect(contentPixels(grid, 9, 90, 23, 49).length).toBeGreaterThan(100)
+    expect(contentPixels(grid, 9, 90, 17, 21).length).toBe(0)
+
+    page.onKeyPress(1)
+    const half = page.render(NOW, FX_NOW_MS).keys[1]!
+    expect(half.emoji).toBeUndefined()
+    expect(half.icon?.kind).toBe('fog')
+  })
+
+  it('keeps the fog icon still when the forecast is stale', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { emoji: '🌫' })
+    const { page } = build({ days, stale: true })
+    expect(page.render(NOW, FX_NOW_MS).keys[0]!.icon).toEqual({ kind: 'fog' })
+  })
+
+  it('keeps every other condition on its emoji', () => {
+    const days = sevenDays()
+    days[0] = day('NOW', { emoji: '⛅' })
+    const { page } = build({ days })
+    const key = page.render(NOW, FX_NOW_MS).keys[0]!
+    expect(key.emoji).toBe('⛅')
+    expect(key.icon).toBeUndefined()
+  })
+})
+
+describe('WeatherPage glow-up: the wind compass', () => {
+  function windKey(windSpeed: string, windDirection: string, over: Partial<Fakes> = {}): KeySpec {
+    const { page } = build({
+      conditions: { windSpeed, windDirection, temperature: 70, shortForecast: 'Sunny' },
+      ...over,
+    })
+    return page.render(NOW, FX_NOW_MS).keys[7]!
+  }
+
+  /** Cyan arrow pixels around the compass centre (48, 38), by region. */
+  function arrowRegions(key: KeySpec): { ne: number; sw: number; n: number; s: number } {
+    const buf = renderKey({ ...key, lines: undefined })
+    let ne = 0, sw = 0, n = 0, s = 0
+    for (let y = 4; y < 73; y++) {
+      for (let x = 9; x < 88; x++) {
+        if (!near3(probe(buf, x, y), theme.cyan, 40)) continue
+        if (x > 50 && y < 36) ne++
+        if (x < 46 && y > 40) sw++
+        if (y < 36) n++
+        if (y > 40) s++
+      }
+    }
+    return { ne, sw, n, s }
+  }
+
+  it('points the arrow where the wind blows TO: a SW wind points north-east', () => {
+    // Break the fix (pass the "from" bearing without + 180): the ink moves to
+    // the south-west region and this fails.
+    const q = arrowRegions(windKey('12 mph', 'SW'))
+    expect(q.ne).toBeGreaterThan(20)
+    expect(q.ne).toBeGreaterThan(q.sw * 3)
+  })
+
+  it('points a north wind south', () => {
+    const q = arrowRegions(windKey('12 mph', 'N'))
+    expect(q.s).toBeGreaterThan(q.n * 3)
+  })
+
+  it('draws no arrow at all for an unknown direction, never a fake north', () => {
+    // Break the fix (default the bearing to 0): cyan ink appears.
+    for (const dir of ['', 'Variable']) {
+      const key = windKey('12 mph', dir)
+      expect(key.icon).toBeUndefined()
+      expect(key.lines).toEqual(['WIND', '12 mph'])
+      const q = arrowRegions(key)
+      expect(q.n + q.s).toBe(0)
+    }
+  })
+
+  it('draws no arrow for a calm wind, whatever the direction field says', () => {
+    const key = windKey('0 mph', 'N')
+    expect(key.icon).toBeUndefined()
+    expect(key.lines).toEqual(['WIND', '0 mph'])
+  })
+
+  it('puts the speed below the compass ink, at y 76 or lower', () => {
+    // Break the fix (move WIND_SPEED_Y above 76): text ink appears in the
+    // compass rows and this fails.
+    const key = windKey('10 to 15 mph', 'WNW')
+    const textOnly = renderKey({ ...key, icon: undefined })
+    const blank = renderKey({ ...key, icon: undefined, lines: undefined })
+    let above = 0, below = 0
+    for (let y = 0; y < KEY_SIZE; y++) {
+      for (let x = 9; x < 88; x++) {
+        if (near3(probe(textOnly, x, y), probe(blank, x, y), 1)) continue
+        if (y < 76) above++
+        else below++
+      }
+    }
+    expect(above).toBe(0)
+    expect(below).toBeGreaterThan(20)
+  })
+
+  it('wobbles only while fresh, and holds still when stale', () => {
+    // Break the fix (always pass nowMs): the stale icon carries a clock and
+    // the key rewrites for nothing.
+    const fresh = windKey('12 mph', 'SW')
+    expect(fresh.icon).toEqual({ kind: 'compass', bearingDeg: 45, nowMs: FX_NOW_MS })
+    const stale = windKey('12 mph', 'SW', { stale: true })
+    expect(stale.icon).toEqual({ kind: 'compass', bearingDeg: 45 })
+    expect(stale.dim).toBe(true)
   })
 })

@@ -1,15 +1,12 @@
-import type { DeckFrame, FxSpec, FxVariant, KeySpec, Rgb, StripSpec } from '../render/specs.js'
+import type { DeckFrame, FxSpec, FxVariant, IconSpec, KeySpec, Rgb, StripSpec } from '../render/specs.js'
 import { FX_INTENSITY_MIN } from '../render/canvas.js'
-import { theme } from '../render/theme.js'
+import { blend, theme } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
 import type { Conditions, DayForecast, PeriodDetail, WeatherStatus } from '../sources/weather.js'
 
 /** Measured limit for one strip line. See `render/canvas.ts`. */
 const STRIP_CHARS = 30
-/** Matches `PROJECT_CHARS` on the Claude page: a short label fits an 11 px
- * Menlo line on a 96 px key with room to spare. */
-const PLACE_CHARS = 10
 /** Rain at or above this percent gets the emphasis colour. */
 const PRECIP_HOT_THRESHOLD = 50
 const DAY_TILE_COUNT = 7
@@ -41,8 +38,18 @@ const DAY_LABEL_Y = 3
  */
 const TEMP_SIZES = [16, 13, 11]
 const TEMP_Y = 54
-const PRECIP_SIZE = 20
-const PRECIP_Y = 74
+/**
+ * The high and the low share one row: the high large, bold and warm, the low
+ * smaller and grey beside it. The low sits 4 px lower so the two read as one
+ * baseline. Each line is padded with spaces to a symmetric string (see
+ * `tempPair`), so the renderer measures the whole padded width — if the
+ * padded string fits, the visible half fits too.
+ */
+const HIGH_SIZES = [17, 14, 12]
+const LOW_SIZES = [13, 11]
+const LOW_Y = TEMP_Y + 4
+const PRECIP_SIZE = 16
+const PRECIP_Y = 76
 
 /**
  * Candidate sizes for the detail view's variable-length text lines: the
@@ -75,11 +82,36 @@ const TEXT_WRAP_LINES = 3
 /** Fixed size for the detail view's BACK label, matching the stocks detail view. */
 const BACK_SIZE = 16
 
-/** Heat colour bands for the high temperature (or the low, when there is no
- * high). A null temperature — nothing to grade — stays neutral. */
-const HEAT_HOT = 90
-const HEAT_WARM = 80
-const HEAT_MILD = 70
+/**
+ * The high's warm scale. On this deck red means a loss, so a solid-red high
+ * read as an alarm. The scale runs cool blue-white, through warm gold, to a
+ * soft orange — and never reaches `theme.red`. Between two stops the colour
+ * blends linearly; outside them it holds the end colour.
+ */
+const HEAT_COOL: Rgb = [150, 195, 255]
+const HEAT_GOLD: Rgb = [255, 196, 92]
+const HEAT_ORANGE: Rgb = [255, 140, 72]
+const HEAT_COOL_AT = 58
+const HEAT_GOLD_AT = 74
+const HEAT_ORANGE_AT = 88
+/** The low is secondary information: quiet grey. */
+const LOW_COLOR: Rgb = theme.textDim
+
+/** The wind compass key: the speed sits under the compass ink (y 4..72). */
+const WIND_SPEED_SIZES = [16, 13, 11]
+const WIND_SPEED_Y = 77
+/** With no direction there is no compass, so the key shows a label and the
+ * speed, larger, in the space the compass would use. */
+const WIND_LABEL_Y = 18
+const WIND_ONLY_SIZES = [22, 18, 14, 11]
+const WIND_ONLY_Y = 42
+
+/** NWS `windDirection` values (1 to 3 letters, docs/VERIFIED-FACTS.md), in
+ * clockwise order from north, 22.5 degrees apart. */
+const COMPASS_POINTS = [
+  'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+  'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW',
+] as const
 
 /**
  * One row per forecast condition, keyed by the SAME emoji the forecast already
@@ -162,22 +194,80 @@ export function conditionFx(
   return { variant: style.fx, nowMs, intensity, seed }
 }
 
-/** Grades the high temperature (or the low, when there is no high) into one
- * of four heat colours. A null temperature — nothing to grade — stays
- * neutral, the same colour as the 70-to-79 band. */
-export function heatColor(high: number | null, low: number | null): Rgb {
-  const t = high ?? low
-  if (t === null) return theme.text
-  if (t >= HEAT_HOT) return theme.red
-  if (t >= HEAT_WARM) return theme.amber
-  if (t >= HEAT_MILD) return theme.text
-  return theme.blue
+/**
+ * Grades one temperature on the warm scale: cool blue-white at 58°F and
+ * below, warm gold at 74°F, soft orange at 88°F and above. The input is
+ * rounded first, so the colour changes only when the printed number does.
+ * A null or non-finite temperature — nothing to grade — stays neutral text.
+ */
+export function heatColor(temp: number | null): Rgb {
+  if (typeof temp !== 'number' || !Number.isFinite(temp)) return theme.text
+  const t = Math.round(temp)
+  if (t <= HEAT_GOLD_AT) {
+    return blend(HEAT_COOL, HEAT_GOLD, (t - HEAT_COOL_AT) / (HEAT_GOLD_AT - HEAT_COOL_AT))
+  }
+  return blend(HEAT_GOLD, HEAT_ORANGE, (t - HEAT_GOLD_AT) / (HEAT_ORANGE_AT - HEAT_GOLD_AT))
+}
+
+/**
+ * Converts an NWS compass point (`"WNW"`) to degrees clockwise from north.
+ * Anything else — empty, lower case junk, a number — is unknown and returns
+ * null. A page must never draw an arrow for an unknown direction: a default
+ * of 0 would show a fake north wind.
+ */
+export function compassBearing(direction: string): number | null {
+  const i = COMPASS_POINTS.indexOf(direction.trim().toUpperCase() as (typeof COMPASS_POINTS)[number])
+  return i < 0 ? null : i * 22.5
+}
+
+/** `"5 to 9 mph"` becomes `"5-9 mph"`. Keeps the unit: on the compass key the
+ * unit is the only thing that says this number is a wind speed. */
+function compactSpeed(windSpeed: string): string {
+  return windSpeed.trim().replace(/\s+to\s+/i, '-')
+}
+
+/** Whether a wind reading is calm (`"0 mph"`). A calm wind has no direction
+ * worth an arrow, whatever the direction field says. */
+function isCalm(windSpeed: string): boolean {
+  return /^0+\s*mph$/i.test(windSpeed.trim())
+}
+
+/**
+ * The high and the low as two strings for one shared row, centre-aligned.
+ *
+ * The key font (Menlo) is monospace, so a space is exactly one character
+ * advance. The high gets trailing spaces and the low gets leading spaces,
+ * one more than its own length. Centred, the high's visible text then ends
+ * half a character left of the key's centre and the low's starts half a
+ * character right of it — a small gap, with the pair centred on the key.
+ * `renderKey` measures the padded string, so a pair that fits padded fits
+ * on screen.
+ */
+export function tempPair(high: number, low: number): [string, string] {
+  const hi = `${Math.round(high)}°`
+  const lo = `${Math.round(low)}°`
+  return [hi + ' '.repeat(hi.length + 1), ' '.repeat(lo.length + 1) + lo]
+}
+
+/**
+ * The emoji band's picture for one condition. Fog is a drawn icon, because
+ * the emoji font draws `🌫` as a pale grey block. Every other condition
+ * keeps its emoji. `fxMs` drives the fog drift; null (stale or absent data)
+ * keeps the icon still.
+ */
+function conditionGlyph(emoji: string, fxMs: number | null): Pick<KeySpec, 'emoji' | 'icon'> {
+  if (emoji === '🌫') {
+    const icon: IconSpec = fxMs === null ? { kind: 'fog' } : { kind: 'fog', nowMs: fxMs }
+    return { icon }
+  }
+  return { emoji }
 }
 
 /** The part of `WeatherSource` this page needs. */
 export interface WeatherReader {
-  /** The configured ZIP code, printed on the conditions tile. Read from the
-   * source rather than a module constant, because it is configuration. */
+  /** The configured ZIP code. The strip prints it when the place name is
+   * unknown. Read from the source rather than a module constant, because it
+   * is configuration. */
   getZip(): string
   getDays(): DayForecast[]
   getConditions(): Conditions | null
@@ -188,13 +278,9 @@ export interface WeatherReader {
   setVisible(visible: boolean): void
 }
 
-/** `95` and `77` become `95°/77°`. A null high shows only the low, as `77°`,
- * per the user's decision — never a fabricated `--/77°`. */
-function formatTemps(high: number | null, low: number | null): string {
-  if (high === null && low === null) return '--'
-  if (high === null) return `${Math.round(low!)}°`
-  if (low === null) return `${Math.round(high)}°`
-  return `${Math.round(high)}°/${Math.round(low)}°`
+/** `95` becomes `95°`. Null (unknown) becomes `--`, never a fabricated value. */
+function formatTemp(temp: number | null): string {
+  return temp === null ? '--' : `${Math.round(temp)}°`
 }
 
 /** `96` becomes `96%`. `null` (unknown) becomes `--`, never `0%`. */
@@ -384,7 +470,7 @@ export class WeatherPage implements Page {
       // the same weather read as seven tiles rather than one block.
       keys.push(this.dayKey(days[i], dim, fxMs, i))
     }
-    keys.push(this.conditionsKey(dim))
+    keys.push(this.conditionsKey(dim, fxMs))
 
     return {
       keys,
@@ -416,17 +502,14 @@ export class WeatherPage implements Page {
 
     const key: KeySpec = {
       kind: 'gauge',
-      // Bands 1, 3 and 4. Band 2 (the emoji) sits between the label and the
-      // temperature line, drawn separately by `canvas.ts` from `emoji`.
-      lines: [day.label, formatTemps(day.high, day.low), formatPrecip(day.precipPercent)],
-      lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
-      lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
-      // The temperature line is graded by heat; the precip line keeps the
-      // user's existing rain-chance rule. Per the user's decision, this page
-      // shows percent chance of rain only, never an amount.
-      lineColors: [undefined, heatColor(day.high, day.low), precipColor(day.precipPercent)],
+      // Bands 1, 3 and 4. Band 2 (the emoji, or the drawn fog icon) sits
+      // between the label and the temperature row. Lines 1 and 2 are the
+      // high and the low, on ONE row (see `tempRow`); line 3 is the rain
+      // chance. Per the user's decision, this page shows percent chance of
+      // rain only, never an amount.
+      ...this.tempRow(day.high, day.low, day.label, formatPrecip(day.precipPercent), day.precipPercent),
       align: 'center',
-      emoji: day.emoji,
+      ...conditionGlyph(day.emoji, fxMs),
       // Same keyword match that picked the emoji, so the two can never
       // disagree with each other.
       bg: conditionTint(day.emoji),
@@ -438,27 +521,87 @@ export class WeatherPage implements Page {
     return key
   }
 
-  private conditionsKey(dim: boolean): KeySpec {
-    const conditions = this.source.getConditions()
-    const wind = conditions?.windSpeed || '--'
-    const place = truncate(this.source.getPlace(), PLACE_CHARS) || '--'
+  /**
+   * The text fields of a day tile: label, high, low, rain chance.
+   *
+   * With both temperatures, the high is bold and warm-graded and the low is
+   * smaller and grey, side by side on one row. With only one, it stands
+   * alone and centred in the high's slot: a lone high keeps its warm colour,
+   * a lone low stays grey so it still reads as a low. With neither, `--`.
+   * The empty second slot keeps the line indexes the same in every case.
+   */
+  private tempRow(
+    high: number | null, low: number | null, label: string, precip: string, precipPct: number | null,
+  ): Pick<KeySpec, 'lines' | 'lineSizes' | 'lineY' | 'lineColors' | 'lineWeights'> {
+    let first: string
+    let second = ''
+    let firstColor: Rgb = theme.text
+    if (high !== null && low !== null) {
+      ;[first, second] = tempPair(high, low)
+      firstColor = heatColor(high)
+    } else if (high !== null) {
+      first = `${Math.round(high)}°`
+      firstColor = heatColor(high)
+    } else if (low !== null) {
+      first = `${Math.round(low)}°`
+      firstColor = LOW_COLOR
+    } else {
+      first = '--'
+    }
+    return {
+      lines: [label, first, second, precip],
+      lineSizes: [DAY_LABEL_SIZE, HIGH_SIZES, LOW_SIZES, PRECIP_SIZE],
+      lineY: [DAY_LABEL_Y, TEMP_Y, LOW_Y, PRECIP_Y],
+      lineColors: [undefined, firstColor, LOW_COLOR, precipColor(precipPct)],
+      lineWeights: [undefined, 'bold', undefined, undefined],
+    }
+  }
 
-    const key: KeySpec = {
-      kind: 'gauge',
-      lines: ['WIND', wind, this.source.getZip(), place],
-      // Only the label and the ZIP line get a bigger, unmeasured size — ZIP
-      // is always exactly 5 digits, and "WIND" never changes. Per M3: a
-      // plain `number` here is drawn AS GIVEN, with no measuring at all (see
-      // `resolveLineSpecs`'s own doc comment) — this page must not reason
-      // about whether the raw `windSpeed` string fits, per
-      // docs/LESSONS.md #17. `[11]` is a one-candidate ARRAY, which routes
-      // through the same measure-and-`shrinkToFit` path every other
-      // variable-length line on this page already uses, so an
-      // unexpectedly long reading degrades to an ellipsis instead of
-      // clipping silently. Measured: the widest real value on record,
-      // `"10 to 15 mph"` (12 characters), is 79.5 px at 11 px — see
-      // docs/VERIFIED-FACTS.md's "Weather" section.
-      lineSizes: [12, [11], 16, 11],
+  /**
+   * Key 7: a wind compass. The NWS reports the direction the wind blows
+   * FROM; the arrow points where it blows TO (`from + 180`), the way a
+   * weather map draws it. The speed sits under the compass.
+   *
+   * An unknown direction, or a calm wind, draws no compass at all — a
+   * default bearing would show a fake north wind. The key then shows `WIND`
+   * and the speed alone. Unknown conditions show `--`.
+   */
+  private conditionsKey(dim: boolean, fxMs: number | null): KeySpec {
+    const conditions = this.source.getConditions()
+    const speed = conditions?.windSpeed ? compactSpeed(conditions.windSpeed) : '--'
+    const from = conditions && !isCalm(conditions.windSpeed)
+      ? compassBearing(conditions.windDirection ?? '')
+      : null
+
+    let key: KeySpec
+    if (from === null) {
+      key = {
+        kind: 'gauge',
+        lines: ['WIND', speed],
+        lineSizes: [DAY_LABEL_SIZE, WIND_ONLY_SIZES],
+        lineY: [WIND_LABEL_Y, WIND_ONLY_Y],
+        lineColors: [theme.textDim, undefined],
+        lineWeights: [undefined, 'bold'],
+        align: 'center',
+      }
+    } else {
+      const bearingDeg = (from + 180) % 360
+      // The wobble runs only while the rest of the page animates. Stale or
+      // absent data keeps the arrow still, so the key never rewrites.
+      const icon: IconSpec = fxMs === null
+        ? { kind: 'compass', bearingDeg }
+        : { kind: 'compass', bearingDeg, nowMs: fxMs }
+      key = {
+        kind: 'gauge',
+        icon,
+        // A candidate array, so the renderer measures the speed and shrinks
+        // it rather than drawing a long range past the margin.
+        lines: [speed],
+        lineSizes: [WIND_SPEED_SIZES],
+        lineY: [WIND_SPEED_Y],
+        lineWeights: ['bold'],
+        align: 'center',
+      }
     }
     if (dim) key.dim = true
     return key
@@ -525,16 +668,15 @@ export class WeatherPage implements Page {
 
     const key: KeySpec = {
       kind: 'gauge',
-      // formatTemps's high-only branch and its low-only branch both render a
-      // single value the same way, `${round}°`, so passing the one known
-      // reading as the "high" slot reuses that helper for either half
-      // without a second formatter.
-      lines: [label, formatTemps(period.temperature, null), formatPrecip(period.precipPercent)],
+      lines: [label, formatTemp(period.temperature), formatPrecip(period.precipPercent)],
       lineSizes: [DAY_LABEL_SIZE, TEMP_SIZES, PRECIP_SIZE],
       lineY: [DAY_LABEL_Y, TEMP_Y, PRECIP_Y],
-      lineColors: [undefined, heatColor(period.temperature, null), precipColor(period.precipPercent)],
+      // The one temperature on this tile is its hero, so it takes the warm
+      // scale whichever half it belongs to.
+      lineColors: [undefined, heatColor(period.temperature), precipColor(period.precipPercent)],
+      lineWeights: [undefined, 'bold', undefined],
       align: 'center',
-      emoji: period.emoji,
+      ...conditionGlyph(period.emoji, fxMs),
       bg: conditionTint(period.emoji),
     }
     // Each half carries its OWN condition and its own rain chance, so a rainy
