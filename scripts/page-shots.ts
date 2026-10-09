@@ -283,6 +283,7 @@ async function spotifyPage(): Promise<Page> {
     getStatus: () => 'ok',
     getArt: () => art,
     getArtColor: () => [196, 62, 44] as Rgb,
+    getArtAccent: () => [112, 42, 122] as Rgb,
     play: async () => true,
     pause: async () => true,
     next: async () => true,

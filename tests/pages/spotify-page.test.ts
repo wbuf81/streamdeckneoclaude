@@ -819,7 +819,9 @@ describe('SpotifyPage album-colour theming (task 44)', () => {
   const BLUE: Rgb = [40, 120, 220]
 
   it('borders both control keys, fills the progress bar and lights both round buttons', () => {
-    const { page } = build(player(), 'ok', FAKE_ART, BLUE)
+    // Paused, so the buttons hold steady (they breathe only while playing), and
+    // with no contrasting accent, so both wear the dominant colour.
+    const { page } = build(player({ isPlaying: false }), 'ok', FAKE_ART, BLUE)
     const frame = page.render(NOW, 1_000)
     expect(frame.keys[3]!.border).toEqual(BLUE)
     expect(frame.keys[7]!.border).toEqual(BLUE)

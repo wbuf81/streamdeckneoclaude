@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'n
 import { join } from 'node:path'
 import { loadImage, type Image } from '@napi-rs/canvas'
 import { dominantColor } from '../render/canvas.js'
+import { contrastAccent, sampleCover } from './spotify-palette.js'
 import type { Rgb } from '../render/specs.js'
 import { paths } from '../paths.js'
 import { log } from '../log.js'
@@ -160,6 +161,9 @@ export class SpotifySource extends EventEmitter {
    * means the cover genuinely has no usable accent; an absent key means the art
    * has not been decoded yet. */
   private artColors = new Map<string, Rgb | null>()
+  /** The cover's second, contrasting colour, for the right round button.
+   * Same null-versus-absent rule as `artColors`, and evicted with it. */
+  private artAccents = new Map<string, Rgb | null>()
   /** Track ids with a load in flight, so one miss starts one load. */
   private pending = new Set<string>()
   /** Track ids whose last attempt failed (or had no URL), mapped to the
@@ -573,12 +577,19 @@ export class SpotifySource extends EventEmitter {
     // stored as `null` rather than left absent, so a later `getArtColor` can tell
     // "no colour" apart from "not computed yet" without recomputing.
     try {
-      this.artColors.set(trackId, dominantColor(img))
+      const dominant = dominantColor(img)
+      this.artColors.set(trackId, dominant)
+      // The second colour reads the same downscaled view of the cover, once,
+      // here. A failure here falls into the same catch: both colours go null and
+      // the page shows its theme, never half a palette.
+      const pixels = dominant ? sampleCover(img) : null
+      this.artAccents.set(trackId, dominant && pixels ? contrastAccent(pixels, dominant) : null)
     } catch (e) {
       // Colour extraction must never cost the page its artwork. `log.once`, not
       // `log.warn`: this runs once per track, but a systematically failing
       // decoder would otherwise fill the log (lesson 5).
       this.artColors.set(trackId, null)
+      this.artAccents.set(trackId, null)
       log.once(`art-color-${trackId}`, `album colour extraction failed: ${String(e)}`)
     }
     // A Map keeps insertion order, so the first key is the oldest.
@@ -588,6 +599,7 @@ export class SpotifySource extends EventEmitter {
       this.artCache.delete(oldest)
       // Evicted together, so the two maps cannot drift apart in size or content.
       this.artColors.delete(oldest)
+      this.artAccents.delete(oldest)
     }
   }
 
@@ -599,6 +611,16 @@ export class SpotifySource extends EventEmitter {
   getArtColor(trackId: string): Rgb | null {
     if (!trackId) return null
     return this.artColors.get(trackId) ?? null
+  }
+
+  /**
+   * The cover's contrasting second colour, or null when it has none or the art
+   * has not loaded yet. Computed once per track at decode time, like
+   * `getArtColor`.
+   */
+  getArtAccent(trackId: string): Rgb | null {
+    if (!trackId) return null
+    return this.artAccents.get(trackId) ?? null
   }
 
   /** Bounded the same way as `artCache`: unlike a decoded image, a cooldown
