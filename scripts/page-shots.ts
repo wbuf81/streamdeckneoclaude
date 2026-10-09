@@ -175,8 +175,9 @@ function session(over: Partial<Session>): Session {
   }
 }
 
-function claudePage(): Page {
-  const sessions: Session[] = [
+/** `one`: a single session, which the strip describes without a tape. */
+function claudePage(one = false): Page {
+  const all: Session[] = [
     session({
       sessionId: 'a', state: 'thinking', label: 'Planning the change',
       tool: '', project: 'deckd', startedAt: NOW - 1_260,
@@ -190,6 +191,7 @@ function claudePage(): Page {
       project: 'knob-fw', startedAt: NOW - 95,
     }),
   ]
+  const sessions = one ? all.slice(0, 1) : all
   const usage: UsageSnapshot = {
     fiveHourPct: 62, fiveHourResetsAt: NOW + 4_920,
     sevenDayPct: 34, sevenDayResetsAt: NOW + 345_600, ts: NOW,
@@ -445,6 +447,7 @@ async function main(): Promise<void> {
 
   const shots: Shot[] = [
     { file: 'page-claude.png', page: claudePage() },
+    { file: 'page-claude-one.png', page: claudePage(true) },
     { file: 'page-codex.png', page: codexPage() },
     { file: 'page-spotify.png', page: await spotifyPage() },
     { file: 'page-stocks.png', page: stocksPage() },
