@@ -1,6 +1,17 @@
 import { EventEmitter } from 'node:events'
 import { log } from '../log.js'
 import { DEFAULT_SYMBOLS } from '../config.js'
+import {
+  deriveSessionState,
+  inStartGrace,
+  nextBoundary,
+  nextPollEdge,
+  parsePeriod,
+  type MarketBoundary,
+  type TradingPeriod,
+} from './stocks-session.js'
+
+export type { MarketBoundary, MarketBoundaryKind } from './stocks-session.js'
 
 /**
  * The tickers the deck shows, in the order they fill its eight keys.
@@ -50,6 +61,20 @@ const BASE_URL = 'https://query1.finance.yahoo.com/v8/finance/chart'
 const USER_AGENT = 'Mozilla/5.0'
 const POLL_OPEN_MS = 60_000
 const POLL_CLOSED_MS = 15 * 60 * 1000
+/**
+ * The poll timer never sleeps longer than this. Each wake compares the WALL
+ * clock with the time the next fetch is due. A long `setTimeout` measures
+ * awake time, not wall time, so after the Mac sleeps across 9:30 AM a timer
+ * armed for 9:30 fires late by the whole sleep. A one-second wake bounds
+ * that lag to about a second.
+ */
+const HEARTBEAT_MS = 1000
+/**
+ * After a candidate session start, while every reported window has ended,
+ * poll at the open-market rate for this long. The upstream may roll its
+ * windows to the new day slightly after the edge.
+ */
+const START_GRACE_SECONDS = 5 * 60
 /** A quote older than this, while the market is open, counts as stale. */
 const STALE_SECONDS = 15 * 60
 /**
@@ -168,21 +193,6 @@ export function parseQuote(symbol: string, body: unknown): Quote | null {
   }
 }
 
-/** True when `window` is a usable `{ start, end }` pair — both numeric. */
-function isWindow(window: unknown): boolean {
-  if (!window || typeof window !== 'object') return false
-  const start = (window as Record<string, unknown>).start
-  const end = (window as Record<string, unknown>).end
-  return typeof start === 'number' && typeof end === 'number'
-}
-
-/** True when `now` falls in `[start, end)` of a `{ start, end }` window. */
-function within(window: unknown, now: number): boolean {
-  if (!isWindow(window)) return false
-  const w = window as Record<string, unknown>
-  return now >= (w.start as number) && now < (w.end as number)
-}
-
 /**
  * Derives the market state from `currentTradingPeriod`. Yahoo's chart body
  * has no `marketState` field, so this is the only source of truth.
@@ -195,13 +205,8 @@ function within(window: unknown, now: number): boolean {
  * exclusive of end.
  */
 export function deriveMarketState(period: unknown, now: number): MarketState {
-  if (!period || typeof period !== 'object') return 'unknown'
-  const p = period as Record<string, unknown>
-  if (!isWindow(p.regular) && !isWindow(p.pre) && !isWindow(p.post)) return 'unknown'
-  if (within(p.regular, now)) return 'open'
-  if (within(p.pre, now)) return 'pre'
-  if (within(p.post, now)) return 'post'
-  return 'closed'
+  // A reading taken at `now` itself: the freshest measurement there is.
+  return deriveSessionState(parsePeriod(period), now, now)
 }
 
 /**
@@ -265,14 +270,26 @@ interface YearlyEntry {
 /**
  * Reads daily price movement for a fixed list of tickers from Yahoo's public
  * chart endpoint. It polls only while the page is visible, at 60 seconds
- * while the market is open and 15 minutes otherwise, so a closed market and
- * an unwatched page do not spend requests for no reason.
+ * while the market is open (or its state is unknown) and 15 minutes
+ * otherwise, so a closed market and an unwatched page do not spend requests
+ * for no reason. It also polls at each session edge the upstream reported,
+ * and at each candidate session start once those edges have all passed, so
+ * prices refresh at the open and the close. The market state itself is
+ * derived at read time and needs no poll to change.
  */
 export class StockSource extends EventEmitter {
   private quotes = new Map<string, Quote>()
   private status: StockStatus = 'empty'
-  /** Per I1: `'unknown'`, never `'closed'` — nothing has been measured yet. */
-  private marketState: MarketState = 'unknown'
+  /**
+   * The last usable `currentTradingPeriod`, and the time the fetch that
+   * brought it STARTED. The market state is derived from these at READ
+   * time (`getMarketState`), never stored: a stored answer ages between
+   * fetches. Per I1, `null` reads as `'unknown'`, never `'closed'`.
+   */
+  private period: TradingPeriod | null = null
+  private measuredAt = 0
+  /** When the last poll started, in epoch seconds. Null before the first. */
+  private lastPollAt: number | null = null
   private timer: NodeJS.Timeout | null = null
   private visible = false
   /** Set by `stop()`, so a refresh continuation already in flight cannot arm
@@ -358,8 +375,27 @@ export class StockSource extends EventEmitter {
     return this.status
   }
 
+  /**
+   * The market state at the instant of the call, from the injected clock
+   * and the windows the upstream last reported. Read-only and pure: it
+   * never fetches. It flips on the boundary second (pre-market start, the
+   * open, the close, after-hours end) whether or not a fetch ran then.
+   * See `deriveSessionState` for how an old reading decays to `'unknown'`.
+   */
   getMarketState(): MarketState {
-    return this.marketState
+    return deriveSessionState(this.period, this.measuredAt, this.now())
+  }
+
+  /**
+   * The next session edge the upstream actually reported, strictly after
+   * now, or null when none is known (no data, state `'unknown'`, or every
+   * reported window has ended and the next day's are not in yet). Read-only
+   * and pure: it never fetches. A page can draw "CLOSES IN 2h 14m" from
+   * `atMs - nowMs`, and fire an edge animation when its own clock passes
+   * `atMs`; `getMarketState()` reports `next` from that same second on.
+   */
+  getNextBoundary(): MarketBoundary | null {
+    return nextBoundary(this.period, this.measuredAt, this.now())
   }
 
   /**
@@ -387,8 +423,9 @@ export class StockSource extends EventEmitter {
   isSymbolStale(symbol: string): boolean {
     const q = this.quotes.get(symbol)
     if (!q) return false
-    if (this.marketState === 'unknown') return true
-    if (this.marketState !== 'open') return false
+    const state = this.getMarketState()
+    if (state === 'unknown') return true
+    if (state !== 'open') return false
     return this.now() - q.asOf > STALE_SECONDS
   }
 
@@ -418,6 +455,10 @@ export class StockSource extends EventEmitter {
    * failure is logged rather than swallowed, and polling continues either
    * way via the `finally`. */
   private async refreshAndSchedule(): Promise<void> {
+    // Recorded here as well as in `doRefresh`: a refresh that rejects before
+    // `doRefresh` runs must still count as a poll, or `dueAt()` would stay
+    // in the past and the heartbeat would retry every second.
+    this.lastPollAt = this.now()
     try {
       await this.refresh()
     } catch (e) {
@@ -449,11 +490,47 @@ export class StockSource extends EventEmitter {
     // check below.
     if (this.stopped) return
     if (this.timer) clearTimeout(this.timer)
+    this.timer = null
     if (!this.visible) return
-    const delay = this.marketState === 'open' ? POLL_OPEN_MS : POLL_CLOSED_MS
-    this.timer = setTimeout(() => {
+    const waitMs = (this.dueAt() - this.now()) * 1000
+    const delay = Math.max(0, Math.min(HEARTBEAT_MS, waitMs))
+    this.timer = setTimeout(() => this.tick(), delay)
+  }
+
+  /**
+   * One heartbeat. It emits `change` when the read-time state crossed a
+   * boundary since the last snapshot, and starts a fetch once one is due.
+   */
+  private tick(): void {
+    this.timer = null
+    if (this.stopped || !this.visible) return
+    this.emitIfChanged()
+    if (this.now() >= this.dueAt()) {
       void this.refreshAndSchedule()
-    }, delay)
+    } else {
+      this.schedule()
+    }
+  }
+
+  /**
+   * The epoch second the next fetch is due: the cadence for the state at
+   * this instant, or the next session edge if that comes first. So prices
+   * refresh at the open and the close, and the new day's windows arrive at
+   * the first possible pre-market start. `'unknown'` polls at the open
+   * rate: it is what a failed fetch at a boundary leaves behind, and it
+   * must recover in a minute, not fifteen.
+   */
+  private dueAt(): number {
+    const now = this.now()
+    const last = this.lastPollAt
+    // Never polled, or the wall clock moved backwards past the last poll.
+    if (last === null || now < last) return now
+    const state = this.getMarketState()
+    const fast = state === 'open' || state === 'unknown'
+      || inStartGrace(this.period, now, START_GRACE_SECONDS)
+    const cadence = (fast ? POLL_OPEN_MS : POLL_CLOSED_MS) / 1000
+    const edge = nextPollEdge(this.period, last)
+    return Math.min(last + cadence, edge ?? Number.POSITIVE_INFINITY)
   }
 
   private async fetchOne(symbol: string): Promise<FetchResult> {
@@ -515,11 +592,16 @@ export class StockSource extends EventEmitter {
   }
 
   private async doRefresh(): Promise<void> {
+    // The START of the fetch is the measurement time. A fetch that began
+    // before an edge and settled after it reports the old side of that
+    // edge, so it must not count as proof for the new side.
+    const startedAt = this.now()
+    this.lastPollAt = startedAt
     const results = await Promise.all(this.symbols.map((s) => this.fetchOne(s)))
 
     const next = new Map(this.quotes)
     let anySuccess = false
-    let period: unknown = null
+    let period: TradingPeriod | null = null
     for (let i = 0; i < this.symbols.length; i++) {
       const symbol = this.symbols[i]!
       const r = results[i]!
@@ -527,13 +609,20 @@ export class StockSource extends EventEmitter {
         next.set(symbol, r.quote)
         anySuccess = true
       }
-      if (period === null && r.period !== null) period = r.period
+      // The first USABLE period wins. A malformed one from an earlier
+      // symbol must not hide a good one from a later symbol.
+      if (period === null) period = parsePeriod(r.period)
     }
     this.quotes = next
     this.status = anySuccess ? 'ok' : this.quotes.size > 0 ? 'offline' : 'empty'
-    // Keep the last known market state when every symbol failed this round;
-    // a total outage must not reset the state to `closed`.
-    if (period !== null) this.marketState = deriveMarketState(period, this.now())
+    // Keep the last known windows when no symbol carried any this round; a
+    // total outage must not reset the state to `closed`. The old windows
+    // keep their old `measuredAt`, so once a candidate session start has
+    // passed they read `'unknown'`, not a stale `'closed'`.
+    if (period !== null) {
+      this.period = period
+      this.measuredAt = startedAt
+    }
 
     // M1: re-check the watched symbol's yearly freshness on the source's own
     // poll tick, so `render()` never has to call `requestYearly` itself.
@@ -542,10 +631,20 @@ export class StockSource extends EventEmitter {
     // the one fetch a real staleness justifies, never one per poll.
     if (this.watchedSymbol) this.requestYearly(this.watchedSymbol)
 
+    this.emitIfChanged()
+  }
+
+  /**
+   * Emits `change` when the whole snapshot differs from the last one. The
+   * market state is part of it, read at THIS instant, so the heartbeat can
+   * announce a boundary that passed with no fetch. One key in one place:
+   * the fetch path and the heartbeat must not drift apart.
+   */
+  private emitIfChanged(): void {
     const key = JSON.stringify({
       quotes: [...this.quotes.entries()],
       status: this.status,
-      marketState: this.marketState,
+      marketState: this.getMarketState(),
     })
     if (key === this.lastKey) return
     this.lastKey = key
