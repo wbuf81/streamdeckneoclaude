@@ -1,4 +1,5 @@
 import type { Image } from '@napi-rs/canvas'
+import { canonicalKeySpec, canonicalStripSpec } from './motion.js'
 
 export type Rgb = readonly [number, number, number]
 
@@ -146,6 +147,184 @@ export interface SparkSpec {
    * unset, so nothing draws there.
    */
   label?: string
+  /**
+   * `'bar'` (the default, and the only style before the glow-up) draws one
+   * vertical bar per value. `'line'` draws a 1.8 px polyline with a soft
+   * area fill beneath it and an emphasised dot on the last point. Both
+   * styles honour `slice`, `fullHeight`, `labelBand`, `label`, `baseline`
+   * and `minHalfRange` the same way.
+   */
+  style?: 'bar' | 'line'
+  /**
+   * A reference value, in the series' own units — the previous close, for a
+   * stock. A dotted horizontal rule marks it, the vertical scale always
+   * includes it, and the `'line'` style fills its area toward it rather than
+   * toward the band floor. Absent, no rule draws.
+   */
+  baseline?: number
+  /**
+   * The smallest half-range the vertical scale may use, in the series' own
+   * units, centred on `baseline` (or on the series midpoint when `baseline`
+   * is absent). A 0.1 percent day plotted against a 1 percent half-range
+   * looks nearly flat, which is the truth; without it, any wiggle stretches
+   * to fill the band. Absent or non-positive, the scale is the series'
+   * own min and max, exactly as before this field existed.
+   */
+  minHalfRange?: number
+  /**
+   * `'line'` only: draws the emphasised endpoint dot (a 2.4 px core with a
+   * soft halo). Default `true`. Ignored by `'bar'`.
+   */
+  endDot?: boolean
+}
+
+/**
+ * A horizontal range gauge: a rounded track from `lo` to `hi` with a marker
+ * at `value` — a day range, or a 52-week range. Values outside `lo..hi`
+ * clamp to the nearest end; `lo >= hi` puts the marker at the centre.
+ */
+export interface RangeSpec {
+  lo: number
+  hi: number
+  value: number
+  /** Top edge of the track, in key px. Default 44. */
+  y?: number
+  /** Track height in px. Default 8. */
+  height?: number
+  /** Track colour when `gradient` is absent. Default `[42,46,56]`. */
+  track?: Rgb
+  /** Paints the track as a left-to-right gradient, `lo` colour to `hi`
+   * colour, at 55 percent strength. The mockup uses red to green. */
+  gradient?: readonly [Rgb, Rgb]
+  /** Marker colour. Default white. */
+  color?: Rgb
+  /** `'arrow'` (default) is a downward triangle above the track; `'tick'` is
+   * a 3 px bar that crosses it. */
+  marker?: 'arrow' | 'tick'
+}
+
+/**
+ * A one-shot effect: it starts at `startedAtMs`, runs for its variant's fixed
+ * duration, then draws nothing. Both clocks are unix milliseconds; the page
+ * passes its own `nowMs`, never `Date.now()`.
+ *
+ * Durations (`ONE_SHOT_DURATION_MS` in `render/motion.ts`): `burst` 1500,
+ * `brick` 1000, `sweep` 500, `hearts` 1500.
+ *
+ * Cost: `keyHash` drops an effect that has not started or has finished, and
+ * rebases a running one to its elapsed time quantised to 40 ms. So a page can
+ * leave a finished effect in its spec forever and the key is never rewritten
+ * for it. While it runs, the key rewrites at most once per 40 ms.
+ */
+export interface OneShotSpec {
+  variant: OneShotVariant
+  startedAtMs: number
+  nowMs: number
+  /** `burst` and `hearts`: the origin, in key px. Default (48, 40) for
+   * `burst`, (48, 34) for `hearts`. */
+  x?: number
+  y?: number
+  /** `burst`: the confetti colours, cycled. Default green, amber, white,
+   * cyan, pink. `hearts`: alternating heart colours. */
+  colors?: readonly Rgb[]
+  /** `burst`: piece count, default 34, at most 80. `hearts`: heart count,
+   * default 1, at most 8. */
+  count?: number
+  /** `sweep`: the flash colour. Default mint `[125,255,176]`. */
+  color?: Rgb
+  /** Decorrelates two keys bursting at once. Default 0. */
+  seed?: number
+}
+
+export type OneShotVariant = 'burst' | 'brick' | 'sweep' | 'hearts'
+
+/**
+ * A pixel-art mascot that owns the middle of a key. `bull` hops; `bear`
+ * sleeps under a drifting "z". Both draw a soft glow behind themselves —
+ * green for the bull, red for the bear. The label ("BULLISH") is the page's
+ * own text line; leave the band below y 80 for it.
+ *
+ * `nowMs` is quantised to 100 ms by both `keyHash` and the renderer, so a
+ * mascot key rewrites at most 10 times a second.
+ */
+export interface MascotSpec {
+  kind: 'bull' | 'bear'
+  nowMs: number
+}
+
+/**
+ * A drawn glyph, for a picture the emoji font draws badly.
+ *
+ * - `fog`: four stacked rounded bars in the emoji band (y 23..48), drifting
+ *   gently. Use instead of `🌫`, which renders as a pale grey block.
+ * - `compass`: a ring with N/E/S/W and a cyan arrow. It is larger than the
+ *   emoji band — centre y 38, ring radius 22, letters at radius 30 (ink
+ *   y 4..72) — so it suits a key whose only other content is one line at
+ *   the bottom (top edge y 76 or lower).
+ *
+ * `nowMs` (optional) drives the fog drift and the compass wobble. It is
+ * quantised to 100 ms. Absent, the glyph is static and the key never
+ * rewrites for it.
+ */
+export type IconSpec =
+  | { kind: 'fog'; nowMs?: number; color?: Rgb }
+  | {
+      kind: 'compass'
+      /** The direction the arrow POINTS, in degrees clockwise from north
+       * (0 = up, 90 = right). For wind reported "from" a bearing, pass
+       * `from + 180` to show where the wind goes. */
+      bearingDeg: number
+      nowMs?: number
+      /** Arrow colour. Default `theme.cyan`. */
+      color?: Rgb
+    }
+
+/** One lit run along one edge of a key. `from` and `to` are fractions, 0 to
+ * 1, along that edge in CLOCKWISE order: top runs left to right, right runs
+ * top to bottom, bottom runs right to left, left runs bottom to top. */
+export interface EdgeRun {
+  edge: 'top' | 'right' | 'bottom' | 'left'
+  from: number
+  to: number
+}
+
+/**
+ * A thin glowing line along some edges of a key — a progress line around a
+ * multi-key block. Build it with `blockPerimeterProgress` in
+ * `render/motion.ts` rather than by hand.
+ *
+ * Fractions are quantised to 1/192 of an edge (half a pixel), by both
+ * `keyHash` and the renderer.
+ */
+export interface EdgeProgressSpec {
+  runs: readonly EdgeRun[]
+  /** Default `[255,217,196]`, a warm white. */
+  color?: Rgb
+}
+
+/**
+ * Moves and turns `image` — the crab's hop and spin. Applied about the key
+ * centre, after the crop, inside the key's own bounds.
+ */
+export interface ImageTransform {
+  /** Vertical offset in px; negative moves up. Default 0. */
+  dy?: number
+  /** Clockwise rotation in degrees. Default 0. */
+  rotateDeg?: number
+  /** Uniform scale. Default 1. Clamped to 0.25..3. */
+  scale?: number
+}
+
+/**
+ * Scales one text line up and back, around its own centre, for 1 s — the
+ * "scale-pop" on a hero number. Same one-shot clock rules as `OneShotSpec`:
+ * absent from the hash once finished.
+ */
+export interface LinePopSpec {
+  /** Index into `lines`. */
+  line: number
+  startedAtMs: number
+  nowMs: number
 }
 
 export interface KeySpec {
@@ -196,6 +375,20 @@ export interface KeySpec {
    * this task fixes) could place a line below a gap.
    */
   lineY?: number[]
+  /**
+   * Per-line alignment, aligned by index with `lines`, overriding `align`
+   * for that line. `'right'` anchors at the key's right padding (x 90). Two
+   * lines with the same `lineY` and opposite alignments share one row — a
+   * symbol on the left and a price on the right. An absent entry uses
+   * `align`.
+   */
+  lineAligns?: ('left' | 'center' | 'right' | undefined)[]
+  /** Per-line weight, aligned by index with `lines`. `'bold'` draws Menlo
+   * Bold. An absent entry is regular. Candidate-size fitting measures in the
+   * line's own weight. */
+  lineWeights?: ('normal' | 'bold' | undefined)[]
+  /** A one-shot scale-pop on one line. See `LinePopSpec`. */
+  linePop?: LinePopSpec
   align?: 'left' | 'center'
   border?: Rgb
   /** True draws the border. False draws it dark. The page owns the phase. */
@@ -285,6 +478,21 @@ export interface KeySpec {
    * one frame — lesson 11 in docs/LESSONS.md.
    */
   fx?: FxSpec
+  /** A horizontal range gauge. See `RangeSpec`. */
+  range?: RangeSpec
+  /** A drawn glyph. See `IconSpec`. */
+  icon?: IconSpec
+  /** A pixel-art mascot. See `MascotSpec`. */
+  mascot?: MascotSpec
+  /** Hop, spin and scale for `image`. See `ImageTransform`. */
+  imageTransform?: ImageTransform
+  /**
+   * One-shot effects, drawn over the key's content (a `brick` also shakes
+   * the content). Several may run at once. See `OneShotSpec`.
+   */
+  effects?: readonly OneShotSpec[]
+  /** A glowing progress line along some edges. See `EdgeProgressSpec`. */
+  edgeProgress?: EdgeProgressSpec
   dim?: boolean
   /**
    * A thin outline drawn around the whole key perimeter, on top of every
@@ -327,6 +535,53 @@ export interface StripSpec {
    * frame by design. `stripHash` covers this field and must keep covering it.
    */
   tape?: TapeSpec
+  /**
+   * One large centred line that owns the strip's text area — a page name
+   * during a transition, or "OPENING BELL". When set, `lines`, `right` and
+   * `tape` do not draw; `bar` still does. See `StripBanner`.
+   */
+  banner?: StripBanner
+  /**
+   * A small pixel sprite walking across the strip, drawn over everything
+   * else on a dark backing plate so the text under it cannot show through.
+   */
+  sprite?: StripSprite
+}
+
+export interface StripBanner {
+  text: string
+  /** Default `theme.text`. */
+  color?: Rgb
+  /** Font size in px, default 20. The banner shrinks (to 11 px at the least,
+   * then truncates) until it fits the strip's 236 px. Bold Menlo, with the
+   * colour-emoji font as a fallback, so `🔔 OPENING BELL` renders. */
+  size?: number
+  /** An optional small line beneath, 12 px, centred. With `sub`, the banner
+   * line sits higher (centre y 22) to make room. */
+  sub?: string
+  /** Default `theme.textDim`. */
+  subColor?: Rgb
+  /** A one-shot scale-pop on the banner line, 1 s. Same clock rules as
+   * `LinePopSpec`. */
+  pop?: { startedAtMs: number; nowMs: number }
+}
+
+export interface StripSprite {
+  /** The only sprite today: the two-frame pixel crab, 48 x 28 px. */
+  kind: 'crab'
+  /** Left edge in strip px. May be negative or past the right edge, so a
+   * walk can enter and leave; the sprite is clipped to the strip. Rounded to
+   * a whole pixel. */
+  x: number
+  /** Walk frame, 0 or 1. The page alternates it (for example every 125 ms). */
+  frame: 0 | 1
+  /** Vertical offset in px, negative is up, for a step bob. Default 0. The
+   * crab's resting top edge is y 26. */
+  dy?: number
+  /** A short speech line drawn right of the crab, 12 px bold. */
+  say?: string
+  /** Default `[255,177,153]`. */
+  sayColor?: Rgb
 }
 
 /**
@@ -367,12 +622,16 @@ export function blankKey(): KeySpec {
  * because the buffer is large and its identity is enough.
  */
 export function keyHash(spec: KeySpec): string {
-  const { image, ...rest } = spec
+  // Canonical first: a finished one-shot effect drops out and a running
+  // one rebases to its quantised elapsed time, so an idle key hashes the
+  // same on every frame and the daemon never rewrites it. The renderer
+  // draws from the SAME canonical spec, so equal hashes mean equal pixels.
+  const { image, ...rest } = canonicalKeySpec(spec)
   return JSON.stringify(rest, replacer)
 }
 
 export function stripHash(spec: StripSpec): string {
-  return JSON.stringify(spec, replacer)
+  return JSON.stringify(canonicalStripSpec(spec), replacer)
 }
 
 /** Sorts object keys, so key order cannot change a hash. */
