@@ -337,17 +337,19 @@ function day(
 }
 
 function weatherPage(): Page {
+  // A mixed autumn week, so the preview shows the warm scale from cool to
+  // hot, both cloud strengths, rain and the drawn fog icon.
   const days: DayForecast[] = [
-    day('NOW', '⛈', 92, 76, 80, 'Thunderstorms'),
-    day('THU', '🌧', 89, 75, 70, 'Rain likely'),
-    day('FRI', '⛅', 91, 74, 30, 'Partly sunny'),
-    day('SAT', '☀️', 94, 76, 10, 'Sunny'),
-    day('SUN', '☀️', 95, 77, 10, 'Sunny'),
-    day('MON', '☁️', 90, 75, 40, 'Cloudy'),
-    day('TUE', '🌧', 88, 74, 60, 'Showers'),
+    day('NOW', '⛅', 74, 61, 10, 'Partly cloudy'),
+    day('FRI', '☀️', 78, 62, 0, 'Sunny'),
+    day('SAT', '☀️', 88, 70, 5, 'Sunny'),
+    day('SUN', '🌧', 68, 58, 70, 'Rain likely'),
+    day('MON', '☁️', 64, 55, 30, 'Cloudy'),
+    day('TUE', '⛈', 57, 48, 60, 'Thunderstorms'),
+    day('WED', '🌫', 63, 54, 20, 'Patchy fog'),
   ]
   const conditions: Conditions = {
-    windSpeed: '8 mph', temperature: 91, shortForecast: 'Thunderstorms',
+    windSpeed: '12 mph', windDirection: 'SW', temperature: 74, shortForecast: 'Partly cloudy',
   }
   return new WeatherPage({
     getZip: () => '10001',
