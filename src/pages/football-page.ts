@@ -1,9 +1,18 @@
 import type { Image } from '@napi-rs/canvas'
-import type { DeckFrame, KeySpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
+import type { DeckFrame, KeySpec, OneShotSpec, Rgb, StripSpec, TapeSegment } from '../render/specs.js'
 import { theme, blend } from '../render/theme.js'
 import { truncate, formatEasternTime } from '../render/text.js'
 import type { Page, PressOutcome } from './types.js'
-import type { FootballStatus, Game, GameResult, Team, TeamRecord } from '../sources/football.js'
+import type {
+  FootballStatus,
+  Game,
+  GameResult,
+  LiveGame,
+  NextKickoff,
+  ScoringEvent,
+  Team,
+  TeamRecord,
+} from '../sources/football.js'
 import { LOGO_ART_FRACTION } from '../sources/football.js'
 import { tapeOffsetPx } from '../render/canvas.js'
 
@@ -253,6 +262,146 @@ export function resultWash(result: GameResult): Rgb | undefined {
   return blend(theme.bg, result === 'win' ? theme.green : theme.red, RECORD_MAX_BLEND)
 }
 
+/* ------------------------------------------------------------ live game */
+
+/** The placeholder for an unknown live value. Never `0`: an unknown score
+ * drawn as 0 reads as a real score (docs/LESSONS.md #18). */
+export const UNKNOWN = '—'
+
+/** How long before a known kickoff a `pre` game takes over its row. */
+export const SCOREBOARD_LEAD_MS = 15 * 60 * 1000
+
+/** How long the row flood, the confetti and the button flash run. */
+export const CELEBRATE_MS = 2000
+/** How long the touchdown flood holds the row's tint. */
+const FLOOD_MS = 1600
+/** How long the strip banner stays after a score of mine. */
+export const BANNER_MS = 6000
+/** How long the strip note stays after a score that is not celebrated. */
+export const NOTE_MS = 30_000
+/**
+ * A scoring event older than this, by the source's own clock, is recorded
+ * but never celebrated. It covers the case where the source saw the score
+ * while this page was not rendering (hidden, or in the drill-down): a
+ * touchdown from five minutes ago must not erupt when the page comes back.
+ */
+export const CELEBRATE_FRESH_MS = 60_000
+/** The cascade step between the four keys of a sweep, from the render API. */
+const SWEEP_STAGGER_MS = 90
+/** The button flash alternates at this period. Five changes a second costs
+ * two cheap button writes each, and reads as a flash, not a flicker. */
+const BUTTON_FLASH_MS = 200
+
+/** The field bar's top edge and height. They match the renderer's own `bar`
+ * band (y 66, 8 px), which draws the field when the ball's spot is unknown,
+ * so the field sits in the same place with or without a ball. */
+const FIELD_Y = 66
+const FIELD_H = 8
+const FIELD_EMPTY: Rgb = [42, 46, 56]
+
+const SCORE_SIZES = [40, 32, 26]
+const PERIOD_SIZES = [20, 16]
+const COUNTDOWN_SIZES = [22, 18, 14]
+
+/** The kinds of score this page celebrates, and how. */
+export type CelebrationKind = 'touchdown' | 'field-goal' | 'note'
+
+/** One score this page has reacted to, and when it first saw it. */
+export interface Celebration {
+  kind: CelebrationKind
+  event: ScoringEvent
+  /** The page's own render clock when the event was first seen. */
+  startedAtMs: number
+  /** The last play when the event was first seen, for the banner's sub line. */
+  lastPlay: string | null
+}
+
+/** A score, or the unknown placeholder. */
+export function formatScore(score: number | null): string {
+  return score === null || !Number.isFinite(score) ? UNKNOWN : String(score)
+}
+
+/**
+ * `Q3`, `OT`, `2OT`, or `HALF` at halftime. Unknown when the period is.
+ * Halftime is read from ESPN's own detail text, which says `Halftime`.
+ */
+export function formatPeriod(live: Pick<LiveGame, 'period' | 'detail'>): string {
+  if (/half/i.test(live.detail)) return 'HALF'
+  const p = live.period
+  if (p === null || !Number.isInteger(p) || p < 1) return UNKNOWN
+  if (p <= 4) return `Q${p}`
+  return p === 5 ? 'OT' : `${p - 4}OT`
+}
+
+/**
+ * Time left until a kickoff, coarse enough to change at most once a minute:
+ * `2d 3h`, `5h 12m`, `12m`, `<1m`. Never negative. Rounded DOWN, so the
+ * countdown never claims more time than is left.
+ */
+export function formatCountdown(msUntil: number): string {
+  if (!Number.isFinite(msUntil) || msUntil <= 0) return 'NOW'
+  const totalMin = Math.floor(msUntil / 60_000)
+  if (totalMin < 1) return '<1m'
+  const d = Math.floor(totalMin / 1440)
+  const h = Math.floor((totalMin % 1440) / 60)
+  const m = totalMin % 60
+  if (d > 0) return `${d}d ${h}h`
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m`
+}
+
+/**
+ * The ball's spot as yards from MY goal line, 0 to 100, or null.
+ *
+ * ESPN prints the spot as `<team> <yard line>` (`TB 18`), measured in
+ * `play-4018729803719.json`, using the same team code as the event's
+ * `shortName` (`TB @ DAL`) — which is where `opponentShort` comes from. A
+ * spot on the opponent's side is `100 - n`. The code names one of exactly
+ * two teams, so a code that is not the opponent's is mine. `50` alone is
+ * midfield.
+ *
+ * Null — and no ball drawn — when the text is absent or has another shape,
+ * or when the opponent's code is unknown: without it the two halves cannot
+ * be told apart.
+ */
+export function parseFieldPosition(text: string | null, opponentShort: string): number | null {
+  if (!text) return null
+  const t = text.trim()
+  if (/^50$/.test(t)) return 50
+  const m = /^([A-Za-z0-9&.]{1,6})\s+(\d{1,2})$/.exec(t)
+  if (!m) return null
+  const n = Number(m[2])
+  if (!Number.isInteger(n) || n < 0 || n > 50) return null
+  const opp = opponentShort.trim().toUpperCase()
+  if (!opp) return null
+  return m[1]!.toUpperCase() === opp ? 100 - n : n
+}
+
+/** Whether a live game owns its team's row: in progress, final, or about to
+ * kick off. */
+export function isScoreboard(live: LiveGame | null, nowMs: number): live is LiveGame {
+  if (!live) return false
+  if (live.state === 'in' || live.state === 'post') return true
+  return Number.isFinite(live.kickoffEpochMs) && live.kickoffEpochMs - nowMs <= SCOREBOARD_LEAD_MS
+}
+
+/** Which celebration a new scoring event earns. Only my touchdowns and field
+ * goals celebrate; everything else is a quiet strip note. */
+export function celebrationKind(event: ScoringEvent): CelebrationKind {
+  if (event.side !== 'mine') return 'note'
+  if (event.kind === 'touchdown') return 'touchdown'
+  if (event.kind === 'field-goal') return 'field-goal'
+  return 'note'
+}
+
+const SCORE_KIND_LABEL: Record<ScoringEvent['kind'], string> = {
+  touchdown: 'TD',
+  'field-goal': 'FG',
+  safety: 'SAFETY',
+  conversion: 'PAT',
+  other: 'SCORE',
+}
+
 export interface FootballReader {
   /** The two configured teams, in row order: top row first. The page draws
    * whatever it is given and never names a team itself. */
@@ -270,6 +419,12 @@ export interface FootballReader {
   /** The team's accent colour, taken from its crest, or null when it has none.
    * Computed once when the logo is decoded — never on the render path. */
   getTeamColor(team: Team): Rgb | null
+  /** The live state of the team's current game, or null when no game is in
+   * its live window. Every null field inside it means UNKNOWN. */
+  getLive(team: Team): LiveGame | null
+  /** The team's next kickoff after `nowMs`, or null. It may carry
+   * `timeTbd: true`: its date is real, its time of day is not. */
+  getNextKickoff(team: Team, nowMs: number): NextKickoff | null
   setVisible(visible: boolean): void
 }
 
@@ -307,6 +462,18 @@ export class FootballPage implements Page {
    * so there is no stale-selection risk here. */
   private selected: Selection | null = null
 
+  /**
+   * The last scoring-event id seen per team, and `null` for "seen, no score
+   * yet". A team with NO entry has never been seen live: its current score
+   * is recorded on first sight and never celebrated, so a deck that starts
+   * mid-game stays calm. Kept for the life of the page, across `onLeave`, so
+   * nothing re-fires when the page comes back.
+   */
+  private readonly seenScoreIds = new Map<Team, string | null>()
+  /** The latest score each team reacted to. Finished ones stay; every reader
+   * checks the clock, and a finished one-shot costs no USB write. */
+  private readonly celebrations = new Map<Team, Celebration>()
+
   constructor(private readonly source: FootballReader) {}
 
   onEnter(): void {
@@ -338,6 +505,11 @@ export class FootballPage implements Page {
     if (this.selected) return undefined
     const nowMs = this.nowMsForTick()
     if (nowMs === null) return undefined
+    // A celebration animates at the one-shot rate until it finishes.
+    if (this.animating(nowMs)) return TAPE_TICK_MS
+    // A live strip carries no tape, and the live data changes every 20 s at
+    // the fastest — the default rate is plenty.
+    if (this.liveFocus(nowMs)) return undefined
     const [top, bottom] = this.source.getTeams()
     const topColor = this.source.getTeamColor(top) ?? theme.gray
     const bottomColor = this.source.getTeamColor(bottom) ?? theme.gray
@@ -373,22 +545,356 @@ export class FootballPage implements Page {
     const topColor = this.source.getTeamColor(top) ?? theme.gray
     const bottomColor = this.source.getTeamColor(bottom) ?? theme.gray
 
+    const topLive = this.liveRow(top, clockMs)
+    const bottomLive = this.liveRow(bottom, clockMs)
+    const anyLive = topLive !== null || bottomLive !== null
+
     const keys: KeySpec[] = [
-      this.logoKey(top, dim, topColor),
-      ...this.nextThreeKeys(top, clockMs, dim, topColor),
-      this.logoKey(bottom, dim, bottomColor),
-      ...this.nextThreeKeys(bottom, clockMs, dim, bottomColor),
+      ...this.rowKeys(top, topLive, anyLive, clockMs, dim, topColor),
+      ...this.rowKeys(bottom, bottomLive, anyLive, clockMs, dim, bottomColor),
     ]
+
+    const focus = this.liveFocus(clockMs)
+    const strip = focus ? this.liveStrip(focus.team, focus.live, clockMs) : this.strip(clockMs, topColor, bottomColor)
 
     // The ONE page where the two round buttons should differ. Every other page
     // shows a single board-level signal, so two colours would read as two
     // unrelated controls — but here the deck genuinely splits by row, one team on
     // top and one beneath, so each light names its own row.
-    return {
-      keys,
-      strip: this.strip(clockMs, topColor, bottomColor),
-      buttons: [topColor, bottomColor],
+    const buttons: [Rgb, Rgb] = this.flashButtons(clockMs) ?? [topColor, bottomColor]
+    return { keys, strip, buttons }
+  }
+
+  /* ---------------------------------------------------------- live game */
+
+  /**
+   * The team's live game when it owns the row, or null. Also the ONE place a
+   * new scoring event is noticed, so every reader of the live state agrees
+   * on whether a celebration exists.
+   */
+  private liveRow(team: Team, nowMs: number): LiveGame | null {
+    const live = this.source.getLive(team)
+    if (live) this.observe(team, live, nowMs)
+    return isScoreboard(live, nowMs) ? live : null
+  }
+
+  /**
+   * Records a scoring event the first time this page sees it, and starts its
+   * celebration when it earns one.
+   *
+   * The invariant: an event fires AT MOST once, and only when it is new to
+   * this page and fresh. Three routes to a wrong firing, and what stops each:
+   * - first sight of a game already scored (deck start, page first shown):
+   *   the first id per team is recorded, not celebrated;
+   * - a score the source saw while this page was not rendering (hidden, or
+   *   in the drill-down): the freshness check against the event's `atMs`;
+   * - the same id seen again on a later render, or after `onLeave`: the seen
+   *   id is kept for the life of the page.
+   */
+  private observe(team: Team, live: LiveGame, nowMs: number): void {
+    const id = live.lastScore?.id ?? null
+    const firstSight = !this.seenScoreIds.has(team)
+    const prev = this.seenScoreIds.get(team) ?? null
+    this.seenScoreIds.set(team, id)
+    const event = live.lastScore
+    if (firstSight || !event || id === prev) return
+    if (!Number.isFinite(event.atMs) || Math.abs(nowMs - event.atMs) > CELEBRATE_FRESH_MS) return
+    this.celebrations.set(team, {
+      kind: celebrationKind(event),
+      event: { ...event },
+      startedAtMs: nowMs,
+      lastPlay: live.lastPlay,
+    })
+  }
+
+  /** The team's celebration while it still shows anything, or null. */
+  private activeCelebration(team: Team, nowMs: number): Celebration | null {
+    const c = this.celebrations.get(team)
+    if (!c) return null
+    const age = nowMs - c.startedAtMs
+    const shownFor = c.kind === 'note' ? NOTE_MS : BANNER_MS
+    return age >= 0 && age < shownFor ? c : null
+  }
+
+  /** True while any key, button or banner pop still moves. The ONE answer
+   * `tickMs` reads, so the declared rate cannot disagree with the motion. */
+  private animating(nowMs: number): boolean {
+    for (const c of this.celebrations.values()) {
+      if (c.kind === 'note') continue
+      const age = nowMs - c.startedAtMs
+      if (age >= 0 && age < CELEBRATE_MS) return true
     }
+    return false
+  }
+
+  /**
+   * The live game the strip talks about, or null when no row is live. A team
+   * with a banner showing wins, then a game in progress, then the top row.
+   */
+  private liveFocus(nowMs: number): { team: Team; live: LiveGame } | null {
+    const rows: { team: Team; live: LiveGame }[] = []
+    for (const team of this.source.getTeams()) {
+      const live = this.source.getLive(team)
+      if (isScoreboard(live, nowMs)) rows.push({ team, live })
+    }
+    const banner = (team: Team): boolean => {
+      const c = this.activeCelebration(team, nowMs)
+      return c !== null && c.kind !== 'note'
+    }
+    return rows.find((r) => banner(r.team)) ?? rows.find((r) => r.live.state === 'in') ?? rows[0] ?? null
+  }
+
+  /** Both round buttons alternate the scoring team's colour and white, out
+   * of phase, while a touchdown celebrates. Null otherwise. */
+  private flashButtons(nowMs: number): [Rgb, Rgb] | null {
+    for (const team of this.source.getTeams()) {
+      const c = this.celebrations.get(team)
+      if (!c || c.kind !== 'touchdown') continue
+      const age = nowMs - c.startedAtMs
+      if (!(age >= 0 && age < CELEBRATE_MS)) continue
+      const accent = this.source.getTeamColor(team) ?? theme.gray
+      return Math.floor(age / BUTTON_FLASH_MS) % 2 === 0 ? [accent, theme.white] : [theme.white, accent]
+    }
+    return null
+  }
+
+  /** The schedule entry for a live game, by id, or undefined. */
+  private liveGame(team: Team, live: LiveGame): Game | undefined {
+    return this.source.getSchedule(team).find((g) => g.id === live.gameId)
+  }
+
+  /**
+   * One row of four keys. A live game takes the row over. A row that is not
+   * live, while the other row is, trades its third schedule tile for a
+   * kickoff countdown. Otherwise the row is the schedule, unchanged.
+   */
+  private rowKeys(team: Team, live: LiveGame | null, anyLive: boolean, nowMs: number, dim: boolean, accent: Rgb): KeySpec[] {
+    if (live) return this.scoreboardKeys(team, live, nowMs, dim, accent)
+    const games = this.nextThreeKeys(team, nowMs, dim, accent)
+    if (anyLive) {
+      const countdown = this.countdownKey(team, nowMs, dim, accent)
+      if (countdown) return [this.logoKey(team, dim, accent), games[0]!, countdown, games[1]!]
+    }
+    return [this.logoKey(team, dim, accent), ...games]
+  }
+
+  /** `KICKOFF IN 2d 3h`, or the date alone when the time is TBD — never a
+   * countdown to a placeholder time of day. Null when no kickoff lies ahead. */
+  private countdownKey(team: Team, nowMs: number, dim: boolean, accent: Rgb): KeySpec | null {
+    const next = this.source.getNextKickoff(team, nowMs)
+    if (!next) return null
+    const header = homeAwayHeader(next)
+    const key: KeySpec = next.timeTbd
+      ? {
+          kind: 'gauge',
+          lines: ['KICKOFF', formatShortDate(next.kickoffEpochMs), 'TIME TBA', header],
+          lineSizes: [10, COUNTDOWN_SIZES, 11, 12],
+          lineY: [12, 32, 58, 74],
+          lineColors: [theme.textDim, blend(accent, theme.white, 0.35), theme.textDim, theme.text],
+          lineWeights: ['bold', 'bold'],
+          align: 'center',
+        }
+      : {
+          kind: 'gauge',
+          lines: ['KICKOFF IN', formatCountdown(next.kickoffEpochMs - nowMs), header],
+          lineSizes: [10, COUNTDOWN_SIZES, 12],
+          lineY: [12, 36, 70],
+          lineColors: [theme.textDim, blend(accent, theme.white, 0.35), theme.text],
+          lineWeights: ['bold', 'bold'],
+          align: 'center',
+        }
+    key.border = accent
+    if (dim) key.dim = true
+    return key
+  }
+
+  /** Keys A-D of a live row: my score, the opponent's, the clock, the field. */
+  private scoreboardKeys(team: Team, live: LiveGame, nowMs: number, pageDim: boolean, accent: Rgb): KeySpec[] {
+    const dim = pageDim || live.stale
+    const game = this.liveGame(team, live)
+    const opponentCode = game?.opponentShort || game?.opponent || UNKNOWN
+    const celebration = this.activeCelebration(team, nowMs)
+    const ball = (side: 'mine' | 'opponent'): string => (live.possession === side ? '● BALL' : '')
+
+    const mine: KeySpec = {
+      kind: 'gauge',
+      lines: [this.source.getLabel(team) || UNKNOWN, formatScore(live.myScore), ball('mine')],
+      lineSizes: [[12, 11], SCORE_SIZES, 11],
+      lineY: [8, 28, 78],
+      lineColors: [theme.text, accent, theme.amber],
+      lineWeights: ['bold', 'bold', 'bold'],
+      align: 'center',
+      bg: blend(theme.bg, accent, 0.14),
+      border: accent,
+    }
+    const theirs: KeySpec = {
+      kind: 'gauge',
+      lines: [opponentCode, formatScore(live.opponentScore), ball('opponent')],
+      lineSizes: [[12, 11], SCORE_SIZES, 11],
+      lineY: [8, 28, 78],
+      lineColors: [theme.text, theme.text, theme.amber],
+      lineWeights: ['bold', 'bold', 'bold'],
+      align: 'center',
+      border: accent,
+    }
+    const keys = [mine, theirs, this.clockKey(live, nowMs, accent), this.fieldKey(live, game?.opponentShort ?? '', accent)]
+    if (dim) for (const k of keys) k.dim = true
+
+    if (celebration && celebration.kind !== 'note') {
+      const start = celebration.startedAtMs
+      // My score pops when it changes.
+      mine.linePop = { line: 1, startedAtMs: start, nowMs }
+      const colors: Rgb[] = [accent, theme.white, blend(accent, theme.white, 0.5)]
+      if (celebration.kind === 'touchdown') {
+        const flood = blend(theme.bg, accent, 0.45)
+        keys.forEach((k, i) => {
+          k.effects = [
+            { variant: 'sweep', startedAtMs: start + i * SWEEP_STAGGER_MS, nowMs, color: accent },
+            { variant: 'burst', startedAtMs: start + 150, nowMs, colors, seed: i + 1 },
+          ]
+          if (nowMs - start >= 0 && nowMs - start < FLOOD_MS) k.bg = flood
+        })
+      } else {
+        mine.effects = [{ variant: 'burst', startedAtMs: start, nowMs, colors, count: 14, seed: 1 }]
+      }
+    }
+    return keys
+  }
+
+  /** Key C: period, game clock, down and distance — or the kickoff before
+   * the game, or FINAL after it. */
+  private clockKey(live: LiveGame, nowMs: number, accent: Rgb): KeySpec {
+    const base: KeySpec = { kind: 'gauge', align: 'center', border: accent }
+    if (live.state === 'pre') {
+      return {
+        ...base,
+        lines: ['KICKOFF IN', formatCountdown(live.kickoffEpochMs - nowMs), formatEasternTime(live.kickoffEpochMs, { zone: false })],
+        lineSizes: [10, PERIOD_SIZES, [11, 10]],
+        lineY: [12, 36, 72],
+        lineColors: [theme.textDim, theme.amber, theme.textDim],
+        lineWeights: ['bold', 'bold'],
+      }
+    }
+    if (live.state === 'post') {
+      return {
+        ...base,
+        lines: [/^final/i.test(live.detail) ? live.detail.toUpperCase() : 'FINAL'],
+        lineSizes: [PERIOD_SIZES],
+        lineY: [38],
+        lineWeights: ['bold'],
+      }
+    }
+    const period = formatPeriod(live)
+    return {
+      ...base,
+      lines: [period, period === 'HALF' ? '' : live.clock ?? UNKNOWN, live.downDistance ?? UNKNOWN],
+      lineSizes: [PERIOD_SIZES, PERIOD_SIZES, [12, 11]],
+      lineY: [14, 42, 74],
+      lineColors: [theme.text, theme.amber, theme.textDim],
+      lineWeights: ['bold', 'bold'],
+    }
+  }
+
+  /**
+   * Key D: a small field, my end zone on the left. The ball is an arrow over
+   * its spot when the spot parses. Otherwise the field draws with no ball: a
+   * range always draws its marker, so the empty field is a plain bar at the
+   * same height instead. Tinted red in the red zone. After the game it shows
+   * the result.
+   */
+  private fieldKey(live: LiveGame, opponentShort: string, accent: Rgb): KeySpec {
+    if (live.state === 'post') {
+      const result =
+        live.myScore === null || live.opponentScore === null
+          ? null
+          : live.myScore > live.opponentScore
+            ? 'win'
+            : live.myScore < live.opponentScore
+              ? 'loss'
+              : 'tie'
+      const key: KeySpec = {
+        kind: 'gauge',
+        lines: [result ? result.toUpperCase() : UNKNOWN],
+        lineSizes: [PERIOD_SIZES],
+        lineY: [38],
+        lineWeights: ['bold'],
+        align: 'center',
+        border: accent,
+      }
+      const wash = result === 'win' || result === 'loss' ? resultWash(result) : undefined
+      if (wash) key.bg = wash
+      return key
+    }
+    const yards = parseFieldPosition(live.fieldPosition, opponentShort)
+    const key: KeySpec = {
+      kind: 'gauge',
+      lines: [live.fieldPosition ?? UNKNOWN, live.redZone === true ? 'RED ZONE' : ''],
+      lineSizes: [[16, 14, 12], 10],
+      lineY: [26, 80],
+      lineColors: [theme.text, theme.red],
+      lineWeights: ['bold', 'bold'],
+      align: 'center',
+      border: accent,
+    }
+    if (yards !== null) {
+      key.range = { lo: 0, hi: 100, value: yards, y: FIELD_Y, height: FIELD_H, gradient: [accent, theme.gray], marker: 'arrow' }
+    } else {
+      key.bar = { value: 0, color: accent, bg: FIELD_EMPTY }
+    }
+    if (live.redZone === true) key.bg = blend(theme.bg, theme.red, 0.28)
+    return key
+  }
+
+  /** The strip during a live game: the score line, then the last play. A
+   * banner takes over after a score of mine; a quiet note after any other. */
+  private liveStrip(team: Team, live: LiveGame, nowMs: number): StripSpec {
+    const game = this.liveGame(team, live)
+    const mine = this.source.getShort(team) || UNKNOWN
+    const theirs = game?.opponentShort || UNKNOWN
+    const celebration = this.activeCelebration(team, nowMs)
+
+    if (celebration && celebration.kind !== 'note') {
+      const accent = this.source.getTeamColor(team) ?? theme.gray
+      const banner: NonNullable<StripSpec['banner']> = {
+        text: celebration.kind === 'touchdown' ? 'TOUCHDOWN!' : 'FIELD GOAL',
+        color: blend(accent, theme.white, 0.25),
+        size: celebration.kind === 'touchdown' ? 24 : 20,
+        pop: { startedAtMs: celebration.startedAtMs, nowMs },
+      }
+      if (celebration.lastPlay) banner.sub = celebration.lastPlay
+      return { lines: [], banner }
+    }
+
+    // In Menlo the en dash and the unknown placeholder look alike, so an
+    // unknown score never sits beside the separator: `UF — – — UGA` reads
+    // as noise. It says the score is unknown in words instead.
+    const score =
+      live.myScore === null || live.opponentScore === null
+        ? `${mine} vs ${theirs} · score ${UNKNOWN}`
+        : `${mine} ${live.myScore} – ${live.opponentScore} ${theirs}`
+    let line1: string
+    if (live.state === 'pre') line1 = `${mine} vs ${theirs} · ${formatEasternTime(live.kickoffEpochMs)}`
+    else if (live.state === 'post') line1 = `FINAL · ${score}`
+    else {
+      const period = formatPeriod(live)
+      line1 = period === 'HALF' || live.clock === null ? `${score} · ${period}` : `${score} · ${period} ${live.clock}`
+    }
+
+    let line2: string
+    if (celebration) {
+      // A score that earns no celebration: one quiet line, then back to plays.
+      const e = celebration.event
+      line2 = `${e.side === 'mine' ? mine : theirs} ${SCORE_KIND_LABEL[e.kind]} · ${e.myScore}-${e.opponentScore}`
+    } else if (live.state === 'in' && live.lastPlay) {
+      line2 = live.lastPlay
+    } else if (live.state === 'in' && live.downDistance && live.fieldPosition) {
+      line2 = `${live.downDistance} at ${live.fieldPosition}`
+    } else {
+      line2 = `updated ${formatEasternTime(live.updatedAtMs)}`
+    }
+    const spec: StripSpec = { lines: [truncate(line1, STRIP_CHARS), truncate(line2, STRIP_CHARS)] }
+    if (live.stale) spec.dim = true
+    return spec
   }
 
   /** Keys 0 and 4: the team's composited logo (crest plus a reserved plain

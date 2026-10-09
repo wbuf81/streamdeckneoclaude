@@ -40,7 +40,8 @@ import type { UsageSnapshot } from '../src/sources/usage.js'
 import type { CodexSnapshot } from '../src/sources/codex.js'
 import type { PlayerState } from '../src/sources/spotify.js'
 import type { Conditions, DayForecast } from '../src/sources/weather.js'
-import type { Game, Team, TeamRecord } from '../src/sources/football.js'
+import type { Game, LiveGame, Team, TeamRecord } from '../src/sources/football.js'
+import { nextKickoff } from '../src/sources/football.js'
 
 /** Walks up to the repository root — the same helper the contact sheets use,
  * for the same reason: this runs from both `scripts/` and `dist/scripts/`, so
@@ -366,12 +367,30 @@ function game(over: Partial<Game>): Game {
   } as unknown as Game
 }
 
-function footballPage(): Page {
+/** A Gators game in the third quarter, for the live and touchdown shots. */
+function gatorsLive(over: Partial<LiveGame> = {}): LiveGame {
+  return {
+    gameId: 'g0', kickoffEpochMs: NOW_MS - 7_200_000, state: 'in', detail: '2:58 - 3rd',
+    period: 3, clock: '2:58', clockSeconds: 178, myScore: 21, opponentScore: 17,
+    possession: 'mine', downDistance: '2nd & 6', fieldPosition: 'UGA 24',
+    lastPlay: 'Johnson 7 Yd Run', redZone: false, lastScore: null,
+    updatedAtMs: NOW_MS - 5000, stale: false, ...over,
+  }
+}
+
+/**
+ * `live` puts the Gators in a game. `touchdown` also scores one: the page
+ * celebrates only a score it did not see on an earlier render, so the
+ * factory renders once before the score and once at it, 450 ms before the
+ * shot.
+ */
+function footballPage(mode: 'schedule' | 'live' | 'touchdown' = 'schedule'): Page {
   // Kickoffs are offset by real hours as well as days: every game sharing one
   // time of day is a fixture artefact, and it would make the shot look like
   // the page prints a constant.
   const at = (days: number, hour: number) => NOW_MS + days * 86_400_000 + hour * 3_600_000
   const gators: Game[] = [
+    ...(mode === 'schedule' ? [] : [game({ id: 'g0', opponent: 'Georgia Bulldogs', opponentShort: 'UGA', kickoffEpochMs: NOW_MS - 7_200_000 })]),
     game({ id: 'g1', opponent: 'Georgia Bulldogs', opponentShort: 'UGA', isHome: false, kickoffEpochMs: at(2, 4) }),
     game({ id: 'g2', opponent: 'Texas Longhorns', opponentShort: 'TEX', isHome: true, kickoffEpochMs: at(9, 8) }),
     game({ id: 'g3', opponent: 'LSU Tigers', opponentShort: 'LSU', isHome: false, kickoffEpochMs: at(16, 1) }),
@@ -389,7 +408,10 @@ function footballPage(): Page {
     gators: [250, 70, 22],
     jaguars: [0, 103, 120],
   }
-  return new FootballPage({
+  let live: LiveGame | null = mode === 'schedule' ? null : gatorsLive()
+  const page = new FootballPage({
+    getLive: (team: Team) => (team === 'gators' ? live : null),
+    getNextKickoff: (team: Team, nowMs: number) => nextKickoff(team === 'gators' ? gators : jaguars, nowMs),
     getTeams: () => ['gators', 'jaguars'] as const,
     getLabel: (team: string) => (team === 'gators' ? 'GATORS' : 'JAGUARS'),
     getShort: (team: string) => (team === 'gators' ? 'UF' : 'JAX'),
@@ -402,6 +424,15 @@ function footballPage(): Page {
     getTeamColor: (team: Team) => colors[team],
     setVisible: () => {},
   } as never)
+  if (mode === 'touchdown') {
+    page.render(NOW, NOW_MS - 20_450)
+    live = gatorsLive({
+      myScore: 27, possession: null, downDistance: null, fieldPosition: null, lastPlay: 'Johnson 12 Yd Run',
+      lastScore: { id: 'g0:1', seq: 1, side: 'mine', points: 6, kind: 'touchdown', atMs: NOW_MS - 1000, playId: null, myScore: 27, opponentScore: 17 },
+    })
+    page.render(NOW, NOW_MS - 450)
+  }
+  return page
 }
 
 function systemPage(): Page {
@@ -451,6 +482,8 @@ async function main(): Promise<void> {
     { file: 'page-stocks-detail.png', page: stocksPage(), press: 0 },
     { file: 'page-weather.png', page: weatherPage() },
     { file: 'page-football.png', page: footballPage() },
+    { file: 'page-football-live.png', page: footballPage('live') },
+    { file: 'page-football-touchdown.png', page: footballPage('touchdown') },
     { file: 'page-system.png', page: systemPage() },
   ]
 

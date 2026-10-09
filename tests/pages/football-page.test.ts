@@ -16,6 +16,7 @@ import { renderKey, probe, KEY_SIZE } from '../../src/render/canvas.js'
 import { keyHash } from '../../src/render/specs.js'
 import type { KeySpec, Rgb } from '../../src/render/specs.js'
 import type { FootballStatus, Game, Team, TeamRecord } from '../../src/sources/football.js'
+import { nextKickoff } from '../../src/sources/football.js'
 
 const NOW_S = 1755000000 // arbitrary fixed clock, seconds
 
@@ -80,6 +81,10 @@ function build(over: Partial<Fakes> = {}) {
       calls.push(`teamColor:${team}`)
       return f.teamColors[team] ?? null
     },
+    // No game is live in this suite; tests/pages/football-live.test.ts
+    // covers the live scoreboard.
+    getLive: () => null,
+    getNextKickoff: (team: Team, nowMs: number) => nextKickoff(f.schedules[team] ?? [], nowMs),
     setVisible: (v: boolean) => {
       calls.push(`visible:${v}`)
     },
