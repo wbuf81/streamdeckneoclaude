@@ -2,7 +2,7 @@ import type { DeckDevice } from './device.js'
 import { BUTTON_LEFT, BUTTON_RIGHT, NEO_KEY_COUNT } from './device.js'
 import type { PageManager } from './page-manager.js'
 import { renderKey, renderStrip } from './render/canvas.js'
-import { keyHash, stripHash, type DeckFrame, type KeySpec, type Rgb } from './render/specs.js'
+import { keyHash, stripHash, type DeckFrame, type KeySpec, type Rgb, type StripSpec } from './render/specs.js'
 import { theme } from './render/theme.js'
 import { log } from './log.js'
 import type { LockState } from './lock-state.js'
@@ -55,9 +55,99 @@ const FLASH_PUMP_BACKOFF_STEP_MS = 50
 const FLASH_PUMP_MAX_BACKOFF_MS = 1000
 
 /**
+ * Page-change feedback (task: page wipe, name strip, button acknowledgement).
+ *
+ * The deck is 4 columns by 2 rows. Keys 0 to 3 are the top row and 4 to 7
+ * the bottom row (`docs/VERIFIED-FACTS.md`), so a key's column is
+ * `index % WIPE_COLUMNS`.
+ *
+ * A page change reveals the new page one column at a time, in the direction
+ * of travel. The first column is written at once, so the press itself gets
+ * an immediate response; each later column follows `WIPE_STEP_MS` after the
+ * one before. Four columns at 45 ms span about 180 ms of wipe, with the last
+ * column landing at 135 ms. The wipe only GATES which keys the ordinary
+ * dirty-key writer may write: it draws no pixels of its own, so each key is
+ * written at most once per page change, exactly as without the wipe.
+ */
+export const WIPE_COLUMNS = 4
+export const WIPE_STEP_MS = 45
+
+/** How long the strip shows the new page's name after a page change. */
+export const PAGE_NAME_MS = 1000
+
+/**
+ * The round-button acknowledgement: the pressed button's backlight jumps
+ * toward a bright target, then settles back to the page's own colour in
+ * these quantised steps, one step every `ACK_STEP_MS`. Each entry is how far
+ * toward the target the colour sits. After the last entry the button returns
+ * to the page's colour exactly, so one acknowledgement costs
+ * `ACK_LEVELS.length + 1` button writes (5) over about 300 ms — never a
+ * write per render tick.
+ */
+export const ACK_LEVELS: readonly number[] = [0.85, 0.6, 0.35, 0.15]
+export const ACK_STEP_MS = 75
+/** The target for a nav press that changed the page. */
+export const ACK_OK_RGB: Rgb = [255, 255, 255]
+/**
+ * The target for a nav press that could NOT change the page — a deck with
+ * only one page enabled. AGENTS.md: a press that does nothing must still be
+ * visibly rejected, so this is a red tint, matching the red the screen keys
+ * already use for a rejected press. It is not a full red: it is mixed into
+ * the button's own colour, and it fades out on the same schedule.
+ */
+export const ACK_REJECT_RGB: Rgb = [220, 40, 40]
+
+/** Monospaced character columns that fit across the strip's text area at
+ * its 13 px Menlo: 236 px of usable width / 7.83 px per character, measured
+ * with `@napi-rs/canvas` on this Mac. */
+const STRIP_TEXT_COLUMNS = 30
+
+/**
+ * The strip shown for `PAGE_NAME_MS` after a page change. This is the ONE
+ * place that decides how a page's name looks there. Today `StripSpec` has
+ * only 13 px left-aligned lines, so this upper-cases the name, letter-spaces
+ * it when it fits, centres it with leading spaces (Menlo is monospaced), and
+ * puts it on line 2, whose band (y 21 to 34) is the nearest to the strip's
+ * vertical middle (29). When `StripSpec` gains a large centred line, change
+ * only this function.
+ */
+export function pageNameStrip(name: string): StripSpec {
+  const upper = name.toUpperCase()
+  const spaced = upper.split('').join(' ')
+  const text = spaced.length <= STRIP_TEXT_COLUMNS ? spaced : upper
+  const pad = Math.max(0, Math.round((STRIP_TEXT_COLUMNS - text.length) / 2))
+  return { lines: ['', ' '.repeat(pad) + text] }
+}
+
+/** Mixes `base` toward `target` by `t` (0 is `base`, 1 is `target`), rounded
+ * to whole channel values so equal steps hash equal. */
+function mixRgb(base: Rgb, target: Rgb, t: number): Rgb {
+  const ch = (i: 0 | 1 | 2) => Math.round(base[i] + (target[i] - base[i]) * t)
+  return [ch(0), ch(1), ch(2)]
+}
+
+/** A column wipe in progress. `columns` is how many columns of the new page
+ * the writer may write so far, counted from the side the wipe starts on.
+ * `forced` holds keys revealed early because a press ring had to draw on
+ * them; once in, a key stays in until the wipe ends, so its ring can always
+ * be written away again. */
+interface Wipe {
+  fromLeft: boolean
+  columns: number
+  forced: Set<number>
+}
+
+/** One round button's acknowledgement: which `ACK_LEVELS` entry it shows. */
+interface Ack {
+  step: number
+  target: Rgb
+}
+
+/**
  * A transient press-feedback flash on one key, index 0 to 7 — never the two
- * round buttons (8, 9): they carry RGB backlights, not screens, and a page
- * flip is already its own visible feedback, so there is nothing to flash.
+ * round buttons (8, 9): they carry RGB backlights, not screens, so they get
+ * their own backlight acknowledgement instead (see `ACK_LEVELS` and
+ * `changePage`).
  *
  * `ok` is true for a `handled` press (white) and false for `ignored` or
  * `failed` (red) — see `PressOutcome`'s doc comment for why those two share
@@ -176,6 +266,15 @@ export class Daemon {
    * should have to tolerate.
    */
   private pageVisible = true
+  /** The column wipe in progress, or `null`. See `Wipe` and `WIPE_STEP_MS`. */
+  private wipe: Wipe | null = null
+  private wipeTimer: NodeJS.Timeout | null = null
+  /** The page whose name the strip shows, or `null`. See `PAGE_NAME_MS`. */
+  private namePage: string | null = null
+  private nameTimer: NodeJS.Timeout | null = null
+  /** One acknowledgement per round button: slot 0 is left, slot 1 right. */
+  private acks: [Ack | null, Ack | null] = [null, null]
+  private ackTimers: [NodeJS.Timeout | null, NodeJS.Timeout | null] = [null, null]
 
   constructor(
     private readonly device: DeckDevice,
@@ -286,20 +385,12 @@ export class Daemon {
     if (this.stopped || this.locked) return
     const key = `press-${index}`
     try {
-      if (index === BUTTON_LEFT) {
+      if (index === BUTTON_LEFT || index === BUTTON_RIGHT) {
         // The two round buttons have RGB backlights, not screens: there is
-        // nothing to flash, and flipping the page is already its own
-        // visible feedback.
-        this.pages.prev()
-        this.armTimer()
-        await this.renderNow()
-        log.clearOnce(key)
-        return
-      }
-      if (index === BUTTON_RIGHT) {
-        this.pages.next()
-        this.armTimer()
-        await this.renderNow()
+        // no ring to draw. `changePage` gives them their own feedback
+        // instead — the backlight acknowledgement, the column wipe, and the
+        // page-name strip.
+        await this.changePage(index === BUTTON_LEFT ? 0 : 1)
         log.clearOnce(key)
         return
       }
@@ -334,6 +425,137 @@ export class Daemon {
       // same defect drifting (M2).
       log.once(key, `press handling crashed unexpectedly for index ${index}: ${String(e)}`)
     }
+  }
+
+  /**
+   * Handles a round-button press. `slot` 0 is the left button (previous
+   * page), 1 the right (next page).
+   *
+   * Every press acknowledges on the pressed button's backlight. A press that
+   * changed the page brightens toward white; a press that could not (a deck
+   * with one page) tints toward red, because a press that does nothing must
+   * still be visibly rejected (AGENTS.md). Only a real change starts the
+   * column wipe and the page-name strip. A second change mid-wipe simply
+   * starts a new wipe toward the newest page: the writer compares against
+   * what is on the glass, so every column still converges on that page.
+   */
+  private async changePage(slot: 0 | 1): Promise<void> {
+    const before = this.pages.index
+    if (slot === 0) this.pages.prev()
+    else this.pages.next()
+    const changed = this.pages.index !== before
+    this.startAck(slot, changed ? ACK_OK_RGB : ACK_REJECT_RGB)
+    if (changed) {
+      this.startWipe(slot === 1)
+      this.startNameStrip(this.pages.current().name)
+      this.armTimer()
+    }
+    await this.renderNow()
+  }
+
+  /** Starts (or restarts) the column wipe. Right-button travel reveals from
+   * the left; left-button travel reveals from the right. */
+  private startWipe(fromLeft: boolean): void {
+    if (this.wipeTimer) clearTimeout(this.wipeTimer)
+    this.wipe = { fromLeft, columns: 1, forced: new Set() }
+    this.scheduleWipeStep()
+  }
+
+  private scheduleWipeStep(): void {
+    this.wipeTimer = setTimeout(() => {
+      this.wipeTimer = null
+      if (this.stopped || !this.wipe) return
+      this.wipe.columns += 1
+      if (this.wipe.columns >= WIPE_COLUMNS) this.wipe = null
+      else this.scheduleWipeStep()
+      void this.renderNow()
+    }, WIPE_STEP_MS)
+  }
+
+  private startNameStrip(name: string): void {
+    if (this.nameTimer) clearTimeout(this.nameTimer)
+    this.namePage = name
+    this.nameTimer = setTimeout(() => {
+      this.nameTimer = null
+      this.namePage = null
+      if (this.stopped) return
+      void this.renderNow()
+    }, PAGE_NAME_MS)
+  }
+
+  private startAck(slot: 0 | 1, target: Rgb): void {
+    const timer = this.ackTimers[slot]
+    if (timer) clearTimeout(timer)
+    this.acks[slot] = { step: 0, target }
+    this.scheduleAckStep(slot)
+  }
+
+  private scheduleAckStep(slot: 0 | 1): void {
+    this.ackTimers[slot] = setTimeout(() => {
+      this.ackTimers[slot] = null
+      const ack = this.acks[slot]
+      if (this.stopped || !ack) return
+      ack.step += 1
+      if (ack.step >= ACK_LEVELS.length) this.acks[slot] = null
+      else this.scheduleAckStep(slot)
+      void this.renderNow()
+    }, ACK_STEP_MS)
+  }
+
+  /**
+   * Ends every page-change transition at once: the wipe, the name strip, and
+   * both button acknowledgements. `invalidateFrame` calls this, so the rule
+   * is structural: whenever the daemon forgets what is on the glass (lock,
+   * unlock, reconnect, a sleep-sized clock jump, a failed write), the next
+   * frame writes every key, the page's own strip, and the page's own button
+   * colours. A wipe therefore never gates writes over a glass whose state
+   * is unknown, and a blank or reconnect never waits on a transition.
+   */
+  private endTransitions(): void {
+    if (this.wipeTimer) clearTimeout(this.wipeTimer)
+    this.wipeTimer = null
+    this.wipe = null
+    if (this.nameTimer) clearTimeout(this.nameTimer)
+    this.nameTimer = null
+    this.namePage = null
+    for (const slot of [0, 1] as const) {
+      const timer = this.ackTimers[slot]
+      if (timer) clearTimeout(timer)
+      this.ackTimers[slot] = null
+      this.acks[slot] = null
+    }
+  }
+
+  /**
+   * Which keys the writer may write in this frame. `null` means all of them
+   * (no wipe). A key whose column the wipe has not reached yet keeps the old
+   * page's pixels — unless it carries a press ring: a press during the wipe
+   * goes to the new page, so its key is revealed at once, and it stays
+   * revealed until the wipe ends so the ring is also written away on time.
+   */
+  private wipeGate(frame: DeckFrame): ((index: number) => boolean) | null {
+    const wipe = this.wipe
+    if (!wipe) return null
+    for (let i = 0; i < NEO_KEY_COUNT; i++) {
+      if (frame.keys[i]?.flashRing) wipe.forced.add(i)
+    }
+    return (i) => {
+      const column = i % WIPE_COLUMNS
+      const reached = wipe.fromLeft ? column < wipe.columns : column >= WIPE_COLUMNS - wipe.columns
+      return reached || wipe.forced.has(i)
+    }
+  }
+
+  /** Overlays the name strip and the button acknowledgements on `frame`. The
+   * name shows only while its page is still current. */
+  private overlayTransitions(frame: DeckFrame, pageName: string): DeckFrame {
+    const strip = this.namePage === pageName ? pageNameStrip(pageName) : frame.strip
+    const button = (slot: 0 | 1): Rgb => {
+      const ack = this.acks[slot]
+      const level = ack ? ACK_LEVELS[ack.step] : undefined
+      return ack && level !== undefined ? mixRgb(frame.buttons[slot], ack.target, level) : frame.buttons[slot]
+    }
+    return { ...frame, strip, buttons: [button(0), button(1)] }
   }
 
   /**
@@ -559,8 +781,9 @@ export class Daemon {
     // device write.
     const task = (async () => {
       const page = this.pages.current()
-      const frame = page.render(now, nowMs)
-      await this.writeFrame(this.overlayFlashes(padKeys(frame), nowMs, page.name))
+      const frame = this.overlayFlashes(padKeys(page.render(now, nowMs)), nowMs, page.name)
+      const gate = this.wipeGate(frame)
+      await this.writeFrame(this.overlayTransitions(frame, page.name), gate)
     })()
     this.activeRender = task
     try {
@@ -740,10 +963,15 @@ export class Daemon {
     }
   }
 
-  private async writeFrame(frame: DeckFrame): Promise<void> {
+  /** Writes what changed. `allow`, when given, limits which keys may be
+   * written (the page wipe); a key it refuses keeps whatever is on the glass,
+   * and its `lastKeys` entry stays the hash of that, so it is written as soon
+   * as it is allowed. `blankForLock` never passes one. */
+  private async writeFrame(frame: DeckFrame, allow: ((index: number) => boolean) | null = null): Promise<void> {
     for (let i = 0; i < NEO_KEY_COUNT; i++) {
       const spec = frame.keys[i]
       if (!spec) continue
+      if (allow && !allow(i)) continue
       const hash = keyHash(spec)
       if (hash === this.lastKeys[i]) continue
       await this.device.setKeyImage(i, renderKey(spec))
@@ -838,6 +1066,7 @@ export class Daemon {
   }
 
   private invalidateFrame(): void {
+    this.endTransitions()
     this.lastKeys = new Array(NEO_KEY_COUNT).fill(null)
     this.lastStrip = null
     this.lastButtons = [null, null]
@@ -856,6 +1085,7 @@ export class Daemon {
     this.timer = null
     if (this.flashPumpTimer) clearTimeout(this.flashPumpTimer)
     this.flashPumpTimer = null
+    this.endTransitions()
     await this.lockState?.stop()
     await this.lockTransition
     // I1: a render already in flight when `stop()` was called must finish

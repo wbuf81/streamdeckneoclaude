@@ -9,7 +9,7 @@ import type { DeckFrame, KeySpec } from '../src/render/specs.js'
 import { keyHash } from '../src/render/specs.js'
 import { renderKey, renderStrip } from '../src/render/canvas.js'
 import { theme } from '../src/render/theme.js'
-import { DEFAULT_BRIGHTNESS, type LockStateReader } from '../src/daemon.js'
+import { DEFAULT_BRIGHTNESS, PAGE_NAME_MS, WIPE_COLUMNS, WIPE_STEP_MS, type LockStateReader } from '../src/daemon.js'
 
 /** Waits for every pending microtask queued so far to drain. A press's own
  * chain (`onKeyPress`, then `renderOnce`'s several awaited device writes) is
@@ -17,6 +17,12 @@ import { DEFAULT_BRIGHTNESS, type LockStateReader } from '../src/daemon.js'
  * enough to observe its outcome -- it only advances one microtask tick. */
 function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/** Waits, in real time, until a page change's column wipe has written its
+ * last column. A left-button flip reaches key 0 (column 0) last. */
+function settleWipe(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, WIPE_COLUMNS * WIPE_STEP_MS + 30))
 }
 
 /** A page whose content the test controls. `name` defaults to `'test'`, but
@@ -793,7 +799,10 @@ describe('Daemon per-page render interval', () => {
     expect(slow.renderCount).toBe(1)
 
     device.simulatePress(BUTTON_RIGHT)
-    await vi.advanceTimersByTimeAsync(0)
+    // Let the page-change feedback (wipe, button acknowledgement, name
+    // strip) finish first: each of its steps is one extra render, which is
+    // not what this test counts.
+    await vi.advanceTimersByTimeAsync(PAGE_NAME_MS + 1)
     fast.renderCount = 0
     await vi.advanceTimersByTimeAsync(1000)
     // Had the daemon kept the old 1000 ms timer, this would be 1, not 10.
@@ -1309,7 +1318,7 @@ describe('Daemon press-feedback flash', () => {
     // already prove for a flash that WAS drawn before the flip.
     ms = 1020
     device.simulatePress(BUTTON_LEFT) // pageB -> pageA
-    await flush()
+    await settleWipe() // a left flip wipes right-to-left; key 0 is last
     expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['A'] }))).toBe(true)
 
     await daemon.stop()
@@ -1379,7 +1388,7 @@ describe('Daemon press-feedback flash', () => {
     expect(device.keyImages.get(0)?.equals(renderKey({ kind: 'gauge', lines: ['B'] }))).toBe(true)
 
     device.simulatePress(BUTTON_LEFT) // pageB -> pageA
-    await flush()
+    await settleWipe() // a left flip wipes right-to-left; key 0 is last
     expect(device.keyImages.get(0)?.equals(plainKeyA())).toBe(true)
 
     // Every key ever written across start and both page flips -- never a
